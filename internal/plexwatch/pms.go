@@ -590,6 +590,15 @@ func (s *Servers) ViewerServers(ctx context.Context, userID int64) ([]PMSViewerM
 	return out, rows.Err()
 }
 
+// ServerToken returns the decrypted Plex token for the configured PMS server.
+func (s *Servers) ServerToken(ctx context.Context, id int64) (string, error) {
+	row, err := s.loadServer(ctx, id)
+	if err != nil {
+		return "", err
+	}
+	return s.open(row.token, row.machineID)
+}
+
 // Accounts lists the server's accounts live, with their current viewer.
 func (s *Servers) Accounts(ctx context.Context, id int64) ([]PMSAccount, error) {
 	row, err := s.loadServer(ctx, id)

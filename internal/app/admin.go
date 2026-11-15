@@ -332,11 +332,40 @@ func (a *App) listPlexUsers(ctx context.Context) ([]plextv.SharedUser, error) {
 	if a.plextv == nil {
 		return nil, nil
 	}
-	token := a.cfg.Get().Plex.Token
-	if token == "" {
-		return nil, nil
+	seen := make(map[int64]bool)
+	var out []plextv.SharedUser
+	appendUsers := func(list []plextv.SharedUser) {
+		for _, u := range list {
+			if u.PlexID <= 0 || seen[u.PlexID] {
+				continue
+			}
+			seen[u.PlexID] = true
+			out = append(out, u)
+		}
 	}
-	return a.plextv.Users(ctx, token)
+	if token := a.cfg.Get().Plex.Token; token != "" {
+		if users, err := a.plextv.Users(ctx, token); err == nil {
+			appendUsers(users)
+		} else {
+			a.log.Warn("list ether plex.tv users error", "err", err)
+		}
+	}
+	if a.plexServers != nil {
+		if srvs, err := a.plexServers.List(ctx); err == nil {
+			for _, srv := range srvs {
+				pmsToken, err := a.plexServers.ServerToken(ctx, srv.ID)
+				if err != nil || pmsToken == "" {
+					continue
+				}
+				if users, err := a.plextv.Users(ctx, pmsToken); err == nil {
+					appendUsers(users)
+				} else {
+					a.log.Warn("list pms plex.tv users error", "serverId", srv.ID, "err", err)
+				}
+			}
+		}
+	}
+	return out, nil
 }
 
 func (a *App) sharePlexViewer(ctx context.Context, usernameOrEmail string, userID int64) error {
