@@ -33,6 +33,7 @@ import (
 
 	"github.com/braedonsaunders/ether/internal/artwork"
 	"github.com/braedonsaunders/ether/internal/config"
+	"github.com/braedonsaunders/ether/internal/plextv"
 	"github.com/braedonsaunders/ether/internal/core"
 	"github.com/braedonsaunders/ether/internal/diagnostics"
 	"github.com/braedonsaunders/ether/internal/identity"
@@ -295,6 +296,21 @@ type Deps struct {
 	// SharePlexViewer grants library access on plex.tv to the given username,
 	// email or user ID for this server. Nil ignores cloud library sharing.
 	SharePlexViewer func(ctx context.Context, usernameOrEmail string, userID int64) error
+
+	// SharePlexViewerNoSync grants library access on plex.tv without triggering
+	// an immediate friend sync; used by bulk import to sync once at the end.
+	SharePlexViewerNoSync func(ctx context.Context, usernameOrEmail string, userID int64) error
+
+	// SyncPlexFriends refreshes Ether's plex.tv friend list once after batch sharing.
+	SyncPlexFriends func(ctx context.Context) error
+
+	// ListPlexUsers returns the owner's plex.tv friends and home users so PMS
+	// imports can resolve display names / account IDs to full Plex profiles.
+	ListPlexUsers func(ctx context.Context) ([]plextv.SharedUser, error)
+
+	// EnsurePlexFriend upserts a resolved plex.tv friend/home user into auth_users
+	// and returns its viewer ID.
+	EnsurePlexFriend func(ctx context.Context, user plextv.SharedUser) (int64, error)
 }
 
 // Handler is the admin HTTP handler. Use NewHandler when you need access

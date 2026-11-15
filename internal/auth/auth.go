@@ -1362,6 +1362,59 @@ RETURNING id`,
 	return err
 }
 
+// EnsurePlexFriend upserts a Plex.tv friend or home user into auth_users with
+// their full Plex profile so PMS imports can link to a Plex viewer even before
+// Plex.tv access_tokens reflects a newly created share.
+func (s *Service) EnsurePlexFriend(ctx context.Context, u plextv.SharedUser) (int64, error) {
+	if u.PlexID <= 0 {
+		return 0, errors.New("auth: plex user ID required")
+	}
+	display := strings.TrimSpace(u.Title)
+	if display == "" {
+		display = strings.TrimSpace(u.Username)
+	}
+	if display == "" {
+		display = strings.TrimSpace(u.Email)
+	}
+	if display == "" {
+		display = strconv.FormatInt(u.PlexID, 10)
+	}
+	s.membershipMu.Lock()
+	defer s.membershipMu.Unlock()
+	now := s.o.Now().Unix()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	var uid int64
+	if err := tx.QueryRowContext(ctx, `
+INSERT INTO auth_users (plex_id, uuid, username, title, email, thumb, is_home, restricted, active, plex_shared, origin, plex_sections, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 'friend', '[]', ?, ?)
+ON CONFLICT(plex_id) DO UPDATE SET
+	uuid=CASE WHEN excluded.uuid<>'' THEN excluded.uuid ELSE auth_users.uuid END,
+	username=CASE WHEN excluded.username<>'' THEN excluded.username ELSE auth_users.username END,
+	title=CASE WHEN excluded.title<>'' THEN excluded.title ELSE auth_users.title END,
+	email=CASE WHEN excluded.email<>'' THEN excluded.email ELSE auth_users.email END,
+	thumb=CASE WHEN excluded.thumb<>'' THEN excluded.thumb ELSE auth_users.thumb END,
+	is_home=excluded.is_home,
+	restricted=excluded.restricted,
+	origin=CASE WHEN auth_users.origin='owner' THEN auth_users.origin ELSE 'friend' END,
+	updated_at=excluded.updated_at
+WHERE auth_users.origin<>'dlna_guest'
+RETURNING id`,
+		u.PlexID, u.UUID, u.Username, display, u.Email, u.Thumb, store.BoolInt(u.Home), store.BoolInt(u.Restricted), now, now).Scan(&uid); err != nil {
+		return 0, fmt.Errorf("auth: ensure plex friend %d: %w", u.PlexID, err)
+	}
+	if err := upsertPlexLink(ctx, tx, u.PlexID, display, now); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return uid, nil
+}
+
 // sectionIDs converts plex.tv section keys ("1", "/library/sections/1") to
 // ints; nil when everything is shared.
 func sectionIDs(keys []string, all bool) []int {

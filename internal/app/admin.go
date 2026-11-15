@@ -242,9 +242,13 @@ func (a *App) buildAdmin() http.Handler {
 		OwnerArtwork:    a.artwork,
 		PlexWatch:       a.plexWatchAPI(),
 		Trakt:           a.traktAPI(),
-		PlexServers:     a.plexServersAPI(),
-		SharePlexViewer: a.sharePlexViewer,
-		Prerolls:        a.prerollAdmin(),
+		PlexServers:           a.plexServersAPI(),
+		SharePlexViewer:       a.sharePlexViewer,
+		SharePlexViewerNoSync: a.sharePlexViewerNoSync,
+		SyncPlexFriends:       a.syncPlexFriends,
+		ListPlexUsers:         a.listPlexUsers,
+		EnsurePlexFriend:      a.users.EnsurePlexFriend,
+		Prerolls:              a.prerollAdmin(),
 	}
 	// Optional role-owned dependencies stay absent until a real local or private
 	// service supplies them. This preserves console/auth/config/catalog without
@@ -302,7 +306,7 @@ func (a *App) plexWatchAPI() admin.PlexWatch {
 	return plexWatchAdmin{a.plexWatch}
 }
 
-func (a *App) sharePlexViewer(ctx context.Context, usernameOrEmail string, userID int64) error {
+func (a *App) sharePlexViewerNoSync(ctx context.Context, usernameOrEmail string, userID int64) error {
 	if a.plextv == nil {
 		return errors.New("plextv: client not initialized")
 	}
@@ -314,12 +318,32 @@ func (a *App) sharePlexViewer(ctx context.Context, usernameOrEmail string, userI
 	if cfg.Server.MachineIdentifier == "" {
 		return errors.New("plextv: server machine identifier not configured")
 	}
-	if err := a.plextv.ShareServer(ctx, token, usernameOrEmail, userID, nil); err != nil {
+	return a.plextv.ShareServer(ctx, token, usernameOrEmail, userID, nil)
+}
+
+func (a *App) syncPlexFriends(ctx context.Context) error {
+	if a.registrar == nil {
+		return nil
+	}
+	return a.registrar.SyncFriendsNow(ctx)
+}
+
+func (a *App) listPlexUsers(ctx context.Context) ([]plextv.SharedUser, error) {
+	if a.plextv == nil {
+		return nil, nil
+	}
+	token := a.cfg.Get().Plex.Token
+	if token == "" {
+		return nil, nil
+	}
+	return a.plextv.Users(ctx, token)
+}
+
+func (a *App) sharePlexViewer(ctx context.Context, usernameOrEmail string, userID int64) error {
+	if err := a.sharePlexViewerNoSync(ctx, usernameOrEmail, userID); err != nil {
 		return err
 	}
-	if a.registrar != nil {
-		_ = a.registrar.SyncFriendsNow(ctx)
-	}
+	_ = a.syncPlexFriends(ctx)
 	return nil
 }
 

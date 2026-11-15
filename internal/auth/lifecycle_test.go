@@ -155,3 +155,51 @@ func TestViewerLifecycleRefusalsAndRemoval(t *testing.T) {
 		t.Fatalf("merged-away viewer still present: %v", err)
 	}
 }
+
+func TestEnsurePlexFriend(t *testing.T) {
+	ctx := context.Background()
+	db := store.OpenTest(t)
+	s, err := New(ctx, db, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	uid, err := s.EnsurePlexFriend(ctx, plextv.SharedUser{
+		PlexID:   703916194,
+		UUID:     "uuid-sakib",
+		Username: "sakib99",
+		Title:    "Sakib Talukder",
+		Email:    "sakib@example.com",
+		Thumb:    "https://plex.tv/users/sakib/avatar",
+	})
+	if err != nil || uid <= 0 {
+		t.Fatalf("EnsurePlexFriend failed: uid=%d err=%v", uid, err)
+	}
+
+	var (
+		plexID   int64
+		uuid     string
+		username string
+		title    string
+		email    string
+		thumb    string
+		origin   string
+	)
+	if err := db.QueryRowContext(ctx, `SELECT plex_id, uuid, username, title, email, thumb, origin FROM auth_users WHERE id=?`, uid).
+		Scan(&plexID, &uuid, &username, &title, &email, &thumb, &origin); err != nil {
+		t.Fatal(err)
+	}
+	if plexID != 703916194 || uuid != "uuid-sakib" || username != "sakib99" || title != "Sakib Talukder" || email != "sakib@example.com" || thumb != "https://plex.tv/users/sakib/avatar" || origin != "friend" {
+		t.Fatalf("unexpected row: plexID=%d uuid=%q username=%q title=%q email=%q thumb=%q origin=%q", plexID, uuid, username, title, email, thumb, origin)
+	}
+
+	// Upsert again with updated title: should return the same user ID.
+	uid2, err := s.EnsurePlexFriend(ctx, plextv.SharedUser{
+		PlexID:   703916194,
+		Username: "sakib99",
+		Title:    "Sakib T.",
+	})
+	if err != nil || uid2 != uid {
+		t.Fatalf("expected same uid %d on re-upsert, got %d (err=%v)", uid, uid2, err)
+	}
+}

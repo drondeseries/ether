@@ -13,6 +13,7 @@ import (
 	"github.com/braedonsaunders/ether/internal/admin"
 	"github.com/braedonsaunders/ether/internal/core"
 	"github.com/braedonsaunders/ether/internal/identity"
+	"github.com/braedonsaunders/ether/internal/plextv"
 	"github.com/braedonsaunders/ether/internal/plexwatch"
 	"github.com/braedonsaunders/ether/internal/store"
 )
@@ -751,6 +752,113 @@ func (m *mockPlexServers) BackfillIn(context.Context, int64, int64) (plexwatch.P
 
 func (m *mockPlexServers) BackfillOut(context.Context, int64, int64) (plexwatch.PMSServer, error) {
 	return plexwatch.PMSServer{}, nil
+}
+
+func TestViewersPlexImportAllResolvesPlexUsersAndBatchesSync(t *testing.T) {
+	db := store.OpenTest(t)
+	storeCfg := newStore(t, seededConfig)
+	invites, err := identity.NewInvite(db, time.Hour, time.Hour, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pms := &mockPlexServers{
+		servers: []plexwatch.PMSServer{{ID: 10, Name: "One.Plex"}},
+		accounts: map[int64][]plexwatch.PMSAccount{
+			10: {
+				{ID: 703916194, Name: "Sakib Talukder", Owner: false, UserID: 0},
+				{ID: 99, Name: "Kids Room", Owner: false, UserID: 0},
+			},
+		},
+	}
+
+	type shareCall struct {
+		target string
+		userID int64
+	}
+	var (
+		batchShares   []shareCall
+		ensured       []plextv.SharedUser
+		syncCalls     int
+		refreshCalls  int
+		legacyShares  int
+	)
+
+	deps := admin.Deps{
+		Config:       storeCfg,
+		IsOwnerToken: storedOwner(storeCfg),
+		PlexServers:  pms,
+		Invites:      invites,
+		ListPlexUsers: func(ctx context.Context) ([]plextv.SharedUser, error) {
+			return []plextv.SharedUser{
+				{
+					PlexID:   703916194,
+					UUID:     "uuid-sakib",
+					Username: "sakib99",
+					Title:    "Sakib Talukder",
+					Email:    "sakib@example.com",
+					Thumb:    "https://plex.tv/users/sakib/avatar",
+				},
+			}, nil
+		},
+		EnsurePlexFriend: func(ctx context.Context, u plextv.SharedUser) (int64, error) {
+			ensured = append(ensured, u)
+			return 501, nil
+		},
+		SharePlexViewer: func(ctx context.Context, usernameOrEmail string, userID int64) error {
+			legacyShares++
+			return nil
+		},
+		SharePlexViewerNoSync: func(ctx context.Context, usernameOrEmail string, userID int64) error {
+			batchShares = append(batchShares, shareCall{target: usernameOrEmail, userID: userID})
+			return nil
+		},
+		SyncPlexFriends: func(ctx context.Context) error {
+			syncCalls++
+			return nil
+		},
+		RefreshViewers: func(ctx context.Context) error {
+			refreshCalls++
+			return nil
+		},
+	}
+	h := admin.NewHandler(deps)
+
+	r := req(http.MethodPost, "/ether/api/viewers/import-plex/all", "")
+	r.Header.Set("X-Plex-Token", ownerToken)
+	res := serve(h, r)
+	if res.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", res.Code, res.Body)
+	}
+
+	var items []map[string]any
+	if err := json.Unmarshal(res.Body.Bytes(), &items); err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("expected 2 items, got %+v", items)
+	}
+	if items[0]["id"].(float64) != 501 || items[0]["inviteUrl"] != nil {
+		t.Fatalf("expected Sakib Talukder imported as viewer 501 without inviteUrl, got %+v", items[0])
+	}
+	if items[1]["inviteUrl"] == nil || items[1]["inviteUrl"] == "" {
+		t.Fatalf("expected Kids Room to fall back to invite viewer, got %+v", items[1])
+	}
+	if legacyShares != 0 {
+		t.Fatalf("expected SharePlexViewer not called during bulk import when SharePlexViewerNoSync is set, got %d", legacyShares)
+	}
+	if len(batchShares) != 2 || batchShares[0].userID != 703916194 || batchShares[0].target != "sakib@example.com" {
+		t.Fatalf("expected first batch share with PlexID 703916194 and email, got %+v", batchShares)
+	}
+	if len(ensured) != 1 || ensured[0].PlexID != 703916194 || ensured[0].Email != "sakib@example.com" {
+		t.Fatalf("expected EnsurePlexFriend called for Sakib, got %+v", ensured)
+	}
+	if syncCalls != 1 {
+		t.Fatalf("expected SyncPlexFriends called once after bulk import, got %d", syncCalls)
+	}
+	if refreshCalls != 1 {
+		t.Fatalf("expected RefreshViewers called once after bulk import, got %d", refreshCalls)
+	}
 }
 
 func (m *mockPlexServers) ViewerServers(context.Context, int64) ([]plexwatch.PMSViewerMapping, error) {
