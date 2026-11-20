@@ -93,7 +93,10 @@ type HLSRequest struct {
 	Info        MediaInfo
 	Decision    Decision
 	StartOffset time.Duration
-	// ResumeHint warms one speculative Matroska copy seek without moving the playlist origin.
+	// ResumeHint advises the transcoder of the expected resume position when
+	// StartOffset is 0: Matroska HLS warms a speculative copy seek without
+	// moving the playlist origin, and DASH places its initial run at the
+	// resume segment rather than segment 0.
 	ResumeHint time.Duration `json:",omitempty"`
 	// SegmentDuration defaults to 4s when zero (5s for DASH).
 	SegmentDuration time.Duration
