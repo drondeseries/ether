@@ -26,7 +26,7 @@ describe("app reachability copy", () => {
     );
   });
 
-  it("names only the chosen address when several are published", () => {
+  it("names the dedicated listener port first when several addresses are published", () => {
     const status = {
       lan: "unknown",
       connectUrls: [
@@ -38,11 +38,11 @@ describe("app reachability copy", () => {
       ],
     };
     const detail = homeSummary(status).detail;
-    expect(detail).toContain("http://192.168.68.65:32400/jellyfin");
-    expect(detail).not.toMatch(/fd79|100\.65|10\.255|:8098/);
-    const chosen = homeSummary(status, "http://192.168.68.65:8098").detail;
-    expect(chosen).toContain("http://192.168.68.65:8098");
-    expect(chosen).not.toContain("32400/jellyfin");
+    expect(detail).toContain("http://192.168.68.65:8098");
+    expect(detail).not.toMatch(/fd79|100\.65|10\.255|32400\/jellyfin/);
+    const chosen = homeSummary(status, "http://192.168.68.65:32400/jellyfin").detail;
+    expect(chosen).toContain("http://192.168.68.65:32400/jellyfin");
+    expect(chosen).not.toContain(":8098");
   });
 
   it("names the address people use when home reachability was not checked", () => {
@@ -59,6 +59,23 @@ describe("app reachability copy", () => {
     expect(awaySummary({ wan: "unknown" }, { remoteAccess: false }).detail).toBe(
       "Not checked yet: remote access is off.",
     );
+  });
+
+  it("names the public route away from home and never calls a failed self-check unreachable", () => {
+    const ok = awaySummary({
+      wan: "reachable",
+      wanReason: "self_check",
+      wanAddress: "https://ether.example.com",
+    });
+    expect(ok.address).toBe("https://ether.example.com");
+    expect(ok.detail).toMatch(/Checked from this server/);
+    const failed = awaySummary({
+      wan: "unknown",
+      wanReason: "self_check_failed",
+      wanAddress: "https://ether.example.com",
+    });
+    expect(failed.label).toBe("Not confirmed");
+    expect(failed.detail).toMatch(/could not reach https:\/\/ether\.example\.com/);
   });
 
   it("keeps home-network apps from sounding like a failed remote check", () => {

@@ -3,7 +3,9 @@
 package resolver
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"slices"
 	"strings"
 
@@ -12,19 +14,16 @@ import (
 	"github.com/braedonsaunders/ether/internal/core"
 )
 
-// defaultProfile is used when config has no usable profiles at all.
+// defaultProfile is used when config has no usable profiles at all: the
+// shipped 1080p profile.
 func defaultProfile() core.QualityProfile {
-	return core.QualityProfile{
-		Name:             "default",
-		MaxHeight:        1080,
-		MinHeight:        720,
-		PreferredSources: []core.Source{core.SourceWEBDL, core.SourceBluRay, core.SourceWEBRip, core.SourceHDTV},
-		PreferredCodecs:  []string{"h264", "hevc"},
-		PreferredAudio:   []string{"eac3", "ac3", "aac"},
-		MinSizeMBPerMin:  5,
-		MaxSizeMBPerMin:  150,
-		Ranking:          core.DefaultRanking(nil),
+	for _, p := range config.DefaultQuality().Profiles {
+		if p.Name == "1080p" {
+			p.Name, p.MediaType = "default", core.MediaAny
+			return p
+		}
 	}
+	return core.QualityProfile{Name: "default", MaxHeight: 1080, MinHeight: 720}
 }
 
 func clientDevice(caps core.ClientCaps) string {
@@ -42,30 +41,13 @@ func defaultCappedAndroidClient(caps core.ClientCaps) bool {
 	return clientreg.HasQuirk(clientreg.Identity{Product: caps.Product, Platform: caps.Platform, Device: clientDevice(caps), Version: caps.Version}, "android-mobile-ceiling")
 }
 
-func isSurroundAudioCodec(c string) bool {
-	switch strings.ToLower(strings.TrimSpace(c)) {
-	case "eac3", "ec3", "e-ac3", "ac3", "dts", "dtshd", "dts-hd", "dtshd_ma", "dca", "dca-ma", "truehd", "mlp":
-		return true
-	}
-	return false
-}
-
-func filterOutSurroundAudio(codecs []string) []string {
-	var kept []string
-	for _, c := range codecs {
-		if !isSurroundAudioCodec(c) {
-			kept = append(kept, c)
-		}
-	}
-	return kept
-}
-
 // ProfileSource names the layer that picked a client's quality profile.
 type ProfileSource string
 
 const (
 	ProfileFromRule    ProfileSource = "rule"    // the first matching quality rule
 	ProfileFromRemote  ProfileSource = "remote"  // the Away profile, for a remote client no rule covers
+	ProfileFromLibrary ProfileSource = "library" // the library the title belongs to
 	ProfileFromDefault ProfileSource = "default" // the At home (default) profile
 	ProfileFromFirst   ProfileSource = "first"   // the first configured profile
 	ProfileBuiltin     ProfileSource = "builtin" // no usable profile is configured
@@ -99,13 +81,13 @@ func titleMedia(t *core.Title) string {
 	switch t.Type {
 	case core.TypeMovie:
 		return core.MediaMovie
-	case core.TypeEpisode:
+	case core.TypeShow, core.TypeSeason, core.TypeEpisode:
 		return core.MediaTV
 	}
 	switch t.Key.Kind() {
 	case core.KindMovie:
 		return core.MediaMovie
-	case core.KindEpisode:
+	case core.KindShow, core.KindSeason, core.KindEpisode:
 		return core.MediaTV
 	}
 	return core.MediaAny
@@ -150,7 +132,7 @@ func profileApplies(p core.QualityProfile, media string) bool {
 
 // chooseProfile is the media-neutral form for callers with no title.
 func chooseProfile(q config.Quality, caps core.ClientCaps, user *core.User) profileChoice {
-	return chooseProfileForMedia(q, caps, user, core.MediaAny)
+	return chooseProfileForMedia(q, caps, user, core.MediaAny, "")
 }
 
 // chooseProfileForMedia is the single place that picks a client's profile.
@@ -158,11 +140,13 @@ func chooseProfile(q config.Quality, caps core.ClientCaps, user *core.User) prof
 // Selection order: the first rule whose non-empty matchers all match, whose
 // media scope applies, and whose profile exists and applies; otherwise the
 // media's remote profile for a remote client (when set and applicable);
-// otherwise the media's default; otherwise the first applicable profile;
-// otherwise the built-in default. A rule for a device or viewer is more
-// specific than "away from home", so it wins there too. A movie-scoped
-// profile is never chosen for a show, or the reverse.
-func chooseProfileForMedia(q config.Quality, caps core.ClientCaps, user *core.User, media string) profileChoice {
+// otherwise the quality profile set on the library the title belongs to
+// (libProfile, when set and applicable); otherwise the media's default;
+// otherwise the first applicable profile; otherwise the built-in default. A
+// rule for a device or viewer is more specific than "away from home", so it
+// wins there too. A movie-scoped profile is never chosen for a show, or the
+// reverse.
+func chooseProfileForMedia(q config.Quality, caps core.ClientCaps, user *core.User, media, libProfile string) profileChoice {
 	media = normalizeMedia(media)
 	for i, rule := range q.Rules {
 		if !core.MediaApplies(rule.MediaType, media) || !ruleMatches(rule, caps, user) {
@@ -175,6 +159,11 @@ func chooseProfileForMedia(q config.Quality, caps core.ClientCaps, user *core.Us
 	if caps.Remote {
 		if p, ok := core.FindProfile(q.Profiles, remoteProfileName(q, media), media); ok {
 			return profileChoice{profile: p, source: ProfileFromRemote, rule: -1}
+		}
+	}
+	if libProfile != "" {
+		if p, ok := core.FindProfile(q.Profiles, libProfile, media); ok {
+			return profileChoice{profile: p, source: ProfileFromLibrary, rule: -1}
 		}
 	}
 	if p, ok := core.FindProfile(q.Profiles, defaultProfileName(q, media), media); ok {
@@ -205,6 +194,7 @@ type ruleEffect struct {
 }
 
 func stripSurroundAudioCaps(caps core.ClientCaps) core.ClientCaps {
+	caps.ConvertSurroundAudio = true
 	if len(caps.AudioCodecs) == 0 {
 		if defaults := clientreg.Playback(clientreg.Identity{Product: caps.Product, Platform: caps.Platform, Device: clientDevice(caps), Version: caps.Version}, nil); len(defaults.Audio) > 0 {
 			caps.AudioCodecs = append([]string(nil), defaults.Audio...)
@@ -212,12 +202,12 @@ func stripSurroundAudioCaps(caps core.ClientCaps) core.ClientCaps {
 			caps.AudioCodecs = []string{"aac", "mp3", "flac", "alac", "opus"}
 		}
 	}
-	caps.AudioCodecs = filterOutSurroundAudio(caps.AudioCodecs)
+	caps.AudioCodecs = core.FilterOutSurroundAudio(caps.AudioCodecs)
 	if len(caps.AudioCodecs) == 0 {
 		caps.AudioCodecs = []string{"aac"}
 	}
 	if len(caps.TranscodeAudioCodecs) > 0 {
-		caps.TranscodeAudioCodecs = filterOutSurroundAudio(caps.TranscodeAudioCodecs)
+		caps.TranscodeAudioCodecs = core.FilterOutSurroundAudio(caps.TranscodeAudioCodecs)
 	}
 	if caps.Profiles != nil {
 		cp := *caps.Profiles
@@ -227,7 +217,7 @@ func stripSurroundAudioCaps(caps core.ClientCaps) core.ClientCaps {
 			if len(base) == 0 {
 				base = caps.AudioCodecs
 			}
-			filtered := filterOutSurroundAudio(base)
+			filtered := core.FilterOutSurroundAudio(base)
 			if len(filtered) == 0 {
 				filtered = []string{"aac"}
 			}
@@ -235,7 +225,7 @@ func stripSurroundAudioCaps(caps core.ClientCaps) core.ClientCaps {
 		}
 		cp.Transcoding = slices.Clone(caps.Profiles.Transcoding)
 		for i := range cp.Transcoding {
-			filtered := filterOutSurroundAudio(cp.Transcoding[i].AudioCodecs)
+			filtered := core.FilterOutSurroundAudio(cp.Transcoding[i].AudioCodecs)
 			if len(filtered) == 0 {
 				filtered = []string{"aac"}
 			}
@@ -269,26 +259,26 @@ func ApplyClientRulesForMedia(q config.Quality, caps core.ClientCaps, user *core
 		})
 		q.Rules = slices.DeleteFunc(slices.Clone(q.Rules), func(r config.QualityRule) bool { return r.MediaType != core.MediaAny })
 	}
-	caps, _ = applyClientRules(q, caps, user, media)
+	caps, _ = applyClientRules(q, caps, user, media, "")
 	return caps
 }
 
 // ApplyClientRulesForTitle applies the rules that match a specific title's
 // media, so a movie rule cannot change a show's caps or the reverse.
 func ApplyClientRulesForTitle(q config.Quality, caps core.ClientCaps, user *core.User, t *core.Title) core.ClientCaps {
-	caps, _ = applyClientRules(q, caps, user, titleMedia(t))
+	caps, _ = applyClientRules(q, caps, user, titleMedia(t), "")
 	return caps
 }
 
-func applyClientRules(q config.Quality, caps core.ClientCaps, user *core.User, media string) (core.ClientCaps, ruleEffect) {
-	if len(caps.VideoCodecs) == 0 && caps.Protocol != "plex" && !strings.Contains(strings.ToLower(caps.Product), "plex") {
+func applyClientRules(q config.Quality, caps core.ClientCaps, user *core.User, media, libProfile string) (core.ClientCaps, ruleEffect) {
+	if len(caps.VideoCodecs) == 0 && !caps.PreserveEmptyVideoCodecs {
 		if defaults := clientreg.Playback(clientreg.Identity{Product: caps.Product, Platform: caps.Platform, Device: clientDevice(caps), Version: caps.Version}, nil); defaults.ID != "" && defaults.ID != "generic" && len(defaults.Video) > 0 {
 			caps.VideoCodecs = append([]string(nil), defaults.Video...)
 		}
 	}
 	// Rule matchers read only protocol, product, platform and viewer, none
 	// of which this function changes, so the choice holds for the result.
-	eff := ruleEffect{choice: chooseProfileForMedia(q, caps, user, media)}
+	eff := ruleEffect{choice: chooseProfileForMedia(q, caps, user, media, libProfile)}
 	if caps.Download {
 		return caps, eff
 	}
@@ -305,9 +295,15 @@ func applyClientRules(q config.Quality, caps core.ClientCaps, user *core.User, m
 		if !caps.ExplicitMaxHeight {
 			if rule.MaxHeight > 0 {
 				caps.MaxHeight = rule.MaxHeight
+				caps.MaxHeightSource = fmt.Sprintf("client quality rule (maxHeight=%dp)", rule.MaxHeight)
 				eff.ruleHeight = rule.MaxHeight
 			} else if defaultCappedAndroidClient(caps) && caps.MaxHeight < targetHeight {
 				caps.MaxHeight = targetHeight
+				if targetHeight >= 2160 {
+					caps.MaxHeightSource = ""
+				} else {
+					caps.MaxHeightSource = fmt.Sprintf("client quality rule (%s profile)", prof.Name)
+				}
 				eff.lifted = targetHeight
 			}
 		} else if rule.MaxHeight > 0 {
@@ -329,6 +325,16 @@ func applyClientRules(q config.Quality, caps core.ClientCaps, user *core.User, m
 	return caps, eff
 }
 
+// libProfileForTitle is the quality profile set on the library a title
+// belongs to, or "" when none applies (no lookup wired, no matching
+// library, or the library left it at Default).
+func (s *Service) libProfileForTitle(ctx context.Context, t *core.Title) string {
+	if s.libProfiles == nil || t == nil {
+		return ""
+	}
+	return s.libProfiles.QualityProfileForTitle(ctx, t)
+}
+
 // SelectProfile picks the quality profile for a client and clamps it
 // to what the client can direct-play. Playback uses it for
 // pre-resolution estimates; the resolver uses it for ranking.
@@ -343,7 +349,15 @@ func SelectProfile(q config.Quality, caps core.ClientCaps, user *core.User) core
 // SelectProfileForMedia is SelectProfile with a movie or show context, so
 // media-scoped profiles and rules apply. An empty media is media-neutral.
 func SelectProfileForMedia(q config.Quality, caps core.ClientCaps, user *core.User, media string) core.QualityProfile {
-	return decideProfile(q, caps, user, media).profile
+	return decideProfile(q, caps, user, media, "").profile
+}
+
+// SelectProfileForTitle is SelectProfileForMedia with the quality profile
+// set on the library the title belongs to (libProfile, from
+// LibraryProfileForTitle). It applies after a client rule and the Away
+// profile, before the generic Movies/Shows default.
+func SelectProfileForTitle(q config.Quality, caps core.ClientCaps, user *core.User, t *core.Title, libProfile string) core.QualityProfile {
+	return decideProfile(q, caps, user, titleMedia(t), libProfile).profile
 }
 
 // profileDecision is SelectProfile's answer with what decided it.
@@ -353,25 +367,22 @@ type profileDecision struct {
 	effect  ruleEffect
 }
 
-func decideProfile(q config.Quality, caps core.ClientCaps, user *core.User, media string) profileDecision {
+func decideProfile(q config.Quality, caps core.ClientCaps, user *core.User, media, libProfile string) profileDecision {
 	if caps.Download && caps.DownloadSourceMaxHeight > caps.MaxHeight {
 		caps.MaxHeight = caps.DownloadSourceMaxHeight
 	}
-	caps, eff := applyClientRules(q, caps, user, media)
+	caps, eff := applyClientRules(q, caps, user, media, libProfile)
 	prof := eff.choice.profile
 	// Deep-copy slices so callers cannot mutate config.
-	prof.PreferredSources = append([]core.Source(nil), prof.PreferredSources...)
-	prof.PreferredCodecs = append([]string(nil), prof.PreferredCodecs...)
-	prof.PreferredAudio = append([]string(nil), prof.PreferredAudio...)
 	prof.PreferredLanguages = append([]string(nil), prof.PreferredLanguages...)
 	prof.AllowedQualities = append([]string(nil), prof.AllowedQualities...)
-	prof.Ranking = append([]string(nil), prof.Ranking...)
-	if prof.RankingConfig != nil {
-		cloned := make(map[string]json.RawMessage, len(prof.RankingConfig))
-		for k, v := range prof.RankingConfig {
+	prof.QualityOrder = config.CloneQualityOrder(prof.QualityOrder)
+	if prof.PluginScores != nil {
+		cloned := make(map[string]json.RawMessage, len(prof.PluginScores))
+		for k, v := range prof.PluginScores {
 			cloned[k] = append(json.RawMessage(nil), v...)
 		}
-		prof.RankingConfig = cloned
+		prof.PluginScores = cloned
 	}
 	if prof.CustomFormatScores != nil {
 		copyScores := map[string]int{}
@@ -404,35 +415,38 @@ func decideProfile(q config.Quality, caps core.ClientCaps, user *core.User, medi
 	prof = snapshotConfiguredMaxHeight(prof)
 
 	if caps.Download {
+		before := prof.MaxHeight
 		prof = downloadProfile(prof, caps)
+		if prof.MaxHeight > 0 && (before == 0 || prof.MaxHeight < before) {
+			prof.CeilingSource = "offline download profile"
+		}
 	}
 
 	// Clamp to client capabilities.
 	if caps.MaxHeight > 0 && (prof.MaxHeight == 0 || prof.MaxHeight > caps.MaxHeight) {
 		prof.MaxHeight = caps.MaxHeight
+		prof.CeilingSource = caps.MaxHeightSource
 	}
 	if prof.MinHeight > prof.MaxHeight && prof.MaxHeight > 0 {
 		prof.MinHeight = prof.MaxHeight
 	}
 	prof.AllowHDR = prof.AllowHDR && caps.HDR10
 	prof.AllowDolbyVision = prof.AllowDolbyVision && caps.DolbyVision
+	// A codec the client can't decode earns nothing from its format: it
+	// plays only through a transcode, which the streaming formats score.
 	if len(caps.VideoCodecs) > 0 {
-		kept := prof.PreferredCodecs[:0:0]
-		for _, c := range prof.PreferredCodecs {
-			if caps.SupportsVideo(c) {
-				kept = append(kept, c)
+		for _, c := range core.FormatCodecs {
+			if !caps.SupportsVideo(c) {
+				delete(prof.CustomFormatScores, core.CodecFormat(c))
 			}
 		}
-		prof.PreferredCodecs = kept
 	}
 	if eff.choice.source == ProfileFromRule && q.Rules[eff.choice.rule].ConvertSurroundAudio && len(caps.AudioCodecs) > 0 {
-		kept := prof.PreferredAudio[:0:0]
-		for _, a := range prof.PreferredAudio {
-			if caps.SupportsAudio(a) {
-				kept = append(kept, a)
+		for _, a := range core.FormatAudioCodecs {
+			if !caps.SupportsAudio(a) {
+				delete(prof.CustomFormatScores, core.AudioFormat(a))
 			}
 		}
-		prof.PreferredAudio = kept
 	}
 	return profileDecision{profile: prof, caps: caps, effect: eff}
 }
@@ -443,8 +457,10 @@ func decideProfile(q config.Quality, caps core.ClientCaps, user *core.User, medi
 // not need it), WEB-DL first, H.264 — or HEVC when the device decodes
 // it — and MP4-friendly AAC/AC3/EAC3 audio only (no TrueHD/DTS-HD,
 // which neither copies into a broadly playable MP4 nor helps a phone).
-// The size cap (~10 Mbps average) keeps a two-hour film near 9 GB worst
-// case and typical 1080p WEB-DLs well inside it. caps.MaxHeight and
+// The profile's release type, codec and audio format scores are
+// reassigned in that order, so each keeps the weight the profile gives
+// it. The size cap (~10 Mbps average) keeps a two-hour film near 9 GB
+// worst case and typical 1080p WEB-DLs well inside it. caps.MaxHeight and
 // caps.MaxBitrateKbps from the client's videoQuality/videoResolution
 // request still clamp on top of this in SelectProfile.
 func downloadProfile(prof core.QualityProfile, caps core.ClientCaps) core.QualityProfile {
@@ -461,13 +477,28 @@ func downloadProfile(prof core.QualityProfile, caps core.ClientCaps) core.Qualit
 	}
 	prof.AllowHDR = false
 	prof.AllowDolbyVision = false
-	prof.PreferredSources = []core.Source{core.SourceWEBDL, core.SourceWEBRip, core.SourceBluRay, core.SourceHDTV}
-	if len(caps.VideoCodecs) == 0 || caps.SupportsVideo("hevc") {
-		prof.PreferredCodecs = []string{"h264", "hevc"}
-	} else {
-		prof.PreferredCodecs = []string{"h264"}
+	if prof.CustomFormatScores == nil {
+		prof.CustomFormatScores = map[string]int{}
 	}
-	prof.PreferredAudio = []string{"aac", "eac3", "ac3"}
+	sources := []string{}
+	for _, s := range core.FormatSources {
+		sources = append(sources, core.SourceFormat(s))
+	}
+	reorderFormats(prof.CustomFormatScores, sources, []string{core.SourceFormat(core.SourceWEBDL), core.SourceFormat(core.SourceWEBRip), core.SourceFormat(core.SourceBluRay), core.SourceFormat(core.SourceHDTV)}, 10)
+	codecs := []string{}
+	for _, c := range core.FormatCodecs {
+		codecs = append(codecs, core.CodecFormat(c))
+	}
+	if len(caps.VideoCodecs) == 0 || caps.SupportsVideo("hevc") {
+		reorderFormats(prof.CustomFormatScores, codecs, []string{core.CodecFormat("h264"), core.CodecFormat("hevc")}, 6)
+	} else {
+		reorderFormats(prof.CustomFormatScores, codecs, []string{core.CodecFormat("h264")}, 6)
+	}
+	audio := []string{}
+	for _, a := range core.FormatAudioCodecs {
+		audio = append(audio, core.AudioFormat(a))
+	}
+	reorderFormats(prof.CustomFormatScores, audio, []string{core.AudioFormat("aac"), core.AudioFormat("eac3"), core.AudioFormat("ac3")}, 4)
 	// A source for conversion can be larger than the compact copy target;
 	// keep the owner's size ceilings instead of adding the copy-only cap.
 	if caps.DownloadSourceMaxHeight == 0 {
@@ -478,8 +509,29 @@ func downloadProfile(prof core.QualityProfile, caps core.ClientCaps) core.Qualit
 			prof.EpisodeMaxSizeMBPerMin = 80
 		}
 	}
-	prof.PreferLargest = false
 	return prof
+}
+
+// reorderFormats gives the formats of order (best first) the family's
+// scores, highest first; the family's other formats get its lowest. A
+// family the profile does not score gets step points a place.
+func reorderFormats(scores map[string]int, family, order []string, step int) {
+	vals := make([]int, len(family))
+	for i, id := range family {
+		vals[i] = scores[id]
+	}
+	slices.SortFunc(vals, func(a, b int) int { return b - a })
+	low := vals[len(vals)-1]
+	for _, id := range family {
+		scores[id] = low
+	}
+	for i, id := range order {
+		v := vals[min(i, len(vals)-1)]
+		if vals[0] <= 0 {
+			v = step * (len(order) - i)
+		}
+		scores[id] = v
+	}
 }
 
 // configuredUnlimited marks a profile whose owner set no max-height
@@ -557,4 +609,10 @@ func ruleMatches(rule config.QualityRule, caps core.ClientCaps, user *core.User)
 	// A rule with no matchers at all would match everything; require
 	// at least one matcher to avoid surprises from empty config rows.
 	return rule.Protocol != "" || rule.Product != "" || rule.Platform != "" || rule.UserID != 0
+}
+
+// ProfileForTitle is the shared library-aware policy used by playback caches,
+// resolution, and discovery. Context is used only for bounded local membership reads.
+func (s *Service) ProfileForTitle(ctx context.Context, caps core.ClientCaps, user *core.User, t *core.Title) core.QualityProfile {
+	return SelectProfileForTitle(s.qualityCfg(), caps, user, t, s.libProfileForTitle(ctx, t))
 }

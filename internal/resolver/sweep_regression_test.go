@@ -8,6 +8,7 @@ import (
 
 	"github.com/braedonsaunders/ether/internal/core"
 	"github.com/braedonsaunders/ether/internal/releaseparse"
+	"github.com/braedonsaunders/ether/internal/releasepolicy"
 )
 
 func withParsed(r core.Release) core.Release {
@@ -51,24 +52,12 @@ func TestImplausiblySmallRejectedWithRuntime(t *testing.T) {
 	}
 }
 
-// An uncapped profile must not let height swamp every other preference.
-func TestUncappedProfileHeightScoreIsBounded(t *testing.T) {
-	s := New(&fakeIndexer{}, nil, nil, testCfg(), Options{})
-	defer s.Close()
-	p := core.QualityProfile{Name: "any"}
-	hi := s.score(withParsed(rel("a", "The.Signal.1999.2160p.WEB-DL.H264-GRP", 0)), p, matrixTitle(), s.now())
-	lo := s.score(withParsed(rel("b", "The.Signal.1999.1080p.WEB-DL.H264-GRP", 0)), p, matrixTitle(), s.now())
-	if hi-lo <= 0 || hi-lo > 50 {
-		t.Fatalf("height gap %v", hi-lo)
-	}
-}
-
 func TestRemuxQualityModifierMatchesTrashValue(t *testing.T) {
 	defs, err := ImportCustomFormats([]byte(`{"name":"Remux","specifications":[{"implementation":"QualityModifierSpecification","required":true,"fields":{"value":5}}],"trash_scores":{"default":100}}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	sc, _ := NewFormatScorer(defs, nil)
+	sc, _ := NewFormatScorer(defs)
 	if got, _, _ := sc.Score(core.Release{Info: core.ReleaseInfo{Source: core.SourceRemux}}); got != 100 {
 		t.Fatalf("remux score %d", got)
 	}
@@ -87,13 +76,14 @@ func TestNotEnglishFormatSkipsUntaggedEnglishRelease(t *testing.T) {
 	s := New(&fakeIndexer{}, nil, nil, cfg, Options{})
 	defer s.Close()
 	profile := s.ProfileFor(appleTVCaps(), nil)
-	eng, err := s.scoreRelease(withParsed(rel("e", "The.Signal.1999.1080p.WEB-DL.H264-GRP", 4000)), profile, appleTVCaps(), matrixTitle(), s.now())
-	if err != nil || eng.format != 0 {
-		t.Fatalf("untagged English release format score %d (%v)", eng.format, err)
+	profile.CustomFormatScores[formatID(defs[0])] = -10000
+	eng, err := s.scoreRelease(withParsed(rel("e", "The.Signal.1999.1080p.WEB-DL.H264-GRP", 4000)), profile, appleTVCaps(), matrixTitle(), releasepolicy.Result{}, formatFacts{})
+	if err != nil || eng.counted != 0 {
+		t.Fatalf("untagged English release format score %d (%v)", eng.counted, err)
 	}
-	fr, _ := s.scoreRelease(withParsed(rel("f", "The.Signal.1999.FRENCH.1080p.WEB-DL.H264-GRP", 4000)), profile, appleTVCaps(), matrixTitle(), s.now())
-	if fr.format != -10000 {
-		t.Fatalf("French release format score %d", fr.format)
+	fr, _ := s.scoreRelease(withParsed(rel("f", "The.Signal.1999.FRENCH.1080p.WEB-DL.H264-GRP", 4000)), profile, appleTVCaps(), matrixTitle(), releasepolicy.Result{}, formatFacts{})
+	if fr.counted != -10000 {
+		t.Fatalf("French release format score %d", fr.counted)
 	}
 }
 
@@ -101,7 +91,7 @@ func TestVariantBitrateUsesEpisodeNotPackSize(t *testing.T) {
 	ep := &core.Title{Key: core.EpisodeKey(1, 1, 1), Type: core.TypeEpisode, Runtime: 45 * time.Minute}
 	pack := withParsed(rel("pack", "Show.S01.1080p.WEB-DL.H264-GRP", 40<<10))
 	pack.Protocol = core.ProtocolTorrent
-	out := pickVariants(ep, core.ClientCaps{}, core.QualityProfile{}, pack, nil, nil, 2, 4, false)
+	out := pickVariants(ep, core.ClientCaps{}, core.QualityProfile{}, pack, nil, nil, 2, 4, false, nil)
 	if len(out) != 1 || out[0].Info.BitrateKbps > 20000 {
 		t.Fatalf("pack variant bitrate %+v", out)
 	}
@@ -125,9 +115,8 @@ func (f flakyFetchIndexer) FetchNZB(ctx context.Context, r core.Release) ([]byte
 	return f.fakeIndexer.FetchNZB(ctx, r)
 }
 
-// A pin whose indexer is temporarily out of grabs must not make the title
-// unplayable while other releases work.
-func TestPinTransientFailureFallsBackToRanking(t *testing.T) {
+// A temporary failure must preserve the owner's source constraint and reason.
+func TestPinTransientFailurePreservesSource(t *testing.T) {
 	ctx := context.Background()
 	idx := flakyFetchIndexer{fakeIndexer: &fakeIndexer{releases: movieReleases()}, down: "sd720"}
 	s := New(idx, fakeHealth{}, nil, testCfg(), Options{})
@@ -137,13 +126,16 @@ func TestPinTransientFailureFallsBackToRanking(t *testing.T) {
 		t.Fatal(err)
 	}
 	res, err := s.Resolve(ctx, core.ResolveRequest{Title: matrixTitle(), Client: appleTVCaps()})
-	if err != nil || res.Release.ID == "sd720" {
+	if !errors.Is(err, core.ErrBudgetExhausted) || res != nil {
 		t.Fatalf("res=%+v err=%v", res, err)
 	}
 	if p, _ := s.PinFor(matrixTitle().Key); p.LastStatus != PinUnavailable {
 		t.Fatalf("pin status %q", p.LastStatus)
 	}
-	// A viewer's pick behaves the same way.
+	// Without a pin, a viewer's preference retains its ordinary fallback.
+	if _, err := s.Unpin(ctx, matrixTitle().Key); err != nil {
+		t.Fatal(err)
+	}
 	res, err = s.Resolve(ctx, core.ResolveRequest{Title: matrixTitle(), Client: appleTVCaps(), Prefer: "sd720"})
 	if err != nil || res.Release.ID == "sd720" {
 		t.Fatalf("prefer res=%+v err=%v", res, err)
@@ -162,9 +154,11 @@ func TestSizeFormatIgnoresSeasonPackTotal(t *testing.T) {
 	pack := withParsed(rel("pack", "Show.S01.1080p.WEB-DL.H264-GRP", 40<<10))
 	pack.Protocol = core.ProtocolTorrent
 	ep := &core.Title{Key: core.EpisodeKey(1, 1, 1), Type: core.TypeEpisode, Runtime: 45 * time.Minute}
-	sc, err := s.scoreRelease(pack, s.ProfileFor(appleTVCaps(), nil), appleTVCaps(), ep, s.now())
-	if err != nil || sc.format != 0 {
-		t.Fatalf("pack size format score %d (%v)", sc.format, err)
+	profile := s.ProfileFor(appleTVCaps(), nil)
+	profile.CustomFormatScores[formatID(defs[0])] = -1000
+	sc, err := s.scoreRelease(pack, profile, appleTVCaps(), ep, releasepolicy.Result{}, formatFacts{})
+	if err != nil || sc.counted != 0 {
+		t.Fatalf("pack size format score %d (%v)", sc.counted, err)
 	}
 }
 

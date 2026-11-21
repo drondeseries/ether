@@ -6,11 +6,12 @@ import { ErrorPanel } from "../../components/feedback";
 import { useViewers, viewerName } from "../../components/pickers";
 import { t } from "../../i18n";
 import { api, errorMessage } from "../../lib/api";
-import type { HomeLayout } from "../../lib/contract";
+import type { HomeLayout, ViewerHome } from "../../lib/contract";
 import { useAsync } from "../../lib/hooks";
 import { Workspace, PanelHead } from "../../components/workspace";
 import {
   EMPTY_LAYOUT,
+  atFor,
   collectionScheduleChanges,
   overrideCount,
   prune,
@@ -28,13 +29,13 @@ import { TuningPanel } from "./TuningPanel";
 
 function initialContext(): ViewContext {
   const now = new Date();
-  return { device: "tv", day: now.getDay(), hour: now.getHours(), section: "home" };
+  return { device: "tv", day: now.getDay(), hour: now.getHours() };
 }
 
 /**
- * Home: the native Plex Home (each viewer's For You) for everyone, personalization
+ * Home: the native Home screen (each viewer's For You) for everyone, personalization
  * within it, and per-viewer overrides on top. Controls on the left third,
- * the live Plex Home (rendered server-side from the draft) on the right.
+ * the live Home preview (rendered server-side from the draft) on the right.
  */
 export default function Designer() {
   const { viewers, error: viewersError } = useViewers();
@@ -45,8 +46,9 @@ export default function Designer() {
   const [ctx, setCtx] = useState<ViewContext>(initialContext);
   const [saving, setSaving] = useState(false);
   const [nonce, setNonce] = useState(0);
-  const [tools, setTools] = useState("layout");
+  const [tools, setTools] = useState("rows");
   const [focusRow, setFocusRow] = useState<string | null>(null);
+  const [preview, setPreview] = useState<ViewerHome | null>(null);
 
   const saved = doc.data?.layout ?? EMPTY_LAYOUT;
   // Adopt the stored layout in the render that delivers it; an effect could
@@ -62,11 +64,21 @@ export default function Designer() {
       ? { ...row, title: t("Favorites"), description: t("Titles this viewer marked as favorites.") }
       : row,
   );
-  const defaults = doc.data?.defaults.maxRows ?? { home: 14, movies: 10, shows: 10 };
+  const defaults = doc.data?.defaults.maxRows ?? { home: 14, library: 16 };
 
   const viewerId = layer === "global" ? spotCheck : layer;
+  const previewAt = useMemo(() => atFor(ctx.day, ctx.hour).toISOString(), [ctx.day, ctx.hour]);
+  const previewRequest = useMemo(
+    () => ({ viewerId, device: ctx.device, at: previewAt }),
+    [viewerId, ctx.device, previewAt],
+  );
   const overrideTotal = (viewers ?? []).reduce((n, v) => n + overrideCount(draft, v.id), 0);
+  // i18n: memo holds no copy
   const viewerById = useMemo(() => new Map((viewers ?? []).map((v) => [v.id, v])), [viewers]);
+  const previewWho =
+    viewerId !== null && viewerById.get(viewerId)
+      ? viewerName(viewerById.get(viewerId)!)
+      : t("Typical viewer");
   const layerName =
     layer === "global"
       ? t("everyone's Home")
@@ -130,7 +142,7 @@ export default function Designer() {
     draft,
     onChange: setDraft,
     layer,
-    section: ctx.section,
+    section: "home" as const,
     viewers: viewers ?? [],
   };
 
@@ -139,6 +151,7 @@ export default function Designer() {
     setFocusRow(null);
   };
 
+  const controlsReady = Boolean(viewers && doc.data);
   const state = viewersError ? (
     <div className="p-6">
       <ErrorPanel error={viewersError} />
@@ -147,11 +160,7 @@ export default function Designer() {
     <div className="p-6">
       <ErrorPanel error={doc.error} onRetry={() => void doc.reload()} />
     </div>
-  ) : !viewers || !doc.data ? (
-    <div className="grid flex-1 place-items-center">
-      <Spinner size={22} label={t("Loading the Home layout")} />
-    </div>
-  ) : viewers.length === 0 ? (
+  ) : viewers && viewers.length === 0 ? (
     <div className="p-6">
       <EmptyState
         icon={<Users />}
@@ -169,7 +178,7 @@ export default function Designer() {
       mainLabel={t("Home preview")}
       mainClassName="p-3 sm:p-6"
       aside={
-        viewers ? (
+        controlsReady && viewers ? (
           <>
             <PanelHead>
               <div
@@ -189,8 +198,8 @@ export default function Designer() {
                 active={tools}
                 onSelect={setTools}
                 tabs={[
-                  { key: "layout", label: t("Layout") },
                   { key: "rows", label: t("Rows") },
+                  { key: "layout", label: t("Layout") },
                   { key: "tuning", label: t("Tuning") },
                   {
                     key: "overrides",
@@ -213,34 +222,41 @@ export default function Designer() {
                   available={available}
                   focusRow={focusRow}
                   onFocusRow={setFocusRow}
+                  preview={preview}
+                  previewWho={previewWho}
+                  previewRequest={previewRequest}
                 />
               )}
               {tools === "tuning" && <TuningPanel {...editing} />}
               {tools === "overrides" && <OverrideList {...editing} onOpenLayer={switchLayer} />}
             </div>
           </>
-        ) : null
+        ) : (
+          <div className="grid flex-1 place-items-center p-6">
+            <Spinner size={22} label={t("Loading the Home layout")} />
+          </div>
+        )
       }
       main={
-        viewers ? (
-          <HomeCanvas
-            draft={draft}
-            dirty={dirty}
-            saved={saved}
-            layer={layer}
-            layerName={layerName}
-            ctx={ctx}
-            viewers={viewers}
-            viewerId={viewerId}
-            onSpotCheck={setSpotCheck}
-            refreshNonce={nonce}
-            onChange={setDraft}
-            onEditRow={(row) => {
-              setTools("rows");
-              setFocusRow(row);
-            }}
-          />
-        ) : null
+        <HomeCanvas
+          ready={controlsReady}
+          draft={draft}
+          dirty={dirty}
+          saved={saved}
+          layer={layer}
+          layerName={layerName}
+          ctx={ctx}
+          viewers={viewers ?? []}
+          viewerId={viewerId}
+          onSpotCheck={setSpotCheck}
+          refreshNonce={nonce}
+          onChange={setDraft}
+          onPreviewChange={setPreview}
+          onEditRow={(row) => {
+            setTools("rows");
+            setFocusRow(row);
+          }}
+        />
       }
     >
       {state}

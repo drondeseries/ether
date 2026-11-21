@@ -24,12 +24,13 @@ import (
 // Tests point them at httptest servers; the URLs owners paste are always
 // validated against the real hosts.
 type ExternalBases struct {
-	TraktAPI   string // https://api.trakt.tv
-	Letterboxd string // https://letterboxd.com
-	MDBList    string // https://mdblist.com
-	AniListAPI string // https://graphql.anilist.co
-	AnimeIDs   string // the anime id mapping document (anilist -> TMDB/TVDB/IMDb)
-	StevenLu   string // https://popular-movies-data.stevenlu.com
+	TraktAPI        string // https://api.trakt.tv
+	Letterboxd      string // https://letterboxd.com
+	MDBList         string // https://mdblist.com
+	MDBListPageSize int    // optional page size override for tests; defaults to 100
+	AniListAPI      string // https://graphql.anilist.co
+	AnimeIDs        string // the anime id mapping document (anilist -> TMDB/TVDB/IMDb)
+	StevenLu        string // https://popular-movies-data.stevenlu.com
 }
 
 func defaultBases() ExternalBases {
@@ -61,6 +62,7 @@ type extRef struct {
 	MetadataProvider string
 	ProviderID       string
 	TMDB             int64
+	FallbackID       int64 // legacy MDBList id when explicit tmdb_id is absent
 	IMDB             string
 	TVDB             int64
 	Type             string // "movie", "show" or "" (unknown)
@@ -489,61 +491,138 @@ func (s *Service) letterboxdFilmTMDB(ctx context.Context, slug string) (int64, s
 // ---------------------------------------------------------------------------
 // MDBList
 
+const mdbListDefaultPageSize = 100
+
+type mdbListItem struct {
+	ID          json.Number `json:"id"`
+	TMDBID      json.Number `json:"tmdb_id"`
+	TMDBIDAlt   json.Number `json:"tmdbid"`
+	IMDB        string      `json:"imdb_id"`
+	IMDBAlt     string      `json:"imdb"`
+	TVDB        json.Number `json:"tvdb_id"`
+	TVDBAlt     json.Number `json:"tvdbid"`
+	Title       string      `json:"title"`
+	MediaType   string      `json:"mediatype"`
+	ReleaseYear json.Number `json:"release_year"`
+	YearAlt     json.Number `json:"year"`
+	Rank        int         `json:"rank"`
+}
+
+func parseMDBInt64(nums ...json.Number) int64 {
+	for _, num := range nums {
+		if n, err := num.Int64(); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 0
+}
+
+func decodeMDBListPage(body []byte) ([]mdbListItem, error) {
+	var items []mdbListItem
+	if err := json.Unmarshal(body, &items); err == nil {
+		return items, nil
+	}
+	var obj struct {
+		Movies []mdbListItem `json:"movies"`
+		Shows  []mdbListItem `json:"shows"`
+		Items  []mdbListItem `json:"items"`
+	}
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return nil, fmt.Errorf("mdblist: unexpected response (is the list public?)")
+	}
+	for i := range obj.Movies {
+		obj.Movies[i].MediaType = firstNonEmpty(obj.Movies[i].MediaType, "movie")
+	}
+	for i := range obj.Shows {
+		obj.Shows[i].MediaType = firstNonEmpty(obj.Shows[i].MediaType, "show")
+	}
+	return append(append(obj.Items, obj.Movies...), obj.Shows...), nil
+}
+
+func mdbListExtRef(it mdbListItem) extRef {
+	r := extRef{
+		IMDB:  firstNonEmpty(it.IMDB, it.IMDBAlt),
+		Title: it.Title,
+		TVDB:  parseMDBInt64(it.TVDB, it.TVDBAlt),
+		Year:  int(parseMDBInt64(it.ReleaseYear, it.YearAlt)),
+	}
+	if tmdb := parseMDBInt64(it.TMDBID, it.TMDBIDAlt); tmdb > 0 {
+		r.TMDB = tmdb
+	} else if legacyID := parseMDBInt64(it.ID); legacyID > 0 {
+		if r.IMDB == "" && r.TVDB == 0 {
+			r.TMDB = legacyID
+		} else {
+			r.FallbackID = legacyID
+		}
+	}
+	switch strings.ToLower(strings.TrimSpace(it.MediaType)) {
+	case "movie":
+		r.Type = "movie"
+	case "show", "tv", "series":
+		r.Type = "show"
+	}
+	return r
+}
+
+func mdbListRefKey(r extRef) string {
+	return fmt.Sprintf("%s|tmdb:%d|fallback:%d|imdb:%s|tvdb:%d|title:%s|year:%d",
+		r.Type, r.TMDB, r.FallbackID, strings.ToLower(strings.TrimSpace(r.IMDB)), r.TVDB,
+		strings.ToLower(strings.TrimSpace(r.Title)), r.Year)
+}
+
 func (s *Service) fetchMDBList(ctx context.Context, rawURL string) ([]extRef, error) {
 	path, err := parseMDBListURL(rawURL)
 	if err != nil {
 		return nil, err
 	}
-	body, _, err := s.web.get(ctx, s.bases.MDBList+path+"/json", map[string]string{"Accept": "application/json"})
-	if err != nil {
-		return nil, fmt.Errorf("mdblist: %w", err)
+	pageSize := s.bases.MDBListPageSize
+	if pageSize <= 0 {
+		pageSize = mdbListDefaultPageSize
 	}
-	type item struct {
-		ID          json.Number `json:"id"`
-		TMDBID      json.Number `json:"tmdb_id"`
-		IMDB        string      `json:"imdb_id"`
-		TVDB        json.Number `json:"tvdb_id"`
-		Title       string      `json:"title"`
-		MediaType   string      `json:"mediatype"`
-		ReleaseYear json.Number `json:"release_year"`
-		Rank        int         `json:"rank"`
-	}
-	var items []item
-	if err := json.Unmarshal(body, &items); err != nil {
-		var obj struct {
-			Movies []item `json:"movies"`
-			Shows  []item `json:"shows"`
-			Items  []item `json:"items"`
+	hdr := map[string]string{"Accept": "application/json"}
+	var out []extRef
+	seen := make(map[string]struct{})
+	offset := 0
+	for page := 1; page <= maxExternalPages; page++ {
+		pageURL := fmt.Sprintf("%s%s/json?limit=%d&offset=%d", s.bases.MDBList, path, pageSize, offset)
+		body, _, err := s.web.get(ctx, pageURL, hdr)
+		if err != nil {
+			if page == 1 || ctx.Err() != nil {
+				return nil, fmt.Errorf("mdblist: %w", err)
+			}
+			return out, &partialListError{msg: fmt.Sprintf("MDBList list is incomplete: page %d failed: %v", page, err)}
 		}
-		if err2 := json.Unmarshal(body, &obj); err2 != nil {
-			return nil, fmt.Errorf("mdblist: unexpected response (is the list public?)")
+		items, err := decodeMDBListPage(body)
+		if err != nil {
+			if page > 1 && len(out) > 0 {
+				return out, &partialListError{msg: fmt.Sprintf("MDBList list is incomplete: page %d has an invalid response: %v", page, err)}
+			}
+			return nil, err
 		}
-		for i := range obj.Movies {
-			obj.Movies[i].MediaType = firstNonEmpty(obj.Movies[i].MediaType, "movie")
+		if len(items) == 0 {
+			break
 		}
-		for i := range obj.Shows {
-			obj.Shows[i].MediaType = firstNonEmpty(obj.Shows[i].MediaType, "show")
+		addedOnPage := 0
+		for _, it := range items {
+			r := mdbListExtRef(it)
+			key := mdbListRefKey(r)
+			if _, dup := seen[key]; dup {
+				continue
+			}
+			seen[key] = struct{}{}
+			out = append(out, r)
+			addedOnPage++
 		}
-		items = append(append(obj.Items, obj.Movies...), obj.Shows...)
-	}
-	out := make([]extRef, 0, len(items))
-	for _, it := range items {
-		r := extRef{IMDB: it.IMDB, Title: it.Title}
-		if n, err := it.TMDBID.Int64(); err == nil && n > 0 {
-			r.TMDB = n
-		} else if n, err := it.ID.Int64(); err == nil && n > 0 {
-			r.TMDB = n
+		if page > 1 && addedOnPage == 0 {
+			return out, &partialListError{msg: fmt.Sprintf("MDBList list is incomplete: page %d repeated prior items without advancing offset", page)}
 		}
-		r.TVDB, _ = it.TVDB.Int64()
-		y, _ := it.ReleaseYear.Int64()
-		r.Year = int(y)
-		switch strings.ToLower(it.MediaType) {
-		case "movie":
-			r.Type = "movie"
-		case "show", "tv":
-			r.Type = "show"
+		if len(items) < pageSize {
+			break
 		}
-		out = append(out, r)
+		if page == maxExternalPages {
+			return out, &partialListError{msg: fmt.Sprintf("MDBList list is incomplete: list exceeds %d pages (%d items)", maxExternalPages, len(out))}
+		}
+		offset += len(items)
 	}
 	return out, nil
 }

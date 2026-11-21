@@ -13,6 +13,7 @@ import (
 
 	"github.com/braedonsaunders/ether/internal/config"
 	"github.com/braedonsaunders/ether/internal/core"
+	"github.com/braedonsaunders/ether/internal/releaseparse"
 )
 
 // The Starr apps whose TRaSH Guides data Ether imports.
@@ -106,18 +107,16 @@ func ImportQualityProfile(data []byte) (QualityImport, error) {
 	} else if language := bytes.TrimSpace(native.Language); len(language) > 0 && !bytes.Equal(language, []byte("null")) {
 		imp.App = AppRadarr
 	}
+	// The pack ranks with its own quality order and custom formats, exactly
+	// as its authors wrote it; Ether adds only its streaming formats.
 	p := core.QualityProfile{
 		Name:                 native.Name,
-		PreferredCodecs:      []string{"h264", "hevc"},
-		PreferredAudio:       []string{"eac3", "ac3", "aac"},
 		MinSizeMBPerMin:      5, // the same fake filter as a new profile; scaled down for SD
 		MinCustomFormatScore: &native.MinFormatScore,
-		Ranking:              core.DefaultRanking(nil),
+		CustomFormatScores:   core.StreamingFormatScores(),
 	}
 	seenQuality := map[string]bool{}
-	seenSource := map[core.Source]bool{}
 	skipped := map[string]bool{}
-	hasRemux := false
 	add := func(name string) (core.Source, bool) {
 		q, source, height, ok := parseImportedQuality(name)
 		if !ok {
@@ -134,9 +133,6 @@ func ImportQualityProfile(data []byte) (QualityImport, error) {
 				imp.App = AppSonarr
 			}
 		}
-		if source == core.SourceRemux {
-			hasRemux = true
-		}
 		if !seenQuality[q] {
 			seenQuality[q] = true
 			p.AllowedQualities = append(p.AllowedQualities, q)
@@ -148,7 +144,7 @@ func ImportQualityProfile(data []byte) (QualityImport, error) {
 		return source, true
 	}
 	// Starr ranks the top item highest; qualities grouped together rank
-	// equally, so a group's sources follow Ether's own order.
+	// equally.
 	for _, raw := range native.Items {
 		var item struct {
 			Name    string            `json:"name"`
@@ -175,16 +171,15 @@ func ImportQualityProfile(data []byte) (QualityImport, error) {
 				names = append(names, name)
 			}
 		}
-		var group []core.Source
+		var order []string
 		for _, name := range names {
-			if source, ok := add(name); ok && !seenSource[source] && !slices.Contains(group, source) {
-				group = append(group, source)
+			if q, _, _, ok := parseImportedQuality(name); ok && !slices.Contains(order, q) {
+				order = append(order, q)
 			}
+			add(name)
 		}
-		slices.SortStableFunc(group, func(a, b core.Source) int { return sourceRank(a) - sourceRank(b) })
-		for _, s := range group {
-			seenSource[s] = true
-			p.PreferredSources = append(p.PreferredSources, s)
+		if len(order) > 0 {
+			p.QualityOrder = append(p.QualityOrder, core.QualityItem{Name: strings.TrimSpace(item.Name), Qualities: order})
 		}
 	}
 	if len(p.AllowedQualities) == 0 {
@@ -193,16 +188,10 @@ func ImportQualityProfile(data []byte) (QualityImport, error) {
 		}
 		return QualityImport{}, fmt.Errorf("quality profile: no playable qualities enabled")
 	}
-	if p.MaxHeight >= 2160 || hasRemux {
-		// UHD discs and remuxes carry lossless audio; a profile built for
-		// them should not rank compressed tracks above it.
-		p.PreferredAudio = []string{"truehd", "dtshd", "eac3", "ac3", "dts", "aac"}
-	}
 	if p.MaxHeight >= 2160 {
-		// UHD profiles exist for HDR. Both still need an app that supports
-		// them, and Dolby Vision without an HDR10 base stays off.
+		// UHD profiles exist for HDR. It still needs an app that supports
+		// it, and Dolby Vision without an HDR10 base stays off.
 		p.AllowHDR, p.AllowDolbyVision = true, true
-		p.PreferredCodecs = []string{"hevc", "h264"}
 	}
 	if len(imp.Skipped) > 0 {
 		imp.Warnings = append(imp.Warnings, fmt.Sprintf("Left out %s: Ether has no equivalent for %s.",
@@ -214,13 +203,14 @@ func ImportQualityProfile(data []byte) (QualityImport, error) {
 	var language string
 	if json.Unmarshal(native.Language, &language) == nil {
 		switch name := strings.ToLower(strings.TrimSpace(language)); name {
-		case "", "any", "unknown":
-		case "original":
-			imp.Warnings = append(imp.Warnings, "Radarr limits this profile to each title's original language. Ether doesn't filter by language; it passes over dubs that don't match the original language, and the profile's language formats still score releases.")
+		case "", "unknown":
+		case core.ProfileLanguageAny:
+			p.Language = core.ProfileLanguageAny
+		case core.ProfileLanguageOriginal:
+			p.Language = core.ProfileLanguageOriginal
 		default:
-			if knownLanguageName(name) {
-				p.PreferredLanguages = []string{name}
-				imp.Warnings = append(imp.Warnings, fmt.Sprintf("The %s language requirement became a preference: %s releases rank first, but others can still play.", language, language))
+			if knownLanguageName(name) && releaseparse.KnownLanguage(name) {
+				p.Language = name
 			} else {
 				imp.Warnings = append(imp.Warnings, fmt.Sprintf("The %s language requirement is left out: Ether doesn't recognise that language.", language))
 			}
@@ -264,11 +254,6 @@ func parseImportedQuality(name string) (q string, source core.Source, height int
 		}
 	}
 	return fmt.Sprintf("%s-%d", source, height), source, height, true
-}
-
-// sourceRank orders equally ranked sources best first.
-func sourceRank(s core.Source) int {
-	return slices.Index([]core.Source{core.SourceRemux, core.SourceBluRay, core.SourceWEBDL, core.SourceWEBRip, core.SourceHDTV, core.SourceDVD}, s)
 }
 
 func releaseQuality(info core.ReleaseInfo) string {
@@ -351,8 +336,9 @@ type QualityImportPlan struct {
 	Skipped   []string            `json:"skippedQualities"`
 	// Unusable, when set, is why the profile cannot work in Ether; Apply
 	// refuses it.
-	Unusable string   `json:"unusable,omitempty"`
-	Warnings []string `json:"warnings"`
+	Unusable       string   `json:"unusable,omitempty"`
+	MinimumWarning string   `json:"-"`
+	Warnings       []string `json:"warnings"`
 	// Definitions holds the source's current definition of every format
 	// the profile scores, including ones already saved. The guide sync
 	// upserts them so a saved profile tracks the source exactly. Not part
@@ -419,7 +405,7 @@ func PlanQualityImport(imp QualityImport, app string, found map[string]core.Cust
 			def.ID = id
 			def.App = app
 			f.Name = cmpOr(def.Name, name)
-			if _, err := NewFormatScorer([]core.CustomFormat{def}, nil); err != nil {
+			if _, err := NewFormatScorer([]core.CustomFormat{def}); err != nil {
 				if present {
 					// The owner's working definition stays; only the
 					// source's score is adopted below.
@@ -457,7 +443,7 @@ func PlanQualityImport(imp QualityImport, app string, found map[string]core.Cust
 		plan.Formats = append(plan.Formats, f)
 	}
 	if len(existing)+len(plan.Definitions) > 1000 {
-		plan.Warnings = append(plan.Warnings, "Custom scoring is limited to 1,000 formats; remove some from a quality profile's More options before importing this profile.")
+		plan.Warnings = append(plan.Warnings, "Ether keeps at most 1,000 custom formats; remove some under a quality profile's custom format definitions before importing this profile.")
 	}
 	slices.SortStableFunc(plan.Formats, func(a, b ImportFormat) int {
 		if a.Score != b.Score {
@@ -477,19 +463,26 @@ func PlanQualityImport(imp QualityImport, app string, found map[string]core.Cust
 	if other := len(existing) - countPresent(plan.Formats); other > 0 {
 		plan.Warnings = append(plan.Warnings, fmt.Sprintf("%d custom %s already saved %s part of this profile and won't change its ranking.", other, plural(other, "format", "formats"), plural(other, "isn't", "aren't")))
 	}
-	if len(scores) > 0 {
-		plan.Profile.CustomFormatScores = scores
+	if plan.Profile.CustomFormatScores == nil {
+		plan.Profile.CustomFormatScores = map[string]int{}
+	}
+	for id, v := range scores {
+		plan.Profile.CustomFormatScores[id] = v
 	}
 	// No release can exceed the sum of the positive scores the import can
-	// score, so a higher minimum would reject every release for ever.
+	// score, so a higher preferred minimum can only produce closest matches.
 	bestPossible := 0
 	for _, v := range scores {
 		if v > 0 {
 			bestPossible += v
 		}
 	}
+	if len(imp.FormatIDs) > 0 && len(scores) == 0 {
+		plan.Unusable = "None of this profile's custom formats can be imported."
+	}
 	if min := plan.Profile.MinCustomFormatScore; min != nil && *min > bestPossible {
-		plan.Unusable = fmt.Sprintf("This profile requires a custom format score of at least %d, but its importable formats can score at most %d, so no release could ever be accepted.", *min, bestPossible)
+		plan.MinimumWarning = fmt.Sprintf("This profile prefers a custom format score of at least %d, but its importable formats can score at most %d. Ether will use the best available release while keeping hard rules.", *min, bestPossible)
+		plan.Warnings = append(plan.Warnings, plan.MinimumWarning)
 	}
 	plan.Profile.Name = uniqueProfileName(plan.Profile.Name, plan.MediaType, cfg.Quality.Profiles)
 	return plan
@@ -575,6 +568,7 @@ func (p QualityImportPlan) Apply(c *config.Config, name string) error {
 	prof := p.Profile
 	prof.Name = name
 	prof.MediaType = media
+	prof.CustomFormatScores = core.ScoresForMedia(prof.CustomFormatScores, media)
 	if p.Source != "" {
 		prof.Import = &core.ProfileImport{
 			Source:   p.Source,
@@ -588,48 +582,25 @@ func (p QualityImportPlan) Apply(c *config.Config, name string) error {
 		prof.Import = nil
 	}
 	prof.AllowedQualities = slices.Clone(prof.AllowedQualities)
-	prof.PreferredSources = slices.Clone(prof.PreferredSources)
-	prof.PreferredCodecs = slices.Clone(prof.PreferredCodecs)
-	prof.PreferredAudio = slices.Clone(prof.PreferredAudio)
+	prof.QualityOrder = config.CloneQualityOrder(prof.QualityOrder)
 	prof.PreferredLanguages = slices.Clone(prof.PreferredLanguages)
-	prof.Ranking = slices.Clone(prof.EffectiveRanking())
 	if prof.MinCustomFormatScore != nil {
 		v := *prof.MinCustomFormatScore
 		prof.MinCustomFormatScore = &v
 	}
+	// A format a profile does not list scores 0 for it, as in Radarr and
+	// Sonarr, so adding the pack's formats changes no other profile.
 	scores := maps.Clone(prof.CustomFormatScores)
-	if scores == nil {
-		scores = map[string]int{}
-	}
-	for id := range have {
-		if _, ok := scores[id]; !ok {
-			scores[id] = 0
-		}
-	}
-	var added []string
 	for _, f := range p.Definitions {
 		id := formatID(f)
 		if id == "" || have[id] {
 			continue
 		}
 		have[id] = true
-		added = append(added, id)
 		if p.Source != "" {
 			f.ManagedBy = p.Source + ":" + p.App
 		}
 		c.Resolver.CustomFormats = append(c.Resolver.CustomFormats, f)
-	}
-	for i := range c.Quality.Profiles {
-		other := &c.Quality.Profiles[i]
-		for _, id := range added {
-			if _, ok := other.CustomFormatScores[id]; ok {
-				continue
-			}
-			if other.CustomFormatScores == nil {
-				other.CustomFormatScores = map[string]int{}
-			}
-			other.CustomFormatScores[id] = 0
-		}
 	}
 	if len(scores) > 0 {
 		prof.CustomFormatScores = scores

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"testing"
 
 	at "github.com/braedonsaunders/ether/internal/archive/archivetest"
@@ -31,7 +32,9 @@ func TestDetect(t *testing.T) {
 		{[]byte("7z\xbc\xaf\x27\x1c\x00\x04"), Format7z},
 		{[]byte("Rar!\x1a\x07"), FormatUnknown},
 		{[]byte("Rar!\x1a\x07\x02\x00"), FormatUnknown},
-		{[]byte("PK\x03\x04"), FormatUnknown},
+		{[]byte("PK\x03\x04"), FormatZIP},
+		{[]byte("PK\x07\x08"), FormatZIP},
+		{[]byte("PK\x05\x06"), FormatUnknown},
 		{nil, FormatUnknown},
 	}
 	for _, c := range cases {
@@ -39,7 +42,7 @@ func TestDetect(t *testing.T) {
 			t.Errorf("Detect(%q) = %v, want %v", c.in, got, c.want)
 		}
 	}
-	for f, s := range map[Format]string{FormatUnknown: "unknown", FormatRAR4: "rar4", FormatRAR5: "rar5", Format7z: "7z", Format(99): "unknown"} {
+	for f, s := range map[Format]string{FormatUnknown: "unknown", FormatRAR4: "rar4", FormatRAR5: "rar5", Format7z: "7z", FormatZIP: "zip", Format(99): "unknown"} {
 		if f.String() != s {
 			t.Errorf("Format(%d).String() = %q, want %q", f, f.String(), s)
 		}
@@ -667,5 +670,82 @@ func TestStreamableOrder(t *testing.T) {
 	m.Stored = true
 	if !errors.Is(m.Streamable(), ErrUnsupported) {
 		t.Fatal("dir last")
+	}
+}
+
+func TestReadRAR4TailVolumeNumber(t *testing.T) {
+	bufs := buildRAR(t, at.RAROptions{Version: 4, VolumeSize: 1000, NewNumbering: true}, sampleFiles())
+	for i, b := range bufs {
+		if got := ReadRAR4TailVolumeNumber(b); got != i {
+			t.Fatalf("vol %d tail number = %d, want %d", i, got, i)
+		}
+	}
+	unnumbered := buildRAR(t, at.RAROptions{Version: 4, VolumeSize: 1000, OmitEndVolumeNumber: true}, sampleFiles())
+	if got := ReadRAR4TailVolumeNumber(unnumbered[0]); got != -1 {
+		t.Fatalf("unnumbered tail = %d, want -1", got)
+	}
+}
+
+func TestRAR5EstimatedVolumeSize(t *testing.T) {
+	const (
+		volSize  = 200_000_000
+		packSize = 199_999_360
+		estSize  = 187_084_800
+	)
+	build200M := func(splitAfter bool) *sparseReader {
+		s := newSparse(t)
+		s.add(at.RAR5Signature).add(at.RAR5MainHeader(splitAfter, 0, false))
+		svcHdr := at.RAR5Block(3, 0, []byte{0}, nil, true, 65)
+		s.add(svcHdr).hole(65)
+		if s.size != 94 {
+			t.Fatalf("pre-file offset = %d, want 94", s.size)
+		}
+		end := at.RAR5EndHeader(splitAfter)
+		wantFileHdr := int(volSize - s.size - packSize - int64(len(end)))
+		var fh []byte
+		for n := 1; n <= wantFileHdr; n++ {
+			cand := at.RAR5FileHeader(at.Header{
+				Name:       strings.Repeat("a", n) + ".mkv",
+				PackSize:   packSize,
+				UnpackSize: 200_500_000,
+				SplitAfter: splitAfter,
+				CRC:        0x12345678,
+			})
+			if len(cand) == wantFileHdr {
+				fh = cand
+				break
+			}
+		}
+		if fh == nil {
+			t.Fatalf("failed to size RAR5 file header to %d bytes", wantFileHdr)
+		}
+		s.add(fh).hole(packSize).add(end)
+		if s.size != volSize {
+			t.Fatalf("volume size = %d, want %d", s.size, volSize)
+		}
+		return s
+	}
+
+	split := build200M(true)
+	if _, err := ReadRARVolume(eofReader{split, split.size}, estSize, nil); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("known underestimated size err = %v, want ErrCorrupt", err)
+	}
+	v, err := ReadRARVolume(eofReader{split, split.size}, estSize, &RAROptions{SizeEstimated: true})
+	if err != nil {
+		t.Fatalf("estimated split volume failed: %v", err)
+	}
+	if len(v.Files) != 1 || v.Files[0].HeaderOffset != 94 || v.Files[0].PackedSize != packSize || !v.Files[0].SplitAfter {
+		t.Fatalf("parsed split volume = %+v", v)
+	}
+
+	// Non-split volume reads past packSize to verify the trailing end block,
+	// so genuine truncation is still caught even when SizeEstimated is true.
+	single := build200M(false)
+	v, err = ReadRARVolume(eofReader{single, single.size}, estSize, &RAROptions{SizeEstimated: true})
+	if err != nil || !v.EndFound {
+		t.Fatalf("estimated single volume = %+v, %v", v, err)
+	}
+	if _, err := ReadRARVolume(eofReader{single, 150_000_000}, estSize, &RAROptions{SizeEstimated: true}); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("genuinely truncated estimated volume err = %v, want ErrCorrupt", err)
 	}
 }

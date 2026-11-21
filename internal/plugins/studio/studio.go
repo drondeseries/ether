@@ -1,6 +1,7 @@
 package studio
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/base64"
@@ -62,6 +63,7 @@ type Project struct {
 	CreatedAt   time.Time         `json:"createdAt"`
 	UpdatedAt   time.Time         `json:"updatedAt"`
 	kv          map[string][]byte
+	badges      map[string]map[string][]string
 	calls       []plugins.CallRecord
 	logs        []string
 	journal     []plugins.JournalEntry
@@ -1287,6 +1289,123 @@ func (h *devHost) CallHost(ctx context.Context, name string, raw json.RawMessage
 		h.s.mu.Unlock()
 		out, _ := json.Marshal(keys)
 		return out, nil
+
+	case "kv.usage":
+		var used int64
+		for _, v := range p.kv {
+			used += int64(len(v))
+		}
+		keys := int64(len(p.kv))
+		h.s.mu.Unlock()
+		out, _ := json.Marshal(plugins.KVUsage{
+			Bytes:      used + keys*plugins.KVKeyChargeBytes,
+			Keys:       keys,
+			QuotaBytes: plugins.KVQuotaBytes,
+			QuotaKeys:  plugins.KVQuotaKeys,
+		})
+		return out, nil
+
+	case "badges.set":
+		man, err := plugins.ParseManifest([]byte(p.Files["manifest.json"]))
+		if err != nil {
+			h.s.mu.Unlock()
+			return nil, wasm.Forbidden("a valid manifest is required")
+		}
+		var entries []plugins.BadgeEntry
+		if len(args) > 1 && len(args[1]) > 0 && string(args[1]) != "null" {
+			if err := json.Unmarshal(args[1], &entries); err != nil {
+				h.s.mu.Unlock()
+				return nil, &wasm.Fault{Code: "bad_arguments", Message: "badges.set takes (setKey, entries[])"}
+			}
+		}
+		norm, verr := plugins.ValidateBadgeSetCall(man, str(0), entries)
+		if verr != nil {
+			h.s.mu.Unlock()
+			if errors.Is(verr, plugins.ErrPermissionDenied) {
+				return nil, wasm.Forbidden(verr.Error())
+			}
+			return nil, &wasm.Fault{Code: string(wasm.StatusInvalidInput), Message: verr.Error()}
+		}
+		if !p.Shadow {
+			if p.badges == nil {
+				p.badges = map[string]map[string][]string{}
+			}
+			if p.badges[str(0)] == nil {
+				p.badges[str(0)] = map[string][]string{}
+			}
+			for _, e := range norm {
+				tmdbK, imdbK := plugins.ExternalBadgeKeys(e.Title)
+				k := tmdbK
+				if k == "" {
+					k = imdbK
+				}
+				if len(e.Labels) == 0 {
+					delete(p.badges[str(0)], k)
+				} else {
+					p.badges[str(0)][k] = e.Labels
+				}
+			}
+		}
+		recordJournal("badges.set", str(0), map[string]any{"op": "badges.set", "setKey": str(0), "entries": len(norm)})
+		h.s.mu.Unlock()
+		return json.RawMessage("null"), nil
+
+	case "badges.clear":
+		man, err := plugins.ParseManifest([]byte(p.Files["manifest.json"]))
+		if err != nil {
+			h.s.mu.Unlock()
+			return nil, wasm.Forbidden("a valid manifest is required")
+		}
+		if verr := plugins.ValidateBadgeClearCall(man, str(0)); verr != nil {
+			h.s.mu.Unlock()
+			if errors.Is(verr, plugins.ErrPermissionDenied) {
+				return nil, wasm.Forbidden(verr.Error())
+			}
+			return nil, &wasm.Fault{Code: string(wasm.StatusInvalidInput), Message: verr.Error()}
+		}
+		if !p.Shadow {
+			delete(p.badges, str(0))
+		}
+		recordJournal("badges.clear", str(0), map[string]any{"op": "badges.clear", "setKey": str(0)})
+		h.s.mu.Unlock()
+		return json.RawMessage("null"), nil
+
+	case "badges.usage":
+		man, err := plugins.ParseManifest([]byte(p.Files["manifest.json"]))
+		if err != nil || !man.HasCapability(plugins.CapPosterBadges) {
+			h.s.mu.Unlock()
+			return nil, wasm.Forbidden("poster_badges capability is required")
+		}
+		distinct := map[string]bool{}
+		for _, setMap := range p.badges {
+			for k := range setMap {
+				distinct[k] = true
+			}
+		}
+		h.s.mu.Unlock()
+		out, _ := json.Marshal(plugins.BadgeUsage{Titles: int64(len(distinct)), QuotaTitles: plugins.PosterBadgeQuotaTitles})
+		return out, nil
+
+	case "events.publish":
+		man, err := plugins.ParseManifest([]byte(p.Files["manifest.json"]))
+		if err != nil {
+			h.s.mu.Unlock()
+			return nil, wasm.Forbidden("a valid manifest is required")
+		}
+		payload := json.RawMessage(`{}`)
+		if len(args) > 1 && len(bytes.TrimSpace(args[1])) > 0 && string(bytes.TrimSpace(args[1])) != "null" {
+			payload = args[1]
+		}
+		if _, _, verr := plugins.ValidatePublishEventCall(man, str(0), payload); verr != nil {
+			h.s.mu.Unlock()
+			if errors.Is(verr, plugins.ErrPermissionDenied) {
+				return nil, wasm.Forbidden(verr.Error())
+			}
+			return nil, &wasm.Fault{Code: string(wasm.StatusInvalidInput), Message: verr.Error()}
+		}
+		recordJournal("events.publish", str(0), map[string]any{"op": "events.publish", "key": str(0), "payload": payload})
+		h.s.mu.Unlock()
+		return json.RawMessage("null"), nil
 
 	case "collections.upsert":
 		var colDoc map[string]any

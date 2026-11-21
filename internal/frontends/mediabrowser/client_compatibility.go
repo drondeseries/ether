@@ -1,7 +1,11 @@
 package mediabrowser
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -24,19 +28,77 @@ func (i *instance) clientCompatibilityRoutes() error {
 		{"/Items/Filters", i.queryFilters}, {"/Items/Filters2", i.queryFilters},
 		{"/Shows/Upcoming", i.upcomingEpisodes},
 		{"/Videos/{id}/AdditionalParts", i.additionalParts},
+		{"/Items/{id}/theme.m4a", i.themeStream},
 		{"/Items/{id}/ThemeMedia", i.themeMedia}, {"/Items/{id}/ThemeSongs", i.themeMedia}, {"/Items/{id}/ThemeVideos", i.themeMedia},
 		{"/Items/{id}/PlaybackInfo", i.playbackInfo},
 		{"/Localization/Options", i.emptyOptionalArray},
+		{"/System/WakeOnLanInfo", i.emptyOptionalArray},
+		{"/Users/{userId}/HomeSections", i.homeSections},
 		{"/Artists", i.emptyOptionalItems}, {"/Artists/AlbumArtists", i.emptyOptionalItems},
 		{"/Items/{id}/InstantMix", i.emptyItemCompanions},
 		{"/LiveTv/Timers", i.emptyOptionalItems}, {"/LiveTv/SeriesTimers", i.emptyOptionalItems},
 		{"/LiveTv/Recordings/Folders", i.emptyOptionalItems},
+		{"/Years", i.years},
+		{"/Years/{year}", i.year},
+		{"/UserItems/{id}/UserData", i.userItemData},
 	} {
 		if err := i.router.Handle("GET", entry.path, entry.handler); err != nil {
 			return err
 		}
 	}
+	if i.protocol == "jellyfin" {
+		if err := i.router.Handle("POST", "/ClientLog/Document", http.HandlerFunc(i.clientLogDocument)); err != nil {
+			return err
+		}
+	}
 	return i.router.Handle("DELETE", "/Videos/ActiveEncodings", http.HandlerFunc(i.stopEncoding))
+}
+
+// clientLogDocument accepts a client log upload the way Jellyfin 10.10
+// does: authenticated, at most 1,000,000 bytes, answered with the stored
+// file name. Ether keeps no client logs, so the body is drained and
+// discarded; the name follows Jellyfin's client-log naming so clients
+// that surface it show something sensible.
+func (i *instance) clientLogDocument(w http.ResponseWriter, r *http.Request) {
+	v, _, err := i.viewer(r)
+	if err != nil || v == nil {
+		http.Error(w, "Unauthorized", 401)
+		return
+	}
+	const maxClientLogDocument = 1_000_000
+	if r.ContentLength > maxClientLogDocument {
+		http.Error(w, "Payload must be less than 1,000,000 bytes", http.StatusRequestEntityTooLarge)
+		return
+	}
+	if _, err := io.Copy(io.Discard, http.MaxBytesReader(w, r.Body, maxClientLogDocument)); err != nil {
+		http.Error(w, "Payload must be less than 1,000,000 bytes", http.StatusRequestEntityTooLarge)
+		return
+	}
+	client := device(r).Client
+	if client == "" {
+		client = "unknown-client"
+	}
+	name := "clientlog-" + clientLogNamePart(client) + "-" + time.Now().UTC().Format("20060102150405") + ".log"
+	jsonReply(w, map[string]any{"FileName": name})
+}
+
+func clientLogNamePart(client string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(client) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case b.Len() > 0:
+			b.WriteByte('-')
+		}
+		if b.Len() >= 40 {
+			break
+		}
+	}
+	if s := strings.Trim(b.String(), "-"); s != "" {
+		return s
+	}
+	return "client"
 }
 
 func (i *instance) queryFilters(w http.ResponseWriter, r *http.Request) {
@@ -49,45 +111,56 @@ func (i *instance) queryFilters(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Unavailable", 503)
 		return
 	}
-	// Facets are derived from the viewer's visible library, never the global index.
-	genres, err := i.host.Experience.Facets(r.Context(), v, device(r), facetView(r), "genre")
-	if err != nil {
-		http.Error(w, "Unavailable", 503)
-		return
-	}
-	if strings.EqualFold(r.URL.Path, "/Items/Filters2") {
-		names := []any{}
-		for _, g := range genres {
-			names = append(names, map[string]any{"Name": g.Title, "Id": g.ID})
+	// A cold aggregate or unavailable index must not hold a library page.
+	// All five indexed lookups share one small request budget.
+	ctx, cancel := context.WithTimeout(r.Context(), 250*time.Millisecond)
+	defer cancel()
+	// Read each facet independently: an absent optional facet must not hide
+	// the filters that are available. Production implements the indexed reader;
+	// embedded hosts can still supply their bounded Facets implementation.
+	read := func(kind string) []frontend.FacetValue {
+		var values []frontend.FacetValue
+		var err error
+		if reader, ok := i.host.Experience.(frontend.FilterFacetReader); ok {
+			values, err = reader.FilterFacets(ctx, v, device(r), facetView(r), kind)
+		} else {
+			values, err = i.host.Experience.Facets(ctx, v, device(r), facetView(r), kind)
 		}
-		jsonReply(w, map[string]any{"Genres": names, "Tags": []string{}, "AudioLanguages": []any{}, "SubtitleLanguages": []any{}})
-	} else {
-		names := []string{}
-		for _, g := range genres {
-			names = append(names, g.Title)
-		}
-		years, err := i.host.Experience.Facets(r.Context(), v, device(r), facetView(r), "year")
 		if err != nil {
-			http.Error(w, "Unavailable", 503)
-			return
+			i.logFacetFailure(kind, err)
+			return nil
 		}
-		ratings, err := i.host.Experience.Facets(r.Context(), v, device(r), facetView(r), "contentRating")
-		if err != nil {
-			http.Error(w, "Unavailable", 503)
-			return
-		}
-		yearValues := []int{}
-		for _, year := range years {
-			if n, e := strconv.Atoi(year.Title); e == nil {
-				yearValues = append(yearValues, n)
-			}
-		}
-		ratingValues := []string{}
-		for _, rating := range ratings {
-			ratingValues = append(ratingValues, contentrating.Prefixed(rating.Title))
-		}
-		jsonReply(w, map[string]any{"Genres": names, "Tags": []string{}, "OfficialRatings": ratingValues, "Years": yearValues})
+		return values
 	}
+	genres, studios := read("genre"), read("studio")
+	genreNames, studioNames, tags, ratings := []string{}, []string{}, []string{}, []string{}
+	genreItems, studioItems := []any{}, []any{}
+	for _, value := range genres {
+		genreNames = append(genreNames, value.Title)
+		genreItems = append(genreItems, map[string]any{"Name": value.Title, "Id": value.ID})
+	}
+	for _, value := range studios {
+		studioNames = append(studioNames, value.Title)
+		studioItems = append(studioItems, map[string]any{"Name": value.Title, "Id": value.ID})
+	}
+	for _, value := range read("tag") {
+		tags = append(tags, value.Title)
+	}
+	for _, value := range read("contentRating") {
+		ratings = append(ratings, contentrating.Prefixed(value.Title))
+	}
+	years := []int{}
+	for _, value := range read("year") {
+		if n, err := strconv.Atoi(value.Title); err == nil {
+			years = append(years, n)
+		}
+	}
+	result := map[string]any{"Genres": genreNames, "Studios": studioNames, "Tags": tags, "OfficialRatings": ratings, "Years": years}
+	if strings.HasSuffix(strings.ToLower(r.URL.Path), "/items/filters2") {
+		result["Genres"], result["Studios"] = genreItems, studioItems
+		result["AudioLanguages"], result["SubtitleLanguages"] = []any{}, []any{}
+	}
+	jsonReply(w, result)
 }
 
 func (i *instance) upcomingEpisodes(w http.ResponseWriter, r *http.Request) {
@@ -107,29 +180,48 @@ func (i *instance) upcomingEpisodes(w http.ResponseWriter, r *http.Request) {
 	q.Desc = false
 	now := time.Now().UTC().Truncate(24 * time.Hour)
 	q.Filter.ReleasedFilters = []frontend.DateFilter{{Op: ">=", Unix: now.AddDate(0, 0, -1).Unix()}}
-	if len(route.Query(r.URL.Query(), "Limit")) == 0 {
-		q.Limit = showChildPageMax
+	if len(route.Query(r.URL.Query(), "Limit")) == 0 || q.Limit <= 0 {
+		q.Limit = upcomingEpisodesMax
+	} else if q.Limit > upcomingEpisodesMax {
+		q.Limit = upcomingEpisodesMax
 	}
-	view := ""
+	var page frontend.Page
 	if parent := route.Query(r.URL.Query(), "parentId"); len(parent) > 0 {
-		if len(parent) != 1 {
+		if len(parent) != 1 || parent[0] == "" {
 			http.Error(w, "Bad Request", 400)
 			return
 		}
-		n, e := ids.ParseGUID(ids.View, parent[0])
-		if e != nil {
+		// Jellyfin clients (Android TV's series page) scope Upcoming to the
+		// series item id. A view id scopes it to that library instead.
+		if key, e := ids.ParseRatingKeyGUID(parent[0]); e == nil {
+			page, err = i.host.Experience.Children(r.Context(), v, device(r), key, q)
+			if err == nil {
+				i.nameChildSeries(r, v, key, &page)
+			}
+		} else if n, e := ids.ParseGUID(ids.View, parent[0]); e == nil {
+			page, err = i.host.Experience.LibraryItems(r.Context(), v, device(r), ids.Decimal(n), q)
+		} else {
 			http.NotFound(w, r)
 			return
 		}
-		view = ids.Decimal(n)
+	} else {
+		page, err = i.host.Experience.LibraryItems(r.Context(), v, device(r), "", q)
 	}
-	page, err := i.host.Experience.LibraryItems(r.Context(), v, device(r), view, q)
 	if err != nil {
+		if errors.Is(err, frontend.ErrNotFound) {
+			i.replyItems(w, r, i.queryResult([]any{}, 0, q.Offset))
+			return
+		}
 		http.Error(w, "Unavailable", 503)
 		return
 	}
 	i.page(w, r, v, page, q.Offset)
 }
+
+// upcomingEpisodesMax bounds one /Shows/Upcoming page. The premiere-date
+// filter and sort run on the catalogue's release index, so the bound is a
+// page size, not a scan limit.
+const upcomingEpisodesMax = 100
 
 func (i *instance) additionalParts(w http.ResponseWriter, r *http.Request) {
 	if _, ok := i.authorizedItem(w, r); !ok {
@@ -139,19 +231,39 @@ func (i *instance) additionalParts(w http.ResponseWriter, r *http.Request) {
 	jsonReply(w, i.queryResult([]any{}, 0, 0))
 }
 
+func (i *instance) themeStream(w http.ResponseWriter, r *http.Request) {
+	d, ok := i.authorizedTheme(w, r)
+	if !ok {
+		return
+	}
+	if i.host.Themes == nil {
+		http.NotFound(w, r)
+		return
+	}
+	i.host.Themes.ServeTheme(w, r, d.Title)
+}
+
 func (i *instance) themeMedia(w http.ResponseWriter, r *http.Request) {
-	if _, ok := i.authorizedItem(w, r); !ok {
+	d, ok := i.authorizedTheme(w, r)
+	if !ok {
 		return
 	}
-	// Theme assets are optional and Ether does not index them. Preserve the
-	// nested result shape expected by Jellyfin Web rather than a bare array.
 	empty := i.queryResult([]any{}, 0, 0)
-	empty["OwnerId"] = "00000000000000000000000000000000"
-	if strings.EqualFold(r.URL.Path, "/Items/"+r.PathValue("id")+"/ThemeMedia") {
-		jsonReply(w, map[string]any{"ThemeSongsResult": empty, "ThemeVideosResult": empty, "SoundtrackSongsResult": empty})
+	empty["OwnerId"] = r.PathValue("id")
+	songs := empty
+	if !strings.HasSuffix(strings.ToLower(r.URL.Path), "/themevideos") && i.host.Themes != nil && i.host.Themes.Theme(d.Title, true) {
+		id := r.PathValue("id")
+		themeID := themeWireID(d.Title.Key)
+		path := "/Audio/" + themeID + "/stream.m4a"
+		source := map[string]any{"Id": themeID, "Path": path, "Protocol": "Http", "Container": "m4a", "SupportsDirectPlay": true, "SupportsDirectStream": true, "SupportsTranscoding": false, "MediaStreams": []any{map[string]any{"Type": "Audio", "Codec": "aac", "Index": 0, "Channels": 2}}, "DirectStreamUrl": path}
+		songs = i.queryResult([]any{map[string]any{"Id": themeID, "Name": d.Title.Title, "Type": "Audio", "MediaType": "Audio", "Container": "m4a", "IsFolder": false, "Path": path, "MediaSources": []any{source}, "MediaStreams": source["MediaStreams"]}}, 1, 0)
+		songs["OwnerId"] = id
+	}
+	if strings.HasSuffix(strings.ToLower(r.URL.Path), "/thememedia") {
+		jsonReply(w, map[string]any{"ThemeSongsResult": songs, "ThemeVideosResult": empty, "SoundtrackSongsResult": empty})
 		return
 	}
-	jsonReply(w, empty)
+	jsonReply(w, songs)
 }
 
 // Stop only the authenticated device's broker session; a client-supplied
@@ -201,10 +313,208 @@ func (i *instance) emptyItemCompanions(w http.ResponseWriter, r *http.Request) {
 	jsonReply(w, i.queryResult([]any{}, 0, 0))
 }
 
+// homeSections is the Emby home layout the native apps request at startup
+// (GET /Users/{userId}/HomeSections, Emby Server 4.10+). Ether has no
+// per-user section editor, so it answers the standard layout: library
+// tiles, Continue Watching, Next Up, then Latest Media per visible library.
+// Known section types carry no DisplayText; the apps label them with their
+// own localized strings. The viewer scope comes from i.viewer, which also
+// rejects a {userId} that is not the caller.
+func (i *instance) homeSections(w http.ResponseWriter, r *http.Request) {
+	v, _, err := i.viewer(r)
+	if err != nil || v == nil {
+		http.Error(w, "Unauthorized", 401)
+		return
+	}
+	if i.host.Experience == nil {
+		http.Error(w, "Unavailable", 503)
+		return
+	}
+	views, err := i.host.Experience.Views(r.Context(), v)
+	if err != nil {
+		http.Error(w, "Unavailable", 503)
+		return
+	}
+	items := []any{}
+	add := func(sectionType, collectionID string) {
+		section := map[string]any{"Id": homeSectionID(sectionType, collectionID), "SectionType": sectionType}
+		if collectionID != "" {
+			section["CollectionId"] = collectionID
+		}
+		items = append(items, section)
+	}
+	add("SmallLibraryTiles", "")
+	add("Resume", "")
+	add("NextUp", "")
+	for _, view := range views {
+		if view.Type != "movie" && view.Type != "show" {
+			continue
+		}
+		n, err := ids.ParseDecimal(view.ID)
+		if err != nil {
+			continue
+		}
+		id, err := ids.GUID(ids.View, n)
+		if err != nil {
+			continue
+		}
+		add("LatestMedia", id)
+	}
+	jsonReply(w, i.queryResult(items, len(items), 0))
+}
+
+// homeSectionID is a stable GUID-shaped id for one standard section. It is
+// not an item id; nothing in Ether resolves it.
+func homeSectionID(sectionType, collectionID string) string {
+	sum := sha256.Sum256([]byte("ether.homesection." + sectionType + "." + collectionID))
+	return hex.EncodeToString(sum[:16])
+}
+
 func (i *instance) emptyOptionalArray(w http.ResponseWriter, r *http.Request) {
 	if v, _, err := i.viewer(r); err != nil || v == nil {
 		http.Error(w, "Unauthorized", 401)
 		return
 	}
 	jsonReply(w, []any{})
+}
+
+// years lists the production years a filter can offer, from the same year
+// facet /Items/Filters reads. Jellyfin Web and Swiftfin ask GET /Years to build
+// their year filter; it must exist, not only the embedded Filters list.
+func (i *instance) years(w http.ResponseWriter, r *http.Request) {
+	v, _, err := i.viewer(r)
+	if err != nil || v == nil {
+		http.Error(w, "Unauthorized", 401)
+		return
+	}
+	if i.host.Experience == nil {
+		http.Error(w, "Unavailable", 503)
+		return
+	}
+	facets, err := i.host.Experience.Facets(r.Context(), v, device(r), facetView(r), "year")
+	if err != nil {
+		http.Error(w, "Unavailable", 503)
+		return
+	}
+	offset, limit := queryInt(r, "StartIndex", 0), queryInt(r, "Limit", 50)
+	if limit <= 0 {
+		limit = 50
+	}
+	items := make([]any, 0, len(facets))
+	for _, facet := range facets {
+		n, e := strconv.Atoi(facet.Title)
+		if e != nil {
+			continue
+		}
+		id, e := ids.GUID(ids.View, int64(n))
+		if e != nil {
+			continue
+		}
+		items = append(items, map[string]any{"Name": facet.Title, "Id": id, "Type": "Year", "ServerId": i.info.ID, "ProductionYear": n})
+	}
+	start := min(max(offset, 0), len(items))
+	end := min(start+limit, len(items))
+	jsonReply(w, i.queryResult(items[start:end], len(items), offset))
+}
+
+// year answers GET /Years/{year} with the year item a client opened. Its items
+// are reachable through /Items?Years=, which clients use for the listing.
+func (i *instance) year(w http.ResponseWriter, r *http.Request) {
+	v, _, err := i.viewer(r)
+	if err != nil || v == nil {
+		http.Error(w, "Unauthorized", 401)
+		return
+	}
+	raw := r.PathValue("year")
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	id, err := ids.GUID(ids.View, int64(n))
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	jsonReply(w, map[string]any{"Name": raw, "Id": id, "Type": "Year", "ServerId": i.info.ID, "ProductionYear": n, "IsFolder": true})
+}
+
+// userItemData answers GET /UserItems/{id}/UserData, which Jellyfin Web reads
+// for an item's played, favorite and resume state outside a full detail load.
+func (i *instance) userItemData(w http.ResponseWriter, r *http.Request) {
+	v, _, err := i.viewer(r)
+	if err != nil || v == nil {
+		http.Error(w, "Unauthorized", 401)
+		return
+	}
+	if i.host.Experience == nil {
+		http.Error(w, "Unavailable", 503)
+		return
+	}
+	key, err := ids.ParseRatingKeyGUID(r.PathValue("id"))
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if _, err := i.host.Experience.Item(i.identityContext(r), frontend.ItemRequest{Viewer: v, Device: device(r), Key: key}); err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	idsWire := ids.RatingKeyGUID(key)
+	state, err := i.host.Experience.UserData(i.identityContext(r), v, []frontend.RatingKey{key})
+	if err != nil {
+		http.Error(w, "Unavailable", 503)
+		return
+	}
+	jsonReply(w, i.userDataDTO(idsWire, state[key]))
+}
+
+func (i *instance) themePlaybackInfo(w http.ResponseWriter, r *http.Request) {
+	wireID := r.PathValue("id")
+	r.SetPathValue("id", themeParentID(wireID))
+	d, ok := i.authorizedTheme(w, r)
+	if !ok {
+		return
+	}
+	if i.host.Themes == nil || !i.host.Themes.Theme(d.Title, false) {
+		http.NotFound(w, r)
+		return
+	}
+	path := "/Audio/" + wireID + "/stream.m4a"
+	jsonReply(w, map[string]any{"MediaSources": []any{map[string]any{"Id": wireID, "Path": path, "Protocol": "Http", "Container": "m4a", "SupportsDirectPlay": true, "SupportsDirectStream": true, "SupportsTranscoding": false, "DirectStreamUrl": path, "MediaStreams": []any{map[string]any{"Type": "Audio", "Codec": "aac", "Index": 0, "Channels": 2}}}}})
+}
+
+// Negative item GUIDs reserve a stateless audio identity separate from the
+// positive catalogue key, while remaining UUID-shaped for native clients.
+func themeWireID(key frontend.RatingKey) string { return ids.RatingKeyGUID(-key) }
+func themeParentID(id string) string {
+	key, err := ids.ParseRatingKeyGUID(id)
+	if err != nil || key >= 0 {
+		return ""
+	}
+	parent := -key
+	switch parent.Kind() {
+	case frontend.KindShow, frontend.KindSeason, frontend.KindEpisode:
+		return ids.RatingKeyGUID(parent)
+	}
+	return ""
+}
+
+func (i *instance) authorizedTheme(w http.ResponseWriter, r *http.Request) (frontend.ItemDetail, bool) {
+	viewer, _, err := i.viewer(r)
+	if err != nil || viewer == nil {
+		http.Error(w, "Unauthorized", 401)
+		return frontend.ItemDetail{}, false
+	}
+	key, err := ids.ParseRatingKeyGUID(r.PathValue("id"))
+	if err != nil || i.host.ThemeTitle == nil {
+		http.NotFound(w, r)
+		return frontend.ItemDetail{}, false
+	}
+	title, err := i.host.ThemeTitle(i.identityContext(r), viewer, key)
+	if err != nil {
+		http.NotFound(w, r)
+		return frontend.ItemDetail{}, false
+	}
+	return frontend.ItemDetail{Title: *title}, true
 }

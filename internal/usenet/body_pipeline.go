@@ -181,7 +181,6 @@ func (p *pool) bodyWorker(prio core.Priority) {
 		p.bodyMu.Lock()
 		if claimed {
 			p.bodyClaimed[prio]--
-			claimed = false
 		}
 		q := p.bodyQueue[prio]
 		if len(q) == 0 {
@@ -297,6 +296,8 @@ func (p *pool) runBodyBatch(c *Conn, batch []*bodyFlight, prio core.Priority) {
 	var lastErr error
 	var replay []*bodyFlight
 	lastReplayed := false
+	beforeWire := c.wireBytes()
+	batchStart := time.Now()
 	c.bodyPipelineStarted(ctx, ids, &yenc.DecodeOptions{MaxSize: p.o.MaxArticleSize}, func() {
 		p.bodyMu.Lock()
 		for _, f := range batch {
@@ -305,6 +306,7 @@ func (p *pool) runBodyBatch(c *Conn, batch []*bodyFlight, prio core.Priority) {
 		p.bodyMu.Unlock()
 	}, func(i int, part *yenc.Part, err error) {
 		f := batch[i]
+		bodyStarted := c.bodyStarted
 		if err != nil {
 			p.bodyMu.Lock()
 			f.started = false
@@ -328,7 +330,7 @@ func (p *pool) runBodyBatch(c *Conn, batch []*bodyFlight, prio core.Priority) {
 			if !network || !networkRecorded {
 				// A mid-body drop says nothing about idle siblings. Only the
 				// first reply on a reused socket can expose a stale idle pool.
-				err = p.failed(err, reused && i == 0 && !c.bodyStarted, ctx)
+				err = p.failed(err, reused && i == 0 && !bodyStarted, ctx)
 				if network {
 					networkRecorded = true
 				}
@@ -347,6 +349,7 @@ func (p *pool) runBodyBatch(c *Conn, batch []*bodyFlight, prio core.Priority) {
 			p.fetching.add(time.Since(start))
 			p.latMu.Unlock()
 		}
+		p.statTrust.noteBodyResult(f.key.id, err, bodyStarted, f.ctx)
 		if f.ctx.Err() != nil {
 			err = f.ctx.Err()
 			part = nil
@@ -357,6 +360,9 @@ func (p *pool) runBodyBatch(c *Conn, batch []*bodyFlight, prio core.Priority) {
 			p.completeBody(f, part, err)
 		}
 	})
+	if reused && !networkRecorded && lastErr == nil {
+		p.noteBodyTransfer(c, c.wireBytes()-beforeWire, time.Since(batchStart))
+	}
 	p.put(c, prio)
 	if len(replay) > 0 {
 		p.requeueBodies(replay, prio)

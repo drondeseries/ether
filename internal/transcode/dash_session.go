@@ -16,6 +16,7 @@ import (
 // dashState is what a DASH session adds to Session: its representations
 // and their current init segments. Guarded by Session.mu.
 type dashState struct {
+	pms      bool // Plex TV manifest shape and buffer requirements
 	reps     []dashRep
 	initURL  string
 	mediaURL string
@@ -137,7 +138,7 @@ func (s *Session) ServeManifest(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			idle := s.cur == nil || s.cur.finished
-			if idle && !restarted && !complete {
+			if idle && !restarted && !complete && (len(s.rungs) <= 1 || s.info.Duration <= 0) {
 				restarted = true
 				if err := s.startRunForLocked(s.lastReq, s.failures > 0, "dash manifest"); err == nil {
 					idle = false
@@ -222,6 +223,9 @@ func (s *Session) renderMPDLocked() []byte {
 		s.log.Warn("using growing DASH manifest", "reason", "source duration unavailable")
 		return renderLiveMPD(s.created, time.Now(), s.segDur, s.commonDoneLocked(), s.dash.initURL, s.dash.mediaURL, reps)
 	}
+	if s.dash.pms {
+		return renderMPDWithBuffer(s.info.Duration, s.segDur, 2*s.segDur, s.dash.initURL, s.dash.mediaURL, reps)
+	}
 	return renderMPD(s.info.Duration, s.segDur, s.dash.initURL, s.dash.mediaURL, reps)
 }
 
@@ -254,6 +258,7 @@ func (s *Session) collectDASH(r *run, exited bool) {
 	s.mu.Lock()
 	skip := s.closed || (r.stopped && s.cur != r)
 	stopped := r.stopped
+	eof := !skip && exited && !stopped && r.proc.Err() == nil
 	s.mu.Unlock()
 	if skip {
 		return
@@ -275,10 +280,6 @@ func (s *Session) collectDASH(r *run, exited bool) {
 	}
 	var inits []initPub
 	var segs []segPub
-	eof := false
-	if exited {
-		eof = !stopped && r.proc.Err() == nil
-	}
 	for t, tr := range dr.tracks {
 		st := t
 		if t < len(dr.sessionTrack) {
@@ -362,6 +363,9 @@ func (s *Session) collectDASH(r *run, exited bool) {
 	}
 	changed := false
 	for _, in := range inits {
+		if s.cur != r && in.t == s.audioTrackLocked() {
+			continue
+		}
 		old := s.dash.inits[in.t]
 		s.dash.inits[in.t] = in.file
 		s.dash.codecs[in.t] = in.info.Codecs
@@ -373,6 +377,12 @@ func (s *Session) collectDASH(r *run, exited bool) {
 		changed = true
 	}
 	for _, sp := range segs {
+		if s.cur != r && sp.t == s.audioTrackLocked() {
+			if sp.file != "" {
+				s.removals.remove(sp.file)
+			}
+			continue
+		}
 		done := s.done[sp.t]
 		n := sp.out.n
 		if done[n] {
@@ -413,6 +423,7 @@ func (s *Session) collectDASH(r *run, exited bool) {
 		changed = true
 	}
 	if changed {
+		s.advanceHandoffLocked(r)
 		if r.produced > 0 && s.cur == r {
 			if r.rtx && r.rtxConfirmed.Load() {
 				s.decision.Enhancement.State = "running"

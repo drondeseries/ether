@@ -93,6 +93,11 @@ CREATE UNIQUE INDEX auth_users_one_owner ON auth_users(is_owner) WHERE is_owner=
 	store.Register("auth", 4, sqliteAuthV4)
 	store.RegisterDialect("auth", 4, store.Postgres, `ALTER TABLE auth_users ALTER COLUMN plex_id DROP NOT NULL;`)
 	store.RegisterSQLiteApply("auth", 4, applySQLiteAuthV4)
+	// v0.3.8: viewer sharing is library sharing (§1.4). Values carry over
+	// because Movies=1 and Shows=2 already are the library ids. RENAME
+	// COLUMN has the same syntax on SQLite and PostgreSQL, and the
+	// logical-restore history reads it from this SQL.
+	store.Register("auth", 9, `ALTER TABLE auth_users RENAME COLUMN allowed_sections TO allowed_libraries;`)
 
 }
 
@@ -347,8 +352,9 @@ type Service struct {
 	users        map[int64]*row  // by local id
 	byPlex       map[int64]int64 // plex id -> local id
 	tokens       map[string]int64
+	serverTokens map[string]bool
 	pos          map[string]cacheEntry
-	neg          map[string]time.Time
+	neg          map[string]negEntry
 	inflight     flight.Group[string, validation]
 	ownerPlexID  int64
 	plexDefaults map[int64]PlexViewerDefaults
@@ -369,8 +375,48 @@ type Service struct {
 	refreshMu   sync.RWMutex
 	refreshFunc func(context.Context) error
 
+	onViewerEvent atomic.Pointer[func(ViewerEvent)]
+
 	invalMu sync.Mutex
 	inval   *clusterbus.Invalidator // nil on a standalone server
+}
+
+// ViewerEvent describes a viewer membership, access, or session lifecycle change.
+type ViewerEvent struct {
+	Kind             string // "joined", "deactivated", "merged", "access_changed", "grant_revoked"
+	ViewerID         int64
+	Username         string
+	Role             string
+	Source           string
+	Reason           string
+	Actor            string
+	FromViewerID     int64
+	IntoViewerID     int64
+	StreamLimit      int
+	MaxContentRating string
+	AllowedLibraries []core.LibraryID
+	GrantKind        string
+}
+
+// SetOnViewerEvent installs an optional non-blocking observer for viewer lifecycle events.
+func (s *Service) SetOnViewerEvent(fn func(ViewerEvent)) {
+	if s == nil {
+		return
+	}
+	if fn == nil {
+		s.onViewerEvent.Store(nil)
+		return
+	}
+	s.onViewerEvent.Store(&fn)
+}
+
+func (s *Service) emitViewerEvent(ev ViewerEvent) {
+	if s == nil {
+		return
+	}
+	if fn := s.onViewerEvent.Load(); fn != nil && *fn != nil {
+		(*fn)(ev)
+	}
 }
 
 // SetUnknownTokenRefresher installs or replaces the callback invoked when an
@@ -452,7 +498,7 @@ func New(ctx context.Context, db *sql.DB, o Options) (*Service, error) {
 		incarnation = 1
 	}
 	s := &Service{db: db, o: o, log: o.Logger.With("component", "auth"),
-		pos: map[string]cacheEntry{}, neg: map[string]time.Time{},
+		pos: map[string]cacheEntry{}, neg: map[string]negEntry{}, serverTokens: map[string]bool{},
 		seen: map[int64]time.Time{}, incarnation: incarnation,
 		receipts: map[uint64]receipt{}, idsByHash: map[string][]uint64{},
 		tokenGen: map[string]uint64{}, refreshFunc: o.RefreshUnknownToken}
@@ -472,7 +518,7 @@ func HashToken(token string) string {
 }
 
 const userCols = `id, COALESCE(plex_id, 0), uuid, username, title, email, thumb, is_owner, is_home, restricted, active, origin,
-	plex_sections, stream_limit, max_content_rating, subtitle_languages, audio_languages, allowed_sections, last_seen_at, CASE WHEN created_at>0 THEN created_at ELSE COALESCE((SELECT MIN(event_time) FROM (SELECT verified_at AS event_time FROM identity_links WHERE viewer_id=auth_users.id AND verified_at>0 UNION ALL SELECT created_at AS event_time FROM auth_tokens WHERE user_id=auth_users.id AND created_at>0 UNION ALL SELECT last_seen_at AS event_time WHERE last_seen_at>0) AS known_times),0) END, updated_at, COALESCE(owner_enabled, 1), COALESCE(plex_shared, 1), plex_id`
+	plex_sections, stream_limit, max_content_rating, subtitle_languages, audio_languages, allowed_libraries, last_seen_at, CASE WHEN created_at>0 THEN created_at ELSE COALESCE((SELECT MIN(event_time) FROM (SELECT verified_at AS event_time FROM identity_links WHERE viewer_id=auth_users.id AND verified_at>0 UNION ALL SELECT created_at AS event_time FROM auth_tokens WHERE user_id=auth_users.id AND created_at>0 UNION ALL SELECT last_seen_at AS event_time WHERE last_seen_at>0) AS known_times),0) END, updated_at, COALESCE(owner_enabled, 1), COALESCE(plex_shared, 1), plex_id`
 
 func scanRow(sc interface{ Scan(...any) error }) (*row, error) {
 	var r row
@@ -489,7 +535,7 @@ func scanRow(sc interface{ Scan(...any) error }) (*row, error) {
 	_ = json.Unmarshal([]byte(plexSecs), &r.PlexSections)
 	_ = json.Unmarshal([]byte(subs), &r.SubtitleLanguages)
 	_ = json.Unmarshal([]byte(auds), &r.AudioLanguages)
-	_ = json.Unmarshal([]byte(secs), &r.AllowedSections)
+	_ = json.Unmarshal([]byte(secs), &r.AllowedLibraries)
 	if created > 0 {
 		r.CreatedAt = time.Unix(created, 0).UTC()
 	}
@@ -538,7 +584,7 @@ func (s *Service) applyRemote(ctx context.Context, hints []string, all bool) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.neg = map[string]time.Time{}
+	s.neg = map[string]negEntry{}
 	if all {
 		s.pos = map[string]cacheEntry{}
 		s.retireAllCacheLocked()
@@ -607,6 +653,23 @@ func (s *Service) reload(ctx context.Context) error {
 	if err := trows.Err(); err != nil {
 		return err
 	}
+	srows, err := s.db.QueryContext(ctx, `SELECT token_hash FROM auth_tokens WHERE source=?`, sourceServer)
+	if err != nil {
+		return fmt.Errorf("auth: load server tokens: %w", err)
+	}
+	serverTokens := map[string]bool{}
+	for srows.Next() {
+		var h string
+		if err := srows.Scan(&h); err != nil {
+			srows.Close()
+			return err
+		}
+		serverTokens[h] = true
+	}
+	srows.Close()
+	if err := srows.Err(); err != nil {
+		return err
+	}
 	defaults, err := s.loadPlexDefaults(ctx)
 	if err != nil {
 		return fmt.Errorf("auth: load plex defaults: %w", err)
@@ -631,7 +694,7 @@ func (s *Service) reload(ctx context.Context) error {
 		}
 	}
 	changed := !plexDefaultsEqual(s.plexDefaults, defaults)
-	s.users, s.byPlex, s.tokens, s.ownerPlexID, s.plexDefaults = users, byPlex, tokens, owner, defaults
+	s.users, s.byPlex, s.tokens, s.serverTokens, s.ownerPlexID, s.plexDefaults = users, byPlex, tokens, serverTokens, owner, defaults
 	if changed {
 		s.gen.Add(1)
 	}
@@ -640,6 +703,13 @@ func (s *Service) reload(ctx context.Context) error {
 		if u := users[e.userID]; u == nil || !u.Active {
 			delete(s.pos, h)
 			s.retireCacheLocked(h)
+		}
+	}
+	for h, n := range s.neg {
+		if n.plexID != 0 {
+			if id, ok := byPlex[n.plexID]; ok && users[id] != nil && users[id].Active {
+				delete(s.neg, h)
+			}
 		}
 	}
 	s.mu.Unlock()
@@ -651,11 +721,15 @@ func (r *row) effective() core.User {
 	u := r.User
 	u.SubtitleLanguages = append([]string{}, r.SubtitleLanguages...)
 	u.AudioLanguages = append([]string{}, r.AudioLanguages...)
-	u.AllowedSections = append([]int{}, r.AllowedSections...)
-	if len(u.AllowedSections) == 0 && len(r.PlexSections) > 0 && !r.IsOwner {
+	u.AllowedLibraries = append([]core.LibraryID{}, r.AllowedLibraries...)
+	if len(u.AllowedLibraries) == 0 && len(r.PlexSections) > 0 && !r.IsOwner {
 		// No Ether-side restriction: honour the sections the owner shared
-		// on plex.tv.
-		u.AllowedSections = append([]int{}, r.PlexSections...)
+		// on plex.tv. Plex section id == LibraryID (§1.4), so no
+		// translation table is needed.
+		u.AllowedLibraries = make([]core.LibraryID, len(r.PlexSections))
+		for i, sec := range r.PlexSections {
+			u.AllowedLibraries[i] = core.LibraryID(sec)
+		}
 	}
 	return u
 }
@@ -745,7 +819,7 @@ func (s *Service) Accept(ctx context.Context, token string) (*core.User, Accepta
 		s.touch(u.ID, now)
 		return u, acc, nil
 	}
-	if exp, ok := s.neg[h]; ok && now.Before(exp) {
+	if neg, ok := s.neg[h]; ok && now.Before(neg.expires) {
 		s.mu.RUnlock()
 		return nil, Acceptance{}, core.ErrUnauthorized
 	}
@@ -811,21 +885,7 @@ func (s *Service) activePlexUser(id int64) *core.User {
 
 // validate asks plex.tv, collapsing concurrent requests for one token.
 func (s *Service) validate(ctx context.Context, token, h string) (*core.User, Acceptance, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, Acceptance{}, err
-	}
-	// Detached, so one impatient client does not fail the others waiting
-	// on the same token. Waiters share that one acceptance receipt.
-	out, err := s.inflight.DoDetachedLimit(ctx, h, s.o.MaxConcurrentValidations, func(ctx context.Context) (validation, error) {
-		ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
-		defer cancel()
-		return s.validateOnce(ctx, token, h)
-	})
-	// Only the direct admission refusal takes this path; validation errors may
-	// wrap other causes and retain their existing stale-fallback semantics.
-	if err == flight.ErrCapacity {
-		return s.stale(h, errors.New("auth: token validation capacity reached"))
-	}
+	out, err := s.validateResult(ctx, token, h)
 	return out.user, out.acc, err
 }
 
@@ -833,7 +893,19 @@ func (s *Service) validateOnce(ctx context.Context, token, h string) (validation
 	if refresh := s.unknownTokenRefresher(); refresh != nil {
 		_ = refresh(ctx)
 		if u, acc, matched, err := s.acceptDurable(h, s.o.Now()); matched {
-			return validation{user: u, acc: acc}, err
+			var plexID int64
+			var notShared bool
+			if u != nil {
+				plexID = u.PlexID
+			} else {
+				s.mu.RLock()
+				if r := s.users[s.tokens[h]]; r != nil && r.Origin != "dlna_guest" && r.PlexID != 0 {
+					plexID = r.PlexID
+					notShared = true
+				}
+				s.mu.RUnlock()
+			}
+			return validation{user: u, acc: acc, plexID: plexID, notShared: notShared}, err
 		}
 	}
 	if s.o.Validator == nil {
@@ -846,7 +918,15 @@ func (s *Service) validateOnce(ctx context.Context, token, h string) (validation
 			return validation{}, core.ErrUnauthorized
 		}
 		u, acc, staleErr := s.stale(h, err)
-		return validation{user: u, acc: acc}, staleErr
+		var plexID int64
+		if u != nil {
+			plexID = u.PlexID
+		}
+		return validation{user: u, acc: acc, plexID: plexID}, staleErr
+	}
+	if acct == nil || acct.ID <= 0 {
+		s.reject(h)
+		return validation{}, core.ErrUnauthorized
 	}
 	// Membership changes must remain available while plex.tv is slow. Only
 	// local membership decisions and writes hold this lock, never network I/O.
@@ -863,8 +943,8 @@ func (s *Service) validateOnce(ctx context.Context, token, h string) (validation
 	s.mu.RUnlock()
 
 	if revoked {
-		s.reject(h)
-		return validation{}, core.ErrUnauthorized
+		s.rejectNotShared(h, acct.ID)
+		return validation{plexID: acct.ID, notShared: true}, core.ErrUnauthorized
 	}
 	switch {
 	case owner != 0 && acct.ID == owner:
@@ -881,7 +961,11 @@ func (s *Service) validateOnce(ctx context.Context, token, h string) (validation
 				return validation{}, core.ErrUnauthorized
 			}
 			u, acc, staleErr := s.stale(h, err)
-			return validation{user: u, acc: acc}, staleErr
+			var plexID int64
+			if u != nil {
+				plexID = u.PlexID
+			}
+			return validation{user: u, acc: acc, plexID: plexID}, staleErr
 		}
 		if !ok {
 			if known {
@@ -895,8 +979,8 @@ func (s *Service) validateOnce(ctx context.Context, token, h string) (validation
 				s.notify("")
 			}
 			s.log.Info("token without access to this server", "plexId", acct.ID, "username", acct.Username)
-			s.reject(h)
-			return validation{}, core.ErrUnauthorized
+			s.rejectNotShared(h, acct.ID)
+			return validation{plexID: acct.ID, notShared: true}, core.ErrUnauthorized
 		}
 		// A sync may have revoked this account during HasServer. The upsert
 		// preserves active=0 on existing rows; activeUser below then refuses it.
@@ -926,16 +1010,24 @@ func (s *Service) validateOnce(ctx context.Context, token, h string) (validation
 	}
 	s.mu.Unlock()
 	if u == nil {
-		return validation{}, core.ErrUnauthorized
+		return validation{plexID: acct.ID, notShared: true}, core.ErrUnauthorized
 	}
 	s.touch(u.ID, s.o.Now())
-	return validation{user: u, acc: acc}, nil
+	return validation{user: u, acc: acc, plexID: u.PlexID}, nil
 }
 
 func (s *Service) reject(h string) {
+	s.rejectEntry(h, negEntry{expires: s.o.Now().Add(s.o.NegativeTTL)})
+}
+
+func (s *Service) rejectNotShared(h string, plexID int64) {
+	s.rejectEntry(h, negEntry{expires: s.o.Now().Add(s.o.NegativeTTL), plexID: plexID, notShared: true})
+}
+
+func (s *Service) rejectEntry(h string, entry negEntry) {
 	s.mu.Lock()
 	s.evictLocked()
-	s.neg[h] = s.o.Now().Add(s.o.NegativeTTL)
+	s.neg[h] = entry
 	delete(s.pos, h)
 	s.retireCacheLocked(h)
 	s.mu.Unlock()
@@ -974,8 +1066,8 @@ func (s *Service) evictLocked() {
 			s.retireCacheLocked(h)
 		}
 	}
-	for h, exp := range s.neg {
-		if now.After(exp) {
+	for h, neg := range s.neg {
+		if now.After(neg.expires) {
 			delete(s.neg, h)
 		}
 	}
@@ -1120,7 +1212,7 @@ func (s *Service) SetOwner(ctx context.Context, a plextv.Account, serverToken st
 	}
 	s.mu.Lock()
 	s.pos = map[string]cacheEntry{}
-	s.neg = map[string]time.Time{}
+	s.neg = map[string]negEntry{}
 	s.mu.Unlock()
 	err = s.reload(ctx)
 	s.notify("caches")
@@ -1146,8 +1238,31 @@ func (s *Service) setOwnerTx(ctx context.Context, a plextv.Account, serverToken 
 	}
 	defer tx.Rollback()
 	// A Plex claim attaches to the existing local owner, retaining its viewer
-	// ID and all state. A Plex ID already linked to another viewer must fail
-	// rather than silently merging two people's state.
+	// ID and all state. The claim is a plex.tv sign-in, so the claimer
+	// controls this Plex account: a non-owner viewer row already holding it
+	// (a Plex app that signed in before the claim) is the same person, and
+	// is merged into the owner rather than refusing the claim with a
+	// constraint error.
+	var localOwner, holder int64
+	if err := tx.QueryRowContext(ctx, `SELECT id FROM auth_users WHERE is_owner=1 AND plex_id IS NULL`).Scan(&localOwner); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if localOwner != 0 {
+		if err := tx.QueryRowContext(ctx, `SELECT id FROM auth_users WHERE plex_id=? AND is_owner=0 AND origin<>'dlna_guest'`, a.ID).Scan(&holder); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+	}
+	if holder != 0 {
+		if err := store.MergeViewer(ctx, tx, holder, localOwner); err != nil {
+			return fmt.Errorf("auth: merge Plex viewer into owner: %w", err)
+		}
+		if err := store.PurgeViewer(ctx, tx, holder); err != nil {
+			return err
+		}
+		if err := deleteViewerRow(ctx, tx, holder); err != nil {
+			return err
+		}
+	}
 	if _, err := tx.ExecContext(ctx, `UPDATE auth_users SET plex_id=? WHERE is_owner=1 AND plex_id IS NULL`, a.ID); err != nil {
 		return fmt.Errorf("auth: attach Plex owner: %w", err)
 	}
@@ -1221,11 +1336,30 @@ func (s *Service) SyncFriends(ctx context.Context, friends []plextv.Friend) erro
 	if _, err := tx.ExecContext(ctx, `DELETE FROM auth_tokens WHERE source=?`, sourceFriend); err != nil {
 		return err
 	}
+	// Snapshot existing friends so newly joined and deactivated viewers can be
+	// reported after the transaction commits.
+	priorUsers := map[int64]string{}
+	s.mu.RLock()
+	for id, r := range s.users {
+		name := r.Username
+		if name == "" {
+			name = r.Title
+		}
+		priorUsers[id] = name
+	}
+	s.mu.RUnlock()
+
 	// Upsert in plex id order so concurrent syncs on different nodes take
 	// row locks in the same order.
 	friends = append([]plextv.Friend(nil), friends...)
 	sort.SliceStable(friends, func(i, j int) bool { return friends[i].PlexID < friends[j].PlexID })
 	keep := map[int64]bool{}
+	type joinedFriend struct {
+		id   int64
+		name string
+		role string
+	}
+	var joined []joinedFriend
 	for _, f := range friends {
 		var uid int64
 		switch {
@@ -1262,6 +1396,17 @@ RETURNING id`,
 				if err := upsertPlexLink(ctx, tx, f.PlexID, f.DisplayName(), now); err != nil {
 					return err
 				}
+				if _, existed := priorUsers[uid]; !existed {
+					role := "friend"
+					if f.Home {
+						role = "home"
+					}
+					name := f.Username
+					if name == "" {
+						name = f.DisplayName()
+					}
+					joined = append(joined, joinedFriend{id: uid, name: name, role: role})
+				}
 			}
 			if f.Pending {
 				continue // invited but not accepted: no access yet
@@ -1289,7 +1434,9 @@ RETURNING id`,
 		}
 	}
 	// Friends no longer in the list lost access.
-	rows, err := tx.QueryContext(ctx, `SELECT id FROM auth_users WHERE is_owner=0 AND plex_id IS NOT NULL`)
+	// Only friends who still have access can lose it: users already
+	// deactivated by an earlier sync are not counted (or rewritten) again.
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM auth_users WHERE is_owner=0 AND plex_id IS NOT NULL AND (active=1 OR plex_shared=1)`)
 	if err != nil {
 		return err
 	}
@@ -1325,6 +1472,26 @@ RETURNING id`,
 	}
 	err = s.reload(ctx)
 	s.notify("")
+	if err == nil {
+		for _, jf := range joined {
+			s.emitViewerEvent(ViewerEvent{
+				Kind:     "joined",
+				ViewerID: jf.id,
+				Username: jf.name,
+				Role:     jf.role,
+				Source:   "plex",
+			})
+		}
+		for _, id := range gone {
+			s.emitViewerEvent(ViewerEvent{
+				Kind:     "deactivated",
+				ViewerID: id,
+				Username: priorUsers[id],
+				Reason:   "plex_unshared",
+				Actor:    "plex",
+			})
+		}
+	}
 	return err
 }
 
@@ -1410,6 +1577,14 @@ type UserInfo struct {
 	HasPlex      bool `json:"hasPlex"`
 }
 
+// HomeMember reports active Plex Home membership with a constant-time lookup.
+func (s *Service) HomeMember(id int64) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	r := s.users[id]
+	return r != nil && r.Active && r.Home
+}
+
 // AllUsers lists every known user including those who lost access.
 func (s *Service) AllUsers(ctx context.Context) ([]UserInfo, error) {
 	s.mu.RLock()
@@ -1459,16 +1634,16 @@ func (s *Service) Owner(ctx context.Context) (*core.User, error) {
 // Identity fields come from plex.tv and are ignored.
 // plexShareEcho reports sections that are only the plex.tv share effective()
 // filled in for a viewer without an Ether-side library restriction.
-func (s *Service) plexShareEcho(id int64, secs []int) bool {
+func (s *Service) plexShareEcho(id int64, secs []core.LibraryID) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	r := s.users[id]
-	if r == nil || r.IsOwner || len(r.AllowedSections) > 0 || len(r.PlexSections) == 0 || len(secs) != len(r.PlexSections) {
+	if r == nil || r.IsOwner || len(r.AllowedLibraries) > 0 || len(r.PlexSections) == 0 || len(secs) != len(r.PlexSections) {
 		return false
 	}
-	have := map[int]bool{}
+	have := map[core.LibraryID]bool{}
 	for _, sec := range r.PlexSections {
-		have[sec] = true
+		have[core.LibraryID(sec)] = true
 	}
 	for _, sec := range secs {
 		if !have[sec] {
@@ -1496,20 +1671,20 @@ func (s *Service) UpdateUser(ctx context.Context, u core.User) error {
 	}
 	subs, _ := json.Marshal(norm(u.SubtitleLanguages))
 	auds, _ := json.Marshal(norm(u.AudioLanguages))
-	secs := u.AllowedSections
+	secs := u.AllowedLibraries
 	if secs == nil {
-		secs = []int{}
+		secs = []core.LibraryID{}
 	}
 	if s.plexShareEcho(u.ID, secs) {
 		// The caller passed back the plex.tv share that ActiveUser and the
 		// viewer list fill in when Ether adds no restriction of its own.
 		// Storing it would freeze today's share: libraries later shared or
 		// unshared on app.plex.tv would stop applying to this viewer.
-		secs = []int{}
+		secs = []core.LibraryID{}
 	}
 	secJSON, _ := json.Marshal(secs)
 	res, err := s.db.ExecContext(ctx, `UPDATE auth_users SET stream_limit=?, max_content_rating=?, subtitle_languages=?,
-		audio_languages=?, allowed_sections=?, updated_at=? WHERE id=?`,
+		audio_languages=?, allowed_libraries=?, updated_at=? WHERE id=?`,
 		u.StreamLimit, strings.TrimSpace(u.MaxContentRating), string(subs), string(auds), string(secJSON), s.o.Now().Unix(), u.ID)
 	if err != nil {
 		return fmt.Errorf("auth: update user: %w", err)
@@ -1520,5 +1695,24 @@ func (s *Service) UpdateUser(ctx context.Context, u core.User) error {
 	s.gen.Add(1)
 	err = s.reload(ctx)
 	s.notify("")
+	if err == nil {
+		name := u.Username
+		if cur, e := s.User(ctx, u.ID); e == nil && cur != nil {
+			if cur.Username != "" {
+				name = cur.Username
+			} else if cur.Title != "" {
+				name = cur.Title
+			}
+		}
+		s.emitViewerEvent(ViewerEvent{
+			Kind:             "access_changed",
+			ViewerID:         u.ID,
+			Username:         name,
+			StreamLimit:      u.StreamLimit,
+			MaxContentRating: strings.TrimSpace(u.MaxContentRating),
+			AllowedLibraries: append([]core.LibraryID(nil), secs...),
+			Actor:            "owner",
+		})
+	}
 	return err
 }

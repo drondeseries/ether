@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -33,7 +35,11 @@ func (s *Service) Reel(ctx context.Context, id string) (Reel, error) {
 	if e = json.Unmarshal([]byte(b), &r); e != nil {
 		return r, e
 	}
-	r.Anchor = time.Unix(anchor, 0).UTC()
+	// Shipped reels store updated_at=0 so schedules across any day include pods
+	// without anchoring weeklySchedule to 1970-01-01.
+	if anchor > 0 {
+		r.Anchor = time.Unix(anchor, 0).UTC()
+	}
 	order := r.Clips
 	r.Clips = []ReelClip{}
 	rows, e := s.db.QueryContext(ctx, "SELECT data FROM onair_reel_clips WHERE reel_id=? ORDER BY created_at,id", id)
@@ -73,6 +79,19 @@ func (s *Service) Reel(ctx context.Context, id string) (Reel, error) {
 	}
 	r.Clips = sorted
 	rows.Close()
+	s.syncReelClipIndex(r)
+	for i := range r.Clips {
+		if r.Clips[i].Preview == "" {
+			r.Clips[i].Preview = "/ether/api/onair/reels/" + r.ID + "/clips/" + r.Clips[i].ID + "/preview"
+		}
+		if r.Clips[i].Link {
+			_, dur, ok := s.PeekCachedReelClip(r.ID, r.Clips[i].ID)
+			r.Clips[i].Cached = ok
+			if ok && dur > 0 && r.Clips[i].DurationMS <= 0 {
+				r.Clips[i].DurationMS = dur.Milliseconds()
+			}
+		}
+	}
 	if s.o.ReelChannels != nil {
 		usage, err := s.o.ReelChannels(ctx)
 		if err != nil {
@@ -132,13 +151,26 @@ func (s *Service) SaveReel(ctx context.Context, r Reel) (Reel, error) {
 	if e != nil {
 		return r, e
 	}
-	return s.Reel(ctx, r.ID)
+	saved, e := s.Reel(ctx, r.ID)
+	if e == nil {
+		s.notifyReelsChanged(ctx)
+	}
+	return saved, e
 }
 func (s *Service) DeleteReel(ctx context.Context, id string) error {
 	r, e := s.Reel(ctx, id)
 	if e != nil {
 		return e
 	}
+	s.cancelReelImports(ctx, id)
+	for _, c := range r.Clips {
+		if c.Link {
+			s.cancelLinkClip(id, c)
+		}
+	}
+	// assetMu before the write transaction, the order DeleteAsset uses.
+	s.assetMu.Lock()
+	defer s.assetMu.Unlock()
 	tx, e := s.db.BeginTx(ctx, nil)
 	if e != nil {
 		return e
@@ -153,23 +185,35 @@ func (s *Service) DeleteReel(ctx context.Context, id string) error {
 	if _, e = tx.ExecContext(ctx, "DELETE FROM onair_reels WHERE id=?", id); e != nil {
 		return e
 	}
+	digests := make([]string, 0, len(r.Clips))
+	for _, c := range r.Clips {
+		digests = append(digests, c.SourceDigest)
+	}
+	if e = s.dropUnusedReelSources(ctx, tx, digests); e != nil {
+		return e
+	}
 	e = tx.Commit()
 	if e == nil {
+		s.removeUnreferenced(ctx, digests...)
+		s.dropReelClipIndex(id)
 		for _, c := range r.Clips {
 			s.mu.Lock()
 			delete(s.reelReady, c.ID)
 			s.mu.Unlock()
 			os.Remove(filepath.Join(s.o.Dir, "reel-"+c.ID+".mp4"))
 		}
+		s.notifyReelsChanged(ctx)
 	}
 	return e
 }
 func (s *Service) setClip(ctx context.Context, reel string, c ReelClip) error {
-	b, e := json.Marshal(c)
+	stored := c
+	stored.Cached = false
+	b, e := json.Marshal(stored)
 	if e != nil {
 		return e
 	}
-	res, e := s.db.ExecContext(ctx, "UPDATE onair_reel_clips SET name=?,duration_ms=?,status=?,error=?,data=? WHERE id=? AND reel_id=?", c.Name, c.DurationMS, c.Status, c.Error, string(b), c.ID, reel)
+	res, e := s.db.ExecContext(ctx, "UPDATE onair_reel_clips SET name=?,duration_ms=?,status=?,error=?,data=? WHERE id=? AND reel_id=?", stored.Name, stored.DurationMS, stored.Status, stored.Error, string(b), stored.ID, reel)
 	if e != nil {
 		return e
 	}
@@ -205,7 +249,11 @@ func (s *Service) uploadClip(ctx context.Context, reel, name, source, attributio
 		return ReelClip{}, e
 	}
 	defer os.Remove(f.Name())
-	n, e := io.Copy(f, io.LimitReader(r, (500<<20)+1))
+	h := sha256.New()
+	n, e := io.Copy(io.MultiWriter(f, h), io.LimitReader(r, (500<<20)+1))
+	if e == nil {
+		e = f.Sync()
+	}
 	f.Close()
 	if e != nil {
 		return ReelClip{}, e
@@ -213,11 +261,7 @@ func (s *Service) uploadClip(ctx context.Context, reel, name, source, attributio
 	if n == 0 || n > 500<<20 {
 		return ReelClip{}, fmt.Errorf("clip maximum 500 MB")
 	}
-	b, e := os.ReadFile(f.Name())
-	if e != nil {
-		return ReelClip{}, e
-	}
-	a, e := s.putReelAsset(ctx, name, b)
+	a, e := s.putReelAsset(ctx, name, f.Name(), hex.EncodeToString(h.Sum(nil)), n)
 	if e != nil {
 		return ReelClip{}, e
 	}
@@ -254,21 +298,11 @@ func (s *Service) convertClip(ctx context.Context, reel string, c ReelClip) (err
 	if s.o.Probe == nil || s.o.FFmpeg == nil {
 		return fmt.Errorf("media conversion unavailable")
 	}
-	var b []byte
-	if err = s.db.QueryRowContext(ctx, "SELECT content FROM onair_assets WHERE digest=?", c.SourceDigest).Scan(&b); err != nil {
-		return err
-	}
-	f, err := os.CreateTemp(s.o.Dir, ".reel-*")
+	source, err := s.assetPath(ctx, c.SourceDigest)
 	if err != nil {
 		return err
 	}
-	defer os.Remove(f.Name())
-	_, err = f.Write(b)
-	f.Close()
-	if err != nil {
-		return err
-	}
-	info, err := s.o.Probe(ctx, f.Name())
+	info, err := s.o.Probe(ctx, source)
 	if err != nil {
 		return err
 	}
@@ -287,36 +321,78 @@ func (s *Service) convertClip(ctx context.Context, reel string, c ReelClip) (err
 	if err != nil {
 		return err
 	}
+	out := filepath.Join(s.o.Dir, "reel-"+c.ID+".mp4")
+	dur, err := s.encodeNormalizedClip(ctx, r, source, out, info.Duration, hasAudio, func(pct float64) {
+		c.Progress = pct
+		s.clipProgress(ctx, reel, c)
+	})
+	if err != nil {
+		return err
+	}
+	c.DurationMS = dur.Milliseconds()
+	s.mu.Lock()
+	s.reelReady[c.ID] = true
+	s.mu.Unlock()
+	c.Status = "ready"
+	c.Progress = 100
+	err = s.clipProgress(ctx, reel, c)
+	if err == nil {
+		s.notifyReelsChanged(ctx)
+	}
+	return err
+}
+
+func (s *Service) normalizeClipFile(ctx context.Context, r Reel, source, out string, progress func(float64)) (time.Duration, error) {
+	if s.o.NormalizeClip != nil {
+		return s.o.NormalizeClip(ctx, r, source, out)
+	}
+	if s.o.Probe == nil || s.o.FFmpeg == nil {
+		return 0, fmt.Errorf("media conversion unavailable")
+	}
+	info, err := s.o.Probe(ctx, source)
+	if err != nil {
+		return 0, err
+	}
+	if info.Duration <= 0 || info.Duration > 3*time.Minute {
+		return 0, fmt.Errorf("reel clip maximum 3 minutes")
+	}
+	hasVideo, hasAudio := false, false
+	for _, st := range info.Streams {
+		hasVideo = hasVideo || st.Type == "video"
+		hasAudio = hasAudio || st.Type == "audio"
+	}
+	if !hasVideo {
+		return 0, fmt.Errorf("clip has no video")
+	}
+	return s.encodeNormalizedClip(ctx, r, source, out, info.Duration, hasAudio, progress)
+}
+
+func (s *Service) encodeNormalizedClip(ctx context.Context, r Reel, source, out string, duration time.Duration, hasAudio bool, progress func(float64)) (dur time.Duration, err error) {
 	trimStart := time.Duration(0)
 	if r.TrimSilence && hasAudio {
 		var trimEnd time.Duration
-		trimStart, trimEnd, err = s.silenceEdges(ctx, f.Name(), info.Duration)
+		trimStart, trimEnd, err = s.silenceEdges(ctx, source, duration)
 		if err != nil {
-			return err
+			return 0, err
 		}
-		info.Duration = trimEnd - trimStart
-		if info.Duration < time.Second/10 {
-			return fmt.Errorf("clip is silent")
+		duration = trimEnd - trimStart
+		if duration < time.Second/10 {
+			return 0, fmt.Errorf("clip is silent")
 		}
 	}
-	c.DurationMS = info.Duration.Milliseconds()
-	out := filepath.Join(s.o.Dir, "reel-"+c.ID+".mp4")
 	defer func() {
 		if err != nil {
 			os.Remove(out)
 		}
 	}()
-	w, h := 1920, 1080
-	if s.o.WorkingSize != nil {
-		w, h = s.o.WorkingSize()
-	}
+	w, h := s.workingSize()
 	if w < 2 || h < 2 || w > 1920 || h > 1080 || w%2 != 0 || h%2 != 0 {
-		return fmt.Errorf("invalid working size")
+		return 0, fmt.Errorf("invalid working size")
 	}
 	scale := fmt.Sprintf("scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2,format=yuv420p", w, h, w, h)
 	tmp := out + ".tmp.mp4"
 	defer os.Remove(tmp)
-	args := []string{"-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-ss", strconv.FormatFloat(trimStart.Seconds(), 'f', 6, 64), "-i", f.Name()}
+	args := []string{"-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-ss", strconv.FormatFloat(trimStart.Seconds(), 'f', 6, 64), "-i", source}
 	if !hasAudio {
 		args = append(args, "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo")
 	}
@@ -326,7 +402,7 @@ func (s *Service) convertClip(ctx context.Context, reel string, c ReelClip) (err
 	} else {
 		args = append(args, "-map", "1:a:0", "-shortest")
 	}
-	args = append(args, "-t", strconv.FormatFloat(info.Duration.Seconds(), 'f', 3, 64), "-vf", scale, "-r", "30", "-c:v", "libx264", "-threads", "2", "-profile:v", "high", "-level:v", "4.1", "-preset", "medium", "-crf", "20", "-maxrate", "12M", "-bufsize", "24M", "-g", "120", "-c:a", "aac", "-ac", "2", "-ar", "48000", "-b:a", "192k")
+	args = append(args, "-t", strconv.FormatFloat(duration.Seconds(), 'f', 3, 64), "-vf", scale, "-r", "30", "-c:v", "libx264", "-threads", "2", "-profile:v", "high", "-level:v", "4.1", "-preset", "medium", "-crf", "20", "-maxrate", "12M", "-bufsize", "24M", "-g", "120", "-c:a", "aac", "-ac", "2", "-ar", "48000", "-b:a", "192k")
 	if r.LoudnessMatch {
 		args = append(args, "-af", "loudnorm=I=-23:TP=-2:LRA=7")
 	}
@@ -335,10 +411,10 @@ func (s *Service) convertClip(ctx context.Context, reel string, c ReelClip) (err
 	cmd := mediaproc.CommandContext(ctx, mediaproc.EncodeTimeout, s.o.FFmpeg(), args...)
 	pipe, e := cmd.StdoutPipe()
 	if e != nil {
-		return e
+		return 0, e
 	}
 	if err = cmd.Start(); err != nil {
-		return err
+		return 0, err
 	}
 	scan := bufio.NewScanner(pipe)
 	scan.Buffer(make([]byte, 1024), 4096)
@@ -349,9 +425,8 @@ func (s *Service) convertClip(ctx context.Context, reel string, c ReelClip) (err
 			continue
 		}
 		us, e := strconv.ParseFloat(v, 64)
-		if e == nil && time.Since(last) > time.Second {
-			c.Progress = min(99, 100*us/float64(info.Duration.Microseconds()))
-			s.clipProgress(ctx, reel, c)
+		if e == nil && progress != nil && time.Since(last) > time.Second {
+			progress(min(99, 100*us/float64(duration.Microseconds())))
 			last = time.Now()
 		}
 	}
@@ -361,20 +436,22 @@ func (s *Service) convertClip(ctx context.Context, reel string, c ReelClip) (err
 			_ = cmd.Cancel()
 		}
 		_ = cmd.Wait()
-		return scan.Err()
+		return 0, scan.Err()
 	}
 	if err = cmd.Wait(); err != nil {
-		return err
+		return 0, err
 	}
 	if err = os.Rename(tmp, out); err != nil {
-		return err
+		return 0, err
 	}
-	s.mu.Lock()
-	s.reelReady[c.ID] = true
-	s.mu.Unlock()
-	c.Status = "ready"
-	c.Progress = 100
-	return s.clipProgress(ctx, reel, c)
+	return duration, nil
+}
+
+func (s *Service) workingSize() (int, int) {
+	if s.o.WorkingSize != nil {
+		return s.o.WorkingSize()
+	}
+	return 1920, 1080
 }
 
 var _ *core.MediaInfo
@@ -387,6 +464,9 @@ func (s *Service) resumeConversions() {
 	}
 	for _, r := range rs {
 		for _, c := range r.Clips {
+			if c.Link {
+				continue
+			}
 			if c.Status == "converting" {
 				s.enqueue(renderJob{Hash: "reel-" + c.ID, convert: func(ctx context.Context) error { return s.convertClip(ctx, r.ID, c) }})
 			}
@@ -438,6 +518,7 @@ func (s *Service) silenceEdges(ctx context.Context, path string, duration time.D
 }
 
 func (s *Service) DeleteClip(ctx context.Context, reel, id string) error {
+	s.cancelImport(id)
 	res, e := s.db.ExecContext(ctx, "DELETE FROM onair_imports WHERE id=? AND reel_id=?", id, reel)
 	if e != nil {
 		return e
@@ -449,12 +530,17 @@ func (s *Service) DeleteClip(ctx context.Context, reel, id string) error {
 	}
 	for _, c := range r.Clips {
 		if c.ID == id {
-			_, e = s.db.ExecContext(ctx, "DELETE FROM onair_reel_clips WHERE reel_id=? AND id=?", reel, id)
+			if c.Link {
+				s.cancelLinkClip(reel, c)
+			}
+			e = s.deleteClipRow(ctx, reel, c)
 			if e == nil {
 				s.mu.Lock()
 				delete(s.reelReady, c.ID)
+				delete(s.reelClipIndex, reel+"\x00"+c.ID)
 				s.mu.Unlock()
 				os.Remove(filepath.Join(s.o.Dir, "reel-"+c.ID+".mp4"))
+				s.notifyReelsChanged(ctx)
 			}
 			return e
 		}
@@ -465,6 +551,67 @@ func (s *Service) DeleteClip(ctx context.Context, reel, id string) error {
 	return ErrNotFound
 }
 
+// deleteClipRow deletes one clip and, in the same transaction, its source
+// upload once nothing else uses it.
+func (s *Service) deleteClipRow(ctx context.Context, reel string, c ReelClip) error {
+	s.assetMu.Lock()
+	defer s.assetMu.Unlock()
+	tx, e := s.db.BeginTx(ctx, nil)
+	if e != nil {
+		return e
+	}
+	defer tx.Rollback()
+	if _, e = tx.ExecContext(ctx, "DELETE FROM onair_reel_clips WHERE reel_id=? AND id=?", reel, c.ID); e != nil {
+		return e
+	}
+	if e = s.dropUnusedReelSources(ctx, tx, []string{c.SourceDigest}); e != nil {
+		return e
+	}
+	if e = tx.Commit(); e != nil {
+		return e
+	}
+	s.removeUnreferenced(ctx, c.SourceDigest)
+	return nil
+}
+
+// dropUnusedReelSources deletes the reel source uploads among digests that
+// no clip, look, family or channel uses any more, under the same rules as
+// DeleteAsset. Without it a deleted reel's sources stayed in the database
+// and kept counting against the reel budget. The caller holds assetMu,
+// taken before its transaction.
+func (s *Service) dropUnusedReelSources(ctx context.Context, tx *sql.Tx, digests []string) error {
+	channels, e := s.hasChannelAssets(ctx)
+	if e != nil {
+		return e
+	}
+	query := `DELETE FROM onair_assets WHERE digest=? AND kind='reel' AND NOT EXISTS(SELECT 1 FROM onair_reel_clips WHERE source_digest=?) AND NOT EXISTS(SELECT 1 FROM onair_looks WHERE data LIKE ?) AND NOT EXISTS(SELECT 1 FROM onair_families WHERE data LIKE ?)`
+	if channels {
+		query += ` AND NOT EXISTS(SELECT 1 FROM livetv_channels WHERE data LIKE ?)`
+	}
+	seen := map[string]bool{}
+	for _, d := range digests {
+		if d == "" || seen[d] {
+			continue
+		}
+		seen[d] = true
+		like := "%" + d + "%"
+		args := []any{d, d, like, like}
+		if channels {
+			args = append(args, like)
+		}
+		res, e := tx.ExecContext(ctx, query, args...)
+		if e != nil {
+			return e
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			if _, e = tx.ExecContext(ctx, "DELETE FROM onair_asset_replicas WHERE digest=?", d); e != nil {
+				return e
+			}
+		}
+	}
+	return nil
+}
+
 func (s *Service) loadReels() {
 	rs, e := s.Reels(s.ctx)
 	if e != nil {
@@ -472,9 +619,19 @@ func (s *Service) loadReels() {
 	}
 	for _, r := range rs {
 		for _, c := range r.Clips {
+			if c.Link {
+				if c.Status == "downloading" || c.Status == "converting" || c.Status == "queued" {
+					c.Status = "ready"
+					c.Progress = 0
+					_ = s.setClip(s.ctx, r.ID, c)
+				}
+				continue
+			}
 			if c.Status == "ready" {
 				if st, e := os.Stat(filepath.Join(s.o.Dir, "reel-"+c.ID+".mp4")); e == nil && st.Size() > 0 {
+					s.mu.Lock()
 					s.reelReady[c.ID] = true
+					s.mu.Unlock()
 				}
 			}
 		}

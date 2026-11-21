@@ -395,7 +395,7 @@ describe("setup wizard", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "Save and continue" }));
     await screen.findByRole("button", { name: "Finish setup" });
-    const finishNow = screen.getByRole("button", { name: "Finish now, add the TMDB key later" });
+    const finishNow = screen.getByRole("button", { name: "Finish setup" });
     fireEvent.click(finishNow);
     expect(
       await screen.findByRole("heading", { name: "Restart Ether to use your cache folder" }),
@@ -943,7 +943,7 @@ describe("setup wizard", () => {
       },
     );
     const finishNow = await screen.findByRole("button", {
-      name: "Finish now, add the TMDB key later",
+      name: "Finish setup",
     });
     expect(screen.queryAllByRole("link", { name: "Overview" })).toHaveLength(0);
     fireEvent.click(finishNow);
@@ -960,7 +960,7 @@ describe("setup wizard", () => {
         "Your settings are saved. Add a debrid or Usenet account so titles can play.",
       ),
     ).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Add a TMDB key" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Add a TMDB key" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Add a debrid account" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Connect Plex" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Connect a device" })).toBeInTheDocument();
@@ -983,9 +983,7 @@ describe("setup wizard", () => {
         f.state.config.setupComplete = false;
       },
     );
-    fireEvent.click(
-      await screen.findByRole("button", { name: "Finish now, add the TMDB key later" }),
-    );
+    fireEvent.click(await screen.findByRole("button", { name: "Finish setup" }));
     const readyRegion = await screen.findByRole("region", { name: "Ether is ready" });
     // The Escape listener is attached in an effect after the region renders;
     // keep pressing until the skip lands rather than racing that effect.

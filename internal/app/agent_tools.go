@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"maps"
 	"net/url"
 	"strings"
 	"time"
@@ -42,6 +43,7 @@ func (a *App) registerBuiltinTools(c *tools.Catalogue) error {
 		Profiles:    &appProfileService{a: a},
 		Frontends:   &appFrontendService{a: a},
 		Server:      &appServerService{a: a},
+		Flows:       &appFlowsService{a: a},
 		OwnerUser: func(ctx context.Context) (*core.User, error) {
 			if a.users == nil {
 				return nil, errors.New("no owner")
@@ -66,6 +68,8 @@ func (a *App) registerBuiltinTools(c *tools.Catalogue) error {
 // literal extend.T("...") calls so web/scripts/i18n.mjs extracts every title.
 func builtinToolLabel(name, fallback string) extend.Text {
 	switch name {
+	case "livetv_channel_apply":
+		return extend.T("Apply channel")
 	case "look_draft", "livetv_look_draft":
 		return extend.T("Draft a look")
 	case "channel_summary":
@@ -114,8 +118,12 @@ func builtinToolLabel(name, fallback string) extend.Text {
 		return extend.T("Blocklist a release")
 	case "release_pin":
 		return extend.T("Pin a release")
-	case "ranking_reorder":
-		return extend.T("Reorder release ranking")
+	case "quality_profiles":
+		return extend.T("Quality profiles")
+	case "quality_order_set":
+		return extend.T("Change quality order")
+	case "format_scores_set":
+		return extend.T("Change custom format scores")
 	case "rule_add":
 		return extend.T("Add a release rule")
 	case "source_add_stremio":
@@ -128,6 +136,18 @@ func builtinToolLabel(name, fallback string) extend.Text {
 		return extend.T("Turn a plugin on or off")
 	case "server_restart":
 		return extend.T("Restart the server")
+	case "flows_list":
+		return extend.T("Flows")
+	case "flow_get":
+		return extend.T("Flow details")
+	case "flow_create_from_template":
+		return extend.T("Create a flow from a template")
+	case "flow_enable":
+		return extend.T("Turn a flow on or off")
+	case "flow_test_run":
+		return extend.T("Test-run a flow")
+	case "flow_runs":
+		return extend.T("Flow runs")
 	default:
 		return extend.Text{Source: fallback}
 	}
@@ -588,12 +608,22 @@ func (p *appPluginService) SetPluginEnabled(ctx context.Context, id string, enab
 
 func toPluginInfo(r plugins.Record, h plugins.Health) builtin.PluginInfo {
 	status := h.Status
-	if status == "" {
-		if r.Enabled {
-			status = "ok"
-		} else {
-			status = "disabled"
+	if !r.Enabled {
+		status = "disabled"
+	} else if status == "" {
+		status = "ok"
+	}
+	var detail string
+	switch status {
+	case "error":
+		detail = firstNonEmptyStr(h.Reason, h.LastError)
+	case "disabled":
+		if h.Status == "disabled" {
+			detail = h.Reason
 		}
+	case "ok":
+	default:
+		detail = h.Reason
 	}
 	return builtin.PluginInfo{
 		ID:      r.ID,
@@ -602,7 +632,7 @@ func toPluginInfo(r plugins.Record, h plugins.Health) builtin.PluginInfo {
 		Kind:    r.Kind,
 		Enabled: r.Enabled,
 		Health:  status,
-		Detail:  firstNonEmptyStr(h.Reason, h.LastError),
+		Detail:  detail,
 	}
 }
 
@@ -657,20 +687,49 @@ func (ps *appProfileService) Profiles(ctx context.Context) ([]builtin.ProfileInf
 	out := make([]builtin.ProfileInfo, 0, len(cfg.Quality.Profiles))
 	for _, p := range cfg.Quality.Profiles {
 		out = append(out, builtin.ProfileInfo{
-			Name:    p.Name,
-			Media:   p.MediaType,
-			Ranking: append([]string(nil), p.Ranking...),
-			Rules:   append([]core.ReleaseRule(nil), p.ReleaseRules...),
+			Name:               p.Name,
+			Media:              p.MediaType,
+			Scores:             maps.Clone(p.CustomFormatScores),
+			Rules:              append([]core.ReleaseRule(nil), p.ReleaseRules...),
+			QualityOrder:       config.CloneQualityOrder(p.QualityOrder),
+			Language:           p.Language,
+			PreferredLanguages: append([]string(nil), p.PreferredLanguages...),
+			MaxHeight:          p.MaxHeight,
+			MinHeight:          p.MinHeight,
+			AllowedQualities:   append([]string(nil), p.AllowedQualities...),
 		})
 	}
 	return out, nil
 }
 
-func (ps *appProfileService) SetRanking(ctx context.Context, profile, media string, ranking []string) error {
+func (ps *appProfileService) SetQualityOrder(ctx context.Context, profile, media string, order []core.QualityItem) error {
 	return ps.a.saveValidated(func(c *config.Config) error {
 		for i := range c.Quality.Profiles {
-			if strings.EqualFold(c.Quality.Profiles[i].Name, profile) && c.Quality.Profiles[i].MediaType == media {
-				c.Quality.Profiles[i].Ranking = append([]string(nil), ranking...)
+			p := &c.Quality.Profiles[i]
+			if strings.EqualFold(p.Name, profile) && p.MediaType == media {
+				p.QualityOrder = config.CloneQualityOrder(order)
+				return nil
+			}
+		}
+		return tools.Userf("no profile named %q", profile)
+	})
+}
+
+func (ps *appProfileService) SetFormatScores(ctx context.Context, profile, media string, scores map[string]int) error {
+	return ps.a.saveValidated(func(c *config.Config) error {
+		for i := range c.Quality.Profiles {
+			p := &c.Quality.Profiles[i]
+			if strings.EqualFold(p.Name, profile) && p.MediaType == media {
+				if p.CustomFormatScores == nil {
+					p.CustomFormatScores = map[string]int{}
+				}
+				for id, v := range scores {
+					if v == 0 {
+						delete(p.CustomFormatScores, id)
+					} else {
+						p.CustomFormatScores[id] = v
+					}
+				}
 				return nil
 			}
 		}
@@ -731,9 +790,10 @@ func (fs *appFrontendService) Frontends(ctx context.Context) ([]builtin.Frontend
 	}
 	cfg := fs.a.cfg.Get()
 	var out []builtin.FrontendInfo
+	// Wire the built-in frontend identities for the agent app list.
 	for _, id := range []string{"plex", "jellyfin", "emby", "stremio", "dlna", "webdav", "m3u"} {
 		enabled := cfg.Frontends[id].Enabled
-		if cfg.Frontends == nil && id == "plex" {
+		if cfg.Frontends == nil && frontendHostPolicy(frontend.Protocol(id)).MainListener {
 			enabled = true
 		}
 		out = append(out, builtin.FrontendInfo{ID: id, Name: id, Enabled: enabled})
@@ -748,8 +808,8 @@ func (fs *appFrontendService) SetFrontendEnabled(ctx context.Context, id string,
 	return fs.a.cfg.Update(func(c *config.Config) error {
 		if c.Frontends == nil {
 			c.Frontends = map[string]config.Frontend{}
-			if id != "plex" {
-				c.Frontends["plex"] = config.Frontend{Enabled: true}
+			if !frontendHostPolicy(frontend.Protocol(id)).MainListener {
+				c.Frontends["plex"] = config.Frontend{Enabled: true} // Preserve the default main-listener registration.
 			}
 		}
 		v := c.Frontends[id]
@@ -778,6 +838,7 @@ func (a *App) consoleRoutes() []builtin.RouteInfo {
 		{Route: "/apps", Label: "Apps"},
 		{Route: "/integrations", Label: "Integrations"},
 		{Route: "/plugins", Label: "Plugins"},
+		{Route: "/flows", Label: "Flows"},
 		{Route: "/notifications", Label: "Notifications"},
 		{Route: "/logs", Label: "Logs"},
 		{Route: "/settings", Label: "Settings"},

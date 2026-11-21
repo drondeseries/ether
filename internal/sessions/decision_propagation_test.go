@@ -58,7 +58,7 @@ func newDecisionBroker(t *testing.T) (*Broker, *decisionRecordingPlayback) {
 	active := func(_ context.Context, id int64) (*core.Viewer, error) { return &core.Viewer{ID: id}, nil }
 	bus := NewEventBus(nil, active)
 	t.Cleanup(bus.Close)
-	broker, err := NewBroker(BrokerDeps{Lookup: func(_ context.Context, _ *core.Viewer, _ core.Device, k core.RatingKey) (*core.Title, error) {
+	broker, err := NewBroker(BrokerDeps{SurfacePolicy: testSessionPolicy, Lookup: func(_ context.Context, _ *core.Viewer, _ core.Device, k core.RatingKey) (*core.Title, error) {
 		return &core.Title{Key: k}, nil
 	}, Playback: p, Transcoder: tc, Progress: &fakeProgress{}, ActiveViewer: active, CanPlay: func(*core.Viewer, bool, time.Time) bool { return true }, BitrateLimit: func(*core.Viewer) int { return 0 }, OnTimeline: func(*core.Viewer, core.RatingKey, time.Duration, time.Duration, string) {}, Events: bus})
 	if err != nil {
@@ -109,8 +109,8 @@ func TestBrokerStartStreamRecordsDecisionOnPlayback(t *testing.T) {
 	}
 }
 
-// The Plex adapter starts ffmpeg itself and reports through
-// NotePlexEncoder; that note must also reach the playback session.
+// Plex starts its local encoder through the broker and reports the negotiated
+// decision through NotePlexEncoder; that note must reach the source session.
 func TestNotePlexEncoderRecordsDecisionOnPlayback(t *testing.T) {
 	ctx := context.Background()
 	broker, p := newDecisionBroker(t)
@@ -119,18 +119,37 @@ func TestNotePlexEncoderRecordsDecisionOnPlayback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	plexCtx := WithPlexAdmission(ctx, func(context.Context) (PlexAdmission, error) {
-		return PlexAdmission{Source: ps, Media: ps.Info, Caps: core.ClientCaps{ClientID: "plex-tv"}, Options: core.DecideOptions{DirectPlay: true, DirectStream: true}}, nil
+	adapterCtx := WithPlanAdmission(ctx, func(context.Context) (PlanAdmission, error) {
+		return PlanAdmission{Source: ps, Media: ps.Info, Caps: core.ClientCaps{ClientID: "plex-tv"}, Options: core.DecideOptions{DirectPlay: true, DirectStream: true}}, nil
 	})
 	dev := core.Device{ID: "plex-tv"}
-	plan, err := broker.Plan(plexCtx, frontend.PlanRequest{Viewer: viewer, Device: dev, Protocol: "plex", Item: core.MovieKey(1), Caps: core.ClientCaps{ClientID: "plex-tv"}, Intent: frontend.PlayIntent{ClientSessionID: "plex-1", Options: core.DecideOptions{DirectPlay: true, DirectStream: true}}})
+	plan, err := broker.Plan(adapterCtx, frontend.PlanRequest{Viewer: viewer, Device: dev, Protocol: "plex", Item: core.MovieKey(1), Caps: core.ClientCaps{ClientID: "plex-tv"}, Intent: frontend.PlayIntent{ClientSessionID: "plex-1", Options: core.DecideOptions{DirectPlay: true, DirectStream: true}}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = broker.Open(plexCtx, frontend.OpenRequest{Viewer: viewer, Device: dev, Protocol: "plex", PlanID: plan.ID}); err != nil {
+	if _, err = broker.Open(adapterCtx, frontend.OpenRequest{Viewer: viewer, Device: dev, Protocol: "plex", PlanID: plan.ID}); err != nil {
 		t.Fatal(err)
 	}
 	want := core.Decision{Kind: core.DecisionTranscode, VideoCopy: false, AudioCopy: true, Container: "mpegts"}
+	q := core.HLSRequest{SessionID: "plex-1", ReleaseID: ps.SourceReleaseID(), Info: ps.Info, Decision: want}
+	wrong := q
+	wrong.ReleaseID = "different-source"
+	if _, err = broker.StartSegmentedHLS(ctx, viewer, ps.ID, "plex-1", wrong); !errors.Is(err, core.ErrNotAvailable) {
+		t.Fatalf("wrong source started: %v", err)
+	}
+	if _, err = broker.StartSegmentedHLS(ctx, &core.Viewer{ID: 3}, ps.ID, "plex-1", q); !errors.Is(err, core.ErrUnauthorized) {
+		t.Fatalf("wrong viewer started: %v", err)
+	}
+	if _, err = broker.StartSegmentedHLS(ctx, viewer, ps.ID, "different-session", q); !errors.Is(err, core.ErrUnauthorized) {
+		t.Fatalf("wrong public session started: %v", err)
+	}
+	hs, err := broker.StartSegmentedHLS(ctx, viewer, ps.ID, "plex-1", q)
+	if err != nil || hs == nil {
+		t.Fatalf("local Plex encoder: %v", err)
+	}
+	if got, owned := broker.SegmentedHLSSession("plex-1"); !owned || got != hs {
+		t.Fatal("local Plex encoder ownership was not retained")
+	}
 	broker.NotePlexEncoder("plex-1", frontend.StreamHLS, want, 0)
 	dec, ok := p.lastDecision(ps.ID)
 	if !ok {
@@ -138,6 +157,15 @@ func TestNotePlexEncoderRecordsDecisionOnPlayback(t *testing.T) {
 	}
 	if dec.Kind != want.Kind || dec.VideoCopy != want.VideoCopy || dec.AudioCopy != want.AudioCopy {
 		t.Fatalf("recorded decision = %+v, want %+v", dec, want)
+	}
+	if !broker.StopSegmentedHLS("plex-1") {
+		t.Fatal("local Plex retirement fell back to the adapter")
+	}
+	if _, exists := broker.SegmentedHLSSession("plex-1"); exists {
+		t.Fatal("local Plex encoder survived retirement")
+	}
+	if !broker.StopSegmentedHLS("plex-1") {
+		t.Fatal("repeated retirement lost broker ownership")
 	}
 }
 
@@ -161,8 +189,8 @@ func TestPlexPartAdmissionClampsPolicy(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			ctx = WithPlexAdmission(ctx, func(context.Context) (PlexAdmission, error) {
-				return PlexAdmission{Source: ps, Caps: caps, Options: core.DecideOptions{DirectPlay: true, DirectStream: true}}, nil
+			ctx = WithPlanAdmission(ctx, func(context.Context) (PlanAdmission, error) {
+				return PlanAdmission{Source: ps, Caps: caps, Options: core.DecideOptions{DirectPlay: true, DirectStream: true}}, nil
 			})
 			req := frontend.PlanRequest{Viewer: viewer, Device: core.Device{ID: "plezy"}, Protocol: "plex", Item: ps.Key, Caps: caps, Intent: frontend.PlayIntent{ClientSessionID: "plezy-session"}}
 			plan, err := b.Plan(ctx, req)

@@ -3,36 +3,67 @@ package livetv
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net/http"
-	"net/http/httptest"
-	"net/url"
-	"path"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/braedonsaunders/ether/internal/clientreg"
 	"github.com/braedonsaunders/ether/internal/core"
 	"github.com/braedonsaunders/ether/internal/streamgrant"
-	"github.com/braedonsaunders/ether/internal/transcode"
 )
 
-const segmentDuration = 4 * time.Second
+const (
+	segmentDuration = 4 * time.Second
+
+	iptvProbeBudget = 8 * time.Second
+	iptvStartFloor  = 8 * time.Second
+	iptvStartMax    = 12 * time.Second
+)
+
+// iptvSourceStartBudget gives post-probe stream startup its own bounded window
+// once probing proved the input answers. Slower routes (such as an outbound
+// SOCKS5 proxy) take longer per round-trip to open playlists and first
+// segments too, so the window scales from the probe's measured duration rather
+// than a proxy-specific constant.
+func iptvSourceStartBudget(probeElapsed time.Duration) time.Duration {
+	return min(max(iptvStartFloor, probeElapsed+4*time.Second), iptvStartMax)
+}
 
 type channelLimiter interface {
 	BeginChannel(*core.User, core.ClientCaps, string) error
 	EndChannel(string)
 }
 
+const directChannelPrefix = "direct:"
+
+// DirectStream describes an ephemeral direct-URL live stream (such as a
+// plugin library live tab item) tuned through the HLS passthrough/relay
+// pipeline without registering a Live TV channel.
+type DirectStream struct {
+	ID         string
+	Title      string
+	URL        string
+	Headers    map[string]string
+	AllowCheck func(context.Context, *core.User) error
+	Resolve    func(context.Context) (DirectStreamResult, error)
+}
+
 type session struct {
 	broadcastPolicy     broadcastViewerPolicy
 	broadcast           *broadcastLease
+	ephemeral           bool
+	allowCheck          func(context.Context, *core.User) error
+	direct              *directStreamState
+	sniffedManifest     *cachedManifest
 	inputURL            string // selected upstream, immutable once the tune is ready
 	inputSource         StreamSource
 	inputHeaders        http.Header
 	firstMediaDelivered bool
+	firstMediaByte      bool
+	bytesServed         int64
+	tuneStartedAt       time.Time
+	startDeadline       time.Time // bounded post-probe startup window for Direct playout
 	lastMediaWarning    time.Time
 	consumed            bool
 	mediaStarted        bool
@@ -40,11 +71,13 @@ type session struct {
 	view                core.PlaySession   // immutable monitoring snapshot, including pending tunes
 	reserved            bool
 	ready               bool
-	relay               core.HLSSession
-	relayCancel         context.CancelFunc
 	relayInfo           *core.MediaInfo
-	dash                core.DASHSession
-	http                core.HTTPSession
+	steadyRefused       string // why Steady refused this tune; Direct must not escalate back into it
+	// owned is the Ether-owned client timeline of a Direct (passthrough or
+	// relay) session; ServePlaylist and ServeRelaySegment read it.
+	owned *ownedLease
+	dash  core.DASHSession
+	http  core.HTTPSession
 	// httpStart is closed when an in-flight ensureHTTP StartHLS finishes.
 	// Waiters re-check liveHTTP instead of starting a second encoder.
 	httpStart chan struct{}
@@ -62,8 +95,6 @@ type session struct {
 	// is deliberately separate from mu so that slow preparation blocks
 	// neither media serving nor close.
 	prepareMu sync.Mutex
-	// failoverGate serializes source changes without blocking close or readers.
-	failoverGate chan struct{} // initialized under mu
 	// ctx is the session lifetime, cancelled by close; preparation I/O is
 	// bound to it (bindContext) so Stop cancels a slow Prepare/probe.
 	ctx    context.Context
@@ -81,8 +112,52 @@ type session struct {
 	user        core.User
 	caps        core.ClientCaps
 	last        time.Time
-	resources   map[string]string
 	closed      bool
+}
+
+func (ss *session) setSniffedManifest(cm *cachedManifest) {
+	if ss == nil {
+		return
+	}
+	ss.mu.Lock()
+	ss.sniffedManifest = cm
+	direct := ss.direct
+	ss.mu.Unlock()
+	if direct != nil && cm != nil && cm.isMaster {
+		direct.setManifest(cm)
+	}
+}
+
+func (ss *session) sniffedManifestFor(raw string) *cachedManifest {
+	if ss == nil || raw == "" {
+		return nil
+	}
+	ss.mu.Lock()
+	cm := ss.sniffedManifest
+	direct := ss.direct
+	ss.mu.Unlock()
+	if direct != nil {
+		if dm := direct.manifestFor(raw); dm != nil {
+			return dm
+		}
+		// Never hand back a stale session copy if the direct stream was
+		// invalidated on 403/410.
+		if _, _, _, _, _, invalidated, _ := direct.current(); invalidated {
+			return nil
+		}
+	}
+	if cm != nil && cm.raw == raw {
+		return cm
+	}
+	return nil
+}
+
+func (ss *session) cachedMasterFor(raw string) *cachedManifest {
+	cm := ss.sniffedManifestFor(raw)
+	if cm != nil && cm.isMaster {
+		return cm
+	}
+	return nil
 }
 
 // bindContext derives a context cancelled when parent ends or when the
@@ -147,14 +222,14 @@ func (ss *session) cancelBound() {
 func (s *Service) startOwnedHLS(request context.Context, ss *session, req core.HLSRequest) (core.HLSSession, context.CancelFunc, error) {
 	base := ss.ctx
 	if base == nil {
-		base = s.ctx
+		base = s.serviceContext()
 	}
 	if base == nil {
 		base = context.Background()
 	}
 	lifetime, cancel := context.WithCancel(base)
 	stop := context.AfterFunc(request, cancel)
-	hls, err := s.o.Transcoder.StartHLS(lifetime, req)
+	hls, err := s.transcoder().StartHLS(lifetime, req)
 	stop()
 	if err == nil && request.Err() != nil {
 		err = request.Err()
@@ -173,6 +248,7 @@ func (s *Service) startOwnedHLS(request context.Context, ss *session, req core.H
 }
 
 func (ss *session) close(s *Service) {
+	defer s.onChannelSessionClosed(ss.info.Channel.ID)
 	defer s.endPersonal(ss.info.Channel, ss.info.UserID)
 	if ss.startupCancel != nil {
 		ss.startupCancel()
@@ -190,25 +266,24 @@ func (ss *session) close(s *Service) {
 	ss.generation++
 	broadcast := ss.broadcast
 	ss.broadcast = nil
-	relay := ss.relay
-	relayCancel := ss.relayCancel
+	owned := ss.owned
+	ss.owned = nil
 	dash := ss.dash
 	httpStream := ss.http
 	ss.dash = nil
 	ss.http = nil
 	reserved := ss.reserved
 	ready, requested, delivered := ss.ready, ss.consumed, ss.firstMediaDelivered
+	bytesServed := ss.bytesServed
+	mode := sessionPlayoutModeLocked(ss)
+	stopInfo := ss.info
+	stopSrc := ss.inputSource
 	ss.mu.Unlock()
 	if broadcast != nil {
 		broadcast.close()
 	}
 	s.revokeInput(ss)
-	if relayCancel != nil {
-		relayCancel()
-	}
-	if relay != nil {
-		relay.Close()
-	}
+	owned.close()
 	if dash != nil {
 		dash.Close()
 	}
@@ -220,7 +295,11 @@ func (ss *session) close(s *Service) {
 			limiter.EndChannel(ss.info.ID)
 		}
 	}
-	s.sessionLog(ss).Info("live session resources released", "ready", ready, "media_requested", requested, "media_delivered", delivered, "age", s.o.Now().Sub(ss.info.StartedAt), "viewer_reservation_released", reserved)
+	age := s.o.Now().Sub(stopInfo.StartedAt)
+	if ready {
+		s.emitChannelStopped(stopInfo, stopSrc, age.Milliseconds(), bytesServed, mode)
+	}
+	s.sessionLog(ss).Info("live session resources released", "ready", ready, "media_requested", requested, "media_delivered", delivered, "age", age, "viewer_reservation_released", reserved)
 }
 
 func (s *Service) Tune(ctx context.Context, u *core.User, channelID string, caps core.ClientCaps) (SessionInfo, error) {
@@ -230,6 +309,9 @@ func (s *Service) Tune(ctx context.Context, u *core.User, channelID string, caps
 // TuneWithSession preserves the client's playback-session identity independently
 // of the server's stream, subscription and activity identities.
 func (s *Service) TuneWithSession(ctx context.Context, u *core.User, channelID string, caps core.ClientCaps, clientSessionID string) (result SessionInfo, resultErr error) {
+	if !s.Enabled() {
+		return SessionInfo{}, core.ErrNotAvailable
+	}
 	started := time.Now()
 	attemptID := liveSessionID()
 	log := s.logger().With("session", attemptID, "channel", channelID, "client", caps.ClientID, "product", caps.Product)
@@ -242,7 +324,7 @@ func (s *Service) TuneWithSession(ctx context.Context, u *core.User, channelID s
 			if detail.Code == "cancelled" {
 				log.Debug("live tune cancelled", attrs...)
 			} else {
-				log.Warn("live tune failed", attrs...)
+				log.Info("live tune failed", attrs...)
 			}
 		} else {
 			log.Info("live tune ready", append(attrs, "source", result.Channel.SourceID, "analyzed", result.MediaInfo != nil)...)
@@ -255,6 +337,13 @@ func (s *Service) TuneWithSession(ctx context.Context, u *core.User, channelID s
 	if u == nil || (s.o.CanPlay != nil && !s.o.CanPlay(u, caps.Remote, s.o.Now())) {
 		return SessionInfo{}, core.ErrUnauthorized
 	}
+	if s.o.ConfirmAdmission != nil {
+		confirmed, err := s.o.ConfirmAdmission(ctx, u, caps.Remote, s.o.Now())
+		if err != nil {
+			return SessionInfo{}, err
+		}
+		u = confirmed
+	}
 	ctx, policy, err := s.withPolicy(ctx, u)
 	if err != nil {
 		return SessionInfo{}, err
@@ -262,6 +351,15 @@ func (s *Service) TuneWithSession(ctx context.Context, u *core.User, channelID s
 	c, err := s.Channel(ctx, channelID)
 	if err != nil {
 		return SessionInfo{}, err
+	}
+	if c.Kind == "virtual" {
+		// Cold guide preparation and source startup share the first-playlist
+		// budget. A tune immediately after restart may need more than the
+		// five seconds allowed to an ordinary guide request.
+		var cancelStartup context.CancelFunc
+		ctx, cancelStartup = context.WithTimeout(ctx, 20*time.Second)
+		defer cancelStartup()
+		ctx = context.WithValue(ctx, virtualTuneGuideKey{}, true)
 	}
 	c = s.personalChannel(ctx, c, u)
 	ps, err := s.programmes(ctx, c, s.o.Now(), s.o.Now().Add(time.Second))
@@ -301,6 +399,9 @@ func (s *Service) TuneWithSession(ctx context.Context, u *core.User, channelID s
 			s.sessionLog(old).Info("live session superseded", "replacement_session", attemptID)
 			old.close(s)
 		}
+		if len(superseded) > 0 {
+			s.notifySessionsChanged()
+		}
 	}
 	var playbackSessions []*core.PlaySession
 	if s.o.Playback != nil {
@@ -330,7 +431,7 @@ func (s *Service) TuneWithSession(ctx context.Context, u *core.User, channelID s
 	}
 	// A provider that allows N connections can carry N different channels;
 	// viewers of a channel already playing share its connection.
-	if c.Kind == "iptv" && c.SourceID != "" && !s.useBroadcast(c) {
+	if c.Kind == "iptv" && c.SourceID != "" {
 		if max := s.sourceConnectionLimit(c.SourceID); max > 0 {
 			playing := map[string]bool{}
 			for _, other := range s.sessions {
@@ -338,34 +439,32 @@ func (s *Service) TuneWithSession(ctx context.Context, u *core.User, channelID s
 					playing[other.info.Channel.ID] = true
 				}
 			}
-			if !playing[c.ID] && len(playing)+s.inputRelay.taps.externalCount(c.SourceID) >= max {
+			if active := len(playing) + s.inputRelay.taps.externalCount(c.SourceID); !playing[c.ID] && active >= max {
 				s.mu.Unlock()
+				s.emitProviderLimitReached(c.SourceID, active, max, c.ID)
 				return SessionInfo{}, ErrProviderBusy
 			}
 		}
 	}
 	s.nextSubscription++
 	ss := &session{
+		tuneStartedAt: started,
 		info: SessionInfo{
 			ID: attemptID, SubscriptionID: s.nextSubscription,
 			ActivityID: liveSessionID(), ClientSessionID: clientSessionID,
 			UserID: u.ID, Channel: c, Programme: p, StartedAt: s.o.Now(),
 		},
-		streamGrant: randomID(), user: *u, caps: caps, last: s.o.Now(), resources: map[string]string{},
+		streamGrant: randomID(), user: *u, caps: caps, last: s.o.Now(),
 	}
-	base := s.ctx
+	base := s.serviceContext()
 	if base == nil {
 		base = context.Background()
 	}
 	ss.ctx, ss.cancel = context.WithCancel(base)
-	// Upstream retries and probing share one startup budget. A stalled public
-	// source must not occupy a viewer slot for three HTTP timeouts.
-	var cancel context.CancelFunc
-	if c.Kind == "iptv" {
-		ctx, cancel = context.WithTimeout(ctx, 10*time.Second)
-	} else {
-		ctx, cancel = context.WithCancel(ctx)
-	}
+	// Probing and post-probe stream startup enforce their own bounded budgets
+	// so a dead input still fails fast while a slower route that answered its
+	// probe has room to open. startupCancel aborts whichever stage is running.
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	ss.startupCancel = cancel
 	ss.view = core.PlaySession{ID: ss.info.ID, PlaybackGroup: ss.info.ID, UserID: u.ID, Username: u.Username, ClientID: caps.ClientID, Client: caps, TitleName: c.Name, StartedAt: ss.info.StartedAt, Decision: core.DecisionRemux, DecisionReason: "Live channel playout"}
@@ -378,6 +477,7 @@ func (s *Service) TuneWithSession(ctx context.Context, u *core.User, channelID s
 	s.sessions[ss.info.ID] = ss
 	s.noteWatchedLocked(c.ID)
 	s.mu.Unlock()
+	s.notifySessionsChanged()
 	s.beginPersonal(c, u)
 	if limiter, ok := s.o.Playback.(channelLimiter); ok {
 		if joined, ok := s.o.Playback.(interface {
@@ -430,12 +530,26 @@ func (s *Service) TuneWithSession(ctx context.Context, u *core.User, channelID s
 	// waiting behind up to ~10s of upstream work.
 	if s.useBroadcast(c) {
 		err = s.startBroadcast(ctx, ss)
+		if errors.Is(err, errSteadyRefused) {
+			// A refused tune is an ordinary direct session: it holds its own
+			// viewer reservation instead of a share of the channel output.
+			err = s.reserveDirectViewer(u, caps, ss)
+			if err == nil {
+				err = s.startIPTVSession(ctx, ss)
+			}
+			if err == nil {
+				err = s.awaitOwnedStart(ctx, ss)
+			}
+		}
 		if err != nil {
 			s.Stop(ctx, ss.info.ID, u)
 			return SessionInfo{}, err
 		}
 	} else {
 		err = s.startIPTVSession(ctx, ss)
+		if err == nil {
+			err = s.awaitOwnedStart(ctx, ss)
+		}
 		if err != nil {
 			s.Stop(ctx, ss.info.ID, u)
 			return SessionInfo{}, err
@@ -448,14 +562,203 @@ func (s *Service) TuneWithSession(ctx context.Context, u *core.User, channelID s
 	}
 	ss.ready = true
 	info := ss.info
+	tunedSrc := ss.inputSource
+	tunedUser := ss.user
+	tunedCaps := ss.caps
+	mode := sessionPlayoutModeLocked(ss)
 	if ss.relayInfo != nil {
 		info.MediaInfo = ss.relayInfo
 	}
 	ss.mu.Unlock()
+	s.emitChannelTuned(info, tunedSrc, tunedUser, tunedCaps, mode)
 	info.Channel.StreamURL = ""
 	info.Channel.StreamSources = nil
 	return info, nil
 }
+
+// TuneDirectStream tunes an ephemeral direct-URL live stream (such as a plugin
+// library live tab item) through Ether's HLS passthrough and relay pipeline
+// without requiring Live TV channels to exist or registering one in Live TV.
+func (s *Service) TuneDirectStream(ctx context.Context, u *core.User, ds DirectStream, caps core.ClientCaps, clientSessionID string) (result SessionInfo, resultErr error) {
+	if !validHTTP(ds.URL) {
+		return SessionInfo{}, core.ErrNotAvailable
+	}
+	started := time.Now()
+	attemptID := liveSessionID()
+	title := strings.TrimSpace(ds.Title)
+	if title == "" {
+		title = "Live stream"
+	}
+	log := s.logger().With("session", attemptID, "direct_live", ds.ID, "client", caps.ClientID, "product", caps.Product)
+	log.Info("direct live tune started")
+	defer func() {
+		attrs := []any{"elapsed", time.Since(started)}
+		if resultErr != nil {
+			detail := Diagnose("tune", resultErr)
+			attrs = append(attrs, detail.LogAttrs()...)
+			if detail.Code == "cancelled" {
+				log.Debug("direct live tune cancelled", attrs...)
+			} else {
+				log.Info("direct live tune failed", attrs...)
+			}
+		} else {
+			log.Info("direct live tune ready", append(attrs, "analyzed", result.MediaInfo != nil)...)
+		}
+	}()
+
+	if clientSessionID == "" {
+		clientSessionID = caps.ClientID
+	}
+	if u == nil || (s.o.CanPlay != nil && !s.o.CanPlay(u, caps.Remote, s.o.Now())) {
+		return SessionInfo{}, core.ErrUnauthorized
+	}
+	if s.o.ConfirmAdmission != nil {
+		confirmed, err := s.o.ConfirmAdmission(ctx, u, caps.Remote, s.o.Now())
+		if err != nil {
+			return SessionInfo{}, err
+		}
+		u = confirmed
+	}
+	if ds.AllowCheck != nil {
+		if err := ds.AllowCheck(ctx, u); err != nil {
+			return SessionInfo{}, err
+		}
+	}
+
+	c := Channel{
+		ID:      directChannelPrefix + attemptID,
+		Name:    title,
+		Kind:    "iptv",
+		Enabled: true,
+		StreamSources: []StreamSource{{
+			ID:      "direct",
+			Name:    title,
+			URL:     ds.URL,
+			Headers: CleanInputHeaders(ds.Headers),
+			Enabled: true,
+		}},
+	}
+
+	if caps.ClientID != "" {
+		var superseded []*session
+		s.mu.Lock()
+		for id, old := range s.sessions {
+			if old.info.UserID == u.ID && old.caps.ClientID == caps.ClientID {
+				delete(s.sessions, id)
+				superseded = append(superseded, old)
+			}
+		}
+		s.mu.Unlock()
+		for _, old := range superseded {
+			s.sessionLog(old).Info("live session superseded", "replacement_session", attemptID)
+			old.close(s)
+		}
+		if len(superseded) > 0 {
+			s.notifySessionsChanged()
+		}
+	}
+	var playbackSessions []*core.PlaySession
+	if s.o.Playback != nil {
+		playbackSessions = s.o.Playback.Sessions()
+	}
+	s.mu.Lock()
+	count := 0
+	for _, ss := range s.sessions {
+		if ss.info.UserID == u.ID {
+			count++
+		}
+	}
+	limit := u.StreamLimit
+	if s.o.StreamLimit != nil {
+		limit = s.o.StreamLimit(u)
+	}
+	if s.o.Playback != nil {
+		for _, ps := range playbackSessions {
+			if ps.UserID == u.ID && ps.PlaybackGroup == "" {
+				count++
+			}
+		}
+	}
+	if limit > 0 && count >= limit {
+		s.mu.Unlock()
+		return SessionInfo{}, core.ErrStreamLimit
+	}
+	s.nextSubscription++
+	base := s.serviceContext()
+	if base == nil {
+		base = context.Background()
+	}
+	ss := &session{
+		tuneStartedAt: started,
+		ephemeral:     true,
+		allowCheck:    ds.AllowCheck,
+		direct:        newDirectStreamState(base, ds.URL, ds.Headers, ds.Resolve),
+		info: SessionInfo{
+			ID: attemptID, SubscriptionID: s.nextSubscription,
+			ActivityID: liveSessionID(), ClientSessionID: clientSessionID,
+			UserID: u.ID, Channel: c, StartedAt: s.o.Now(),
+		},
+		streamGrant: randomID(), user: *u, caps: caps, last: s.o.Now(),
+	}
+	ss.ctx, ss.cancel = context.WithCancel(base)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	ss.startupCancel = cancel
+	ss.view = core.PlaySession{
+		ID: ss.info.ID, PlaybackGroup: ss.info.ID,
+		UserID: u.ID, Username: u.Username,
+		ClientID: caps.ClientID, Client: caps,
+		TitleName: title, StartedAt: ss.info.StartedAt,
+		Decision: core.DecisionRemux, DecisionReason: "Plugin live stream",
+	}
+	s.sessions[ss.info.ID] = ss
+	s.mu.Unlock()
+	s.notifySessionsChanged()
+
+	if limiter, ok := s.o.Playback.(channelLimiter); ok {
+		if err := limiter.BeginChannel(u, caps, ss.info.ID); err != nil {
+			s.Stop(ctx, ss.info.ID, u)
+			return SessionInfo{}, err
+		}
+		ss.mu.Lock()
+		if ss.closed {
+			ss.mu.Unlock()
+			limiter.EndChannel(ss.info.ID)
+			return SessionInfo{}, core.ErrNotFound
+		}
+		ss.reserved = true
+		ss.mu.Unlock()
+	}
+
+	err := s.startIPTVSession(ctx, ss)
+	if err == nil {
+		err = s.awaitOwnedStart(ctx, ss)
+	}
+	if err != nil {
+		s.Stop(ctx, ss.info.ID, u)
+		return SessionInfo{}, err
+	}
+	ss.mu.Lock()
+	if ss.closed {
+		ss.mu.Unlock()
+		return SessionInfo{}, core.ErrNotFound
+	}
+	ss.ready = true
+	info := ss.info
+	tunedSrc := ss.inputSource
+	tunedUser := ss.user
+	tunedCaps := ss.caps
+	mode := sessionPlayoutModeLocked(ss)
+	if ss.relayInfo != nil {
+		info.MediaInfo = ss.relayInfo
+	}
+	ss.mu.Unlock()
+	s.emitChannelTuned(info, tunedSrc, tunedUser, tunedCaps, mode)
+	info.Channel.StreamURL = ""
+	info.Channel.StreamSources = nil
+	return info, nil
+}
+
 func (s *Service) getSession(ctx context.Context, id string, u *core.User) (*session, error) {
 	s.mu.Lock()
 	ss := s.sessions[id]
@@ -470,8 +773,16 @@ func (s *Service) getSession(ctx context.Context, id string, u *core.User) (*ses
 	}
 	ss.mu.Lock()
 	shared := ss.broadcast != nil
+	ephemeral := ss.ephemeral
+	allowCheck := ss.allowCheck
 	ss.mu.Unlock()
-	if shared {
+	if ephemeral {
+		if allowCheck != nil {
+			if err := allowCheck(ctx, u); err != nil {
+				return nil, err
+			}
+		}
+	} else if shared {
 		ctx, err := s.broadcastPolicyContext(ctx, ss, u)
 		if err != nil {
 			return nil, err
@@ -517,11 +828,17 @@ func (s *Service) touchMedia(ss *session) {
 	ss.consumed = true
 	ss.mediaStarted = true
 	ss.last = s.o.Now()
+	// A shared passthrough timeline may have left the source this tune
+	// selected; its producer records the health of what actually plays.
+	shared := ss.owned != nil && ss.owned.relay == nil
+	src := ss.inputSource
 	ss.mu.Unlock()
 	if first {
 		s.sessionLog(ss).Info("live media first requested", "since_tune", s.o.Now().Sub(ss.info.StartedAt))
 	}
-	s.recordSourceHealth(ss.info.Channel.ID, ss.inputSource, nil, true)
+	if !shared {
+		s.recordSourceHealth(ss.info.Channel.ID, src, nil, true)
+	}
 }
 func (s *Service) Session(ctx context.Context, id string, u *core.User) (SessionInfo, error) {
 	ss, err := s.getSession(ctx, id, u)
@@ -541,10 +858,19 @@ func (s *Service) Session(ctx context.Context, id string, u *core.User) (Session
 	if ss.relayInfo != nil {
 		info.MediaInfo = ss.relayInfo
 	}
+	if lease := ss.owned; lease != nil && lease.source != nil {
+		if id := lease.source(); id != "" {
+			info.ActiveSourceID = id
+		}
+	}
 	channel := ss.info.Channel
+	ephemeral := ss.ephemeral
 	ss.mu.Unlock()
 	info.Channel.StreamURL = ""
 	info.Channel.StreamSources = nil
+	if ephemeral {
+		return info, nil
+	}
 	lookupCtx, cancel := ss.bindContext(ctx)
 	defer cancel()
 	ps, err := s.programmes(lookupCtx, channel, s.o.Now(), s.o.Now().Add(time.Second))
@@ -589,6 +915,7 @@ func (s *Service) Stop(ctx context.Context, id string, u *core.User) error {
 	delete(s.sessions, id)
 	s.mu.Unlock()
 	ss.close(s)
+	s.notifySessionsChanged()
 	return nil
 }
 
@@ -606,7 +933,7 @@ func (s *Service) startIPTVSession(ctx context.Context, ss *session) error {
 		return core.ErrNotFound
 	}
 	gen := ss.generation
-	stage := &session{info: ss.info, user: ss.user, caps: ss.caps, ctx: ss.ctx}
+	stage := &session{info: ss.info, user: ss.user, caps: ss.caps, ctx: ss.ctx, steadyRefused: ss.steadyRefused, ephemeral: ss.ephemeral, direct: ss.direct}
 	ss.mu.Unlock()
 
 	ctx, cancel := ss.bindContext(ctx)
@@ -622,28 +949,31 @@ func (s *Service) startIPTVSession(ctx context.Context, ss *session) error {
 		if stage.broadcast != nil {
 			stage.broadcast.close()
 		}
-		relay := stage.relay
 		ss.mu.Unlock()
-		if relay != nil {
-			relay.Close()
-		}
-		if stage.relayCancel != nil {
-			stage.relayCancel()
-		}
+		stage.owned.close()
 		s.revokeInput(stage)
 		return core.ErrNotFound
 	}
 	ss.inputURL, ss.inputSource, ss.inputHeaders = stage.inputURL, stage.inputSource, stage.inputHeaders
+	ss.sniffedManifest = stage.sniffedManifest
 	ss.info.MediaInfo, ss.info.ActiveSourceID = stage.info.MediaInfo, stage.info.ActiveSourceID
-	ss.relay, ss.relayInfo, ss.resources = stage.relay, stage.relayInfo, stage.resources
+	ss.relayInfo, ss.owned = stage.relayInfo, stage.owned
+	ss.startDeadline = stage.startDeadline
 	ss.broadcast = stage.broadcast
-	ss.relayCancel = stage.relayCancel
 	s.transferInput(stage, ss)
+	if ss.owned != nil && ss.owned.relay != nil {
+		ss.owned.relay.bind(ss)
+	}
 	ss.mu.Unlock()
 	return nil
 }
 
 func writeStreamError(w http.ResponseWriter, err error) {
+	var bedtime *core.ErrBedtime
+	if errors.As(err, &bedtime) {
+		http.Error(w, bedtime.Error(), http.StatusForbidden)
+		return
+	}
 	code := http.StatusBadGateway
 	switch err {
 	case core.ErrNotFound:
@@ -670,17 +1000,12 @@ func (s *Service) ServePlaylist(w http.ResponseWriter, r *http.Request, id strin
 	ss.mu.Lock()
 	ss.consumed = true
 	shared := ss.broadcast != nil
-	relay := ss.relay
 	ss.mu.Unlock()
 	if shared {
 		s.serveBroadcastPlaylist(w, r, ss)
 		return
 	}
-	if relay != nil {
-		s.serveRelayPlaylist(w, r, ss)
-		return
-	}
-	s.ServeResource(w, r, id, "index.m3u8", u)
+	s.serveOwnedPlaylist(w, r, ss)
 }
 func withAuth(raw, grant string) string { return streamgrant.GrantURL(raw, grant) }
 
@@ -701,44 +1026,55 @@ func (s *Service) Failover(ctx context.Context, id string, u *core.User) error {
 	return nil
 }
 
-// startIPTV recognizes HLS without assuming URL suffixes (many owners use
-// signed extensionless URLs). Other HTTP streams are remuxed through ffmpeg,
-// whose existing input layer reconnects on network errors with bounded delay.
-func (s *Service) startIPTVSource(ctx context.Context, ss *session) error {
+// startIPTVSource recognizes HLS without assuming URL suffixes (many owners
+// use signed extensionless URLs). Other HTTP streams are remuxed through
+// ffmpeg, whose existing input layer reconnects on network errors with bounded
+// delay. Probing runs under sniffBudget/probeBudget; once the input proves
+// alive, relay/timeline startup gets its own bounded startDeadline.
+func (s *Service) startIPTVSource(ctx context.Context, ss *session, sniffBudget, probeBudget time.Duration, deferSilent bool) error {
 	if ss.closed {
 		return core.ErrNotFound
 	}
+	probeStarted := time.Now()
+	probeCtx, stopProbe := context.WithTimeout(ctx, probeBudget)
+	defer stopProbe()
+	sniffCtx, stopSniff := context.WithTimeout(probeCtx, sniffBudget)
+	defer stopSniff()
+	armStartBudget := func() (context.Context, context.CancelFunc) {
+		ss.startDeadline = time.Now().Add(iptvSourceStartBudget(time.Since(probeStarted)))
+		return context.WithDeadline(ctx, ss.startDeadline)
+	}
 	c := ss.info.Channel
 	c.StreamURL = ss.inputURL
-	analyze := len(ss.caps.VideoCodecs) > 0 || len(ss.caps.AudioCodecs) > 0 || clientreg.HasQuirk(clientreg.Identity{Product: ss.caps.Product, Platform: ss.caps.Platform, Device: ss.caps.Device, Version: ss.caps.Version}, "probe-hls-without-codecs")
-	probe := analyze || c.Transcode || ss.caps.Protocol == "jellyfin" || ss.caps.Protocol == "emby"
+	analyze := len(ss.caps.VideoCodecs) > 0 || len(ss.caps.AudioCodecs) > 0 || ss.caps.ProbeLiveWithoutCodecs
+	probe := analyze || c.Transcode || ss.caps.ProbeLiveInput
 	// Codec analysis overlaps the playlist prefix read. The first tune of a
 	// channel still waits on the probe; a retune inside liveProbeTTL does not.
-	probeCh, probeCancel := s.startEarlyProbe(ctx, ss, probe)
+	probeCh, probeCancel := s.startEarlyProbe(probeCtx, ss, probe)
 	if probeCancel != nil {
 		defer probeCancel()
 	}
 	// The sniff joins the input's provider connection, which the probe and
 	// ffmpeg then read from too.
-	prefix, ctype, err := s.sniffInput(ctx, ss, 7)
+	prefix, ctype, err := s.sniffInput(sniffCtx, ss, 7)
 	if err != nil {
 		return Diagnose("input_sniff", err)
 	}
 	isHLS := strings.HasPrefix(strings.TrimSpace(string(prefix)), "#EXTM3U") || strings.Contains(strings.ToLower(ctype), "mpegurl")
 	var info *core.MediaInfo
 	if isHLS && !c.Transcode {
-		if s.o.Transcoder != nil && probe {
-			probeWaitCtx := ctx
+		if s.transcoder() != nil && probe {
+			probeWaitCtx := probeCtx
 			var waitCancel context.CancelFunc
-			if ss.caps.Protocol == "silo" {
-				// Silo playback/start has a < 1s budget. Wait briefly for a
+			if ss.caps.BestEffortLiveStart {
+				// This caller has a < 1s startup budget. Wait briefly for a
 				// cached or fast probe, then proceed with HLS passthrough if
 				// live ffprobe is still sampling segments.
-				probeWaitCtx, waitCancel = context.WithTimeout(ctx, 350*time.Millisecond)
+				probeWaitCtx, waitCancel = context.WithTimeout(probeCtx, 350*time.Millisecond)
 				defer waitCancel()
 			}
 			info, err = s.takeEarlyProbe(probeWaitCtx, ss, probeCh)
-			if analyze && ss.caps.Protocol != "silo" {
+			if analyze && !ss.caps.BestEffortLiveStart {
 				if err != nil {
 					return Diagnose("probe", err)
 				}
@@ -751,24 +1087,31 @@ func (s *Service) startIPTVSource(ctx context.Context, ss *session) error {
 				copy.Duration = 0
 				info = &copy
 				ss.info.MediaInfo = info
+				if deferSilent && !liveInputHasAudio(info) {
+					return errSilentInput
+				}
 				if analyze {
 					// A playlist is a transport, not evidence that its codecs are
 					// playable. MPEG-2/MP2 HLS needs conversion on Apple TV too.
-					dec := s.o.Transcoder.Decide(*info, ss.caps, core.DecideOptions{DirectPlay: true, DirectStream: true, AudioStream: -1, SubtitleStream: -1})
+					dec := s.transcoder().Decide(*info, ss.caps, core.DecideOptions{DirectPlay: true, DirectStream: true, AudioStream: -1, SubtitleStream: -1})
 					if !dec.VideoCopy || !dec.AudioCopy || info.Video().Codec == "hevc" {
-						return s.startIPTVRelay(ctx, ss, *info)
+						startCtx, stopStart := armStartBudget()
+						defer stopStart()
+						return s.startIPTVRelay(startCtx, ss, *info)
 					}
 				}
 			}
 		}
-		ss.resources["index.m3u8"] = c.StreamURL
+		_, stopStart := armStartBudget()
+		stopStart()
+		ss.owned = s.acquirePassthrough(ss)
 		s.sessionLog(ss).Info("live playback path selected", "path", "hls_passthrough", "analyzed", ss.info.MediaInfo != nil)
 		return nil
 	}
-	if s.o.Transcoder == nil {
+	if s.transcoder() == nil {
 		return core.ErrNotAvailable
 	}
-	info, err = s.takeEarlyProbe(ctx, ss, probeCh)
+	info, err = s.takeEarlyProbe(probeCtx, ss, probeCh)
 	if err != nil {
 		return Diagnose("probe", err)
 	}
@@ -778,7 +1121,12 @@ func (s *Service) startIPTVSource(ctx context.Context, ss *session) error {
 	copy := *info
 	copy.Duration = 0
 	ss.info.MediaInfo = &copy
-	return s.startIPTVRelay(ctx, ss, copy)
+	if deferSilent && !liveInputHasAudio(info) {
+		return errSilentInput
+	}
+	startCtx, stopStart := armStartBudget()
+	defer stopStart()
+	return s.startIPTVRelay(startCtx, ss, copy)
 }
 
 type probeResult struct {
@@ -789,7 +1137,7 @@ type probeResult struct {
 // startEarlyProbe begins codec analysis before the prefix read when this
 // tune will need it. Direct HLS without a codec decision does not probe.
 func (s *Service) startEarlyProbe(ctx context.Context, ss *session, need bool) (<-chan probeResult, context.CancelFunc) {
-	if !need || s.o.Transcoder == nil {
+	if !need || s.transcoder() == nil {
 		return nil, nil
 	}
 	ch := make(chan probeResult, 1)
@@ -812,58 +1160,172 @@ func (s *Service) takeEarlyProbe(ctx context.Context, ss *session, ch <-chan pro
 		return nil, ctx.Err()
 	}
 }
-func (s *Service) serveRelayPlaylist(w http.ResponseWriter, r *http.Request, ss *session) {
+
+// waitOwnedRelayStart waits for a relay timeline's first playlist. If the
+// outer budget expires while at least one segment is already pending, it lets
+// the timeline's bounded startup depth wait finish rather than failing a
+// live stream that is about to publish.
+func waitOwnedRelayStart(parent, deadlineCtx context.Context, lease *ownedLease) error {
+	err := lease.tl.waitStarted(deadlineCtx)
+	if errors.Is(err, context.DeadlineExceeded) && parent.Err() == nil && lease.tl.hasPending() {
+		gctx, cancel := context.WithTimeout(parent, lease.tl.startWaitRemaining()+2*ownedTick)
+		defer cancel()
+		err = lease.tl.waitStarted(gctx)
+	}
+	return err
+}
+
+// awaitOwnedStart holds the tune until a Direct session's owned timeline has
+// its first playlist. An Apple player hangs a live item for good when the
+// first playlist response takes a target duration, so the wait for the
+// first segments belongs to the tune, never to that response. Silo's
+// passthrough start keeps its sub-second budget (700 ms); relay sessions
+// wait for their startup depth so the first playlist request returns ready.
+func (s *Service) awaitOwnedStart(ctx context.Context, ss *session) error {
 	ss.mu.Lock()
-	relay := ss.relay
+	lease := ss.owned
+	deadline := ss.startDeadline
 	ss.mu.Unlock()
-	rec := httptest.NewRecorder()
-	relay.ServePlaylist(rec, r)
-	if rec.Code != 200 {
-		http.Error(w, "IPTV playout unavailable", rec.Code)
+	if lease == nil {
+		return nil
+	}
+	parentCtx := ctx
+	if !deadline.IsZero() {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, deadline)
+		defer cancel()
+	}
+	var err error
+	if lease.relay != nil {
+		err = waitOwnedRelayStart(parentCtx, ctx, lease)
+	} else {
+		wait := ctx
+		if ss.caps.BestEffortLiveStart {
+			var cancel context.CancelFunc
+			wait, cancel = context.WithTimeout(ctx, 700*time.Millisecond)
+			defer cancel()
+		}
+		err = lease.tl.waitStarted(wait)
+		if errors.Is(err, errNeedsRelay) {
+			if lease, err = s.passthroughToRelay(ctx, ss); err == nil {
+				err = waitOwnedRelayStart(parentCtx, ctx, lease)
+			}
+		} else if err != nil && wait.Err() != nil && ctx.Err() == nil {
+			return nil // The playlist request waits for the rest
+		}
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		// The tune budget passed without one segment from the source.
+		return &TuneError{Code: "timeout", Stage: "owned_start", cause: err}
+	}
+	return err
+}
+
+// serveOwnedPlaylist writes a Direct session's owned live playlist. The
+// first request waits for the first segments (bounded), as players reject an
+// empty live playlist.
+func (s *Service) serveOwnedPlaylist(w http.ResponseWriter, r *http.Request, ss *session) {
+	ss.mu.Lock()
+	lease := ss.owned
+	ss.mu.Unlock()
+	if lease == nil {
+		writeStreamError(w, core.ErrNotFound)
 		return
 	}
-	// An unknown-duration transcoder initially has no completed segments.
-	// Native players can reject that empty EVENT playlist immediately. Use
-	// the session's bounded segment wait before returning the first playlist.
-	if !relayPlaylistHasMedia(rec.Body.String()) {
-		ready := &relayReadinessWriter{header: make(http.Header)}
-		relay.ServeSegment(ready, r, 0)
-		if ready.status >= 400 {
-			http.Error(w, "IPTV playout unavailable", ready.status)
-			return
-		}
-		rec = httptest.NewRecorder()
-		relay.ServePlaylist(rec, r)
-		if rec.Code != 200 || !relayPlaylistHasMedia(rec.Body.String()) {
-			http.Error(w, "IPTV playout unavailable", http.StatusBadGateway)
-			return
+	// Include the source target for passthrough inputs with longer segments.
+	// AVPlayer can hang the item permanently when its first playlist takes
+	// a whole target duration. Keep the wait below that, including startup.
+	lease.tl.mu.Lock()
+	target := max(lease.tl.target, lease.tl.targetFloor, s.latencyPolicy().SegmentDuration())
+	lease.tl.mu.Unlock()
+	ctx, cancel := context.WithTimeout(r.Context(), target/2)
+	defer cancel()
+	var err error
+	if lease.relay != nil {
+		err = waitOwnedRelayStart(r.Context(), ctx, lease)
+	} else {
+		err = lease.tl.waitStarted(ctx)
+		if errors.Is(err, errNeedsRelay) {
+			rctx, rcancel := context.WithTimeout(r.Context(), iptvStartFloor)
+			defer rcancel()
+			lease, err = s.passthroughToRelay(rctx, ss)
+			if err == nil {
+				err = waitOwnedRelayStart(r.Context(), rctx, lease)
+			}
 		}
 	}
-	base, _ := url.Parse("http://relay.invalid/")
-	invalid := false
-	rewritten, err := rewriteHLS(rec.Body.Bytes(), base, func(raw string) string {
-		u, _ := url.Parse(raw)
-		name := path.Base(u.Path)
-		n, ok := transcode.ParseSegmentName(name)
-		if !ok {
-			invalid = true
-			return ""
+	if err != nil {
+		if r.Context().Err() == nil {
+			s.sessionLog(ss).Warn("owned live playlist unavailable", Diagnose("playlist", err).LogAttrs()...)
 		}
-		if n >= 0 {
-			name = fmt.Sprintf("%d%s", n, path.Ext(name))
-		}
-		return withAuth(fmt.Sprintf("/livetv/sessions/%s/0/relay/%s", ss.info.ID, name), ss.streamGrant)
-	})
-	if err != nil || invalid {
-		http.Error(w, "invalid relay segment", 502)
+		http.Error(w, "IPTV playout unavailable", http.StatusBadGateway)
 		return
+	}
+	prefix := "/livetv/sessions/" + ss.info.ID + "/0/"
+	body, window := lease.tl.renderSnapshot(func(seq int64, ext string) string {
+		return withAuth(prefix+"relay/"+strconv.FormatInt(seq, 10)+"."+ext, ss.streamGrant)
+	}, func(name string) string {
+		return withAuth(prefix+"resource/"+name, ss.streamGrant)
+	}, ss.caps.Protocol == "vela")
+	if ss.caps.Protocol == "vela" {
+		writeLiveAnchor(w, window)
 	}
 	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 	w.Header().Set("Cache-Control", "no-store")
-	if r.Method != "HEAD" {
-		w.Write(rewritten)
+	if r.Method != http.MethodHead {
+		w.Write(body)
 	}
 }
+
+// passthroughToRelay moves a passthrough session whose provider variants
+// cannot ride one owned timeline (demuxed audio renditions) onto the relay,
+// before its first playlist is served.
+func (s *Service) passthroughToRelay(ctx context.Context, ss *session) (*ownedLease, error) {
+	ss.prepareMu.Lock()
+	defer ss.prepareMu.Unlock()
+	ss.mu.Lock()
+	lease, info := ss.owned, ss.info.MediaInfo
+	ss.mu.Unlock()
+	if lease != nil && lease.relay != nil {
+		return lease, nil
+	}
+	if s.transcoder() == nil {
+		return nil, core.ErrNotAvailable
+	}
+	if info == nil {
+		probed, err := s.probeSessionInput(ctx, ss)
+		if err != nil {
+			return nil, err
+		}
+		if probed == nil || probed.Video() == nil {
+			return nil, &TuneError{Code: "no_video", Stage: "probe", cause: core.ErrNotAvailable}
+		}
+		copy := *probed
+		copy.Duration = 0
+		info = &copy
+	}
+	dec, cut, _ := s.relayPlan(ss, *info)
+	next, err := s.startOwnedRelay(ctx, ss, *info, relayCaps(ss.caps), dec, cut)
+	if err != nil {
+		return nil, Diagnose("relay_start", err)
+	}
+	output := liveRelayInfo(*info, dec)
+	ss.mu.Lock()
+	if ss.closed {
+		ss.mu.Unlock()
+		next.close()
+		return nil, core.ErrNotFound
+	}
+	old := ss.owned
+	ss.owned, ss.relayInfo, ss.info.MediaInfo = next, &output, info
+	ss.mu.Unlock()
+	old.close()
+	s.sessionLog(ss).Info("live playback path selected", "path", "relay", "reason", "provider variants need remux")
+	return next, nil
+}
+
+// ServeRelaySegment serves segment n of the session's owned timeline (or of
+// its shared broadcast).
 func (s *Service) ServeRelaySegment(w http.ResponseWriter, r *http.Request, id string, n int, u *core.User) {
 	ss, err := s.getSession(r.Context(), id, u)
 	if err != nil {
@@ -872,7 +1334,7 @@ func (s *Service) ServeRelaySegment(w http.ResponseWriter, r *http.Request, id s
 	}
 	ss.mu.Lock()
 	shared := ss.broadcast != nil
-	relay := ss.relay
+	lease := ss.owned
 	ss.mu.Unlock()
 	if shared {
 		if n < 0 {
@@ -882,14 +1344,32 @@ func (s *Service) ServeRelaySegment(w http.ResponseWriter, r *http.Request, id s
 		s.serveBroadcastTS(w, r, ss, int64(n))
 		return
 	}
-	if relay == nil || n < transcode.InitSegment {
+	if lease == nil || n < 0 {
 		writeStreamError(w, core.ErrNotFound)
 		return
 	}
-	s.touchMedia(ss)
+	seg, err := lease.tl.segment(r.Context(), int64(n))
+	if err != nil {
+		writeStreamError(w, err)
+		return
+	}
+	if r.Method != http.MethodHead {
+		s.touchMedia(ss)
+	}
+	ctype := "video/mp2t"
+	if seg.ext == "m4s" {
+		ctype = "video/mp4"
+	}
+	w.Header().Set("Content-Type", ctype)
+	w.Header().Set("Content-Length", strconv.Itoa(len(seg.data)))
+	w.Header().Set("Cache-Control", "private, max-age=60")
+	armWriteDeadline(w)
 	observed := s.observeMedia(w, ss)
 	defer observed.done()
-	relay.ServeSegment(observed, r, n)
+	observed.WriteHeader(http.StatusOK)
+	if r.Method != http.MethodHead {
+		_, _ = observed.Write(seg.data)
+	}
 }
 
 // TranscodeFor is unused by shared broadcasts: decoder retries are owned by

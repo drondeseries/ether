@@ -1,3 +1,4 @@
+import { ActionJobs } from "./ActionJobs";
 import { pluginCollectionHref } from "../../collections/links";
 import { DashboardPanel } from "@braedonsaunders/appkit-dashboard/primitives";
 import { Badge, Button, Skeleton, cn } from "@braedonsaunders/appkit-ui";
@@ -52,12 +53,15 @@ export function PluginOverview({
   return (
     <div className="space-y-5">
       {detail.manifest.ether?.runtime?.kind === "remote" ? (
-        <SidecarPairing key={detail.id} id={detail.id} />
+        <SidecarPairing key={detail.id} id={detail.id} sidecar={detail.manifest.ether?.sidecar} />
       ) : null}
       {health.card ? (
         <ProblemCard health={health} onRetry={onRetry} onActivity={onActivity} />
       ) : null}
       <LiveNow detail={detail} calls={calls} onClose={onClose} onFresh={onFresh} />
+      {detail.manifest.ether?.runtime?.kind && detail.manifest.ether.runtime.kind !== "data" ? (
+        <ActionJobs id={detail.id} />
+      ) : null}
       <Placements detail={detail} onClose={onClose} />
     </div>
   );

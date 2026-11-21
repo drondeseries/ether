@@ -10,7 +10,7 @@ import { IntegrationTab } from "../../components/IntegrationTab";
 import { IntegrationMark } from "../../components/integration-brands";
 import { SaveBar } from "../../components/SaveBar";
 import { localized, t } from "../../i18n";
-import { api, apiFetch } from "../../lib/api";
+import { api, apiFetch, errorMessage } from "../../lib/api";
 import { useAsync } from "../../lib/hooks";
 import type { PosterProviderConfig as Posters } from "../../lib/types";
 const emptyPoster: Posters = {
@@ -65,6 +65,8 @@ export function normalizePosters(value?: Posters | null): Posters {
     return {
       ...emptyPoster,
       version: 1,
+      assetFolder: p.assetFolder,
+      ownerEnabled: p.ownerEnabled,
       source: p.enabled ? p.source : "tmdb",
       accounts: p.enabled ? { [p.source]: p } : {},
     };
@@ -158,9 +160,10 @@ export function PosterAccounts({
     setSaving(true);
     setError(null);
     try {
+      const latest = normalizePosters((await api.getConfig()).posters);
       const next = {
-        ...config.data,
-        accounts: { ...config.data.accounts, [account.source]: account },
+        ...latest,
+        accounts: { ...latest.accounts, [account.source]: account },
       };
       if (!account.enabled && next.source === account.source) next.source = "tmdb";
       const result = await apiFetch<{ value: Posters }>("/config/posters", {
@@ -172,6 +175,9 @@ export function PosterAccounts({
       toast.success(t("Poster provider saved"));
     } catch (e) {
       setError(e);
+      if (!draft && !editing) {
+        toast.error(t("Couldn't save the change"), { description: errorMessage(e) });
+      }
     } finally {
       setSaving(false);
     }

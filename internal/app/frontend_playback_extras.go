@@ -2,12 +2,15 @@ package app
 
 import (
 	"context"
+	"errors"
+	"os"
 	"strconv"
 
 	"github.com/braedonsaunders/ether/internal/core"
 	"github.com/braedonsaunders/ether/internal/experience"
 	"github.com/braedonsaunders/ether/internal/extras"
 	"github.com/braedonsaunders/ether/internal/frontend"
+	"github.com/braedonsaunders/ether/internal/sessions"
 )
 
 type extraSurface struct{ extras *extras.Service }
@@ -35,11 +38,112 @@ func (s extraSurface) Open(ctx context.Context, key core.RatingKey) (string, str
 	if err != nil {
 		return "", "", nil, err
 	}
+	if resolved.AudioURL != "" {
+		return "", "", nil, extras.ErrCacheDisabled
+	}
 	return resolved.Container, resolved.URL, resolved.Headers, nil
 }
 
 func frontendExtra(clip extras.Extra) frontend.Extra {
 	return frontend.Extra{Key: clip.Key, ParentKey: clip.ParentKey, Title: clip.Title, Kind: clip.Subtype, Source: clip.Site, SourceID: clip.SiteKey, Language: clip.Language, Official: clip.Official, PublishedAt: clip.PublishedAt, Duration: clip.Duration, Height: clip.Size}
+}
+
+func toExtraClip(e extras.Extra) frontend.ExtraClip {
+	return frontend.ExtraClip{
+		Key:         e.Key,
+		ParentKey:   e.ParentKey,
+		ParentTitle: e.ParentTitle,
+		Title:       e.Title,
+		Subtype:     e.Subtype,
+		ExtraType:   e.ExtraType,
+		Site:        e.Site,
+		SiteKey:     e.SiteKey,
+		DiscoverKey: e.DiscoverKey,
+		Language:    e.Language,
+		Official:    e.Official,
+		PublishedAt: e.PublishedAt,
+		Size:        e.Size,
+		Duration:    e.Duration,
+		Source:      e.Source,
+	}
+}
+
+func (s extraSurface) Enabled() bool {
+	return s.extras != nil && s.extras.Enabled()
+}
+
+func (s extraSurface) List(ctx context.Context, parent *core.Title, lang string) ([]frontend.ExtraClip, error) {
+	if s.extras == nil {
+		return nil, nil
+	}
+	list, err := s.extras.List(ctx, parent, lang)
+	if err != nil || len(list) == 0 {
+		return nil, err
+	}
+	out := make([]frontend.ExtraClip, len(list))
+	for i, clip := range list {
+		out[i] = toExtraClip(clip)
+	}
+	return out, nil
+}
+
+func (s extraSurface) Clip(key core.RatingKey) (frontend.ExtraClip, bool) {
+	if s.extras == nil {
+		return frontend.ExtraClip{}, false
+	}
+	clip, ok := s.extras.Lookup(key)
+	if !ok {
+		return frontend.ExtraClip{}, false
+	}
+	return toExtraClip(clip), true
+}
+
+func (s extraSurface) Resolve(ctx context.Context, e frontend.ExtraClip) (frontend.ResolvedExtra, error) {
+	if s.extras == nil {
+		return frontend.ResolvedExtra{}, core.ErrNotFound
+	}
+	clip, ok := s.extras.Lookup(e.Key)
+	if !ok {
+		clip = extras.Extra{
+			Key:         e.Key,
+			ParentKey:   e.ParentKey,
+			ParentTitle: e.ParentTitle,
+			Title:       e.Title,
+			Subtype:     e.Subtype,
+			ExtraType:   e.ExtraType,
+			Site:        e.Site,
+			SiteKey:     e.SiteKey,
+			DiscoverKey: e.DiscoverKey,
+			Language:    e.Language,
+			Official:    e.Official,
+			PublishedAt: e.PublishedAt,
+			Size:        e.Size,
+			Duration:    e.Duration,
+			Source:      e.Source,
+		}
+	}
+	cached, err := s.extras.CacheExtra(ctx, clip)
+	if errors.Is(err, extras.ErrCacheUnsupported) || errors.Is(err, extras.ErrCacheDisabled) {
+		r, resolveErr := s.extras.Resolve(ctx, clip)
+		if resolveErr != nil {
+			return frontend.ResolvedExtra{}, resolveErr
+		}
+		if r.AudioURL != "" {
+			return frontend.ResolvedExtra{}, err
+		}
+		return frontend.ResolvedExtra{URL: r.URL, Container: r.Container, Headers: r.Headers, Expires: r.Expires}, nil
+	}
+	if err != nil {
+		return frontend.ResolvedExtra{}, err
+	}
+	return frontend.ResolvedExtra{LocalPath: cached.Path, Container: "mp4"}, nil
+}
+
+func (s extraSurface) PrewarmBytes() int64 {
+	if s.extras == nil {
+		return 0
+	}
+	return s.extras.PrewarmBytes()
 }
 
 // cinemaSurface serves the same preroll selection Plex prepends to a movie,
@@ -139,7 +243,16 @@ func (s subtitleSurface) Search(ctx context.Context, viewer *core.Viewer, device
 			release = session.Resolution.Release.Name
 		}
 	}
-	found, err := s.app.subtitles.SearchOnDemand(ctx, &detail.Title, language, release)
+	languages, err := s.subtitleSearchLanguages(ctx, &detail.Title, viewer, language, device.ID)
+	if err != nil {
+		return nil, err
+	}
+	var hash string
+	var size int64
+	if len(languages) > 0 {
+		release, hash, size = s.subtitleSearchSource(ctx, &detail.Title, viewer, device.ID, release)
+	}
+	found, err := s.app.subtitles.SearchOnDemandLanguagesWithHash(ctx, &detail.Title, languages, release, hash, size)
 	if err != nil {
 		return nil, err
 	}
@@ -179,6 +292,14 @@ func (s subtitleSurface) Download(ctx context.Context, viewer *core.Viewer, devi
 	if err != nil {
 		return 0, err
 	}
+	if viewer == nil {
+		return 0, core.ErrUnauthorized
+	}
+	if s.app.db != nil {
+		if err := sessions.NewSubtitleIntents(s.app.db).Record(ctx, viewer.ID, key, true); err != nil {
+			return 0, err
+		}
+	}
 	info, err := s.app.subtitles.DownloadOnDemand(ctx, &detail.Title, fileID)
 	if err != nil {
 		return 0, err
@@ -198,4 +319,23 @@ func (s subtitleSurface) Download(ctx context.Context, viewer *core.Viewer, devi
 		}
 	}
 	return info.Index, nil
+}
+
+func (s extraSurface) OpenCachedExtra(ctx context.Context, key core.RatingKey) (*os.File, string, error) {
+	if s.extras == nil {
+		return nil, "", core.ErrNotAvailable
+	}
+	clip, ok := s.extras.Lookup(key)
+	if !ok {
+		return nil, "", core.ErrNotAvailable
+	}
+	cached, err := s.extras.CacheExtra(ctx, clip)
+	if errors.Is(err, extras.ErrCacheUnsupported) || errors.Is(err, extras.ErrCacheDisabled) {
+		return nil, "", core.ErrNotAvailable
+	}
+	if err != nil {
+		return nil, "", err
+	}
+	f, err := s.extras.OpenCachedTrailer(cached)
+	return f, cached.MIMEType, err
 }

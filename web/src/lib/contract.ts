@@ -47,7 +47,28 @@ export interface TitleDetail extends TitleCard {
   episodeCount?: number;
 }
 
+export interface TitleLibraryReason {
+  code: string;
+  message: string;
+  votes?: number;
+  minVotes?: number;
+  popularity?: number;
+  minPopularity?: number;
+  rule?: string;
+}
+
+export interface TitleLibraryStatus {
+  browsable: boolean;
+  included: boolean;
+  inLibraryTier: boolean;
+  canInclude: boolean;
+  releaseGated: boolean;
+  reasons: string[];
+  items: TitleLibraryReason[];
+}
+
 const RULE_FIELDS = [
+  "title",
   "genre",
   "keyword",
   "person",
@@ -63,13 +84,15 @@ const RULE_FIELDS = [
   "runtime",
   "contentRating",
   "released",
+  "latestSeasonPremiere",
+  "latestEpisode",
   "watchProvider",
   "collection",
   "watched",
   "inProgress",
   "addedAt",
 ] as const;
-export type RuleField = (typeof RULE_FIELDS)[number];
+export type RuleField = (typeof RULE_FIELDS)[number] | `browse:${string}` | "group" | "viewer";
 
 const RULE_OPS = [
   "is",
@@ -90,6 +113,7 @@ export interface Rule {
   op: RuleOp;
   value: unknown;
   label?: string;
+  labels?: string[];
 }
 
 type TmdbListName =
@@ -159,6 +183,8 @@ export interface TargetSchedule {
 }
 
 export interface CollectionSpec {
+  previewOnFocus?: boolean;
+  rankedTop10?: boolean;
   localOnly?: boolean;
   releaseMode?: "released" | "upcoming" | "mixed";
   lookaheadDays?: number;
@@ -205,6 +231,42 @@ export interface CollectionTemplate {
   description: string;
   category: string;
   spec: CollectionSpec;
+}
+
+export interface CollectionTemplateBundle {
+  id: string;
+  name: string;
+  description: string;
+  category?: string;
+  templateIds: string[];
+}
+
+export interface CollectionTemplateBundlePreviewItem {
+  templateId: string;
+  name: string;
+  description?: string;
+  category: string;
+  mediaType?: string;
+  action: "create" | "skip_existing";
+  existingId?: string;
+  existingName?: string;
+}
+
+export interface CollectionTemplateBundlePreview {
+  bundle: CollectionTemplateBundle;
+  items: CollectionTemplateBundlePreviewItem[];
+  willCreate: number;
+  willSkip: number;
+}
+
+export interface CollectionTemplateBundleApplyResult {
+  bundleId: string;
+  bundle?: CollectionTemplateBundle;
+  items?: CollectionTemplateBundlePreviewItem[];
+  created: CollectionSpec[];
+  skipped: CollectionTemplateBundlePreviewItem[];
+  createdCount: number;
+  skippedCount: number;
 }
 
 export type FacetName =
@@ -316,6 +378,7 @@ export interface HomeRow {
   slot?: number;
   anchorSlot?: number;
   placement?: string;
+  hiddenCode?: string;
   hiddenReason?: string;
   policy?: RowPolicy;
   policyLayer?: "global" | "override";
@@ -337,7 +400,11 @@ export interface ViewerHome {
   homeDeduped?: number;
 }
 
-export type LayoutSection = "home" | "movies" | "shows";
+export type BuiltinLayoutSection = "home";
+export type LibraryLayoutSection = `library:${number}`;
+export type LayoutSection = BuiltinLayoutSection | LibraryLayoutSection;
+export type LibraryMediaSurface = "movies" | "shows";
+export type RowSectionTag = LayoutSection | LibraryMediaSurface;
 export type Device = "tv" | "mobile" | "web" | "desktop";
 export type Daypart = "morning" | "afternoon" | "evening" | "late";
 
@@ -356,6 +423,10 @@ export type RowStatus = "always" | "eligible" | "off";
 
 /** The owner's policy for a row (or a family of rows) on a page. */
 export interface RowPolicy {
+  previewOnFocus?: boolean;
+  rankedTop10?: boolean;
+  /** Keep titles that other rows on the page also show. */
+  showRepeats?: boolean;
   /** Kind ("short-on-time"), "collection:<id>", a hub id, or a glob ("because.*"). */
   row: string;
   status: RowStatus;
@@ -413,8 +484,8 @@ export interface AvailableRow {
   title: string;
   kind: string;
   description: string;
-  /** Pages the row can appear on; empty or missing means every page. */
-  sections?: LayoutSection[];
+  /** Pages or media surfaces the row can appear on; empty or missing means every page. */
+  sections?: RowSectionTag[];
   group?: RowGroup;
 }
 
@@ -434,10 +505,43 @@ export interface RankerInsight {
   features: RankerFeature[] | null;
 }
 
+/** A library with its own `library:<id>` Recommended rows page. */
+export interface LayoutLibrary {
+  id: number;
+  name: string;
+  slug: string;
+  type: "movie" | "show" | "plugin";
+  section: LibraryLayoutSection;
+  customized: boolean;
+}
+
+export interface LayoutDefaultsMaxRows {
+  home: number;
+  library?: number;
+  [section: string]: number | undefined;
+}
+
 export interface LayoutDoc {
   layout: HomeLayout;
   availableRows: AvailableRow[];
-  defaults: { maxRows: Record<LayoutSection, number> };
+  defaults: { maxRows: LayoutDefaultsMaxRows };
+  libraries?: LayoutLibrary[];
+}
+
+export interface ViewerLibraryPage {
+  userId: number;
+  page: LayoutPage;
+}
+
+export interface LibraryLayoutDoc {
+  library: LayoutLibrary;
+  customized: boolean;
+  effectivePage: LayoutPage;
+  viewerPages: ViewerLibraryPage[];
+  defaults: { maxRows: number };
+  availableRows: AvailableRow[];
+  collectionSchedules?: Record<string, TargetSchedule | null>;
+  layout: HomeLayout;
 }
 
 interface LayoutImpact {

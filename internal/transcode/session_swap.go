@@ -34,9 +34,34 @@ func (s *Session) swapInput(ctx context.Context, inputURL string, info core.Medi
 	// Decode a tiny bounded sample outside the session lock. Only proven
 	// embedded side bars matching the existing picture are removed.
 	s.mu.Lock()
+	if s.liveRejected[inputURL] {
+		s.mu.Unlock()
+		return fmt.Errorf("transcode: source exceeds fixed live target; new session required")
+	}
+	if s.headerRejected[inputURL] {
+		s.mu.Unlock()
+		return fmt.Errorf("transcode: input rejected after deterministic header failure")
+	}
+	if len(s.headerRestarts) >= 8 && time.Since(s.headerLastFailure) < time.Minute {
+		s.mu.Unlock()
+		return fmt.Errorf("transcode: header restart limit reached")
+	}
+	retryAt := time.Time{}
+	if !s.headerLastFailure.IsZero() {
+		retryAt = s.headerLastFailure.Add(headerRecoveryDelay(len(s.headerRestarts)))
+	}
 	before := s.recoveryBufferLocked()
 	previousInput := s.input
 	s.mu.Unlock()
+	if delay := time.Until(retryAt); !retryAt.IsZero() && delay > 0 {
+		timer := time.NewTimer(delay)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		}
+	}
 	sampleAt := at
 	if preserve {
 		if before.ReadyUntil > sampleAt && before.ReadyUntil < info.Duration {
@@ -50,6 +75,7 @@ func (s *Session) swapInput(ctx context.Context, inputURL string, info core.Medi
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	info = s.m.stageExternalSubtitles(s.dir, info, "")
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
@@ -80,15 +106,6 @@ func (s *Session) swapInput(ctx context.Context, inputURL string, info core.Medi
 	if s.total > 0 && seg >= s.total {
 		seg = s.total - 1
 	}
-	s.stopRunForLocked("input swap")
-	for t, done := range s.done {
-		for n := range done {
-			if n >= seg {
-				_ = os.Remove(s.trackSegPath(t, n))
-				delete(done, n)
-			}
-		}
-	}
 	next := adaptToContract(s.audioMatchBaseDecision(), s.info, info, s.container, s.contract)
 	next = s.applyAudioMatchLocked(inputURL, next)
 	if inputURL == s.input {
@@ -100,6 +117,18 @@ func (s *Session) swapInput(ctx context.Context, inputURL string, info core.Medi
 	}
 	if s.isDASH() {
 		next = dashDecision(info, next)
+	}
+	if !s.liveInput && s.m != nil && s.m.VideoTranscodingOff() && info.Video() != nil && !next.VideoCopy {
+		return ErrVideoTranscodingDisabled
+	}
+	s.stopRunForLocked("input swap")
+	for t, done := range s.done {
+		for n := range done {
+			if n >= seg {
+				_ = os.Remove(s.trackSegPath(t, n))
+				delete(done, n)
+			}
+		}
 	}
 	if next.Kind != s.decision.Kind || next.VideoCopy != s.decision.VideoCopy || next.AudioCopy != s.decision.AudioCopy {
 		s.log.Info("failover changes decision", "from", s.decision.Kind, "to", next.Kind, "reason", next.Reason)
@@ -120,6 +149,9 @@ func (s *Session) swapInput(ctx context.Context, inputURL string, info core.Medi
 		}
 	}
 	if s.input != inputURL {
+		s.textSubtitleStreams = nil // The durable source identity belongs to the original input.
+		s.textSubtitleSource = ""
+		s.healTimestamps = false // clock evidence belongs to the sampled input
 		// SwapInput has no replacement-credential parameter. Never carry an
 		// old provider's credentials onto an independently resolved URL.
 		s.inputHeaders = nil
@@ -133,6 +165,10 @@ func (s *Session) swapInput(ctx context.Context, inputURL string, info core.Medi
 		}
 	}
 	s.inputCrop = crop
+	if s.resumeWarm != nil {
+		s.resumeWarm.encoder.seal()
+		s.resumeWarm = nil
+	}
 	s.input = inputURL
 	s.info = info
 	s.decision = next
@@ -142,6 +178,8 @@ func (s *Session) swapInput(ctx context.Context, inputURL string, info core.Medi
 	s.failures = 0
 	s.failErr = nil
 	s.inputFailed = false
+	s.headerRecovering = false
+	s.headerFallbackPending = ""
 	if !preserve {
 		s.lastReq = seg
 	}
@@ -154,6 +192,9 @@ func (s *Session) swapInput(ctx context.Context, inputURL string, info core.Medi
 // format the client already opened. Playback calls it before committing
 // a replacement so an incompatible candidate is skipped, not spliced.
 func (s *Session) CheckSwap(info core.MediaInfo) error {
+	if !s.liveInput && s.m != nil && s.m.VideoTranscodingOff() && !info.Estimated && info.Video() != nil && !s.SwapWouldCopyVideo(info) {
+		return ErrVideoTranscodingDisabled
+	}
 	if s.contract == nil {
 		return nil
 	}
@@ -265,41 +306,7 @@ func rangeOfDVBase(v *core.StreamInfo) string {
 	return b
 }
 
-// matchStream finds the stream in info that best matches prev: same
-// language and codec, then same language, then the default/first one.
+// matchStream finds the stream in info that best matches prev across failover.
 func matchStream(info core.MediaInfo, prev *core.StreamInfo, typ string) *core.StreamInfo {
-	var sameLang, first, def *core.StreamInfo
-	for i := range info.Streams {
-		s := &info.Streams[i]
-		if s.Type != typ || s.External {
-			continue
-		}
-		if first == nil {
-			first = s
-		}
-		if s.Default && def == nil {
-			def = s
-		}
-		if prev == nil {
-			continue
-		}
-		if s.Language == prev.Language {
-			if s.Codec == prev.Codec && s.Forced == prev.Forced {
-				return s
-			}
-			if sameLang == nil {
-				sameLang = s
-			}
-		}
-	}
-	if sameLang != nil {
-		return sameLang
-	}
-	if typ == "subtitle" {
-		return nil // never invent subtitles the user did not pick
-	}
-	if def != nil {
-		return def
-	}
-	return first
+	return matchReplacementStream(info, prev, typ)
 }

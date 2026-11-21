@@ -7,17 +7,28 @@ import (
 
 	"github.com/braedonsaunders/ether/internal/core"
 	"github.com/braedonsaunders/ether/internal/releaseparse"
+	"github.com/braedonsaunders/ether/internal/releasepolicy"
 )
 
 // DiscoveryCandidate is local, name-based negative evidence only. It does not
 // certify quality or fetch a provider. Feed and playback share this policy.
 func (s *Service) DiscoveryCandidate(t *core.Title, r core.Release) string {
-	return sourceSuitability(r, t, SelectProfileForMedia(s.qualityCfg(), core.ClientCaps{HDR10: true, DolbyVision: true}, nil, titleMedia(t)), false)
+	return sourceSuitability(r, t, s.ProfileForTitle(context.Background(), feedClient, nil, t), false)
 }
 
 func sourceSuitability(r core.Release, t *core.Title, p core.QualityProfile, explicit bool) string {
+	return sourceSuitabilityWithLanguages(r, t, p, explicit, nil)
+}
+
+func sourceSuitabilityWithLanguages(r core.Release, t *core.Title, p core.QualityProfile, explicit bool, probedLangs []string) string {
+	if nonVideoRelease(r, t, core.SearchRequest{}) {
+		return ReasonNotAVideoFile
+	}
 	// Reparse the name: saved feed payloads can contain older parser results.
 	info := releaseparse.Parse(r.Name)
+	if len(probedLangs) > 0 {
+		info.Languages = probedLangs
+	}
 	if !p.AllowCam {
 		// AllowCam is the one pre-release switch: cinema recordings,
 		// screeners, R5s and workprints all play only where it is on.
@@ -28,10 +39,24 @@ func sourceSuitability(r core.Release, t *core.Title, p core.QualityProfile, exp
 			return "screener not allowed"
 		}
 	}
+	// A profile's specific Language is a hard gate, as in Radarr; an
+	// explicitly chosen release (a pin) bypasses it, as it does the
+	// minimum custom format score.
+	if !explicit {
+		if reason := profileLanguageRejection(info, p, t); reason != "" {
+			return reason
+		}
+	}
 	if explicit || !releaseparse.ExplicitDub(r.Name) || len(info.Languages) == 0 {
 		return ""
 	}
 	want := append([]string(nil), p.PreferredLanguages...)
+	// A dub into the profile's own language or required/preferred release
+	// rules is what the profile asks for, not a mismatch.
+	if lang, _ := profileLanguageMode(p); lang != "" {
+		want = append(want, lang)
+	}
+	want = append(want, releasepolicy.PositiveLanguageTargets(p.ReleaseRules)...)
 	if t != nil && t.Language != "" {
 		want = append(want, assumedLanguage(t))
 	}
@@ -82,28 +107,37 @@ func (s *Service) knownUnavailableSince(ctx context.Context, keys []core.RatingK
 				args = append(args, k)
 			}
 			args = append(args, now.Unix())
-			rows, err := s.db.QueryContext(ctx, `SELECT rating_key,checked_at FROM resolver_availability WHERE rating_key IN (`+strings.Join(marks, ",")+`) AND available=0 AND expires_at>?`, args...)
+			rows, err := s.db.QueryContext(ctx, `SELECT rating_key,checked_at,profile_key FROM resolver_availability WHERE rating_key IN (`+strings.Join(marks, ",")+`) AND available=0 AND expires_at>?`, args...)
 			if err != nil {
 				continue
 			}
+			policies := make(map[core.RatingKey]string)
 			for rows.Next() {
 				var k core.RatingKey
 				var checked int64
-				if rows.Scan(&k, &checked) == nil {
+				var policy string
+				if rows.Scan(&k, &checked, &policy) == nil {
+					policies[k] = policy
 					out[k] = time.Unix(checked, 0)
 				}
 			}
 			rows.Close()
+			for k, policy := range policies {
+				if policy != s.availabilityProfileKey(ctx, k) {
+					delete(out, k)
+				}
+			}
 		}
 	}
 	if !memo {
 		return out
 	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	for _, k := range keys {
-		if e, ok := s.avail[int64(k)]; ok {
-			if !e.available && now.Before(e.expires) {
+		s.mu.RLock()
+		e, ok := s.avail[int64(k)]
+		s.mu.RUnlock()
+		if ok {
+			if !e.available && now.Before(e.expires) && e.policy == s.availabilityProfileKey(ctx, k) {
 				out[k] = e.checked
 			} else {
 				delete(out, k)

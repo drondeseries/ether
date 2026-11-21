@@ -30,43 +30,70 @@ export interface Indexer {
   /** "usenet" (Newznab, the default when empty or absent) or "torrent" (Torznab). */
   protocol?: IndexerProtocol | "";
   /**
-   * "cardigann" for a built-in site, "stremio" for a Stremio stream addon
-   * (always protocol "torrent"); empty or "newznab" for a Newznab/Torznab URL.
+   * "cardigann" for a built-in site, "stremio" for a Stremio stream addon,
+   * "zilean" for a self-hosted Zilean instance (always protocol "torrent");
+   * empty or "newznab" for a Newznab/Torznab URL.
    */
   kind?: IndexerKind | "";
+  /** Keep a Stremio add-on's own result order instead of profile re-ranking. */
+  useAddonOrder?: boolean;
   /** Installed definition id of a built-in site. */
   definition?: string;
   /** A built-in site's setting values by name. */
   settings?: Record<string, string> | null;
   /** A built-in site's password settings; each set value is redacted to "••••". */
   secretSettings?: Record<string, string> | null;
-  /** Client identity preset overriding the global policy for this indexer. */
-  clientIdentity?: string;
+  /** User agent overriding the global client identity for this indexer. */
+  userAgent?: string;
+  /** How this indexer's requests look: client profile plus overrides. */
+  requestIdentity?: IndexerRequestIdentity | null;
+  /**
+   * The audio language of the releases this indexer returns, as a BCP 47
+   * tag ("pt-BR"). It is evidence for a bare DUAL/MULTI whose name names no
+   * dub; an explicit language in a release name always wins. Overrides a
+   * built-in site's definition language when set.
+   */
+  language?: string;
 }
 
 /**
- * Input.clientIdentity: one preset per purpose and media, plus the owner's
- * own user agent and headers when a preset is "custom".
+ * Input.clientIdentity: the owner's user agent and headers presented to
+ * Newznab and Torznab indexers.
  */
 export interface ClientIdentityConfig {
-  tvSearch?: string;
-  movieSearch?: string;
-  tvGrab?: string;
-  movieGrab?: string;
   userAgent?: string;
   /** Header values are sealed server-side and arrive redacted to "••••". */
   headers?: Record<string, string> | null;
 }
 
-/** One selectable client identity, as the server reports it. */
-export interface IdentityPreset {
-  key: string;
-  userAgent: string;
-  headers?: Record<string, string> | null;
+/** One header or query-parameter override in a request identity. */
+export interface KVOverride {
+  name: string;
+  value?: string;
+  remove?: boolean;
+}
+
+/** Per-indexer request identity (config.IndexerRequestIdentity). */
+export interface IndexerRequestIdentity {
+  profile?: string;
+  headers?: KVOverride[] | null;
+  params?: KVOverride[] | null;
+  grabProfile?: string;
+  grabHeaders?: KVOverride[] | null;
+  grabParams?: KVOverride[] | null;
+}
+
+/** Masked sample requests from POST /indexer/preview. */
+export interface RequestPreview {
+  profile: string;
+  grabProfile: string;
+  search: { requestLine: string; headers: { name: string; value: string }[] };
+  grab: { requestLine: string; headers: { name: string; value: string }[] };
+  profiles: { id: string; userAgent: string; grabPaired?: string }[];
 }
 
 export type IndexerProtocol = "usenet" | "torrent";
-type IndexerKind = "newznab" | "cardigann" | "stremio";
+type IndexerKind = "newznab" | "cardigann" | "stremio" | "zilean";
 
 /** Definitions source and FlareSolverr for built-in sites (config.indexerSites). */
 export interface IndexerSitesConfig {
@@ -225,6 +252,8 @@ export interface DebridProviderStatus {
 }
 
 export interface PosterProviderConfig {
+  assetFolder?: string;
+  ownerEnabled?: boolean;
   version?: number;
   accounts?: Record<string, PosterProviderConfig>;
   enabled: boolean;
@@ -236,7 +265,10 @@ export interface PosterProviderConfig {
 }
 
 export interface EtherConfig {
-  frontends?: Record<string, { enabled: boolean; settings?: Record<string, unknown> }>;
+  frontends?: Record<
+    string,
+    { enabled: boolean; publicUrl?: string; settings?: Record<string, unknown> }
+  >;
   frontendPorts?: Record<string, number>;
   posters?: PosterProviderConfig;
   availability?: AvailabilityConfig;
@@ -245,8 +277,6 @@ export interface EtherConfig {
     port: number;
     bindAddress: string;
     friendlyName: string;
-    moviesLibraryName: string;
-    tvShowsLibraryName: string;
     machineIdentifier: string;
     logLevel: string;
     defaultStreamLimit: number;
@@ -298,9 +328,11 @@ export interface EtherConfig {
     password?: string;
     indexers: boolean;
     stremio: boolean;
+    liveTV: boolean;
     debrid: boolean;
     usenet: boolean;
     metadata: boolean;
+    extras?: boolean;
     bypass?: string[] | null;
   };
   sharedCache?: EtherConfig["cache"];
@@ -322,6 +354,8 @@ export interface EtherConfig {
     retentionDays?: number;
     replayBoostHours?: number;
     disableSpeculation?: boolean;
+    speculativeWarming?: "on" | "off";
+    keepWarmTitles?: number[];
     detailWarmup?: string;
     detailBytes?: number;
     playbackReadAheadMinutes?: number;
@@ -329,6 +363,7 @@ export interface EtherConfig {
     inProgressPinMaxAge?: string;
     dir: string;
     budgetBytes: number;
+    libraryBudgetBytes?: number;
     prefetchNextEpisode: boolean;
     prefetchBytes: number;
     keepInProgressWarm: boolean;
@@ -350,6 +385,8 @@ export interface EtherConfig {
     unavailableCooloff: string;
     maxCandidates: number;
     sameQualityAlternatives: number;
+    alternativesPerResolution?: boolean;
+    alternativesPerSource?: boolean;
     offerHigherVersions?: boolean;
     blockedGroups: string[] | null;
     blockedTerms: string[] | null;
@@ -359,7 +396,8 @@ export interface EtherConfig {
     sourcePreference?: string;
     sourceAlwaysFirst?: boolean;
     customFormats?: CustomFormatDefinition[] | null;
-    customFormatScores?: Record<string, number>;
+    /** Let a detail page's file-availability check open on-demand add-on streams. */
+    openOnDemandAddonStreams?: boolean;
   };
   quality: {
     profiles: QualityProfile[] | null;
@@ -374,6 +412,7 @@ export interface EtherConfig {
     sync?: QualitySync;
   };
   transcode: {
+    videoTranscoding?: "on" | "off";
     ffmpegPath: string;
     ffprobePath: string;
     hwAccel: string;
@@ -392,17 +431,22 @@ export interface EtherConfig {
   };
   trakt: { enabled: boolean; clientId: string; clientSecret: string };
   simkl?: { enabled: boolean; clientId: string; clientSecret: string };
+  mdblist?: { enabled: boolean };
   plexServers?: { enabled: boolean };
   markers?: {
     theIntroDb: boolean;
     apiKey: string;
+    skipDb?: boolean;
+    skipDbApiKey?: string;
     skipIntro?: boolean;
     skipCredits?: boolean;
     sourceOrder?: string[];
   };
   liveTV?: {
+    latencyProfile?: "auto" | "low" | "stable";
     logoIndexUrl?: string;
     healthSweepMinutes?: number;
+    stability?: "fastest" | "balanced" | "rocksolid" | "";
   };
   subtitles?: {
     providers?: { id: string; kind: string; name?: string; enabled: boolean }[];
@@ -412,6 +456,11 @@ export interface EtherConfig {
     apiKey: string;
     username: string;
     password: string;
+    automaticPreferred?: boolean;
+  };
+  subdl: {
+    enabled: boolean;
+    apiKey: string;
   };
   llm: {
     enabled: boolean;
@@ -496,29 +545,45 @@ export interface QualityProfile {
   /** Set on imported profiles that automatic sync updates in place. */
   import?: ProfileImport;
   releaseRules?: ReleaseRule[] | null;
-  ranking?: string[] | null;
-  rankingConfig?: Record<string, Record<string, unknown>> | null;
+  /** Plugin ranking steps the profile uses, with their settings; each adds its points to the score. */
+  pluginScores?: Record<string, Record<string, unknown>> | null;
+  /** Qualities best first, as in Radarr/Sonarr; qualities in one item rank equally. */
+  qualityOrder?: QualityItem[] | null;
   name: string;
   maxHeight: number;
   minHeight: number;
   fallbackBelowMin?: boolean;
   allowHdr: boolean;
   allowDolbyVision: boolean;
-  preferredSources: string[] | null;
-  preferredCodecs: string[] | null;
-  preferredAudio: string[] | null;
   minSizeMbPerMin: number;
   maxSizeMbPerMin: number;
   episodeMinSizeMbPerMin?: number;
   episodeMaxSizeMbPerMin?: number;
-  preferLargest?: boolean;
   preferredLanguages: string[] | null;
+  /**
+   * The profile's audio language, as in Radarr: "original" (or unset) is
+   * each title's own language, "any" is every language, and any other
+   * value is the one language a release's audio must be in.
+   */
+  language?: string | null;
   allowCam: boolean;
   /** Imported profiles: the only source-resolution pairs allowed, e.g. "webdl-1080". */
   allowedQualities?: string[] | null;
-  /** Imported profiles: custom format scores by trash ID, overriding the defaults. */
+  /**
+   * Every format the profile scores: custom formats by trash ID or name,
+   * Ether's built-in formats ("ether:…") and Prefer rules ("rule:<id>").
+   * A format not listed scores 0.
+   */
   customFormatScores?: Record<string, number> | null;
+  /** Releases whose custom formats score lower aren't played; null sets none. */
   minCustomFormatScore?: number | null;
+}
+
+/** One entry of a quality order: a quality, or a named group ranking equally. */
+export interface QualityItem {
+  name?: string;
+  /** "<source>-<height>", e.g. "webdl-1080"; source "unknown" names no source. */
+  qualities: string[];
 }
 
 export interface QualityRule {
@@ -568,6 +633,7 @@ export interface TestResult {
   durationMs: number;
 }
 export interface LogEntry {
+  id: number;
   time: string;
   level: string;
   message: string;
@@ -596,7 +662,7 @@ export interface EtherUser {
   streamLimit: number;
   /** Content rating limit; "" is unrestricted. */
   maxContentRating: string;
-  allowedSections: number[] | null;
+  allowedLibraries: number[] | null;
 }
 
 /** GET /api/updates/ — the server's self-update manager. */
@@ -612,15 +678,44 @@ export interface UpdateStatus {
     notes?: string;
     publishedAt?: string;
     staged: boolean;
+    /** A security fix: installs at the next quiet moment. */
+    critical?: boolean;
+    /** Staged rollout: installs on its own after this time. */
+    installAfter?: string;
+    /** Missed several maintenance windows: installs at the next long quiet moment. */
+    catchUp?: boolean;
+    /** Notify-only installs: the file to download by hand. */
+    downloadUrl?: string;
+    downloadName?: string;
   };
   capability: "self-apply" | "notify-only" | "disabled";
   capabilityReason?: string;
+  /** How a notify-only install is updated (internal/updater NotifyKind*). */
+  notifyKind?:
+    | "dev"
+    | "macos"
+    | "container"
+    | "deb"
+    | "rpm"
+    | "package"
+    | "unsupervised"
+    | "unwritable"
+    | "unknown"
+    | "installer";
+  channel?: string;
+  arch?: string;
+  catchUpQuietSeconds?: number;
+  /** The last update Ether installed itself, until dismissed. */
+  installed?: { from: string; to: string; at: string };
   state:
     | "idle"
     | "downloading"
     | "staged"
     | "waiting-for-window"
     | "waiting-for-idle"
+    | "waiting-for-rollout"
+    | "waiting-for-turn"
+    | "draining"
     | "applying"
     | "rolled-back";
   autoUpdate: boolean;
@@ -674,6 +769,7 @@ export interface DashboardData {
   version: string;
   /** False when the Plex app is off. Omitted means Plex is on. */
   plexEnabled?: boolean;
+  serverName?: string;
 }
 
 /** One resolver decision (internal/resolver.Trace). Durations are nanoseconds. */
@@ -760,6 +856,7 @@ export interface ClusterNode {
     roles?: string[] | null;
     diagnostics?: ClusterDiagnostics;
     transcode: boolean;
+    videoTranscoding?: string;
     hwAccel?: string;
     weight?: number;
     egressIp?: string;
@@ -893,10 +990,13 @@ export interface AvailabilityConfig {
   movieEvidenceDays?: number;
   /** playable, digital, or immediate. Empty is derived from the gate flags. */
   mode?: string;
+  movieMode?: string;
+  showMode?: string;
   /** gentle, normal, unlimited, or custom. Empty is treated as normal. */
   effort?: string;
   catchUp?: boolean;
   digitalDateEvidence?: boolean;
+  homeReleaseOffsetDays?: number;
   monitor: boolean;
   verify: boolean;
   preferVerified: boolean;

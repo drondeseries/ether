@@ -75,6 +75,10 @@ type CertManagerOptions struct {
 	Now    func() time.Time
 	// TrustRoots, when set, replaces the system roots for VerifyTrust.
 	TrustRoots *x509.CertPool
+	// OnChange is notified when certificate or verification state changes.
+	OnChange func()
+	// OnRenewed is notified when a non-self-signed TLS certificate is renewed or installed.
+	OnRenewed func(domains []string, issuer string, expiresAt time.Time)
 }
 
 // CertManager obtains, stores and renews the server's TLS certificate:
@@ -305,6 +309,13 @@ func (m *CertManager) install(pair *tls.Certificate, leaf *x509.Certificate, cer
 	m.cert = pair
 	m.info = info
 	m.mu.Unlock()
+	m.notifyChange()
+}
+
+func (m *CertManager) notifyChange() {
+	if m != nil && m.o.OnChange != nil {
+		m.o.OnChange()
+	}
 }
 
 func isSelfSigned(c *x509.Certificate) bool {
@@ -492,6 +503,9 @@ func (m *CertManager) requestPlexDirect(ctx context.Context, token string, cur C
 	m.mu.Unlock()
 	m.shareState(ctx, st)
 	m.o.Logger.Info("plex.direct certificate installed", "subject", bundle.Subject, "expires", bundle.Leaf.NotAfter)
+	if m.o.OnRenewed != nil && bundle != nil && bundle.Leaf != nil {
+		m.o.OnRenewed(append([]string(nil), bundle.Leaf.DNSNames...), bundle.Leaf.Issuer.CommonName, bundle.Leaf.NotAfter.UTC())
+	}
 	return nil
 }
 
@@ -517,6 +531,9 @@ func (m *CertManager) Install(b *CertBundle) error {
 	}
 	if !isSelfSigned(b.Leaf) {
 		m.shareState(ctx, m.currentState())
+		if m.o.OnRenewed != nil && b != nil && b.Leaf != nil {
+			m.o.OnRenewed(append([]string(nil), b.Leaf.DNSNames...), b.Leaf.Issuer.CommonName, b.Leaf.NotAfter.UTC())
+		}
 	}
 	return nil
 }
@@ -557,6 +574,7 @@ func (m *CertManager) saveState(st certState) {
 	if err := m.persistState(st); err != nil {
 		m.o.Logger.Warn("save certificate state", "err", err)
 	}
+	m.notifyChange()
 }
 
 func (m *CertManager) persistState(st certState) error {

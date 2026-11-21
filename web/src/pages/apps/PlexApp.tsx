@@ -17,7 +17,7 @@ import { ErrorPanel } from "../../components/feedback";
 import { SaveBar, useDraft } from "../../components/SaveBar";
 import { SettingsRow } from "../../components/SettingsRow";
 import { t, tx } from "../../i18n";
-import { ApiError, api, errorMessage } from "../../lib/api";
+import { ApiError, api, apiFetch, errorMessage } from "../../lib/api";
 import { useAsync } from "../../lib/hooks";
 import type { EtherConfig } from "../../lib/types";
 import { SchemaField, type FieldDef } from "../settings/SchemaForm";
@@ -25,8 +25,14 @@ import * as schema from "../settings/schema";
 import { PlexStatus } from "../settings/sections";
 import { claimFailureMessage, plexAccountClaimed, translatePlexFieldError } from "./plex-account";
 import { StatusRow, ConnectionStatusRow } from "../../components/AppStatusList";
-import { HomeStatusRow } from "./HomeStatus";
-import { awaySummary, type ReachabilityStatus } from "./reachability";
+import {
+  AppAddressCard,
+  ConnectDeviceCard,
+  fetchEtherConfig,
+  saveMainListenerPort,
+  type HubFrontendInfo,
+} from "./ConnectionHub";
+import { awaySummary } from "./reachability";
 
 type Obj = Record<string, unknown>;
 type PlexDraft = { plex: Obj };
@@ -184,8 +190,11 @@ function PlexAccount({
     setBusy(true);
     setNotice("");
     try {
-      const live = await api.getConfig();
-      await api.putSection("plex", { ...live.plex, claimed: false });
+      const live = await fetchEtherConfig();
+      await apiFetch("/config/plex", {
+        method: "PUT",
+        body: JSON.stringify({ ...live.plex, claimed: false }),
+      });
       await onChanged();
       setNotice("");
     } catch (error) {
@@ -198,65 +207,63 @@ function PlexAccount({
   const owner = plex.ownerUsername;
   return (
     <>
-      <>
-        <StatusRow
-          state={claimed ? "reachable" : "unknown"}
-          title={
-            claimed
-              ? owner
-                ? t("Claimed by Plex account {name}", { name: owner })
-                : t("Claimed by owner")
-              : t("Not claimed")
-          }
-          control={
-            claimed ? (
-              <Button variant="outline" size="sm" disabled={busy} onClick={() => void unclaim()}>
-                {t("Sign out of Plex")}
-              </Button>
-            ) : (
-              <Button size="sm" disabled={busy || pin != null} onClick={() => void startPin()}>
-                {t("Sign in & claim")}
-              </Button>
-            )
-          }
-        />
-        {pin ? (
-          <div className="space-y-3 px-5 py-4">
-            <p className="text-sm text-fg">
-              {t(
-                "A plex.tv window opened. Sign in there and allow Ether; this page continues on its own.",
-              )}
-            </p>
-            <div className="flex flex-wrap items-center gap-3 text-sm text-fg-muted">
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => window.open(pin.authUrl, "_blank", "noopener,noreferrer")}
-              >
-                {t("Open plex.tv sign-in")} <ExternalLink size={13} />
-              </Button>
-              <span className="inline-flex items-center gap-2">
-                {t("Waiting for approval")} <Spinner size={13} label={t("Waiting")} />
-              </span>
-            </div>
-            {pin.code.length <= 8 ? (
-              <p className="text-sm text-fg-muted">
-                {tx("Or enter {code} at plex.tv/link.", {
-                  code: <span className="font-mono font-semibold text-fg">{pin.code}</span>,
-                })}
-              </p>
-            ) : null}
-          </div>
-        ) : null}
-        {notice ? <p className="px-5 py-3 text-sm text-fg-muted">{notice}</p> : null}
-        {claimFailed && !pin ? (
-          <div className="px-5 py-3">
-            <Button variant="outline" size="sm" disabled={busy} onClick={() => void claimServer()}>
-              {t("Claim server")}
+      <StatusRow
+        state={claimed ? "reachable" : "warning"}
+        title={
+          claimed
+            ? owner
+              ? t("Claimed by Plex account {name}", { name: owner })
+              : t("Claimed by owner")
+            : t("Not claimed")
+        }
+        control={
+          claimed ? (
+            <Button variant="outline" size="sm" disabled={busy} onClick={() => void unclaim()}>
+              {t("Sign out of Plex")}
             </Button>
+          ) : (
+            <Button size="sm" disabled={busy || pin != null} onClick={() => void startPin()}>
+              {t("Sign in & claim")}
+            </Button>
+          )
+        }
+      />
+      {pin ? (
+        <div className="space-y-3 px-5 py-4">
+          <p className="text-sm text-fg">
+            {t(
+              "A plex.tv window opened. Sign in there and allow Ether; this page continues on its own.",
+            )}
+          </p>
+          <div className="flex flex-wrap items-center gap-3 text-sm text-fg-muted">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => window.open(pin.authUrl, "_blank", "noopener,noreferrer")}
+            >
+              {t("Open plex.tv sign-in")} <ExternalLink size={13} />
+            </Button>
+            <span className="inline-flex items-center gap-2">
+              {t("Waiting for approval")} <Spinner size={13} label={t("Waiting")} />
+            </span>
           </div>
-        ) : null}
-      </>
+          {pin.code.length <= 8 ? (
+            <p className="text-sm text-fg-muted">
+              {tx("Or enter {code} at plex.tv/link.", {
+                code: <span className="font-mono font-semibold text-fg">{pin.code}</span>,
+              })}
+            </p>
+          ) : null}
+        </div>
+      ) : null}
+      {notice ? <p className="px-5 py-3 text-sm text-fg-muted">{notice}</p> : null}
+      {claimFailed && !pin ? (
+        <div className="px-5 py-3">
+          <Button variant="outline" size="sm" disabled={busy} onClick={() => void claimServer()}>
+            {t("Claim server")}
+          </Button>
+        </div>
+      ) : null}
     </>
   );
 }
@@ -275,15 +282,21 @@ function confirmUnclaim() {
 export function PlexApp({
   hidden,
   section,
-  status,
+  info,
+  busy,
+  onToggle,
+  onReloadFrontends,
 }: {
   hidden: boolean;
   section?: string;
-  status?: ReachabilityStatus;
+  info?: HubFrontendInfo;
+  busy?: boolean;
+  onToggle?: (enabled: boolean) => void;
+  onReloadFrontends?: () => Promise<unknown>;
 }) {
   const navigate = useNavigate();
-  const { dashboard, refreshDashboard } = useApp();
-  const config = useAsync(() => api.getConfig(), []);
+  const { boot, dashboard, refreshDashboard } = useApp();
+  const config = useAsync(() => fetchEtherConfig(), []);
   const saved = useMemo<PlexDraft | null>(() => {
     const cfg = config.data;
     if (!cfg) return null;
@@ -299,6 +312,7 @@ export function PlexApp({
   const [saving, setSaving] = useState(false);
   const active = plexSection(section);
   const activeErrors = errors;
+  const status = info?.status;
 
   async function save() {
     if (!draft) return;
@@ -306,10 +320,10 @@ export function PlexApp({
     setError(undefined);
     setErrors({});
     try {
-      await api.putSection("plex", draft.plex);
+      await apiFetch("/config/plex", { method: "PUT", body: JSON.stringify(draft.plex) });
       toast.success(t("Settings saved"));
       await config.reload();
-      void refreshDashboard();
+      void refreshDashboard?.();
     } catch (err) {
       if (err instanceof ApiError && err.fields) {
         const translatedFields = err.fields.map((field) => ({
@@ -361,13 +375,48 @@ export function PlexApp({
         {downloads}
       </>
     );
-  if (config.error) return <ErrorPanel error={config.error} onRetry={() => void config.reload()} />;
-  if (!config.data || !draft)
+
+  const addressHeader = info ? (
+    <>
+      <AppAddressCard
+        info={info}
+        port={config.data?.server?.port ?? info.descriptor.defaultPort ?? 32400}
+        serverPort={config.data?.server?.port ?? 32400}
+        busy={busy}
+        onToggle={onToggle}
+        onSavePlexPort={(nextPort) =>
+          saveMainListenerPort(nextPort, config.data?.server?.port ?? 32400, async () => {
+            if (config.data) await config.reload();
+            await onReloadFrontends?.();
+          })
+        }
+      />
+      <ConnectDeviceCard
+        info={info}
+        preferredPort={String(config.data?.server?.port ?? 32400)}
+        serverName={config.data?.server?.friendlyName || boot?.serverName || "Ether"}
+      />
+    </>
+  ) : null;
+
+  if (config.error) {
     return (
-      <div className="py-10 text-center">
-        <Spinner size={20} label={t("Loading settings")} />
-      </div>
+      <>
+        {addressHeader}
+        <ErrorPanel error={config.error} onRetry={() => void config.reload()} />
+      </>
     );
+  }
+  if (!config.data || !draft) {
+    return (
+      <>
+        {addressHeader}
+        <div className="py-10 text-center">
+          <Spinner size={20} label={t("Loading settings")} />
+        </div>
+      </>
+    );
+  }
 
   const setPlex = (key: string, value: unknown) =>
     setDraft((old) => (old ? { ...old, plex: { ...old.plex, [key]: value } } : old));
@@ -384,21 +433,27 @@ export function PlexApp({
 
   return (
     <>
+      {addressHeader}
       <SettingsSection
-        title={t("Status")}
+        title={t("Plex account")}
         description={
           plexAccountClaimed(plex)
             ? undefined
             : t("Sign in to plex.tv so Plex apps can find Ether.")
         }
       >
-        <HomeStatusRow status={status} />
-        <ConnectionStatusRow state={status?.wan} title={away.title} detail={away.detail} />
+        <ConnectionStatusRow
+          state={status?.wan}
+          title={away.title}
+          detail={away.detail}
+          address={away.address}
+          label={away.label}
+        />
         <PlexAccount
           config={config.data}
           onChanged={async () => {
             await config.reload();
-            void refreshDashboard();
+            void refreshDashboard?.();
           }}
         />
       </SettingsSection>
@@ -459,6 +514,7 @@ function OptionGroup({
   };
   value: Obj;
   errors: Record<string, string>;
+  prefix?: string;
   onChange: (key: string, next: unknown) => void;
   moreLabel?: string;
 }) {
@@ -497,7 +553,7 @@ function OptionGroup({
 
 /** Plex's own metadata for Plex apps. It needs a claimed server and saves on change. */
 function PlexMetadata({ claimed }: { claimed: boolean }) {
-  const doc = useAsync(async () => (await api.getConfig()).plex, []);
+  const doc = useAsync(async () => (await fetchEtherConfig()).plex, []);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState<boolean>();
   const on = saved ?? Boolean(doc.data?.usePlexMetadata);
@@ -519,8 +575,10 @@ function PlexMetadata({ claimed }: { claimed: boolean }) {
             onChange={(e) => {
               const next = e.currentTarget.checked;
               setSaving(true);
-              void api
-                .putSection("plex", { usePlexMetadata: next })
+              void apiFetch("/config/plex", {
+                method: "PUT",
+                body: JSON.stringify({ usePlexMetadata: next }),
+              })
                 .then(() => setSaved(next))
                 .catch((err) => toast.error(t("Couldn't save"), { description: errorMessage(err) }))
                 .finally(() => setSaving(false));

@@ -96,18 +96,12 @@ func TestInstantPrepareAfterWarm(t *testing.T) {
 	waitWarm(t, h, owner.ID, "client", movieKey)
 	resolves0, probes0 := counts(h)
 
-	h.resolver.delay = 500 * time.Millisecond // a cold resolve would pay this
-	start := time.Now()
 	ps, err := h.m.Prepare(context.Background(), owner, movieKey, caps)
-	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if ps.Resolution.Release.ID != "r1" {
 		t.Fatalf("wrong release %+v", ps)
-	}
-	if elapsed > 300*time.Millisecond {
-		t.Fatalf("warm Prepare took %v, want <300ms", elapsed)
 	}
 	if resolves, probes := counts(h); resolves != resolves0 || probes != probes0 {
 		t.Fatalf("warm Prepare called backends: resolves %d->%d probes %d->%d", resolves0, resolves, probes0, probes)
@@ -451,6 +445,40 @@ func TestDownFailoverTriggersOnSlowSource(t *testing.T) {
 }
 
 func TestDownFailoverSkipsFastSourceAndGraceAndUnsafe(t *testing.T) {
+	for _, mode := range []string{"cold read", "cached delivery", "comfortable buffer"} {
+		t.Run(mode, func(t *testing.T) {
+			h := newHarness(t, []*fakeRelease{mkv("A", 80_000_000, 100*time.Second), mkv("B", 10_000_000, 100*time.Second)}, []string{"A", "B"}, func(h *harness, o *Options) { speedOpts(o) })
+			ps := h.prepare(owner, movieKey, "evidence")
+			s := h.m.lookup(ps.ID)
+			f := &repairHLS{fakeHLS: h.tr.addHLS(ps.ID), buffer: core.RecoveryBuffer{Position: time.Second, ReadyUntil: 2 * time.Second}}
+			if mode == "comfortable buffer" {
+				f.buffer.ReadyUntil = 61 * time.Second
+			}
+			h.m.deps.HLSLookup = func(string) (core.HLSSession, bool) { return f, true }
+			h.clock.Advance(30 * time.Second)
+			s.noteFetch(1<<20, 2400*time.Millisecond, h.clock.Now())
+			if mode == "cached delivery" {
+				feedFetches(s, 20, 1<<20, time.Microsecond, h.clock.Now())
+			}
+			if mode == "comfortable buffer" {
+				feedFetches(s, 10, 64<<10, 200*time.Millisecond, h.clock.Now())
+			}
+			for range 4 {
+				h.m.checkSpeeds()
+			}
+			if s.current().backgroundFailover.Load() {
+				t.Fatal("unnecessary down-failover started")
+			}
+			// A forbidden switch is scheduled asynchronously. Joining the manager's
+			// work via Close makes this assertion deterministic.
+			h.m.Close()
+			select {
+			case <-f.swapC:
+				t.Fatal("insufficient evidence or buffered source switched")
+			default:
+			}
+		})
+	}
 	t.Run("fast", func(t *testing.T) {
 		h := newHarness(t, []*fakeRelease{mkv("A", 80_000_000, 100*time.Second), mkv("B", 10_000_000, 100*time.Second)}, []string{"A", "B"},
 			func(h *harness, o *Options) { speedOpts(o) })

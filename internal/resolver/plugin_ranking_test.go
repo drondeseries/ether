@@ -1,8 +1,11 @@
 package resolver
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -32,7 +35,7 @@ func TestPluginRankingOnRealResolve(t *testing.T) {
 	dub.Name = strings.Replace(dub.Name, "1080p", "DUB.1080p", 1)
 	cfg := testCfg()
 	for i := range cfg.Quality.Profiles {
-		cfg.Quality.Profiles[i].Ranking = []string{"plugin:test.dub/dub"}
+		cfg.Quality.Profiles[i].PluginScores = map[string]json.RawMessage{"plugin:test.dub/dub": json.RawMessage(`{}`)}
 	}
 	s := New(&fakeIndexer{releases: []core.Release{plain, dub}}, fakeHealth{}, nil, cfg, Options{})
 	defer s.Close()
@@ -62,5 +65,30 @@ func TestPluginConditionOnResolve(t *testing.T) {
 	}
 	if got.Release.ID != "dub" {
 		t.Fatalf("winner=%s", got.Release.ID)
+	}
+}
+
+func TestPluginConditionOnFilenamePreview(t *testing.T) {
+	rules := []core.ReleaseRule{{ID: "dub", Name: "Dub", Action: "require", Conditions: []core.ReleaseCondition{{Field: "plugin:test.dub/dub", Operator: "in", Value: "fr,es"}}}}
+	s := serviceWithRules(t, &fakeIndexer{}, fakeHealth{}, rules)
+	s.SetRankingHooks(&dubHooks{})
+	body, _ := json.Marshal(map[string]any{
+		"profile": core.QualityProfile{ReleaseRules: rules},
+		"names":   []string{"Movie.2024.1080p.WEB-DL", "Movie.2024.1080p.DUB.WEB-DL"},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/rules/preview", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	s.ConsoleHandler(ConsoleDeps{}).ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("preview status=%d body=%s", w.Code, w.Body.String())
+	}
+	var out struct {
+		Releases []ConsoleRelease `json:"releases"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Releases) != 2 || out.Releases[0].Rejected || !strings.Contains(out.Releases[0].Release.Name, "DUB") || !out.Releases[1].Rejected {
+		t.Fatalf("unexpected filename preview releases: %+v", out.Releases)
 	}
 }

@@ -62,6 +62,9 @@ func readRAR4(r io.ReaderAt, size int64, o RAROptions) (*RARVolume, error) {
 		if headersEncrypted {
 			salt := make([]byte, 8)
 			if err := readAt(r, salt, pos, size); err != nil {
+				if o.SizeEstimated && mainSeen && atEstimatedVolumeEnd(r, pos) {
+					break
+				}
 				return nil, err
 			}
 			keys, err := crypto.rar4(salt)
@@ -76,10 +79,13 @@ func readRAR4(r io.ReaderAt, size int64, o RAROptions) (*RARVolume, error) {
 			headerBytes = 8 + padded
 		} else {
 			if err := readAt(r, base[:], pos, size); err != nil {
+				if o.SizeEstimated && mainSeen && atEstimatedVolumeEnd(r, pos) {
+					break
+				}
 				return nil, err
 			}
 			length := int64(binary.LittleEndian.Uint16(base[5:]))
-			if length < rar4BaseLen || length > size-pos {
+			if length < rar4BaseLen || length > size-pos || (o.MaxHeaderBytes > 0 && length > o.MaxHeaderBytes) {
 				return nil, fmt.Errorf("archive: invalid RAR4 header size: %w", ErrCorrupt)
 			}
 			h = make([]byte, length)
@@ -204,6 +210,39 @@ func finishRAR4(v *RARVolume, numberKnown bool) *RARVolume {
 	return v
 }
 
+// ReadRAR4TailVolumeNumber inspects the trailing bytes of a RAR 4.x volume for
+// an end-of-archive (0x7b) block carrying EARC_VOLNUMBER (0x0008), verified by
+// its 16-bit header CRC. It returns the 0-based volume number, or -1 if no
+// numbered end block is present.
+func ReadRAR4TailVolumeNumber(tail []byte) int {
+	if len(tail) > 64 {
+		tail = tail[len(tail)-64:]
+	}
+	for pos := len(tail) - (rar4BaseLen + 2); pos >= 0; pos-- {
+		if tail[pos+2] != rar4End {
+			continue
+		}
+		flags := binary.LittleEndian.Uint16(tail[pos+3:])
+		if flags&rar4EndVolNumber == 0 {
+			continue
+		}
+		hsize := int(binary.LittleEndian.Uint16(tail[pos+5:]))
+		off := rar4BaseLen
+		if flags&rar4EndDataCRC != 0 {
+			off += 4
+		}
+		if hsize < off+2 || pos+hsize > len(tail) {
+			continue
+		}
+		h := tail[pos : pos+hsize]
+		if uint16(crc32.ChecksumIEEE(h[2:])) != binary.LittleEndian.Uint16(h) {
+			continue
+		}
+		return int(binary.LittleEndian.Uint16(h[off:]))
+	}
+	return -1
+}
+
 // parseRAR4File decodes a file (0x74) or new sub-block (0x7a) header and
 // returns it with the size of the data that follows it.
 func parseRAR4File(h []byte, flags uint16) (RARFile, int64, error) {
@@ -243,7 +282,15 @@ func parseRAR4File(h []byte, flags uint16) (RARFile, int64, error) {
 	if nameSize > len(h)-p {
 		return f, 0, fmt.Errorf("name (%d bytes) overflows header: %w", nameSize, ErrCorrupt)
 	}
-	f.Name = decodeRAR4Name(h[p:p+nameSize], flags&rar4FileUnicode != 0)
+	f.StoredName = decodeRAR4RawName(h[p:p+nameSize], flags&rar4FileUnicode != 0)
+	f.Name = strings.ReplaceAll(f.StoredName, `\`, "/")
+	if flags&rar4FileUnicode == 0 {
+		// Keep embedded NUL bytes visible to identifier safety checks; the
+		// compatibility name decoder truncates them for ordinary RAR readers.
+		f.StoredName = bytesToString(h[p : p+nameSize])
+	}
+	f.NonRegular = (h[15] == 3 && binary.LittleEndian.Uint32(h[28:])&0xf000 != 0 && binary.LittleEndian.Uint32(h[28:])&0xf000 != 0x8000 && binary.LittleEndian.Uint32(h[28:])&0xf000 != 0x4000) || (h[15] == 2 && binary.LittleEndian.Uint32(h[28:])&0x400 != 0)
+	f.UnsafeName = strings.Contains(f.StoredName, "\\")
 	f.Stored = f.Method == rar4MethodStore
 	f.Encrypted = flags&rar4FilePassword != 0
 	f.Solid = flags&rar4FileSolid != 0
@@ -257,6 +304,10 @@ func parseRAR4File(h []byte, flags uint16) (RARFile, int64, error) {
 // field is either plain UTF-8 (no NUL) or an OEM name, a NUL and RAR's
 // compact UTF-16 encoding relative to that name.
 func decodeRAR4Name(field []byte, unicode bool) string {
+	return strings.ReplaceAll(decodeRAR4RawName(field, unicode), `\`, "/")
+}
+
+func decodeRAR4RawName(field []byte, unicode bool) string {
 	var name string
 	nul := -1
 	for i, c := range field {
@@ -279,7 +330,7 @@ func decodeRAR4Name(field []byte, unicode bool) string {
 		}
 		name = bytesToString(field)
 	}
-	return strings.ReplaceAll(name, `\`, "/")
+	return name
 }
 
 // bytesToString keeps valid UTF-8 and otherwise maps each byte to the rune

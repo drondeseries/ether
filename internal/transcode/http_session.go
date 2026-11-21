@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"net/http"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,18 +23,20 @@ import (
 type httpSession struct {
 	m    *Manager
 	id   string
+	dir  string
 	req  core.HLSRequest
 	life *encoderLifetime
 	log  *slog.Logger
 
-	mu         sync.Mutex
-	proc       Process
-	pipe       *io.PipeReader
-	requestSeq uint64
-	closed     bool
-	forceCPU   bool
-	delivered  atomic.Bool
-	lastAccess time.Time
+	mu             sync.Mutex
+	proc           Process
+	pipe           *io.PipeReader
+	requestSeq     uint64
+	closed         bool
+	softwareDecode bool
+	forceCPU       bool
+	delivered      atomic.Bool
+	lastAccess     time.Time
 }
 
 var _ core.HTTPSession = (*httpSession)(nil)
@@ -58,6 +62,10 @@ func (m *Manager) startHTTP(ctx context.Context, req core.HLSRequest, life *enco
 		m.mu.Unlock()
 		return nil, errors.New("transcode: manager closed")
 	}
+	if !req.LiveInput && encoding && m.cfg.VideoTranscodingOff() {
+		m.mu.Unlock()
+		return nil, ErrVideoTranscodingDisabled
+	}
 	if encoding && m.cfg.MaxTranscodes > 0 {
 		if m.encodingLocked("") >= m.cfg.MaxTranscodes {
 			m.preemptBackgroundLocked()
@@ -69,7 +77,7 @@ func (m *Manager) startHTTP(ctx context.Context, req core.HLSRequest, life *enco
 	}
 	life.encoding.Store(encoding)
 	m.mu.Unlock()
-	// Attach uses dir only as a cleanup key; HTTP output is a pipe.
+	// Attach uses dir for cleanup and any staged external sidecars.
 	dir := filepath.Join(m.tempDir, "http-"+unsafeID.ReplaceAllString(id, "_")+"-"+randomHex(4))
 	stub := &Session{
 		id:              id,
@@ -84,9 +92,11 @@ func (m *Manager) startHTTP(ctx context.Context, req core.HLSRequest, life *enco
 	if !life.attach(stub) {
 		return nil, errors.New("transcode: session closed")
 	}
+	req.Info = m.stageExternalSubtitles(dir, req.Info, req.ReleaseID)
 	h := &httpSession{
 		m:    m,
 		id:   id,
+		dir:  dir,
 		req:  req,
 		life: life,
 
@@ -131,6 +141,7 @@ func (s *httpSession) ServeSegment(w http.ResponseWriter, r *http.Request, n int
 }
 
 func (s *httpSession) SwapInput(ctx context.Context, inputURL string, info core.MediaInfo, at time.Duration) error {
+	info = s.m.stageExternalSubtitles(s.dir, info, "")
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
@@ -176,6 +187,26 @@ func (s *httpSession) busy() bool {
 	return s.proc != nil
 }
 
+// rangeStartsAfterZero reports whether a Range header asks for bytes
+// after the start of the body (including suffix ranges). Unparsable
+// headers are ignored, as HTTP allows.
+func rangeStartsAfterZero(rng string) bool {
+	spec, ok := strings.CutPrefix(strings.TrimSpace(rng), "bytes=")
+	if !ok {
+		return false
+	}
+	first, _, _ := strings.Cut(spec, ",")
+	start, _, ok := strings.Cut(strings.TrimSpace(first), "-")
+	if !ok {
+		return false
+	}
+	if start == "" {
+		return true // suffix range: the last N bytes of a stream with no end yet
+	}
+	n, err := strconv.ParseInt(start, 10, 64)
+	return err == nil && n > 0
+}
+
 func (s *httpSession) writeHTTPHeaders(w http.ResponseWriter) {
 	h := w.Header()
 	h.Set("Content-Type", "video/x-matroska")
@@ -195,7 +226,13 @@ func (s *httpSession) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.lastAccess = time.Now()
 	// A byte range cannot resume an encoder's Matroska output: a new encoder
 	// writes a different header and its offsets do not describe the old stream.
-	if s.forceCPU && r.Header.Get("Range") != "" {
+	// Roku retries a stalled progressive stream with a nonzero Range (#650):
+	// answering 200 with a restarted encode corrupts its demuxer, and the
+	// restart also supersedes (kills) the connection it is still playing,
+	// whose clean EOF then looks like the end of the title. Refuse the
+	// range without touching the running encoder; a range from byte 0 is
+	// just a fresh GET and is served normally.
+	if rng := r.Header.Get("Range"); rng != "" && (s.forceCPU || rangeStartsAfterZero(rng)) {
 		s.mu.Unlock()
 		http.Error(w, "progressive transcode does not support byte ranges", http.StatusRequestedRangeNotSatisfiable)
 		return
@@ -215,7 +252,15 @@ func (s *httpSession) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.proc.Stop()
 		s.proc = nil
 	}
+	probe := runSpec{LiveInput: s.req.LiveInput, CopyTimestamps: s.req.CopyTimestamps, InputHeaders: s.req.InputHeaders, Input: s.req.InputURL, Info: s.req.Info, Decision: s.req.Decision, Start: s.req.StartOffset, Protocol: core.ProtocolHTTP}
+	lease := s.req.InputLease
 	s.mu.Unlock()
+	if needsCopyKeyframe(probe) {
+		if scope, err := encoderScopeHeaders(lease, probe.Input); err == nil {
+			probe.InputScopeHeaders = scope
+			probe.SeekFrom, probe.HasSeekFrom = s.m.copyKeyframeBefore(r.Context(), probe)
+		}
+	}
 	silenceAudio := false
 	for attempt := 0; attempt < 2; attempt++ {
 		s.mu.Lock()
@@ -227,7 +272,7 @@ func (s *httpSession) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if s.forceCPU || time.Now().UnixNano() < s.m.httpHWFailedUntil.Load() {
 			accel = core.HWAccel{Name: AccelNone}
 		}
-		spec := runSpec{SilenceAudio: silenceAudio, LiveInput: s.req.LiveInput, CopyTimestamps: s.req.CopyTimestamps, InputHeaders: s.req.InputHeaders, Input: s.req.InputURL, Info: s.req.Info, Decision: s.req.Decision, Start: s.req.StartOffset, Accel: accel, Features: s.m.feat, Protocol: core.ProtocolHTTP, InputTimeout: s.m.opts.stallTimeout}
+		spec := runSpec{SoftwareDecode: s.softwareDecode, SilenceAudio: silenceAudio, LiveInput: s.req.LiveInput, CopyTimestamps: s.req.CopyTimestamps, InputHeaders: s.req.InputHeaders, Input: s.req.InputURL, Info: s.req.Info, Decision: s.req.Decision, Start: s.req.StartOffset, Accel: accel, Features: s.m.feat, Protocol: core.ProtocolHTTP, InputTimeout: s.m.opts.stallTimeout}
 		scopeHeaders, err := encoderScopeHeaders(s.req.InputLease, s.req.InputURL)
 		if err != nil {
 			s.mu.Unlock()
@@ -235,6 +280,9 @@ func (s *httpSession) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		spec.InputScopeHeaders = scopeHeaders
+		if probe.HasSeekFrom && spec.Input == probe.Input && spec.Start == probe.Start {
+			spec.SeekFrom, spec.HasSeekFrom = probe.SeekFrom, true
+		}
 		pr, pw := io.Pipe()
 		stderr := newTailBuffer(40)
 		cmd := Command{Path: s.m.ffmpeg, Args: buildArgs(spec), Stdout: pw, Stderr: &lineWriter{fn: stderr.add}}
@@ -247,6 +295,9 @@ func (s *httpSession) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "transcode failed", http.StatusServiceUnavailable)
 			return
 		}
+		// Progressive encodes run at normal priority; the output pipe
+		// naturally backpressures them when the client has enough media.
+		cmd.Background = !s.req.LiveInput && s.req.Decision.VideoCopy
 		proc, err := s.m.runner.Start(cmd)
 		if err != nil {
 			s.mu.Unlock()
@@ -259,7 +310,7 @@ func (s *httpSession) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "transcode failed", http.StatusInternalServerError)
 			return
 		}
-		s.life.fenceProcess(proc)
+		s.life.fenceProcess(proc, work[2])
 		s.proc = proc
 		s.pipe = pr
 		s.life.markStarted()
@@ -296,7 +347,7 @@ func (s *httpSession) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		clientWriteFailed := false
 		if n > 0 {
 			s.writeHTTPHeaders(w)
-			fw := &httpWriteTracker{writer: flushWriter{ResponseWriter: w, s: s}}
+			fw := &httpWriteTracker{writer: flushWriter{ResponseWriter: w, s: s, timeout: s.m.opts.httpWriteTimeout}}
 			if spec.usesHW() {
 				copyErr = copyHTTPMatroska(fw, io.MultiReader(bytes.NewReader(buf[:n]), pr))
 			} else {
@@ -317,7 +368,13 @@ func (s *httpSession) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		current := !s.closed && s.requestSeq == seq
 		hardwareFailed := current && r.Context().Err() == nil && !clientWriteFailed && spec.usesHW() && procErr != nil && looksLikeEncoderFailure(stderr.String(), spec)
-		if hardwareFailed {
+		if hardwareFailed && decodeInitFailure(stderr.String(), spec) {
+			s.softwareDecode = true
+			if caps := spec.Features.decode; caps != nil {
+				caps.reject(spec.Accel, spec.Info.Video())
+			}
+			s.log.Warn("progressive hardware decode failed; retrying with software decode and hardware encode", "hwaccel", spec.Accel.Name)
+		} else if hardwareFailed {
 			s.forceCPU = true
 			s.m.httpHWFailedUntil.Store(time.Now().Add(5 * time.Minute).UnixNano())
 			s.log.Warn("progressive hardware encoder failed; next request will use CPU", "hwaccel", spec.Accel.Name)
@@ -394,7 +451,8 @@ func (s *httpSession) Close() error {
 
 type flushWriter struct {
 	http.ResponseWriter
-	s *httpSession
+	s       *httpSession
+	timeout time.Duration
 }
 
 type httpWriteTracker struct {
@@ -414,12 +472,36 @@ func (w flushWriter) Write(p []byte) (int, error) {
 	if w.s != nil {
 		w.s.Touch()
 	}
+	// Bound each transport operation, not the lifetime of the movie. Clear
+	// the deadline even on error: waiting for the encoder's next bytes must
+	// not consume the next write's budget or poison a reused connection.
+	rc := http.NewResponseController(w.ResponseWriter)
+	timeout := w.timeout
+	if timeout <= 0 {
+		timeout = core.PausedSessionRetention
+	}
+	arm := func() error {
+		err := rc.SetWriteDeadline(time.Now().Add(timeout))
+		if errors.Is(err, http.ErrNotSupported) {
+			return nil // e.g. in-memory recorders
+		}
+		return err
+	}
+	defer rc.SetWriteDeadline(time.Time{})
+	if err := arm(); err != nil {
+		return 0, err
+	}
 	n, err := w.ResponseWriter.Write(p)
 	if n > 0 && w.s != nil {
 		w.s.delivered.Store(true)
 	}
-	if f, ok := w.ResponseWriter.(http.Flusher); ok {
-		f.Flush()
+	if err == nil {
+		if err = arm(); err == nil {
+			err = rc.Flush()
+			if errors.Is(err, http.ErrNotSupported) {
+				err = nil
+			}
+		}
 	}
 	return n, err
 }

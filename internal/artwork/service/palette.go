@@ -16,12 +16,14 @@ import (
 	"time"
 
 	"github.com/braedonsaunders/ether/internal/core"
+	"github.com/braedonsaunders/ether/internal/frontend"
 	"github.com/braedonsaunders/ether/internal/lru"
 
 	"github.com/braedonsaunders/ether/internal/store"
 )
 
 func init() {
+	// Historical migration namespace and table names preserve existing cached palettes.
 	store.Register("plex", 1, `CREATE TABLE plex_ultrablur (
 		key          INTEGER PRIMARY KEY,
 		backdrop     TEXT    NOT NULL,
@@ -60,6 +62,19 @@ type PaletteCache struct {
 
 	mu    sync.Mutex
 	items *lru.Cache[core.RatingKey, *ultraBlurEntry]
+	// persist reports whether key's colours may be written; nil writes
+	// all. Titles with no stored row keep theirs in the memory cache only.
+	persist func(context.Context, core.RatingKey) bool
+}
+
+// PersistFor limits database writes to keys persist accepts. Call before
+// serving.
+func (c *PaletteCache) PersistFor(persist func(context.Context, core.RatingKey) bool) {
+	if c != nil {
+		c.mu.Lock()
+		c.persist = persist
+		c.mu.Unlock()
+	}
 }
 
 func NewPaletteCache(db *sql.DB, submit func(string, func(context.Context)) bool, now func() time.Time, log *slog.Logger, compute func(context.Context, core.RatingKey, string) (Palette, error)) *PaletteCache {
@@ -110,7 +125,12 @@ func (c *PaletteCache) schedule(key core.RatingKey, path string) {
 			return
 		}
 		c.set(key, path, &colors)
-		c.save(ctx, key, path, colors)
+		c.mu.Lock()
+		persist := c.persist
+		c.mu.Unlock()
+		if persist == nil || persist(ctx, key) {
+			c.save(ctx, key, path, colors)
+		}
 	})
 }
 
@@ -125,10 +145,7 @@ func (c *PaletteCache) set(key core.RatingKey, path string, colors *Palette) {
 }
 
 // ultraBlurWant is one item a listing is about to render.
-type PaletteWant struct {
-	Key  core.RatingKey
-	Path string
-}
+type PaletteWant = frontend.ArtworkPaletteWant
 
 // preload fills the memory cache from the database for items it doesn't
 // hold yet, in one query, so a restart doesn't recompute anything and a
@@ -225,9 +242,7 @@ func (c *PaletteCache) save(ctx context.Context, key core.RatingKey, path string
 
 // CollectionArt is generated collection artwork. Smart-collection UltraBlur
 // colours come from that image when it exists.
-type CollectionArt interface {
-	CollectionArtwork(context.Context, *core.User, core.RatingKey, string, int) ([]byte, string, bool, error)
-}
+type CollectionArt = frontend.ArtworkCollectionArt
 
 // ComputeItemPalette derives UltraBlur colours for one catalogue item.
 // A smart collection uses its generated art (custom collection art) when the

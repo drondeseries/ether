@@ -5,7 +5,7 @@
  */
 import type { ImportFormat, QualityImportPlan, StarrApp, TrashProfile } from "../lib/releases";
 import { mediaTypeForApp } from "../lib/releases";
-import type { EtherConfig, QualityProfile } from "../lib/types";
+import type { EtherConfig, QualityItem, QualityProfile } from "../lib/types";
 
 type Reply = { status: number; body: unknown };
 
@@ -302,6 +302,7 @@ function plan(
   meta: { id?: string; source?: "trash" | "dictionarry" | "" } = {},
 ): QualityImportPlan | Reply {
   const allowed: string[] = [];
+  const qualityOrder: QualityItem[] = [];
   const sources: string[] = [];
   const skipped: string[] = [];
   let min = 0;
@@ -309,6 +310,7 @@ function plan(
   for (const item of native.items ?? []) {
     if (!item.allowed) continue;
     const group: string[] = [];
+    const order: string[] = [];
     for (const q of item.items?.length ? item.items : [item.name]) {
       const parsed = parseQuality(q);
       if (!parsed) {
@@ -317,11 +319,13 @@ function plan(
       }
       const [source, height] = parsed;
       allowed.push(`${source}-${height}`);
+      if (!order.includes(`${source}-${height}`)) order.push(`${source}-${height}`);
       if (!sources.includes(source) && !group.includes(source)) group.push(source);
       min = min ? Math.min(min, height) : height;
       max = Math.max(max, height);
     }
     sources.push(...group.sort((a, b) => SOURCE_ORDER.indexOf(a) - SOURCE_ORDER.indexOf(b)));
+    if (order.length) qualityOrder.push({ name: item.name, qualities: order });
   }
   if (!allowed.length)
     return fail(400, "invalid", "None of its enabled qualities can be streamed.");
@@ -347,14 +351,13 @@ function plan(
     minHeight: min,
     allowHdr: uhd,
     allowDolbyVision: uhd,
-    preferredSources: sources,
-    preferredCodecs: uhd ? ["hevc", "h264"] : ["h264", "hevc"],
-    preferredAudio: ["eac3", "ac3", "aac"],
     minSizeMbPerMin: 5,
     maxSizeMbPerMin: 0,
     preferredLanguages: null,
+    language: native.language?.trim().toLowerCase() || null,
     allowCam: false,
     allowedQualities: allowed,
+    qualityOrder,
     minCustomFormatScore: native.minFormatScore ?? 0,
     customFormatScores: Object.fromEntries(
       formats
@@ -370,10 +373,6 @@ function plan(
   warnings.push(
     "Upgrade and cutoff settings are left out: Ether picks the best release each time a title plays, so there is nothing to upgrade.",
   );
-  if (native.language === "Original")
-    warnings.push(
-      "Radarr limits this profile to each title's original language. Ether doesn't filter by language; it passes over dubs that don't match the original language, and the profile's language formats still score releases.",
-    );
   const lost = formats.filter((f) => f.status === "unsupported" || f.status === "missing").length;
   if (lost)
     warnings.push(
@@ -383,16 +382,15 @@ function plan(
     .filter((f) => f.status === "present" || f.status === "add")
     .reduce((sum, f) => sum + Math.max(0, f.score), 0);
   const minScore = native.minFormatScore ?? 0;
-  const unusable =
-    minScore > best
-      ? `Its minimum custom format score (${minScore}) is higher than the best score it can reach (${best}), so no release would ever play.`
-      : undefined;
+  if (minScore > best)
+    warnings.push(
+      `This profile prefers a score of ${minScore}; Ether will use the best available release while keeping hard rules.`,
+    );
   return {
     app,
     source: meta.source ?? "trash",
     profileId: meta.id,
     mediaType: mediaTypeForApp(app),
-    ...(unusable ? { unusable } : {}),
     profile,
     scoreSet,
     formats,

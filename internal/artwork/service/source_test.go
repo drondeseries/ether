@@ -221,3 +221,60 @@ func TestNeutralArtworkParentLookupIsStoredOnly(t *testing.T) {
 		t.Fatalf("missing inherited parent policy: %v", err)
 	}
 }
+
+func TestPluginLandscapeCardThumbAndBackdropFallback(t *testing.T) {
+	ctx := frontend.WithArtworkKinds(context.Background(), map[string]bool{
+		frontend.ImagePoster:   true,
+		frontend.ImageBackdrop: true,
+		frontend.ImageStill:    true,
+		frontend.ImageThumb:    true,
+	})
+	viewer := &core.User{ID: 1, IsOwner: true}
+	kThumb := core.PluginKey(101)
+	kBackdrop := core.PluginKey(102)
+	src := Source{
+		Catalog: storedArtwork{},
+		PluginItem: func(_ context.Context, _ *core.User, _ core.Device, k core.RatingKey) (*core.Title, []frontend.Image, error) {
+			switch k {
+			case kThumb:
+				title := core.Title{
+					Key:           kThumb,
+					Type:          core.TypeMovie,
+					LandscapeCard: true,
+					PosterPath:    "https://cdn.example/thumb-copied-to-poster.jpg",
+					ThumbPath:     "https://cdn.example/thumb.jpg",
+				}
+				return &title, []frontend.Image{{Kind: frontend.ImageThumb, Path: "https://cdn.example/thumb.jpg", Width: 1280, Height: 720}}, nil
+			case kBackdrop:
+				title := core.Title{
+					Key:           kBackdrop,
+					Type:          core.TypeEpisode,
+					LandscapeCard: true,
+					BackdropPath:  "https://cdn.example/backdrop.jpg",
+				}
+				return &title, []frontend.Image{{Kind: frontend.ImageBackdrop, Path: "https://cdn.example/backdrop.jpg", Width: 1920, Height: 1080}}, nil
+			default:
+				return nil, nil, core.ErrNotFound
+			}
+		},
+	}
+
+	imgs1, ok, err := src.List(ctx, frontend.ArtworkRequest{Viewer: viewer, Item: kThumb})
+	if err != nil || !ok || len(imgs1) != 1 || imgs1[0].Kind != frontend.ImageThumb {
+		t.Fatalf("thumb-only landscape item = %+v (ok=%v err=%v), want single ImageThumb", imgs1, ok, err)
+	}
+
+	imgs2, ok, err := src.List(ctx, frontend.ArtworkRequest{Viewer: viewer, Item: kBackdrop})
+	if err != nil || !ok {
+		t.Fatalf("backdrop landscape item err=%v ok=%v", err, ok)
+	}
+	hasThumb := false
+	for _, im := range imgs2 {
+		if im.Kind == frontend.ImageThumb {
+			hasThumb = true
+		}
+	}
+	if !hasThumb {
+		t.Fatalf("expected ImageThumb synthesized from backdrop on landscape item, got %+v", imgs2)
+	}
+}

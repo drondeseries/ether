@@ -49,7 +49,7 @@ type VODStatus struct {
 // A lease lasts until the response body closes, including cancelled seeks.
 func (s *Service) AcquireProvider(ctx context.Context, id string) (func(), error) {
 	src, err := s.storedSourceByID(ctx, id)
-	if err != nil || !src.VOD || src.Auth == nil || src.Auth.Type != "xtream" {
+	if err != nil || src.Disabled || !src.VOD || src.Auth == nil || src.Auth.Type != "xtream" {
 		return nil, core.ErrSourceUnavailable
 	}
 	e, err := s.sourceEntry(ctx, id)
@@ -60,7 +60,7 @@ func (s *Service) AcquireProvider(ctx context.Context, id string) (func(), error
 	if limit == 0 {
 		limit = 1
 	}
-	return s.reserveVODProvider(id, limit, core.SpeculativeIndexerWork(ctx))
+	return s.reserveVODProvider(ctx, id, limit, core.SpeculativeIndexerWork(ctx))
 }
 func (s *Service) vodClient(src Source, background bool) xtream.Client {
 	a := src.Auth
@@ -72,11 +72,20 @@ func (s *Service) vodClient(src Source, background bool) xtream.Client {
 		if src.MaxConnections > 0 {
 			limit = min(limit, src.MaxConnections)
 		}
-		release, err := s.reserveVODProvider(src.ID, limit, background)
+		requestCtx, cancel := context.WithCancel(ctx)
+		requestCtx = core.WithProviderLeaseCancel(requestCtx, cancel)
+		slot, err := s.reserveVODProvider(requestCtx, src.ID, limit, background)
+		release := func() {
+			if slot != nil {
+				slot()
+			}
+			cancel()
+		}
 		if err != nil {
+			cancel()
 			return nil, xtream.ErrBusy
 		}
-		rc, err := s.openURL(ctx, raw, a.header())
+		rc, err := s.openURL(requestCtx, raw, a.header())
 		if err != nil {
 			release()
 			return nil, err
@@ -93,39 +102,127 @@ type vodBody struct {
 
 func (b *vodBody) Close() error { err := b.ReadCloser.Close(); b.once.Do(b.release); return err }
 
-func (s *Service) vodLoop() {
-	defer s.wg.Done()
-	timer := time.NewTimer(time.Second)
-	defer timer.Stop()
+func (s *Service) wakeVODLoop() {
+	if s.vodWake != nil {
+		select {
+		case s.vodWake <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (s *Service) xtreamVODSources(ctx context.Context) ([]Source, error) {
+	rows, err := s.o.DB.QueryContext(ctx, `SELECT data FROM livetv_sources ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Source
+	for rows.Next() {
+		var b []byte
+		if err = rows.Scan(&b); err != nil {
+			return nil, err
+		}
+		v, _, err := s.decodeSource(b)
+		if err != nil {
+			continue
+		}
+		if !v.Disabled && v.VOD && v.Auth != nil && v.Auth.Type == "xtream" {
+			out = append(out, v)
+		}
+	}
+	return out, rows.Err()
+}
+
+// waitVOD sleeps until the timer fires. A source-change wake re-arms the
+// timer on the old one-minute cadence instead of running at once: an import
+// must not race the owner's own immediate refresh or edit for the provider's
+// single connection (RefreshVOD's TryLock / the stream limit).
+func (s *Service) waitVOD(timer *time.Timer, d time.Duration) bool {
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	timer.Reset(d)
 	for {
 		select {
-		case <-s.ctx.Done():
-			return
+		case <-s.serviceContext().Done():
+			return false
 		case <-timer.C:
-		}
-		sources, err := s.Sources(s.ctx)
-		if err == nil {
-			for _, v := range sources {
-				if !v.VOD || v.Auth == nil || v.Auth.Type != "xtream" {
-					continue
-				}
-				var next int64
-				_ = s.o.DB.QueryRowContext(s.ctx, `SELECT next FROM xtream_vod_refresh WHERE provider=?`, v.ID).Scan(&next)
-				if next > s.o.Now().Unix() {
-					continue
-				}
-				ctx, cancel := context.WithTimeout(s.ctx, 10*time.Minute)
-				err = s.RefreshVOD(ctx, v.ID)
-				cancel()
-				if err != nil && s.ctx.Err() == nil && !errors.Is(err, errVODSourceChanged) && !errors.Is(err, sql.ErrNoRows) {
-					var attempt *vodRefreshFailure
-					if errors.As(err, &attempt) {
-						s.recordVODFailure(s.ctx, v.ID, attempt.sourceData)
-					}
+			return true
+		case <-s.vodWake:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
 				}
 			}
+			timer.Reset(time.Minute)
 		}
-		timer.Reset(time.Minute)
+	}
+}
+
+func (s *Service) vodLoop() {
+	defer s.wg.Done()
+	timer := s.newTimer(time.Second)
+	defer timer.Stop()
+	select {
+	case <-s.serviceContext().Done():
+		return
+	case <-timer.C:
+	}
+	for {
+		sources, err := s.xtreamVODSources(s.serviceContext())
+		if err != nil {
+			if s.serviceContext().Err() != nil {
+				return
+			}
+			if !s.waitVOD(timer, time.Minute) {
+				return
+			}
+			continue
+		}
+		if len(sources) == 0 && store.DialectOf(s.o.DB) == store.SQLite {
+			select {
+			case <-s.serviceContext().Done():
+				return
+			case <-s.vodWake:
+				if !s.waitVOD(timer, time.Minute) {
+					return
+				}
+				continue
+			}
+		}
+		var earliest int64
+		for _, v := range sources {
+			var next int64
+			_ = s.o.DB.QueryRowContext(s.serviceContext(), `SELECT next FROM xtream_vod_refresh WHERE provider=?`, v.ID).Scan(&next)
+			if next <= s.o.Now().Unix() {
+				ctx, cancel := context.WithTimeout(s.serviceContext(), 10*time.Minute)
+				err = s.RefreshVOD(ctx, v.ID)
+				cancel()
+				if err != nil && s.serviceContext().Err() == nil && !errors.Is(err, errVODSourceChanged) && !errors.Is(err, sql.ErrNoRows) {
+					var attempt *vodRefreshFailure
+					if errors.As(err, &attempt) {
+						s.recordVODFailure(s.serviceContext(), v.ID, attempt.sourceData)
+					}
+				}
+				next = 0
+				_ = s.o.DB.QueryRowContext(s.serviceContext(), `SELECT next FROM xtream_vod_refresh WHERE provider=?`, v.ID).Scan(&next)
+			}
+			if next > 0 && (earliest == 0 || next < earliest) {
+				earliest = next
+			}
+		}
+		wait := 5 * time.Minute
+		if earliest > 0 {
+			wait = max(time.Minute, time.Unix(earliest, 0).Sub(s.o.Now()))
+		}
+		if !s.waitVOD(timer, wait) {
+			return
+		}
 	}
 }
 
@@ -326,7 +423,7 @@ func (s *Service) VODSearch(ctx context.Context, req core.SearchRequest) ([]core
 	var out []core.Release
 	for _, m := range matches {
 		src, e := s.storedSourceByID(ctx, m.provider)
-		if e != nil || !src.VOD || src.Auth == nil {
+		if e != nil || src.Disabled || !src.VOD || src.Auth == nil {
 			continue
 		}
 		c := s.vodClient(src, core.SpeculativeIndexerWork(ctx))
@@ -528,16 +625,8 @@ func (v *VODIndexer) hasVOD() bool {
 	if s == nil {
 		return false
 	}
-	sources, err := s.Sources(s.ctx)
-	if err != nil {
-		return false
-	}
-	for _, src := range sources {
-		if src.VOD && src.Auth != nil && src.Auth.Type == "xtream" {
-			return true
-		}
-	}
-	return false
+	sources, err := s.xtreamVODSources(s.serviceContext())
+	return err == nil && len(sources) > 0
 }
 func (v *VODIndexer) MissingSources() error {
 	if v.hasVOD() {
@@ -561,7 +650,41 @@ func (v *VODIndexer) FetchNZB(ctx context.Context, r core.Release) ([]byte, erro
 func (v *VODIndexer) HasDirectSources() bool { return v.hasVOD() }
 
 // The service mutex also covers live sessions and broadcast reservations.
-func (s *Service) reserveVODProvider(id string, limit int, background bool) (func(), error) {
+func (s *Service) reserveVODProvider(ctx context.Context, id string, limit int, background bool) (func(), error) {
+	entry, err := s.sourceEntry(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if entry.pool != nil && (entry.pool.LoginPool || len(entry.pool.Logins) > 0) {
+		if background {
+			s.loginPool.mu.Lock()
+			playing := false
+			for _, l := range s.loginPool.live {
+				if l.source == id && !strings.HasPrefix(l.raw, "vod:") {
+					playing = true
+					break
+				}
+			}
+			s.loginPool.mu.Unlock()
+			if playing {
+				return nil, ErrProviderBusy
+			}
+		}
+		// VOD URLs belong to the primary login; a second live account must
+		// never increase the primary account's VOD connection allowance.
+		lease, err := s.leaseLogin(ctx, id, "vod:"+randomID(), nil)
+		if err != nil {
+			return nil, err
+		}
+		if lease == nil {
+			return nil, ErrProviderBusy
+		}
+		s.loginPool.mu.Lock()
+		lease.onLost = core.ProviderLeaseCancel(ctx)
+		s.loginPool.mu.Unlock()
+		var once sync.Once
+		return func() { once.Do(func() { s.releaseLogin(lease) }) }, nil
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	channels := map[string]bool{}
@@ -650,7 +773,7 @@ func (s *Service) recordVODFailure(ctx context.Context, id string, attemptedSour
 		return
 	}
 	src, _, err := s.decodeSource(data)
-	if err != nil || !src.VOD || src.Auth == nil || src.Auth.Type != "xtream" {
+	if err != nil || src.Disabled || !src.VOD || src.Auth == nil || src.Auth.Type != "xtream" {
 		return
 	}
 	var failures int

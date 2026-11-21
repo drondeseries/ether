@@ -20,6 +20,78 @@ func deviceFor(credential string) frontend.Device {
 	return frontend.Device{ID: "stremio-" + hex.EncodeToString(h[:16]), Client: "Stremio", Product: "Stremio"}
 }
 
+const libraryCatalogPrefix = "ether-lib-"
+
+func libraryCatalogID(viewID string) string { return libraryCatalogPrefix + viewID }
+
+// libraryIDFromCatalog returns the library view id for an ether-lib-<id>
+// catalog id, or "" when the id names something else.
+func libraryIDFromCatalog(catalogID string) string {
+	if !strings.HasPrefix(catalogID, libraryCatalogPrefix) {
+		return ""
+	}
+	return strings.TrimPrefix(catalogID, libraryCatalogPrefix)
+}
+
+// stremioLibraryType maps a published library's Stremio presentation to a type
+// Stremio accepts. Empty means the library has no honest Stremio presentation
+// and is not listed (for example a books library).
+func stremioLibraryType(view frontend.View) string {
+	if view.Native != "" {
+		switch view.Native {
+		case "movie", "series", "channel", "tv":
+			return view.Native
+		}
+		return ""
+	}
+	// Native is empty for a view synthesised without a protocol presentation;
+	// fall back to the projected media type only when it maps cleanly.
+	switch view.Type {
+	case "movie":
+		return "movie"
+	case "show":
+		return "series"
+	default:
+		return ""
+	}
+}
+
+// stremioMetaID is the Stremio id for a catalog row: tmdb:<id> for a catalogue
+// title, else the item's pk: ItemRef when the host supplied one. Empty means
+// the row cannot be addressed by Stremio and is dropped.
+func stremioMetaID(title frontend.Title, ref frontend.ItemRef) string {
+	if title.IDs.TMDB > 0 {
+		return "tmdb:" + strconv.FormatInt(title.IDs.TMDB, 10)
+	}
+	if ref != "" {
+		return string(ref)
+	}
+	return ""
+}
+
+// itemRefs maps each plugin-keyed title to its ItemRef through the optional
+// frontend.KindRefKeys seam. Catalogue titles never need one.
+func (i *instance) itemRefs(r *http.Request, viewer *frontend.Viewer, titles []frontend.Title) map[frontend.RatingKey]frontend.ItemRef {
+	refs, ok := i.host.KindStreams.(frontend.KindRefKeys)
+	if !ok || viewer == nil {
+		return nil
+	}
+	keys := make([]frontend.RatingKey, 0, len(titles))
+	for _, title := range titles {
+		if title.IDs.TMDB <= 0 && title.Key.IsPluginKey() {
+			keys = append(keys, title.Key)
+		}
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+	out, err := refs.RefsForKeys(r.Context(), viewer, keys)
+	if err != nil {
+		return nil
+	}
+	return out
+}
+
 func (i *instance) catalog(w http.ResponseWriter, r *http.Request) {
 	credential := r.PathValue("credential")
 	viewer, err := i.host.Identity.Resolve(r.Context(), credential)
@@ -31,7 +103,27 @@ func (i *instance) catalog(w http.ResponseWriter, r *http.Request) {
 	typ, id := r.PathValue("type"), r.PathValue("id")
 	catalogID := strings.TrimSuffix(id, ".json")
 	purpose := map[string]frontend.RowPurpose{"ether-continue": frontend.RowContinue, "ether-recent": frontend.RowRecentlyReleased, "ether-recommendations": frontend.RowRecommendation}[catalogID]
-	if (typ != "movie" && typ != "series") || (purpose == "" && !((typ == "movie" && catalogID == "ether-movies") || (typ == "series" && catalogID == "ether-series"))) {
+	libID := libraryIDFromCatalog(catalogID)
+	if (typ != "movie" && typ != "series") || (purpose == "" && libID == "" && !((typ == "movie" && catalogID == "ether-movies") || (typ == "series" && catalogID == "ether-series"))) {
+		http.NotFound(w, r)
+		return
+	}
+	views, viewErr := i.host.Experience.Views(r.Context(), viewer)
+	if viewErr != nil {
+		http.Error(w, "Unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	allowed := false
+	for _, view := range views {
+		if stremioLibraryType(view) != typ {
+			continue
+		}
+		if purpose != "" || libID != "" && view.ID == libID || catalogID == "ether-movies" || catalogID == "ether-series" {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
 		http.NotFound(w, r)
 		return
 	}
@@ -69,6 +161,7 @@ func (i *instance) catalog(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var titles []frontend.Title
+	previewTitles := map[frontend.RatingKey]bool{}
 	if purpose == frontend.RowRecentlyReleased {
 		q.Sort, _ = kitsort.Order("PremiereDate")
 		q.Desc = true
@@ -107,6 +200,7 @@ func (i *instance) catalog(w http.ResponseWriter, r *http.Request) {
 					if string(title.Type) != map[string]string{"movie": "movie", "series": "show"}[typ] || seen[title.Key] {
 						continue
 					}
+					previewTitles[title.Key] = row.PreviewOnFocus
 					seen[title.Key] = true
 					titles = append(titles, title)
 				}
@@ -124,6 +218,9 @@ func (i *instance) catalog(w http.ResponseWriter, r *http.Request) {
 		q.Types = []frontend.MediaType{frontend.MediaType(map[string]string{"movie": "movie", "series": "show"}[typ])}
 		page, e := i.host.Experience.Search(r.Context(), viewer, device, query, q)
 		err, titles = e, page.Page.Items
+	} else if libID != "" {
+		page, e := i.host.Experience.LibraryItems(r.Context(), viewer, device, libID, q)
+		err, titles = e, page.Items
 	} else {
 		titles, err = i.libraryPage(r, viewer, device, typ, q)
 	}
@@ -132,18 +229,30 @@ func (i *instance) catalog(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	metas := make([]map[string]any, 0, len(titles))
-	posters := i.artwork(r, credential, device, titles)
+	posters := i.artwork(r, credential, viewer, device, titles)
+	var previewItems []frontend.Title
 	for _, title := range titles {
-		if title.IDs.TMDB <= 0 {
+		if previewTitles[title.Key] {
+			previewItems = append(previewItems, title)
+		}
+	}
+	backdrops := i.backdropArtwork(r, credential, viewer, device, previewItems)
+	refs := i.itemRefs(r, viewer, titles)
+	for _, title := range titles {
+		id := stremioMetaID(title, refs[title.Key])
+		if id == "" {
 			continue
 		}
-		id := "tmdb:" + strconv.FormatInt(title.IDs.TMDB, 10)
 		meta := map[string]any{"id": id, "type": typ, "name": title.Title, "description": title.Summary}
 		if title.Year > 0 {
 			meta["releaseInfo"] = strconv.Itoa(title.Year)
 		}
 		if poster := posters[title.Key]; poster != "" {
 			meta["poster"] = poster
+		}
+		if backdrop := backdrops[title.Key]; backdrop != "" {
+			meta["poster"] = backdrop
+			meta["posterShape"] = "landscape"
 		}
 		metas = append(metas, meta)
 	}
@@ -162,16 +271,22 @@ func (i *instance) libraryPage(r *http.Request, viewer *frontend.Viewer, device 
 	if err != nil {
 		return nil, err
 	}
+	want := map[string]string{"movie": "movie", "series": "show"}[typ]
+	var wanted []frontend.View
+	for _, view := range views {
+		if string(view.Type) == want {
+			wanted = append(wanted, view)
+		}
+	}
 	var titles []frontend.Title
 	offset := q.Offset
-	want := map[string]string{"movie": "movie", "series": "show"}[typ]
-	for _, view := range views {
-		if string(view.Type) != want {
-			continue
-		}
+	for n, view := range wanted {
 		query := q
 		query.Offset = offset
 		query.Limit = q.Limit - len(titles)
+		// Stremio pages by skip alone. Counting a filter's matches reads
+		// every title it admits, so the page is asked for without a total.
+		query.NoTotal = true
 		page, err := i.host.Experience.LibraryItems(r.Context(), viewer, device, view.ID, query)
 		if err != nil {
 			return nil, err
@@ -179,6 +294,14 @@ func (i *instance) libraryPage(r *http.Request, viewer *frontend.Viewer, device 
 		titles = append(titles, page.Items...)
 		if len(titles) >= q.Limit {
 			break
+		}
+		if len(page.Items) == 0 && offset > 0 && n < len(wanted)-1 {
+			// The skip lies past this view. Only its total says how much
+			// of the skip the next view still owes.
+			query.NoTotal = false
+			if page, err = i.host.Experience.LibraryItems(r.Context(), viewer, device, view.ID, query); err != nil {
+				return nil, err
+			}
 		}
 		offset = max(0, offset-page.Total)
 	}

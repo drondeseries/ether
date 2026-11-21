@@ -18,6 +18,8 @@ import (
 
 	"github.com/braedonsaunders/ether/internal/core"
 	"github.com/braedonsaunders/ether/internal/egress"
+	"github.com/braedonsaunders/ether/internal/frontend"
+	"github.com/braedonsaunders/ether/internal/httpclient"
 	"github.com/braedonsaunders/ether/internal/store"
 )
 
@@ -25,13 +27,7 @@ func init() {
 	store.Register("markers", 1, `CREATE TABLE markers_cache(rating_key INTEGER NOT NULL,runtime_ms INTEGER NOT NULL,ranges TEXT NOT NULL,expires_at INTEGER NOT NULL,PRIMARY KEY(rating_key,runtime_ms));`)
 }
 
-type Marker struct {
-	Type    string `json:"type"`
-	StartMS int64  `json:"startTimeOffset"`
-	EndMS   int64  `json:"endTimeOffset"`
-	Final   bool   `json:"final"`
-	Source  string `json:"source"`
-}
+type Marker = frontend.MarkerRange
 
 // Lookup is the live skip-marker configuration.
 // IntroOff and CreditsOff hide those buttons. The zero value offers both.
@@ -41,6 +37,9 @@ type Lookup struct {
 	IntroOff    bool
 	CreditsOff  bool
 	SourceOrder []string
+	// SkipDB turns the built-in SkipDB source on. Reads are open, so it has
+	// no key requirement; results are cached like a plugin source.
+	SkipDB bool
 }
 
 type Options struct {
@@ -97,6 +96,11 @@ func (s *Service) lookup() (enabled bool, apiKey string, intro, credits bool) {
 	}
 	cfg := s.o.Config()
 	return cfg.Enabled, cfg.APIKey, !cfg.IntroOff, !cfg.CreditsOff
+}
+
+// skipDBEnabled reports whether the built-in SkipDB source is switched on.
+func (s *Service) skipDBEnabled() bool {
+	return s.o.Config != nil && s.o.Config().SkipDB
 }
 
 func offer(in []Marker, intro, credits bool) []Marker {
@@ -326,7 +330,7 @@ func (s *Service) fetch(ctx context.Context, key core.RatingKey, d time.Duration
 		return nil, 0, err
 	}
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "Ether/1")
+	req.Header.Set("User-Agent", httpclient.UserAgent())
 	if apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}

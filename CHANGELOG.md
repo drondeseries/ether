@@ -1,5 +1,85 @@
 # Changelog
 
+## 0.3.8
+
+- **Memory:** Ether now sets an automatic soft memory limit at startup (90% of the container/cgroup limit when one exists, otherwise half of physical RAM, floor 1 GiB; logged with its source), so memory no longer climbs unbounded on small machines; set `GOMEMLIMIT` to override — it always wins.
+- **Performance:** availability hidden sets publish only the titles that
+  changed (interval membership instead of a full copy per refresh), so a
+  large library no longer holds the database writer for ~1 s every minute
+  or two and churns the database file; an unchanged set writes nothing.
+
+- **Playback:** HLS fMP4 streams that copy video while converting audio no longer stall on a spinner at multi-segment GOPs or hang on resume on LG webOS TVs, and evicted segments regenerate on demand while open sessions remain active (#417).
+- **Apps:** per-app **Public address** (Apps > Jellyfin, Emby, etc.) so an app routed through its own host name (e.g. `jelly.example.com`) shows that address on Connect and `/ether/me` instead of the Plex host; Plex keeps its custom server URLs, and apps without one keep the server-wide address (#413).
+- **Subtitles:** **Download a subtitle automatically when playback starts** switch under **Integrations > OpenSubtitles** (`openSubtitles.automaticPreferred`, off by default) (#286).
+- **Watchlists:** paste Plex's **Friends' Watchlist RSS** and **Your Watchlist RSS** URLs under **Catalog > Settings > Watchlists** (sealed at rest): because Plex's friends feed does not say which friend added what, Friends' Watchlist RSS publishes a shared **Your friends want to watch** Home row and collection while feeding availability checks, alerts, and warm-up alongside the owner's watchlist (#337).
+- **Trakt:** Viewers can connect Trakt from **Viewers > Limits** or on `/ether/me` using Trakt's activation code flow, syncing watch history, ratings and watchlists per viewer.
+- **Console:** **Plex Media Server sync** (**Integrations > Overview**) and **Plex account sync** (**Viewers > Limits**) are now named for what they sync with, and each viewer's **Limits** tab also shows their Plex Media Server mappings alongside their Plex account status.
+- **Plex Media Server sync:** per-mapping **Bring in full history from this server** and **Send Ether's full history to this server** actions under **Integrations > Plex Media Server sync** walk older watch history in pages in the background with live progress and never overwrite newer watch state on either side.
+
+## 0.3.7 (2026-11-09)
+
+- **Performance:** On Air graphics render only for watched channels, so the
+  decade channels no longer burn CPU unwatched; disabling a channel cancels its
+  renders; faster On Air rasterizing; calmer IPTV listing and availability
+  rebuilds (#409).
+- **Database:** hidden-title sets no longer pile up (minutes of retention,
+  compact storage); daily sweeps of expired derived data; idle compaction
+  returns free pages to disk; one pre-migration snapshot, removed after 7 days.
+- **Updates and health:** startup and migration work queues background writers
+  instead of failing them after 10 seconds; transient post-start states show as
+  checking, not errors; **Sync shared users**; client rules naming removed
+  quality profiles repair themselves (#407).
+- **Playback:** stopped Plex sessions end even if the player keeps fetching
+  (#410); LG webOS / VIDAA keep Direct Play for 4K HEVC, 1080p fallback
+  transcodes, a single HLS variant (#408); faster QSV HDR tone mapping.
+- **Jellyfin/Emby clients:** lenient device-profile decoding for Litefin (#404);
+  tag-less posters for Moonfin, served only for titles every viewer may see
+  (#405).
+- **Console:** Home designer bottom bulk bar and much faster first load; Cache
+  Explorer **Clear** without blocking (#402); **Latest season premiere** and
+  **Latest aired episode** collection rules (#406).
+- **Live TV:** decade channels keep to their own decade; Live TV does no
+  background work while nobody watches; a channel's programme feed is not a
+  second stream on Overview/Activity.
+- **Late fixes:** Experience counts real stalls per hour; Plex Media/Part lists
+  stay stable (#389) and DV-stripped variants keep subtitles (#191); Emby startup
+  calls (#327); live Overview/health; Radarr-style profile Language; season
+  release pinning (#318); home-release offset (#362); parser fixes (#335, #360);
+  diagnostics keep every rejection (#365).
+
+## 0.3.6 (2026-11-09)
+
+- **Decade channels:** CHROMA 80, RIOT 90, ORBIT 00 and SHIFT 10 ship on every
+  install, with weekly schedules built from your catalogue, rebuilt era
+  graphics and their own Apple TV logos; hidden until the catalogue can fill
+  them, and a deleted one stays deleted.
+- **Live TV:** commercials and bumpers from a link (one-click yt-dlp install),
+  **Show in apps** per channel, stability presets with recovery and backup
+  failover, IPTV refresh controls, guide improvements and Apple TV logos with
+  remote access (#383, #391).
+- **Quality:** profiles ranked the Radarr/Sonarr way with custom formats
+  (builds on #355); optional alternatives at every resolution. Profiles reset
+  to the new defaults on upgrade.
+- **Collections:** none created on fresh installs; genres, networks and
+  studios become templates; more than 200 templates in starter bundles,
+  translated into all 20 languages.
+- **Sources:** Statistics and Usage tabs with per-source drawers; Usenet season
+  packs (#378) and disc images (#393); archive, Usenet and anime fixes; a dead
+  debrid CDN node gets a fresh link (#396).
+- **Playback speed:** detail-page warm-up on Jellyfin, Emby and Silo, Stremio
+  stream-list warm-up, faster debrid starts, HDR/HEVC for native Stremio and
+  Nuvio players, native handling and hedged starts for cached add-on streams.
+- **Apps:** Android phones convert Dolby/DTS when streamed (#395), Plex for
+  Roku 4K (#394), Infuse Direct Mode rows and Watchlist, Plex for LG (#375),
+  Plex desktop downloads (#365), Plex account watch sync, Shield, Google TV
+  and Mac device entries.
+- **Database and console:** faster browsing on large libraries, a leaner
+  catalogue tidied in the background, maintenance that no longer blocks writes,
+  SQLite to PostgreSQL fix (#398), Overview and Activity agree, no false
+  plex.direct warning, automatic updates on by default for new installs.
+
+See the [release notes](release-notes/v0.3.6.md) for upgrade guidance and limits.
+
 ## 0.3.5 (2026-11-07)
 
 - **On Air:** virtual channels rebuilt as continuous channels, with styles and

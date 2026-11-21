@@ -35,7 +35,34 @@ func (s *Service) Router() http.Handler {
 			http.Error(w, e.Error(), 400)
 			return
 		}
-		reply(w, v)
+		out, e := s.Settings(r.Context())
+		if e != nil {
+			http.Error(w, "Settings unavailable", 500)
+			return
+		}
+		reply(w, out)
+	})
+	r.Post("/rss/sync", func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), time.Minute)
+		defer cancel()
+		_ = s.SyncRSS(ctx)
+		out, e := s.Settings(r.Context())
+		if e != nil {
+			http.Error(w, "Settings unavailable", 500)
+			return
+		}
+		reply(w, out)
+	})
+	r.Post("/friends/sync", func(w http.ResponseWriter, r *http.Request) {
+		s.StartFriendsSync(r.Context())
+		out, e := s.Settings(r.Context())
+		if e != nil {
+			http.Error(w, "Settings unavailable", 500)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(out)
 	})
 	r.Route("/users/{id}", func(r chi.Router) {
 		r.Use(func(next http.Handler) http.Handler {
@@ -53,6 +80,8 @@ func (s *Service) Router() http.Handler {
 				next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), viewerKey{}, u)))
 			})
 		})
+		s.communityJobRoutes(r)
+		s.availabilityRoutes(r)
 		r.Get("/", func(w http.ResponseWriter, r *http.Request) {
 			v, e := s.Items(r.Context(), viewer(r))
 			if e != nil {
@@ -130,10 +159,8 @@ func (s *Service) Router() http.Handler {
 		r.Post("/sync", func(w http.ResponseWriter, r *http.Request) {
 			ctx, cancel := context.WithTimeout(r.Context(), time.Minute)
 			defer cancel()
-			if e := s.Sync(ctx, viewer(r)); e != nil {
-				http.Error(w, e.Error(), 502)
-				return
-			}
+			result := SyncResult{}
+			syncErr := s.syncViewer(ctx, viewer(r), &result)
 			itemsCtx, itemsCancel := context.WithTimeout(r.Context(), time.Minute)
 			defer itemsCancel()
 			v, e := s.Items(itemsCtx, viewer(r))
@@ -141,23 +168,11 @@ func (s *Service) Router() http.Handler {
 				http.Error(w, "Watchlist unavailable", 500)
 				return
 			}
-			reply(w, v)
-		})
-		r.Post("/check", func(w http.ResponseWriter, r *http.Request) {
-			ctx, cancel := context.WithTimeout(r.Context(), 3*time.Minute)
-			defer cancel()
-			if e := s.Check(ctx, viewer(r)); e != nil {
-				http.Error(w, "Availability check incomplete", 502)
-				return
-			}
-			itemsCtx, itemsCancel := context.WithTimeout(r.Context(), time.Minute)
-			defer itemsCancel()
-			v, e := s.Items(itemsCtx, viewer(r))
-			if e != nil {
-				http.Error(w, "Watchlist unavailable", 500)
-				return
-			}
-			reply(w, v)
+			reply(w, struct {
+				Items []Item `json:"items"`
+				SyncResult
+				Failed bool `json:"failed"`
+			}{v, result, syncErr != nil})
 		})
 		r.Put("/items/{key}", func(w http.ResponseWriter, r *http.Request) {
 			k, e := core.ParseRatingKey(chi.URLParam(r, "key"))

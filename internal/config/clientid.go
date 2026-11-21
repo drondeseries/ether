@@ -4,215 +4,65 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+
+	"github.com/braedonsaunders/ether/internal/httpclient"
 )
 
-// Purpose values for ClientIdentity.Resolve.
-const (
-	IdentitySearch = "search"
-	IdentityGrab   = "grab"
-)
-
-// Preset keys. A preset names the client Ether looks like on the wire.
-const (
-	IdentityEther     = "ether"
-	IdentitySonarr    = "sonarr"
-	IdentityRadarr    = "radarr"
-	IdentityProwlarr  = "prowlarr"
-	IdentityNZBHydra2 = "nzbhydra2"
-	IdentitySABnzbd   = "sabnzbd"
-	IdentityNZBGet    = "nzbget"
-	// IdentityCustom is policy-only: its user agent and headers come from
-	// the policy, so an indexer cannot select it.
-	IdentityCustom = "custom"
-)
-
-// Identity is one resolved identity: what Ether writes on the wire.
+// Identity is the resolved client identity Ether writes on the wire.
 type Identity struct {
-	Preset    string
 	UserAgent string
 	Headers   map[string]string
-	Params    []string // Newznab parameter order; nil keeps Go's alphabetical order
-	Offset0   bool     // send offset=0 on every search, as a paged client does
+	// Ordered is the full header set in profile order (User-Agent included).
+	Ordered []HeaderKV
+	// Params are query-parameter overrides, applied last by ShapeQuery.
+	Params  []KVOverride
+	Shape   QueryShape
+	Profile string
 }
 
 // ClientIdentity is the owner's policy for the client Ether presents to
-// Newznab/Torznab indexers.
+// Newznab/Torznab indexers. An empty UserAgent identifies as Ether.
 type ClientIdentity struct {
-	TVSearch    string            `json:"tvSearch,omitempty"`    // preset key; empty = "ether"
-	MovieSearch string            `json:"movieSearch,omitempty"` // preset key; empty = "ether"
-	TVGrab      string            `json:"tvGrab,omitempty"`      // preset key; empty = "ether"
-	MovieGrab   string            `json:"movieGrab,omitempty"`   // preset key; empty = "ether"
-	UserAgent   string            `json:"userAgent,omitempty"`
-	Headers     map[string]string `json:"headers,omitempty"` // sealed at rest, redacted in API responses
+	UserAgent string            `json:"userAgent,omitempty"`
+	Headers   map[string]string `json:"headers,omitempty"` // sealed at rest, redacted in API responses
 }
 
 // IdentityFieldError is one rejected client-identity setting, keyed like the
-// config field it belongs to ("tvSearch", "userAgent", "headers").
+// config field it belongs to ("userAgent", "headers").
 type IdentityFieldError struct {
 	Field   string
 	Message string
 }
 
-const servarrAccept = "application/rss+xml, text/rss+xml, application/xml, text/xml"
-
-// identityPresets is the literal wire shape of each client. Versions and the
-// Servarr OS token are a snapshot refreshed by editing this table: Servarr
-// builds its user agent from the host's /etc/os-release ID and VERSION_ID,
-// lowercased, quotes trimmed. Header maps here are shared and never mutated.
-var identityPresets = map[string]Identity{
-	IdentityEther: {Preset: IdentityEther, UserAgent: "Ether/1.0"},
-	IdentitySonarr: {
-		Preset:    IdentitySonarr,
-		UserAgent: "Sonarr/4.0.20.3014 (ubuntu 26.04)",
-		Headers:   map[string]string{"Accept": servarrAccept},
-		Params:    []string{"t", "id", "cat", "extended", "apikey", "offset", "limit", "tvdbid", "tmdbid", "imdbid", "season", "ep", "q"},
-		Offset0:   true,
-	},
-	IdentityRadarr: {
-		Preset:    IdentityRadarr,
-		UserAgent: "Radarr/6.4.4.10685 (ubuntu 26.04)",
-		Headers:   map[string]string{"Accept": servarrAccept},
-		Params:    []string{"t", "id", "cat", "extended", "apikey", "offset", "limit", "tvdbid", "tmdbid", "imdbid", "season", "ep", "q"},
-		Offset0:   true,
-	},
-	IdentityProwlarr: {
-		Preset:    IdentityProwlarr,
-		UserAgent: "Prowlarr/2.7.0.5723 (ubuntu 26.04)",
-		Headers:   map[string]string{"Accept": servarrAccept},
-		Params:    []string{"t", "id", "extended", "cat", "apikey", "tvdbid", "tmdbid", "imdbid", "tvmazeid", "rid", "season", "ep", "q", "limit", "offset"},
-		// Prowlarr forwards the caller's offset (Sonarr and Radarr always
-		// send one), so its requests to an indexer carry offset=0.
-		Offset0: true,
-	},
-	IdentityNZBHydra2: {
-		Preset:    IdentityNZBHydra2,
-		UserAgent: "NZBHydra2 9.2.0",
-		Headers:   map[string]string{"Accept": "application/xml", "Content-Type": "application/xml"},
-		Params:    []string{"apikey", "t", "id", "extended", "tvdbid", "tmdbid", "imdbid", "tvmazeid", "rid", "q", "season", "ep", "cat", "limit", "offset"},
-		// Hydra2 pages every search from 0, so offset is always present.
-		Offset0: true,
-	},
-	// SABnzbd and NZBGet are grab-side personas: their user agent and fixed
-	// headers are what a downloader sends when it fetches an NZB.
-	IdentitySABnzbd: {Preset: IdentitySABnzbd, UserAgent: "SABnzbd/5.1.3"},
-	IdentityNZBGet:  {Preset: IdentityNZBGet, UserAgent: "nzbget/26.3", Headers: map[string]string{"Accept": "*/*"}},
+// DefaultUserAgent returns Ether's honest outbound User-Agent string.
+func DefaultUserAgent() string {
+	return httpclient.UserAgent()
 }
 
-// IdentityPreset is one selectable preset as owner-facing APIs report it.
-type IdentityPreset struct {
-	Key       string            `json:"key"`
-	UserAgent string            `json:"userAgent"`
-	Headers   map[string]string `json:"headers,omitempty"`
-}
-
-// identityPresetOrder is the order the owner's selectors show.
-var identityPresetOrder = []string{
-	IdentityEther,
-	IdentitySonarr,
-	IdentityRadarr,
-	IdentityProwlarr,
-	IdentityNZBHydra2,
-	IdentitySABnzbd,
-	IdentityNZBGet,
-}
-
-// IdentityPresets returns every preset in display order. Header maps are
-// copies, so a caller cannot change what goes on the wire.
-func IdentityPresets() []IdentityPreset {
-	out := make([]IdentityPreset, 0, len(identityPresetOrder))
-	for _, key := range identityPresetOrder {
-		id := identityPresets[key]
-		var headers map[string]string
-		if len(id.Headers) > 0 {
-			headers = make(map[string]string, len(id.Headers))
-			for name, value := range id.Headers {
-				headers[name] = value
-			}
-		}
-		out = append(out, IdentityPreset{Key: key, UserAgent: id.UserAgent, Headers: headers})
+// Resolve returns the wire identity for an indexer. override is the indexer's
+// own UserAgent ("": inherit the global policy; an empty policy uses Ether's
+// default User-Agent). Custom headers always come from the global policy.
+func (p ClientIdentity) Resolve(override string) Identity {
+	agent := strings.TrimSpace(override)
+	if agent == "" {
+		agent = strings.TrimSpace(p.UserAgent)
 	}
-	return out
+	if agent == "" {
+		agent = DefaultUserAgent()
+	}
+	return Identity{UserAgent: agent, Headers: p.Headers}
 }
 
-// ValidIndexerIdentity reports whether name can stand in for one indexer.
-// "custom" is policy-only: its user agent and headers belong to the policy.
-func ValidIndexerIdentity(name string) bool {
-	name = strings.ToLower(strings.TrimSpace(name))
-	_, ok := identityPresets[name]
-	return ok
-}
-
-// ValidSearchIdentity reports whether name can present a search. SABnzbd and
-// NZBGet only fetch NZBs, so a search presented as one is a client that does
-// not exist.
-func ValidSearchIdentity(name string) bool {
-	name = strings.ToLower(strings.TrimSpace(name))
-	return ValidIndexerIdentity(name) && name != IdentitySABnzbd && name != IdentityNZBGet
-}
-
-// Resolve returns the identity for one purpose and media. override is the
-// indexer's value; "" inherits the policy, and an unset policy field is the
-// Ether identity. Nothing falls back across fields: what the owner sets is
-// what is sent.
-func (p ClientIdentity) Resolve(override, purpose string, tv bool) Identity {
-	name := strings.TrimSpace(override)
-	if name == "" {
-		switch {
-		case purpose == IdentityGrab && tv:
-			name = p.TVGrab
-		case purpose == IdentityGrab:
-			name = p.MovieGrab
-		case tv:
-			name = p.TVSearch
-		default:
-			name = p.MovieSearch
-		}
-	}
-	name = strings.ToLower(strings.TrimSpace(name))
-	if name == IdentityCustom {
-		agent := strings.TrimSpace(p.UserAgent)
-		if agent == "" {
-			agent = identityPresets[IdentityEther].UserAgent
-		}
-		return Identity{Preset: IdentityCustom, UserAgent: agent, Headers: p.Headers}
-	}
-	if id, ok := identityPresets[name]; ok {
-		return id
-	}
-	return identityPresets[IdentityEther]
+// ValidateUserAgent checks a free-text User-Agent value (global or per
+// indexer), returning "" when valid or a human-readable reason when rejected.
+func ValidateUserAgent(value string) string {
+	return invalidHeaderValue(value, 512)
 }
 
 // Validate rejects settings the transport or an indexer would choke on.
 func (p ClientIdentity) Validate() []IdentityFieldError {
 	var errs []IdentityFieldError
-	custom := false
-	for _, s := range []struct{ field, value string }{
-		{"tvSearch", p.TVSearch},
-		{"movieSearch", p.MovieSearch},
-		{"tvGrab", p.TVGrab},
-		{"movieGrab", p.MovieGrab},
-	} {
-		name := strings.ToLower(strings.TrimSpace(s.value))
-		if name == IdentityCustom {
-			custom = true
-			continue
-		}
-		if name == "" {
-			continue
-		}
-		if !ValidIndexerIdentity(name) {
-			errs = append(errs, IdentityFieldError{s.field, "must be a known client identity"})
-			continue
-		}
-		search := s.field == "tvSearch" || s.field == "movieSearch"
-		if search && !ValidSearchIdentity(name) {
-			errs = append(errs, IdentityFieldError{s.field, "must be a client that searches; SABnzbd and NZBGet only download"})
-		}
-	}
-	if custom && strings.TrimSpace(p.UserAgent) == "" {
-		errs = append(errs, IdentityFieldError{"userAgent", "a user agent is required when an identity is Custom"})
-	}
-	if msg := invalidHeaderValue(p.UserAgent, 512); msg != "" {
+	if msg := ValidateUserAgent(p.UserAgent); msg != "" {
 		errs = append(errs, IdentityFieldError{"userAgent", msg})
 	}
 	if len(p.Headers) > 16 {
@@ -260,8 +110,98 @@ func invalidHeaderValue(value string, max int) string {
 	if strings.ContainsAny(value, "\r\n\x00") {
 		return "must not contain line breaks"
 	}
+	for i := 0; i < len(value); i++ {
+		if (value[i] < 0x20 && value[i] != '\t') || value[i] == 0x7f {
+			return "must contain only printable characters"
+		}
+	}
 	if len(value) > max {
 		return "is too long"
 	}
 	return ""
+}
+
+// legacyPresetUserAgents exists only to convert saved preset selections from
+// older configs into explicit free-text userAgent values on load (no legacy
+// compatibility beyond that one-time conversion).
+var legacyPresetUserAgents = map[string]string{
+	"sonarr":    "Sonarr/4.0.20.3014 (ubuntu 26.04)",
+	"radarr":    "Radarr/6.4.4.10685 (ubuntu 26.04)",
+	"prowlarr":  "Prowlarr/2.7.0.5723 (ubuntu 26.04)",
+	"nzbhydra2": "NZBHydra2 9.2.0",
+	"sabnzbd":   "SABnzbd/5.1.3",
+	"nzbget":    "nzbget/26.3",
+}
+
+// upgradeClientIdentity converts saved pre-removal preset fields on global
+// clientIdentity and per-indexer entries into free-text userAgent values and
+// drops the retired fields, reporting whether doc changed.
+func upgradeClientIdentity(doc map[string]any) bool {
+	changed := false
+	if ci, ok := doc["clientIdentity"].(map[string]any); ok {
+		ua, _ := ci["userAgent"].(string)
+		if strings.TrimSpace(ua) == "" {
+			for _, slot := range []string{"tvSearch", "movieSearch", "tvGrab", "movieGrab"} {
+				raw, _ := ci[slot].(string)
+				key := strings.ToLower(strings.TrimSpace(raw))
+				if key == "" || key == "ether" {
+					continue
+				}
+				if key == "custom" {
+					break
+				}
+				if mapped, ok := legacyPresetUserAgents[key]; ok {
+					ci["userAgent"] = mapped
+					changed = true
+					break
+				}
+			}
+		}
+		for _, slot := range []string{"tvSearch", "movieSearch", "tvGrab", "movieGrab"} {
+			if _, exists := ci[slot]; exists {
+				delete(ci, slot)
+				changed = true
+			}
+		}
+	}
+	if ixs, ok := doc["indexers"].([]any); ok {
+		for _, item := range ixs {
+			ix, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			// One-time migration: a saved per-indexer user agent becomes a
+			// request identity (the matching profile, or custom with that
+			// exact user agent). userAgent stays as a mirror.
+			if _, has := ix["requestIdentity"]; !has {
+				if ua, _ := ix["userAgent"].(string); strings.TrimSpace(ua) != "" {
+					if profile, ok := ProfileForUserAgent(ua); ok {
+						ix["requestIdentity"] = map[string]any{"profile": profile}
+					} else {
+						custom := map[string]any{
+							"profile": "custom",
+							"headers": []any{map[string]any{"name": "User-Agent", "value": strings.TrimSpace(ua)}},
+						}
+						ix["requestIdentity"] = custom
+					}
+					changed = true
+				}
+			}
+			raw, exists := ix["clientIdentity"]
+			if !exists {
+				continue
+			}
+			existingUA, _ := ix["userAgent"].(string)
+			if strings.TrimSpace(existingUA) == "" {
+				preset, _ := raw.(string)
+				key := strings.ToLower(strings.TrimSpace(preset))
+				if mapped, ok := legacyPresetUserAgents[key]; ok {
+					ix["userAgent"] = mapped
+				}
+			}
+			delete(ix, "clientIdentity")
+			changed = true
+		}
+	}
+	return changed
 }

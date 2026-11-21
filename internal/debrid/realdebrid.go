@@ -195,6 +195,13 @@ func rdLinkFor(info *rdInfo, fileID string) string {
 }
 
 func (p *realDebrid) Acquire(ctx context.Context, req AcquireRequest) (_ *Acquired, err error) {
+	if req.Private && !req.privateChecked {
+		var perr error
+		req, perr = prepareAcquire(ctx, p, req, false)
+		if perr != nil {
+			return nil, perr
+		}
+	}
 	id, added := req.TorrentID, false
 	if id == "" {
 		var out struct {

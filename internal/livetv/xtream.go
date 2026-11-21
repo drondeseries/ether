@@ -168,6 +168,13 @@ func fetchXtream(ctx context.Context, s *Service, src *Source) (Fetched, error) 
 	x := newXtreamAPI(s, src.Auth)
 	acct, err := x.account(ctx, s.o.Now())
 	if err != nil {
+		if len(src.Logins) > 0 {
+			src.Account = acct
+			if src.Account == nil {
+				src.Account = &ProviderAccount{Status: "Disabled", CheckedAt: s.o.Now()}
+			}
+			return s.cachedPrimaryLineup(ctx, src, err)
+		}
 		return Fetched{}, err
 	}
 	src.Account = acct
@@ -183,6 +190,11 @@ func fetchXtream(ctx context.Context, s *Service, src *Source) (Fetched, error) 
 	if err := x.get(ctx, "get_live_streams", &streams); err != nil {
 		return Fetched{}, err
 	}
+	if len(streams) == 0 {
+		if err := s.refuseEmptyLineup(ctx, src); err != nil {
+			return Fetched{}, err
+		}
+	}
 	old, err := s.sourceStreamIDs(ctx, src.ID)
 	if err != nil {
 		return Fetched{}, err
@@ -191,7 +203,7 @@ func fetchXtream(ctx context.Context, s *Service, src *Source) (Fetched, error) 
 	src.Account = acct
 	src.Playlist = ""
 	cs = s.applyGroupRules(ctx, src, cs)
-	g, err := fetchSourceGuide(ctx, s, src, cs, true)
+	g, err := fetchSourceGuide(ctx, s, src, cs, true, nil)
 	if err != nil {
 		return Fetched{}, err
 	}

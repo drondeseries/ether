@@ -28,6 +28,9 @@ type CertifiedApp struct {
 }
 
 type Descriptor struct {
+	// Auth declares the authentication mode; none_lan requires an owner-selected viewer.
+	Auth           string         `json:"auth,omitempty"`
+	PathPrefix     string         `json:"pathPrefix,omitempty"`
 	ID             Protocol       `json:"id"`
 	Name           string         `json:"name"`
 	Logo           string         `json:"logo,omitempty"`
@@ -46,6 +49,7 @@ type ListenerSpec struct {
 	Shared bool `json:"shared,omitempty"`
 }
 type Status struct {
+	WebPlayerReady   bool      `json:"webPlayerReady,omitempty"`
 	Mounted          bool      `json:"mounted"`
 	Addresses        []string  `json:"addresses"`
 	ConnectURLs      []string  `json:"connectUrls,omitempty"`
@@ -53,12 +57,18 @@ type Status struct {
 	LANReason        string    `json:"lanReason,omitempty"`
 	LANCheckedAt     time.Time `json:"lanCheckedAt,omitzero"`
 	WAN              string    `json:"wan"`
+	WANReason        string    `json:"wanReason,omitempty"`
+	WANAddress       string    `json:"wanAddress,omitempty"`
+	WANCheckedAt     time.Time `json:"wanCheckedAt,omitzero"`
 	Clients24h       int       `json:"clients24h"`
 	Clients24hKnown  bool      `json:"clients24hKnown"`
 	LiveStreams      int       `json:"liveStreams"`
 	LiveStreamsKnown bool      `json:"liveStreamsKnown"`
 	TargetVersion    string    `json:"targetVersion"`
 	Conformance      string    `json:"conformance"`
+	BusyPort         int       `json:"busyPort,omitempty"`
+	ActualPort       int       `json:"actualPort,omitempty"`
+	BusyPortHolder   string    `json:"busyPortHolder,omitempty"`
 	Error            string    `json:"error,omitempty"`
 	Warnings         []string  `json:"warnings,omitempty"`
 }
@@ -74,6 +84,57 @@ type Frontend interface {
 // SettingsValidator lets a frontend validate its own protocol-specific options.
 // The host also checks common listener options before persistence.
 type SettingsValidator interface{ ValidateSettings(Settings) error }
+
+// Shutdowner is optionally implemented by a Frontend that retains process-owned
+// state across mounts so the host can release it once on runtime shutdown.
+type Shutdowner interface{ Shutdown(context.Context) error }
+
+// DerivedPruner is optionally implemented by a Frontend or Instance that owns
+// derived rows or caches pruned during background maintenance.
+type DerivedPruner interface {
+	Prune(context.Context) (int64, error)
+}
+
+// OwnerSessionStopper is optionally implemented by a mounted Instance that
+// delivers an owner stream-termination message to the client's timeline.
+type OwnerSessionStopper interface {
+	NoteOwnerStop(sessionID, reason string)
+}
+
+// LiveLineupObserver is optionally implemented by a mounted Instance that
+// notifies connected clients when the Live TV lineup changes. A non-positive
+// viewerID broadcasts to all viewers.
+type LiveLineupObserver interface {
+	NotifyLiveLineupChanged(viewerID int64)
+}
+
+// ViewerDiagnostics is optionally implemented by a mounted Instance that
+// contributes protocol-specific viewer facts to owner support bundles.
+type ViewerDiagnostics interface {
+	SupportViewer(context.Context, *core.User) (diagnostics.ViewerFacts, error)
+}
+
+// BackgroundWorker is optionally implemented by a mounted Instance that runs
+// asynchronous work behind requests.
+type BackgroundWorker interface {
+	BackgroundBusy() int
+}
+
+// PublishedLibrarySection describes a library section advertised to external
+// account directories.
+type PublishedLibrarySection struct {
+	ID       int
+	Type     MediaType
+	Title    string
+	UUID     string
+	Language string
+}
+
+// PublishedLibraryProvider is optionally implemented by a mounted Instance
+// that exposes canonical library sections for remote directory registration.
+type PublishedLibraryProvider interface {
+	PublishedLibraries() []PublishedLibrarySection
+}
 
 type Instance interface {
 	Handler() http.Handler
@@ -93,6 +154,7 @@ type SurfaceIdentity interface {
 	ViewerTimes(context.Context, string, int64) (ViewerTimes, error)
 	PublicViewers(context.Context) ([]PublicViewer, error)
 	SignIn(context.Context, string, string, core.Device) (string, error)
+	SignInWithPlex(context.Context, string, core.Device) (string, error)
 	IssueRefresh(context.Context, string, core.Device) (string, error)
 	Refresh(context.Context, string, core.Device) (string, string, error)
 	QuickConnectInitiate(context.Context, core.Device) (code, secret string, err error)
@@ -102,6 +164,11 @@ type SurfaceIdentity interface {
 	QuickConnectApprove(context.Context, *core.Viewer, string) error
 	Revoke(context.Context, string) error
 	SetupComplete() bool
+	Accept(context.Context, string) (*core.Viewer, CredentialAcceptance, error)
+	ReceiptCurrent(context.Context, CredentialAcceptance) error
+	IssueDelegation(context.Context, int64) (string, error)
+	ActiveUser(context.Context, int64) (*core.User, error)
+	Users(context.Context) ([]core.User, error)
 }
 
 type quietIdentityKey struct{}
@@ -184,12 +251,21 @@ var ErrRateLimited = errors.New("frontend identity rate limited")
 // ErrQuickConnectPending means the code has not yet been approved.
 var ErrQuickConnectPending = errors.New("frontend quick connect pending")
 
+// ErrQuickConnectExpired means the code was real and its approval window closed.
+var ErrQuickConnectExpired = errors.New("frontend quick connect expired")
+
+// ErrQuickConnectUsed means the code was already approved or redeemed.
+var ErrQuickConnectUsed = errors.New("frontend quick connect already used")
+
 // BindIdentity alone binds resolution; app-hosted implementations additionally
 // provide credential issuance and Quick Connect operations.
 func (boundIdentity) PublicViewers(context.Context) ([]PublicViewer, error) {
 	return nil, ErrIdentityUnavailable
 }
 func (boundIdentity) SignIn(context.Context, string, string, core.Device) (string, error) {
+	return "", ErrIdentityUnavailable
+}
+func (boundIdentity) SignInWithPlex(context.Context, string, core.Device) (string, error) {
 	return "", ErrIdentityUnavailable
 }
 func (boundIdentity) QuickConnectInitiate(context.Context, core.Device) (string, string, error) {
@@ -209,6 +285,130 @@ func (boundIdentity) QuickConnectApprove(context.Context, *core.Viewer, string) 
 }
 func (boundIdentity) Revoke(context.Context, string) error { return ErrIdentityUnavailable }
 func (boundIdentity) SetupComplete() bool                  { return false }
+func (b boundIdentity) Accept(ctx context.Context, token string) (*core.Viewer, CredentialAcceptance, error) {
+	u, err := b.Resolve(ctx, token)
+	return u, CredentialAcceptance{}, err
+}
+func (boundIdentity) ReceiptCurrent(context.Context, CredentialAcceptance) error {
+	return core.ErrUnauthorized
+}
+func (boundIdentity) IssueDelegation(context.Context, int64) (string, error) {
+	return "", core.ErrUnauthorized
+}
+func (boundIdentity) ActiveUser(context.Context, int64) (*core.User, error) {
+	return nil, ErrIdentityUnavailable
+}
+func (boundIdentity) Users(context.Context) ([]core.User, error) {
+	return nil, ErrIdentityUnavailable
+}
+
+// BindAuth adapts a core.Auth into a SurfaceIdentity for standalone servers and tests.
+func BindAuth(auth core.Auth) SurfaceIdentity {
+	if auth == nil {
+		return nil
+	}
+	return boundAuth{auth: auth}
+}
+
+type boundAuth struct {
+	auth core.Auth
+}
+
+func (b boundAuth) UnwrapAuth() core.Auth { return b.auth }
+
+func (b boundAuth) Resolve(ctx context.Context, credential string) (*core.Viewer, error) {
+	if b.auth == nil {
+		return nil, core.ErrUnauthorized
+	}
+	return b.auth.Authenticate(ctx, credential)
+}
+
+func (b boundAuth) Accept(ctx context.Context, token string) (*core.Viewer, CredentialAcceptance, error) {
+	if b.auth == nil {
+		return nil, CredentialAcceptance{}, core.ErrUnauthorized
+	}
+	if acc, ok := b.auth.(CredentialAcceptor); ok {
+		return acc.Accept(ctx, token)
+	}
+	u, err := b.auth.Authenticate(ctx, token)
+	return u, CredentialAcceptance{}, err
+}
+
+func (b boundAuth) ReceiptCurrent(ctx context.Context, receipt CredentialAcceptance) error {
+	if acc, ok := b.auth.(CredentialAcceptor); ok {
+		return acc.ReceiptCurrent(ctx, receipt)
+	}
+	return core.ErrUnauthorized
+}
+
+func (b boundAuth) IssueDelegation(ctx context.Context, userID int64) (string, error) {
+	if del, ok := b.auth.(DelegationAuth); ok {
+		return del.IssueDelegation(ctx, userID)
+	}
+	return "", core.ErrUnauthorized
+}
+
+func (b boundAuth) ActiveUser(ctx context.Context, id int64) (*core.User, error) {
+	if b.auth == nil {
+		return nil, core.ErrUnauthorized
+	}
+	if a, ok := b.auth.(ActiveUserSource); ok {
+		return a.ActiveUser(ctx, id)
+	}
+	users, err := b.auth.Users(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, u := range users {
+		if u.ID == id {
+			return &u, nil
+		}
+	}
+	return nil, core.ErrNotFound
+}
+
+func (b boundAuth) Users(ctx context.Context) ([]core.User, error) {
+	if b.auth == nil {
+		return nil, nil
+	}
+	return b.auth.Users(ctx)
+}
+
+func (boundAuth) ViewerTimes(context.Context, string, int64) (ViewerTimes, error) {
+	return ViewerTimes{}, ErrIdentityUnavailable
+}
+func (boundAuth) PublicViewers(context.Context) ([]PublicViewer, error) {
+	return nil, ErrIdentityUnavailable
+}
+func (boundAuth) SignIn(context.Context, string, string, core.Device) (string, error) {
+	return "", ErrIdentityUnavailable
+}
+func (boundAuth) SignInWithPlex(context.Context, string, core.Device) (string, error) {
+	return "", ErrIdentityUnavailable
+}
+func (boundAuth) IssueRefresh(context.Context, string, core.Device) (string, error) {
+	return "", ErrIdentityUnavailable
+}
+func (boundAuth) Refresh(context.Context, string, core.Device) (string, string, error) {
+	return "", "", ErrIdentityUnavailable
+}
+func (boundAuth) QuickConnectInitiate(context.Context, core.Device) (string, string, error) {
+	return "", "", ErrIdentityUnavailable
+}
+func (boundAuth) QuickConnectStatus(context.Context, string) (bool, error) {
+	return false, ErrIdentityUnavailable
+}
+func (boundAuth) QuickConnectDetails(context.Context, string) (QuickConnectDetails, error) {
+	return QuickConnectDetails{}, ErrIdentityUnavailable
+}
+func (boundAuth) QuickConnectPoll(context.Context, string) (string, error) {
+	return "", ErrIdentityUnavailable
+}
+func (boundAuth) QuickConnectApprove(context.Context, *core.Viewer, string) error {
+	return ErrIdentityUnavailable
+}
+func (boundAuth) Revoke(context.Context, string) error { return ErrIdentityUnavailable }
+func (boundAuth) SetupComplete() bool                  { return false }
 
 type Settings map[string]any
 
@@ -243,6 +443,7 @@ type Host struct {
 	Preferences        Preferences
 	TrackPreferences   TrackPreferenceService
 	LiveTV             LiveTV
+	LibraryLive        LibraryLive
 	VirtualPaths       VirtualPaths
 	Sessions           Sessions
 	LastPlayedSource   LastPlayedSourceReader
@@ -253,10 +454,18 @@ type Host struct {
 	Editions    Editions
 	LazyStreams LazyStreams
 	LANStreams  LANLazyStreams
+	// KindStreams opens byte-addressable media and lists playable leaves for
+	// plugin-provided content kinds. Nil means plugin kind media is unavailable.
+	KindStreams KindStreams
 	Identity    SurfaceIdentity
 	IDs         ids.Codecs
 	Events      Subscriber
-	Tickets     Tickets
+	// WatchRefresh subscribes a mounted frontend to committed watch-state changes.
+	WatchRefresh WatchRefreshSubscriber
+	// HomeInvalidation subscribes a mounted frontend to committed state changes
+	// that invalidate a viewer's home screen.
+	HomeInvalidation HomeInvalidationSubscriber
+	Tickets          Tickets
 	// WatchParty is the shared Silo and Jellyfin room. Nil leaves both off.
 	WatchParty  WatchParty
 	Images      Images
@@ -267,10 +476,16 @@ type Host struct {
 	// ExtraStreams opens a playable trailer or extra. Nil means extras are not
 	// configured; listing routes still authorize the parent and return nothing.
 	ExtraStreams ExtraStreams
+	Themes       Themes
+	// ThemeTitle authorizes cached metadata without discovery or detail enrichment.
+	ThemeTitle func(context.Context, *Viewer, RatingKey) (*Title, error)
 	// DirectProxy selects the proxy for trailer fetches. Nil follows the
 	// process environment. The app wires the direct route so frontends do
 	// not import the egress policy.
 	DirectProxy func(*http.Request) (*url.URL, error)
+	// MetadataHTTP fetches remote artwork when shared Artwork is not mounted.
+	// Nil uses a 20 s HTTP client.
+	MetadataHTTP *http.Client
 	// Cinema lists preroll trailers of other movies. Nil means cinema intros
 	// are not wired; the intros route returns an empty page after authorization.
 	Cinema CinemaIntros
@@ -279,8 +494,16 @@ type Host struct {
 	Prerolls Prerolls
 	// Subtitles searches and downloads a sidecar only after an explicit pick.
 	// Nil or Enabled false tells clients the server will not fetch one.
-	Subtitles SubtitleCatalog
-	Config    func() Settings
+	Subtitles  SubtitleCatalog
+	Config     func() Settings
+	HostConfig func() HostConfig
+	Now        func() time.Time
+	// TracePlayback logs HLS/transcode diagnostics when ETHER_TRACE_PLAYBACK=1.
+	TracePlayback bool
+	// ServerIdentity describes how this server presents its machine and build identity.
+	ServerIdentity ServerIdentity
+	// OwnerSubscription returns the current owner entitlement snapshot.
+	OwnerSubscription func() (active bool, features []string)
 	// MetadataLanguage is the catalog language (config catalog.language).
 	// Empty skips that step of the no-list audio chain.
 	MetadataLanguage func() string
@@ -294,19 +517,37 @@ type Host struct {
 	Log       *slog.Logger
 	// ViewerPortalURL returns a reachable owner-selected viewer portal URL for this client.
 	ViewerPortalURL func(context.Context, *http.Request) (string, error)
+	// SecureOrigins returns trusted published HTTPS base origins, preferred first.
+	// It never probes the network or derives hosts from request headers.
+	SecureOrigins func(context.Context, *http.Request) []string
 	// SecurePortalURL selects a verified reachable HTTPS portal address.
 	SecurePortalURL func(context.Context, *http.Request) (string, error)
 	// SurfaceURL returns a reachable, verified base for this frontend's routes.
 	SurfaceURL func(context.Context, *http.Request) (string, error)
+	// PublicOrigin returns this server's published public WAN origin, or "" when unavailable.
+	PublicOrigin func() string
+	// RepoFileURL returns an immutable public URL for a committed repository file, or "".
+	RepoFileURL func(path string) string
 	// LANViewer resolves the owner-selected active DLNA viewer only after
 	// trusted-proxy-aware network classification; other surfaces receive nil.
 	LANViewer func(context.Context, *http.Request) (*Viewer, error)
 	// ClientSeen reports an authenticated client's protocol-specific device ID.
 	ClientSeen func(deviceID string)
+	// RemoteClientSeen records authenticated inbound remote connectivity.
+	RemoteClientSeen func(address string)
 	// ClientIP resolves the transport peer using the configured trusted proxies.
 	ClientIP func(*http.Request) (netip.Addr, bool)
 	// PageFreshness invalidates cached browse bodies. Nil disables the cache.
 	PageFreshness func() PageFreshness
+	// CacheDir is a node-local directory this frontend alone may fill with
+	// files it can regenerate. It may be emptied between mounts. Empty
+	// disables on-disk caches.
+	CacheDir string
+	// ClientsDir is a persistent node-local directory for downloaded
+	// third-party client builds. Unlike CacheDir it is never emptied between
+	// mounts: a completed download must survive restarts. Empty disables
+	// runtime client downloads.
+	ClientsDir string
 	// PersonalHomes keeps the last personalized library list so the first
 	// UserViews after a restart can include it. Nil keeps that list in memory.
 	PersonalHomes PersonalHomeStore
@@ -321,10 +562,9 @@ type PersonalHomeStore interface {
 }
 
 // PageFreshness is every input of a cached browse response. A change drops
-// the cached body. ArtBucket rotates image grants before they expire.
+// the cached body.
 type PageFreshness struct {
-	Catalog, Config, Watch, Favorite, Hidden, Listed, Images, Grants, Accounts, Safety uint64
-	ArtBucket                                                                          int64
+	Catalog, Config, Layout, Watch, Favorite, Hidden, Listed, Images, Grants, Accounts, Safety, Libraries, KindSync uint64
 }
 
 var ErrNotRegistered = errors.New("frontend not registered")
@@ -336,6 +576,7 @@ type Registry struct {
 	mu      sync.RWMutex
 	entries map[Protocol]*entry
 	host    func(Protocol) Host
+	closed  bool
 }
 type entry struct {
 	frontend   Frontend
@@ -392,9 +633,40 @@ func (r *Registry) ValidateSettings(id Protocol, settings Settings) (bool, error
 	return true, validator.ValidateSettings(settings)
 }
 
+// Unregister removes a frontend so a plugin-provided surface can be
+// withdrawn without restarting Ether. It refuses while the frontend is
+// mounted and waits out any in-flight mount or unmount, then deletes the
+// entry under the registry lock so a concurrent Mount sees it gone.
+func (r *Registry) Unregister(id Protocol) error {
+	for {
+		r.mu.Lock()
+		e, ok := r.entries[id]
+		if !ok {
+			r.mu.Unlock()
+			return ErrNotRegistered
+		}
+		if wait := e.transition; wait != nil {
+			r.mu.Unlock()
+			<-wait
+			continue
+		}
+		if e.instance != nil {
+			r.mu.Unlock()
+			return ErrAlreadyMounted
+		}
+		delete(r.entries, id)
+		r.mu.Unlock()
+		return nil
+	}
+}
+
 func (r *Registry) Mount(ctx context.Context, id Protocol) (Instance, error) {
 	for {
 		r.mu.Lock()
+		if r.closed {
+			r.mu.Unlock()
+			return nil, errors.New("frontend registry closed")
+		}
 		e, ok := r.entries[id]
 		if !ok {
 			r.mu.Unlock()
@@ -431,7 +703,7 @@ func (r *Registry) Mount(ctx context.Context, id Protocol) (Instance, error) {
 			err = errors.New("frontend returned nil instance")
 		}
 		r.mu.Lock()
-		if current := r.entries[id]; current != e || e.generation != generation {
+		if r.closed || r.entries[id] != e || e.generation != generation {
 			r.mu.Unlock()
 			if instance != nil {
 				_ = instance.Close(ctx)
@@ -506,6 +778,53 @@ func (r *Registry) Descriptors() []Descriptor {
 	r.mu.RUnlock()
 	sort.Slice(result, func(i, j int) bool { return result[i].ID < result[j].ID })
 	return result
+}
+
+// Shutdown marks the registry closed and releases process-retained state on
+// registered frontends that implement Shutdowner.
+func (r *Registry) Shutdown(ctx context.Context) error {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	r.closed = true
+	frontends := make([]Frontend, 0, len(r.entries))
+	for _, e := range r.entries {
+		frontends = append(frontends, e.frontend)
+	}
+	r.mu.Unlock()
+	var errs []error
+	for _, f := range frontends {
+		if s, ok := f.(Shutdowner); ok {
+			if err := s.Shutdown(ctx); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// Prune runs DerivedPruner on a registered frontend or its mounted instance.
+func (r *Registry) Prune(ctx context.Context, id Protocol) (int64, error) {
+	if r == nil {
+		return 0, nil
+	}
+	r.mu.RLock()
+	e, ok := r.entries[id]
+	var fe Frontend
+	var inst Instance
+	if ok {
+		fe = e.frontend
+		inst = e.instance
+	}
+	r.mu.RUnlock()
+	if p, ok := fe.(DerivedPruner); ok {
+		return p.Prune(ctx)
+	}
+	if p, ok := inst.(DerivedPruner); ok {
+		return p.Prune(ctx)
+	}
+	return 0, nil
 }
 
 func cloneDescriptor(d Descriptor) Descriptor {

@@ -20,7 +20,12 @@ func (i *instance) socket(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
-	conn, err := websocket.Accept(w, r, nil)
+	// The viewer is already authenticated from an explicit token (header or
+	// query; this surface never reads cookies), so a page on another origin
+	// cannot ride a viewer's session and the origin check guards nothing.
+	// Packaged TV apps send "Origin: null", and web clients hosted elsewhere
+	// send their own origin; Jellyfin accepts both.
+	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
 	if err != nil {
 		return
 	}
@@ -65,9 +70,9 @@ func (i *instance) socket(w http.ResponseWriter, r *http.Request) {
 	}()
 	writeSessions := func() error {
 		if i.host.Sessions == nil {
-			return nil
+			return write(map[string]any{"MessageType": "Sessions", "Data": []any{}})
 		}
-		rows, err := i.sessionRows(ctx, viewer, device(r))
+		rows, err := i.sessionRows(ctx, viewer, device(r), clientAddress(r, i.host.ClientIP))
 		if err != nil {
 			return err
 		}
@@ -75,7 +80,7 @@ func (i *instance) socket(w http.ResponseWriter, r *http.Request) {
 	}
 	var party <-chan frontend.PartyEvent
 	if i.protocol == "jellyfin" && i.host.WatchParty != nil {
-		ch, done := i.host.WatchParty.Subscribe(frontend.PartyActor{Viewer: viewer, Device: device(r), Protocol: i.protocol})
+		ch, done := i.host.WatchParty.Subscribe(frontend.PartyActor{Viewer: viewer, Device: device(r), Protocol: i.protocol, Capabilities: frontend.PartyCapabilities{GroupEvents: true, SharedControls: true}})
 		party = ch
 		defer done()
 	}
@@ -107,11 +112,12 @@ func (i *instance) socket(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
-			if msg == "KeepAlive" {
+			switch msg {
+			case "KeepAlive":
 				if write(map[string]any{"MessageType": "KeepAlive"}) != nil {
 					return
 				}
-			} else if msg == "SessionsStart" {
+			case "SessionsStart":
 				if cancelSessions != nil {
 					cancelSessions()
 					cancelSessions = nil
@@ -129,12 +135,16 @@ func (i *instance) socket(w http.ResponseWriter, r *http.Request) {
 				if writeSessions() != nil {
 					return
 				}
-			} else if msg == "SessionsStop" {
+			case "SessionsStop":
 				if cancelSessions != nil {
 					cancelSessions()
 					cancelSessions = nil
 				}
 				sessionEvents = nil
+			case "ScheduledTasksInfoStart":
+				if write(map[string]any{"MessageType": "ScheduledTasksInfo", "Data": []any{}}) != nil {
+					return
+				}
 			}
 		case event, ok := <-sessionEvents:
 			if !ok {

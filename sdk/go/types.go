@@ -14,24 +14,31 @@ const (
 	KindNotificationChannel PluginKind = "notification_channel"
 	KindLiveTVSource        PluginKind = "livetv_source"
 	KindExtension           PluginKind = "extension"
+	KindContent             PluginKind = "content"
 )
 
 // Capability names a capability declared in manifest.ether.capabilities.
 type Capability string
 
 const (
-	CapStreamSource   Capability = "stream_source"
-	CapDebridProvider Capability = "debrid_provider"
-	CapListSource     Capability = "list_source"
-	CapLiveTV         Capability = "livetv_channels"
-	CapSubtitles      Capability = "subtitles"
-	CapMarkers        Capability = "markers"
-	CapNotify         Capability = "notify"
-	CapEvents         Capability = "events"
-	CapRankingStep    Capability = "ranking_step"
-	CapRuleCondition  Capability = "rule_condition"
-	CapTools          Capability = "tools"
-	CapUI             Capability = "ui"
+	CapStreamSource    Capability = "stream_source"
+	CapDebridProvider  Capability = "debrid_provider"
+	CapListSource      Capability = "list_source"
+	CapLiveTV          Capability = "livetv_channels"
+	CapSubtitles       Capability = "subtitles"
+	CapMarkers         Capability = "markers"
+	CapNotify          Capability = "notify"
+	CapEvents          Capability = "events"
+	CapFlowActions     Capability = "flow_actions"
+	CapRankingStep     Capability = "ranking_step"
+	CapRuleCondition   Capability = "rule_condition"
+	CapTools           Capability = "tools"
+	CapUI              Capability = "ui"
+	CapCatalogProvider Capability = "catalog_provider"
+	CapKindResolver    Capability = "kind_resolver"
+	CapFrontendAdapter Capability = "frontend_adapter"
+	CapMatcher         Capability = "matcher"
+	CapPosterBadges    Capability = "poster_badges"
 )
 
 // Manifest is the EPP/1 manifest document served at GET /manifest.json.
@@ -102,9 +109,25 @@ type PluginAuthor struct {
 
 // RuntimeDecl declares how the plugin is executed.
 type RuntimeDecl struct {
-	Kind   string `json:"kind"`
-	Entry  string `json:"entry,omitempty"`
-	Module string `json:"module,omitempty"`
+	Kind   string         `json:"kind"`
+	Entry  string         `json:"entry,omitempty"`
+	Module string         `json:"module,omitempty"`
+	Limits *RuntimeLimits `json:"limits,omitempty"`
+}
+
+// RuntimeLimits requests hosted/data resources within owner-controlled ceilings.
+// Defaults: 32 MiB heap, 12h, effectively unlimited background work units.
+type RuntimeLimits struct {
+	FetchBytes           int64  `json:"fetchBytes,omitempty"`
+	ArchiveMemberBytes   int64  `json:"archiveMemberBytes,omitempty"`
+	ArchiveExpandedBytes int64  `json:"archiveExpandedBytes,omitempty"`
+	ArchiveMembers       int    `json:"archiveMembers,omitempty"`
+	MaxItems             int    `json:"maxItems,omitempty"`
+	MemoryBytes          uint64 `json:"memoryBytes,omitempty"`
+	ReadBytes            int64  `json:"readBytes,omitempty"`
+	Deadline             string `json:"deadline,omitempty"`
+	UnitBudget           int64  `json:"unitBudget,omitempty"`
+	PoolSize             int    `json:"poolSize,omitempty"`
 }
 
 // HealthDecl configures periodic health checks.
@@ -126,6 +149,8 @@ type Permissions struct {
 	Collections string             `json:"collections,omitempty"`
 	Folders     string             `json:"folders,omitempty"`
 	Secrets     []string           `json:"secrets,omitempty"`
+	// Sources lets a kind resolver ask Ether to find bytes: ""|none|search|acquire.
+	Sources string `json:"sources,omitempty"`
 }
 
 // ViewerPermissions scopes viewer identity and watch-history access.
@@ -175,20 +200,263 @@ type FieldOption struct {
 
 // Contributes declares the descriptors a plugin contributes to Ether.
 type Contributes struct {
-	Source         *SourceMeta         `json:"source,omitempty"`
-	Channels       *ChannelsMeta       `json:"channels,omitempty"`
-	Subtitles      *SubtitlesMeta      `json:"subtitles,omitempty"`
-	Markers        *MarkersMeta        `json:"markers,omitempty"`
-	Notification   *NotificationMeta   `json:"notification,omitempty"`
-	Events         *EventsMeta         `json:"events,omitempty"`
-	Integration    *IntegrationMeta    `json:"integration,omitempty"`
-	ListSources    []ListSourceMeta    `json:"listSources,omitempty"`
-	RankingSteps   []RankingStepMeta   `json:"rankingSteps,omitempty"`
-	RuleConditions []RuleConditionMeta `json:"ruleConditions,omitempty"`
-	Tools          []ToolMeta          `json:"tools,omitempty"`
-	Pages          []PageMeta          `json:"pages,omitempty"`
-	Slots          []SlotMeta          `json:"slots,omitempty"`
-	Commands       []CommandMeta       `json:"commands,omitempty"`
+	Source           *SourceMeta           `json:"source,omitempty"`
+	Channels         *ChannelsMeta         `json:"channels,omitempty"`
+	Subtitles        *SubtitlesMeta        `json:"subtitles,omitempty"`
+	Markers          *MarkersMeta          `json:"markers,omitempty"`
+	Notification     *NotificationMeta     `json:"notification,omitempty"`
+	Events           *EventsMeta           `json:"events,omitempty"`
+	FlowActions      []FlowActionMeta      `json:"flowActions,omitempty"`
+	Integration      *IntegrationMeta      `json:"integration,omitempty"`
+	ListSources      []ListSourceMeta      `json:"listSources,omitempty"`
+	RankingSteps     []RankingStepMeta     `json:"rankingSteps,omitempty"`
+	RuleConditions   []RuleConditionMeta   `json:"ruleConditions,omitempty"`
+	PosterBadges     []PosterBadgeSetMeta  `json:"posterBadges,omitempty"`
+	Tools            []ToolMeta            `json:"tools,omitempty"`
+	Pages            []PageMeta            `json:"pages,omitempty"`
+	Slots            []SlotMeta            `json:"slots,omitempty"`
+	Commands         []CommandMeta         `json:"commands,omitempty"`
+	MediaKinds       []MediaKindMeta       `json:"mediaKinds,omitempty"`
+	FrontendAdapters []FrontendAdapterMeta `json:"frontendAdapters,omitempty"`
+	Setup            *SetupMeta            `json:"setup,omitempty"`
+}
+
+// Poster badge bounds (#594).
+const (
+	MaxPosterBadgeSets     = 4
+	MaxBadgeEntriesPerCall = 500
+	MaxBadgeLabelsPerTitle = 3
+	MaxBadgeLabelLen       = 16
+	PosterBadgeQuotaTitles = 200_000
+)
+
+// PosterBadgeSetMeta declares one poster overlay badge set contributed by a plugin (#594).
+type PosterBadgeSetMeta struct {
+	Key         string `json:"key"`
+	Label       string `json:"label"`
+	Description string `json:"description,omitempty"`
+}
+
+// BadgeTitleRef identifies a canonical movie or show by TMDB and/or IMDb id.
+type BadgeTitleRef struct {
+	Type string `json:"type"`
+	TMDB int64  `json:"tmdb,omitempty"`
+	IMDB string `json:"imdb,omitempty"`
+}
+
+// BadgeEntry pushes or clears (empty Labels) poster badges for one title.
+type BadgeEntry struct {
+	Title  BadgeTitleRef `json:"title"`
+	Labels []string      `json:"labels"`
+}
+
+// BadgeUsage reports a plugin's badged title count and per-plugin title quota.
+type BadgeUsage struct {
+	Titles      int64 `json:"titles"`
+	QuotaTitles int64 `json:"quotaTitles"`
+}
+
+// Presentations declares how a library is published per protocol.
+type Presentations struct {
+	AdapterOnly bool `json:"adapterOnly,omitempty"`
+	Vela        *struct {
+		Type string `json:"type"` // movies|shows
+	} `json:"vela,omitempty"`
+	Plex *struct {
+		Base string `json:"base"` // movie|show|artist|photo
+	} `json:"plex,omitempty"`
+	MediaBrowser *struct {
+		CollectionType string `json:"collectionType"` // movies|tvshows|music|audiobooks|books|photos|homevideos
+		// ItemTypes maps each level key to its Jellyfin/Emby item type:
+		// Movie|Series|Season|Episode|MusicArtist|MusicAlbum|Audio|
+		// AudioBook|Book|PhotoAlbum|Photo. The declared type drives the
+		// item's Type, MediaType (Audio/Book/Photo/Video), IsFolder and
+		// IncludeItemTypes filtering; unmapped levels keep the video
+		// projection, so declare every level of a music/book kind.
+		ItemTypes map[string]string `json:"itemTypes,omitempty"`
+	} `json:"mediaBrowser,omitempty"`
+	Stremio *struct {
+		Type string `json:"type"`
+	} `json:"stremio,omitempty"`
+	Xtream *struct {
+		Category string `json:"category"`
+	} `json:"xtream,omitempty"`
+	Silo *struct {
+		Type string `json:"type"`
+	} `json:"silo,omitempty"`
+}
+
+// MediaKindMeta declares one content kind; each kind becomes its own library.
+type MediaKindMeta struct {
+	Key     string          `json:"key"`
+	Label   string          `json:"label"`
+	Library KindLibraryDecl `json:"library"`
+	Levels  []KindLevel     `json:"levels"`
+	Fields  []KindField     `json:"fields,omitempty"`
+	Art     []KindArt       `json:"art,omitempty"`
+	Present Presentations   `json:"present"`
+	Browse  KindBrowseDecl  `json:"browse"`
+	Sync    KindSyncDecl    `json:"sync"`
+	Cache   *KindCacheDecl  `json:"cache,omitempty"`
+	Match   *KindMatchDecl  `json:"match,omitempty"`
+}
+
+// MaxKindLibraryTabs is the maximum number of declared sub-tabs per kind library.
+const MaxKindLibraryTabs = 50
+
+// KindLibraryDecl is the library created for a kind on install.
+type KindLibraryDecl struct {
+	Name        string             `json:"name"`
+	Icon        string             `json:"icon,omitempty"`
+	Card        string             `json:"card,omitempty"`        // poster (default)|landscape|square
+	DateDisplay string             `json:"dateDisplay,omitempty"` // year (default)|date
+	Tabs        []KindLibraryTab   `json:"tabs,omitempty"`        // up to 50; defaults to Recommended + Library
+	Shelves     []KindLibraryShelf `json:"shelves,omitempty"`     // up to 40; default Recommended shelves
+}
+
+// KindLibraryTabFilter defines saved filter rules on a "view" tab.
+type KindLibraryTabFilter struct {
+	Match   string               `json:"match,omitempty"`   // "all" (default) or "any"
+	Rules   []KindLibraryTabRule `json:"rules,omitempty"`   // matching conditions
+	Exclude []KindLibraryTabRule `json:"exclude,omitempty"` // excluded conditions
+}
+
+// KindLibraryTabRule is one filter condition inside a "view" tab's filters.
+// Field may be "browse:<indexedField>", "viewer" (with value such as
+// {"history":true}, {"watched":true}, {"unwatched":true}, {"inProgress":true},
+// {"favorite":true}, {"watchlist":true}, {"lastViewedAfter":unix},
+// {"lastViewedBefore":unix}), "year", "rating", or a mapped indexed field.
+type KindLibraryTabRule struct {
+	Field string `json:"field"`
+	Op    string `json:"op"`
+	Value any    `json:"value,omitempty"`
+}
+
+// KindLibraryTab declares one sub-tab shown inside a plugin library.
+type KindLibraryTab struct {
+	Key               string                `json:"key"`
+	Label             string                `json:"label"`
+	Kind              string                `json:"kind"`                        // recommended|library|collections|people|view|live
+	Facet             string                `json:"facet,omitempty"`             // declared browse.facets entry (optional on collections; required people-type facet on people)
+	Order             string                `json:"order,omitempty"`             // count|name (default count on collections, name on people)
+	Card              string                `json:"card,omitempty"`              // landscape (default)|poster|square (live tabs only)
+	Layout            string                `json:"layout,omitempty"`            // grid (default)|list|timeline (view tabs only)
+	Search            *bool                 `json:"search,omitempty"`            // collections/people/view/live only; default true
+	SearchPlaceholder string                `json:"searchPlaceholder,omitempty"` // localizable placeholder (<=60 chars; collections/people/view/live when search is enabled)
+	Sort              string                `json:"sort,omitempty"`              // one of browse.sorts or lastViewed (facet collections or view)
+	Direction         string                `json:"direction,omitempty"`         // asc|desc (facet collections or view)
+	Filters           *KindLibraryTabFilter `json:"filters,omitempty"`           // saved filter rules (view tabs only)
+}
+
+// MaxKindLibraryShelves is the maximum number of declared Recommended shelves per kind library.
+const MaxKindLibraryShelves = 40
+
+// KindLibraryShelf declares one default Recommended shelf for a plugin library.
+// Each shelf gets the stable row ID "plugin:<viewID>:shelf:<key>".
+type KindLibraryShelf struct {
+	Key       string              `json:"key"`
+	Label     string              `json:"label"`
+	Sort      string              `json:"sort,omitempty"`      // released (default)|title|added|year|rating|index
+	Direction string              `json:"direction,omitempty"` // desc (default)|asc
+	Facet     string              `json:"facet,omitempty"`     // single-facet shorthand (declared and indexed)
+	Value     string              `json:"value,omitempty"`     // single value for facet
+	Values    []string            `json:"values,omitempty"`    // OR values for facet
+	Filters   map[string][]string `json:"filters,omitempty"`   // AND across facets, OR within each facet
+}
+
+// KindLevel is one hierarchy level of a kind.
+type KindLevel struct {
+	Key       string `json:"key"`
+	Label     string `json:"label"`
+	Playable  bool   `json:"playable,omitempty"`
+	Container bool   `json:"container,omitempty"`
+}
+
+// KindField is one declared item field.
+type KindField struct {
+	Key     string   `json:"key"`
+	Type    string   `json:"type"` // string|int|float|bool|date|duration|enum|strings|people
+	Label   string   `json:"label"`
+	Indexed bool     `json:"indexed,omitempty"`
+	Enum    []string `json:"enum,omitempty"`
+}
+
+// KindArt declares one artwork role beyond poster/backdrop/thumb/logo.
+type KindArt struct {
+	Role  string `json:"role"`
+	Label string `json:"label"`
+}
+
+// DefaultKindExpandTTLHours is the default freshness window (7 days) for
+// on-demand facet and person slice expansions when ttlHours is omitted or zero.
+const DefaultKindExpandTTLHours = 168
+
+// KindBrowseExpand configures on-demand background expansion for declared
+// browse facets when a viewer opens a facet collection bucket or plugin person.
+type KindBrowseExpand struct {
+	Facets   []string `json:"facets"`
+	TTLHours int      `json:"ttlHours,omitempty"`
+}
+
+// KindBrowseDecl is how a kind library is browsed.
+type KindBrowseDecl struct {
+	Sorts        []string `json:"sorts,omitempty"`
+	Facets       []string `json:"facets,omitempty"`
+	Search       bool     `json:"search"`
+	SearchFields []string `json:"searchFields,omitempty"`
+	// LiveSearch: client searches also call the plugin's /search route
+	// with a short budget; results are upserted and merged (§15.4).
+	LiveSearch bool              `json:"liveSearch,omitempty"`
+	Expand     *KindBrowseExpand `json:"expand,omitempty"`
+}
+
+// Kind sync modes: pull (Ether walks browse/changes) or push (KindUpsert).
+const (
+	KindSyncPull = "pull"
+	KindSyncPush = "push"
+)
+
+// KindSyncDecl is how a kind's items reach Ether's store.
+type KindSyncDecl struct {
+	Mode    string `json:"mode"` // pull|push
+	Refresh string `json:"refresh,omitempty"`
+}
+
+// KindCacheDecl is the per-library blob cache budget; 0 means server default.
+type KindCacheDecl struct {
+	MaxBytes int64  `json:"maxBytes,omitempty"`
+	TTL      string `json:"ttl,omitempty"`
+}
+
+// KindMatchDecl holds matcher defaults for a kind.
+type KindMatchDecl struct {
+	ThresholdDefault float64 `json:"thresholdDefault,omitempty"`
+}
+
+// FrontendAdapterMeta declares one plugin-provided protocol surface.
+type FrontendAdapterMeta struct {
+	Key          string   `json:"key"`
+	Label        string   `json:"label"`
+	ProtocolHint string   `json:"protocolHint"` // opds|subsonic|custom
+	PathPrefix   string   `json:"pathPrefix"`
+	DefaultPort  int      `json:"defaultPort,omitempty"`
+	Clients      []string `json:"clients,omitempty"`
+	Auth         string   `json:"auth,omitempty"` // ether_token (default)|basic|none_lan
+}
+
+// SetupMeta declares guided setup for any plugin kind.
+type SetupMeta struct {
+	Steps []SetupStep `json:"steps"`
+}
+
+// SetupStep is one setup wizard step; an empty Test means saving is the step.
+type SetupStep struct {
+	Key      string   `json:"key"`
+	Label    string   `json:"label"`
+	Hint     string   `json:"hint,omitempty"`
+	Fields   []string `json:"fields"`
+	Test     string   `json:"test"`
+	Required bool     `json:"required"`
 }
 
 // SourceMeta describes a stream source contribution.
@@ -223,9 +491,117 @@ type NotificationMeta struct {
 	MaxLength int      `json:"maxLength,omitempty"`
 }
 
-// EventsMeta lists subscribed event names.
+// EventsMeta declares subscribed event names and custom published event schemas.
 type EventsMeta struct {
-	Subscribe []string `json:"subscribe"`
+	Subscribe []string             `json:"subscribe,omitempty"`
+	Publish   []PublishedEventMeta `json:"publish,omitempty"`
+}
+
+// EventFieldType classifies a typed field in a published event payload or
+// flow action parameter/output schema.
+type EventFieldType string
+
+const (
+	EventFieldString     EventFieldType = "string"
+	EventFieldInt        EventFieldType = "int"
+	EventFieldFloat      EventFieldType = "float"
+	EventFieldBool       EventFieldType = "bool"
+	EventFieldDurationMS EventFieldType = "duration_ms"
+	EventFieldTimestamp  EventFieldType = "timestamp"
+	EventFieldEnum       EventFieldType = "enum"
+	EventFieldStringList EventFieldType = "string_list"
+	EventFieldObject     EventFieldType = "object"
+)
+
+// EventEnumOption describes one allowed option for an enum field or parameter.
+type EventEnumOption struct {
+	Value string `json:"value"`
+	Label string `json:"label,omitempty"`
+}
+
+// EventFieldMeta describes one typed field in a published plugin event payload
+// or flow action output object.
+type EventFieldMeta struct {
+	Name        string            `json:"name"`
+	Type        EventFieldType    `json:"type"`
+	Label       string            `json:"label"`
+	Description string            `json:"description,omitempty"`
+	Unit        string            `json:"unit,omitempty"`
+	Enum        []EventEnumOption `json:"enum,omitempty"`
+	PII         bool              `json:"pii,omitempty"`
+	Secret      bool              `json:"secret,omitempty"`
+	Filterable  bool              `json:"filterable,omitempty"`
+	Example     any               `json:"example,omitempty"`
+}
+
+// PublishedEventMeta declares one custom event emitted via PublishEvent
+// ("plugin:<pluginId>/<key>").
+type PublishedEventMeta struct {
+	Key         string           `json:"key"`
+	Label       string           `json:"label"`
+	Description string           `json:"description,omitempty"`
+	Version     int              `json:"version,omitempty"`
+	Fields      []EventFieldMeta `json:"fields,omitempty"`
+}
+
+// FlowActionParamMeta describes one configurable parameter of a plugin flow action.
+type FlowActionParamMeta struct {
+	Key         string            `json:"key"`
+	Type        EventFieldType    `json:"type"`
+	Label       string            `json:"label"`
+	Description string            `json:"description,omitempty"`
+	Required    bool              `json:"required,omitempty"`
+	Secret      bool              `json:"secret,omitempty"`
+	Template    bool              `json:"template,omitempty"`
+	Default     any               `json:"default,omitempty"`
+	Enum        []EventEnumOption `json:"enum,omitempty"`
+	Unit        string            `json:"unit,omitempty"`
+	Picker      string            `json:"picker,omitempty"`
+}
+
+// FlowActionMeta declares one custom Flow action contributed by a plugin.
+type FlowActionMeta struct {
+	Key         string                `json:"key"`
+	Label       string                `json:"label"`
+	Description string                `json:"description,omitempty"`
+	Icon        string                `json:"icon,omitempty"`
+	Route       string                `json:"route"`
+	Idempotent  bool                  `json:"idempotent,omitempty"`
+	SideEffect  *bool                 `json:"sideEffect,omitempty"`
+	Timeout     string                `json:"timeout,omitempty"`
+	Params      []FlowActionParamMeta `json:"params,omitempty"`
+	Outputs     []EventFieldMeta      `json:"outputs,omitempty"`
+}
+
+// EventCorrelation links a published plugin event to related Ether entities.
+type EventCorrelation struct {
+	Key       string `json:"key,omitempty"`
+	SessionID string `json:"sessionId,omitempty"`
+	PlayID    string `json:"playId,omitempty"`
+	TitleID   string `json:"titleId,omitempty"`
+	ViewerID  int64  `json:"viewerId,omitempty"`
+	ChannelID string `json:"channelId,omitempty"`
+	SourceID  string `json:"sourceId,omitempty"`
+	PluginID  string `json:"pluginId,omitempty"`
+	DeviceID  string `json:"deviceId,omitempty"`
+	LibraryID string `json:"libraryId,omitempty"`
+}
+
+// FlowActionRequest is passed to a FlowAction route handler.
+type FlowActionRequest struct {
+	Key            string         `json:"key,omitempty"`
+	FlowID         string         `json:"flowId"`
+	RunID          string         `json:"runId"`
+	NodeID         string         `json:"nodeId"`
+	IdempotencyKey string         `json:"idempotencyKey"`
+	DryRun         bool           `json:"dryRun,omitempty"`
+	Params         map[string]any `json:"params,omitempty"`
+}
+
+// FlowActionResponse is returned by a FlowAction route handler.
+type FlowActionResponse struct {
+	Output map[string]any `json:"output,omitempty"`
+	Branch string         `json:"branch,omitempty"`
 }
 
 // IntegrationMeta describes an external service integration.
@@ -250,12 +626,11 @@ type ListSourceMeta struct {
 
 // RankingStepMeta describes a custom ranking step.
 type RankingStepMeta struct {
-	Key             string `json:"key"`
-	Label           string `json:"label"`
-	Hint            string `json:"hint,omitempty"`
-	Editor          any    `json:"editor,omitempty"`
-	DefaultPosition int    `json:"defaultPosition,omitempty"`
-	Budget          any    `json:"budget,omitempty"`
+	Key    string `json:"key"`
+	Label  string `json:"label"`
+	Hint   string `json:"hint,omitempty"`
+	Editor any    `json:"editor,omitempty"`
+	Budget any    `json:"budget,omitempty"`
 }
 
 // RuleConditionMeta describes a custom rule condition.
@@ -606,10 +981,13 @@ type ToolResponse map[string]any
 
 // JobRequest is passed to a Job route handler.
 type JobRequest struct {
-	Name string `json:"name"`
+	Name         string          `json:"name"`
+	Continuation json.RawMessage `json:"continuation,omitempty"`
 }
 
-// JobResponse is returned by a Job route handler.
+// JobResponse returns continueInMs, continuation and progress to continue;
+// done:true completes, failed:string stops with an error. Ether caps jobs at
+// the owner time ceiling (12h by default) and 1000000 calls; store checkpoints in KV for restart recovery.
 type JobResponse map[string]any
 
 // NotifyRequest is passed to a Notify route handler.
@@ -683,8 +1061,16 @@ type RawRequest struct {
 	Locale   string            `json:"locale,omitempty"`
 }
 
+// FrontendBlob selects host-served bytes for a frontend adapter response.
+type FrontendBlob struct {
+	LibraryKey  string `json:"libraryKey"`
+	Ref         string `json:"ref"`
+	MemberIndex *int   `json:"memberIndex,omitempty"`
+}
+
 // RawResponse is the low-level transport-agnostic response returned by Plugin.Dispatch.
 type RawResponse struct {
+	Blob       *FrontendBlob     `json:"blob,omitempty"`
 	Status     int               `json:"status"`
 	Headers    map[string]string `json:"headers,omitempty"`
 	Body       json.RawMessage   `json:"body,omitempty"`

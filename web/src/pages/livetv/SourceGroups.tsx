@@ -1,6 +1,6 @@
 import { Badge, Button, Checkbox, Input, Switch, cn } from "@braedonsaunders/appkit-ui";
 import { ArrowDown, ArrowUp, ArrowUpToLine, Search, ShieldCheck } from "lucide-react";
-import { memo, useCallback, useMemo, useState } from "react";
+import { memo, useCallback, useMemo, useRef, useState } from "react";
 import { DragHandle, SortableList } from "../../components/Sortable";
 import { Segmented } from "../../components/fields";
 import { t, tn } from "../../i18n";
@@ -49,6 +49,9 @@ export function ProviderAccountCard({ account }: { account: SourceAccount }) {
           {t("Checked {when}", { when: relativeTime(account.checkedAt) })}
         </span>
       </div>
+      <p className="text-xs text-fg-muted">
+        {t("Connections")}: {account.activeConnections} / {max || 1}
+      </p>
       {left !== null ? (
         <p
           className={cn(
@@ -110,6 +113,7 @@ export function ChannelGroups({
   onChange: (update: (rules: Rules) => Partial<GroupRules>) => void;
 }) {
   const [q, setQ] = useState("");
+  const anchor = useRef<string | null>(null);
   const [orderMode, setOrderMode] = useState<"provider" | "mine">(
     rules.groupOrder?.length ? "mine" : "provider",
   );
@@ -131,22 +135,37 @@ export function ChannelGroups({
   );
 
   const update = onChange;
-  const toggle = useCallback(
-    (g: SourceGroup, include: boolean) =>
+  const setGroups = useCallback(
+    (selection: SourceGroup[], include: boolean) =>
       update((r) => {
-        const key = normGroup(g.name);
-        const rest = read(r).excludeGroups.filter((name) => normGroup(name) !== key);
-        return { excludeGroups: include ? rest : [...rest, g.name] };
+        // Hidden adult groups keep their explicit choice until the owner turns
+        // the adult filter off; a range must never silently change that choice.
+        const editable = selection.filter((g) => !(r.hideAdult && g.adult));
+        const keys = new Set(editable.map((g) => normGroup(g.name)));
+        const rest = read(r).excludeGroups.filter((name) => !keys.has(normGroup(name)));
+        return { excludeGroups: include ? rest : [...rest, ...editable.map((g) => g.name)] };
       }),
     [update],
   );
+  const toggle = useCallback(
+    (g: SourceGroup, include: boolean, range: boolean) => {
+      const first = range ? shown.findIndex((row) => row.name === anchor.current) : -1;
+      const last = shown.findIndex((row) => row.name === g.name);
+      anchor.current = g.name;
+      setGroups(
+        first >= 0 && last >= 0
+          ? shown.slice(Math.min(first, last), Math.max(first, last) + 1)
+          : [g],
+        include,
+      );
+    },
+    [shown, setGroups],
+  );
   // With a search, the quick actions apply to the matching groups only.
-  const setAll = (include: boolean) =>
-    update((r) => {
-      const keys = new Set(shown.map((g) => normGroup(g.name)));
-      const rest = read(r).excludeGroups.filter((name) => !keys.has(normGroup(name)));
-      return { excludeGroups: include ? rest : [...rest, ...shown.map((g) => g.name)] };
-    });
+  const setAll = (include: boolean) => {
+    anchor.current = null;
+    setGroups(shown, include);
+  };
 
   // Included groups in the owner's order; groups not yet ordered follow in
   // the provider's order, exactly as the server numbers them.
@@ -206,14 +225,17 @@ export function ChannelGroups({
             <Input
               type="search"
               value={q}
-              onChange={(e) => setQ(e.currentTarget.value)}
+              onChange={(e) => {
+                anchor.current = null;
+                setQ(e.currentTarget.value);
+              }}
               placeholder={t("Find a group…")}
               aria-label={t("Find a group")}
               className="h-8 pl-7 text-sm"
             />
           </div>
           <Button variant="outline" size="sm" disabled={!shown.length} onClick={() => setAll(true)}>
-            {needle ? t("Include matches") : t("Include all")}
+            {t("Select all")}
           </Button>
           <Button
             variant="outline"
@@ -221,9 +243,12 @@ export function ChannelGroups({
             disabled={!shown.length}
             onClick={() => setAll(false)}
           >
-            {needle ? t("Leave matches out") : t("Leave all out")}
+            {t("Select none")}
           </Button>
         </div>
+        <p className="text-xs text-fg-muted">
+          {t("Select all and Select none apply to matching groups. Shift-click to select a range.")}
+        </p>
         <ul
           aria-label={t("Channel groups")}
           className="app-scroll max-h-[22rem] divide-y divide-border/60 overflow-y-auto rounded-xl border border-border bg-surface"
@@ -347,20 +372,22 @@ const GroupRow = memo(function GroupRow({
   group: SourceGroup;
   included: boolean;
   adultHidden: boolean;
-  onToggle: (g: SourceGroup, include: boolean) => void;
+  onToggle: (g: SourceGroup, include: boolean, range: boolean) => void;
 }) {
   return (
     <li>
       <label
         className={cn(
-          "flex items-center gap-3 px-3 py-2 text-sm",
+          "flex select-none items-center gap-3 px-3 py-2 text-sm",
           adultHidden ? "cursor-not-allowed opacity-60" : "cursor-pointer hover:bg-surface-hover",
         )}
       >
         <Checkbox
           checked={included}
           disabled={adultHidden}
-          onChange={(e) => onToggle(g, e.currentTarget.checked)}
+          onChange={(e) =>
+            onToggle(g, e.currentTarget.checked, (e.nativeEvent as MouseEvent).shiftKey)
+          }
         />
         <span className={cn("min-w-0 flex-1 truncate", included ? "text-fg" : "text-fg-muted")}>
           {groupName(g)}

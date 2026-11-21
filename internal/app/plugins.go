@@ -6,22 +6,30 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/braedonsaunders/ether/internal/admin"
+	"github.com/braedonsaunders/ether/internal/blobcache"
+	"github.com/braedonsaunders/ether/internal/catalog"
 	"github.com/braedonsaunders/ether/internal/clusterbus"
 	"github.com/braedonsaunders/ether/internal/config"
+	"github.com/braedonsaunders/ether/internal/contentrating"
 	"github.com/braedonsaunders/ether/internal/core"
+	"github.com/braedonsaunders/ether/internal/experience"
 	"github.com/braedonsaunders/ether/internal/extend"
 	"github.com/braedonsaunders/ether/internal/identity"
 	"github.com/braedonsaunders/ether/internal/livetv"
 	"github.com/braedonsaunders/ether/internal/notify"
 	"github.com/braedonsaunders/ether/internal/playback"
+	"github.com/braedonsaunders/ether/internal/pluginitems"
 	"github.com/braedonsaunders/ether/internal/plugins"
 	"github.com/braedonsaunders/ether/internal/plugins/adapters"
 	"github.com/braedonsaunders/ether/internal/plugins/catalogue"
+	"github.com/braedonsaunders/ether/internal/plugins/frontendadapter"
 	"github.com/braedonsaunders/ether/internal/plugins/kit"
 	"github.com/braedonsaunders/ether/internal/plugins/remote"
 	"github.com/braedonsaunders/ether/internal/plugins/studio"
@@ -38,10 +46,69 @@ type pluginRuntime struct {
 	pairing       *remote.Pairing
 	pluginHost    http.Handler
 	subtitleProbe *adapters.SubtitleProbe
+	pluginitems   *pluginitems.Service
+	blobcache     *blobcache.Cache
+	kindCatalog   *adapters.KindCatalog
+	kindResolver  *adapters.KindResolver
+	// adapterCtrl keeps plugin-provided frontend adapters registered with
+	// the frontend registry; adapterTickets mints the scoped stream tickets
+	// adapter responses embed.
+	adapterCtrl    *frontendadapter.Controller
+	adapterTickets *frontendadapter.TicketIssuer
 }
 
 func (a *App) buildPlugins(ctx context.Context, cfg config.Config) (*pluginRuntime, error) {
+	var busyMu sync.Mutex
+	var busyAt time.Time
+	var busyValue bool
 	mgr, err := plugins.New(plugins.Deps{
+		EventBus:          a.EventBus(),
+		EventRegistry:     a.EventRegistry(),
+		FlowActions:       a.FlowsActions(),
+		ReadRuntimeConfig: func() config.Plugins { return a.cfg.Read().Plugins },
+		SaveRuntimeConfig: func(id string, limits config.PluginRuntimeLimits) error {
+			return a.cfg.Update(func(c *config.Config) error {
+				if id == "" {
+					c.Plugins.RuntimeLimits = limits
+				} else {
+					next := map[string]config.PluginRuntimeLimits{}
+					for key, value := range c.Plugins.RuntimeOverrides {
+						next[key] = value
+					}
+					next[id] = limits
+					c.Plugins.RuntimeOverrides = next
+				}
+				return nil
+			})
+		},
+		Busy: func() bool {
+			busyMu.Lock()
+			defer busyMu.Unlock()
+			if time.Since(busyAt) < time.Second {
+				return busyValue
+			}
+			busyAt = time.Now()
+			busyValue = false
+			check := func() bool {
+				if a.playback != nil && len(a.playback.Sessions()) > 0 {
+					return true
+				}
+				if a.livetv != nil {
+					if usage, err := a.livetv.LiveUsage(context.Background()); err == nil && usage.Sessions > 0 {
+						return true
+					}
+				}
+				if a.load != nil {
+					s := a.load.Snapshot()
+					if s.Current != nil && (s.Current.CPU > 85 || (s.Current.GPU != nil && *s.Current.GPU > 85)) {
+						return true
+					}
+				}
+				return false
+			}
+			busyValue = check()
+			return busyValue
+		},
 		OnAirContent: a.pluginContent,
 		ImportStylePack: func(ctx context.Context, id string, files map[string][]byte) error {
 			if a.onair == nil {
@@ -59,6 +126,30 @@ func (a *App) buildPlugins(ctx context.Context, cfg config.Config) (*pluginRunti
 		Backends: plugins.Backends{
 			CollectionsUpsert: a.pluginCollectionUpsert,
 			CollectionsDelete: a.pluginCollectionDelete,
+			ResolveBadgeTitles: func(ctx context.Context, refs []plugins.BadgeTitleRef) ([]string, error) {
+				if a.catalog == nil || len(refs) == 0 {
+					return make([]string, len(refs)), nil
+				}
+				crefs := make([]catalog.ExternalTitleRef, len(refs))
+				for i, r := range refs {
+					crefs[i] = catalog.ExternalTitleRef{
+						Type: core.MediaType(r.Type),
+						TMDB: r.TMDB,
+						IMDB: r.IMDB,
+					}
+				}
+				keys, err := a.catalog.ResolveExternalTitles(ctx, crefs)
+				if err != nil {
+					return nil, err
+				}
+				out := make([]string, len(keys))
+				for i, k := range keys {
+					if k != 0 {
+						out[i] = k.String()
+					}
+				}
+				return out, nil
+			},
 			ViewerNames: func(ctx context.Context, ids []int64) (json.RawMessage, error) {
 				out := make([]map[string]any, 0, len(ids))
 				for _, id := range ids {
@@ -190,11 +281,12 @@ func (a *App) buildPlugins(ctx context.Context, cfg config.Config) (*pluginRunti
 	if err != nil {
 		return nil, err
 	}
+	indexURL, indexKey := cfg.Plugins.Catalogue()
 	cat, err := catalogue.New(catalogue.Options{
 		DB:        a.db,
 		Manager:   mgr,
-		IndexURL:  cfg.Plugins.IndexURL,
-		PublicKey: cfg.Plugins.PublicKey,
+		IndexURL:  indexURL,
+		PublicKey: indexKey,
 		Log:       a.log.With("component", "plugins-catalogue"),
 	})
 	if err != nil {
@@ -230,9 +322,17 @@ func (a *App) buildPlugins(ctx context.Context, cfg config.Config) (*pluginRunti
 	})
 	log := a.log.With("component", "plugins-remote")
 	tunnel := remote.NewTunnelServer(remote.TunnelOptions{Auth: auth, Logger: log})
-	factory := &remote.Factory{Tunnel: tunnel, TrustedLAN: remote.GrantsLAN(mgr.GrantsOf), Logger: log}
+	factory := &remote.Factory{Tunnel: tunnel, TrustedLAN: remote.GrantsLAN(mgr.GrantsOf), LocalHosts: remote.GrantsLocalHosts(mgr.GrantsOf), Logger: log}
 	mgr.RegisterRuntime("remote", factory.RuntimeFactory())
-	host := remote.NewHostHandler(remote.HostOptions{Host: remote.HostAdapter{HostFor: mgr.HostFor, SettingsWithSecrets: mgr.PluginSettings}, Auth: auth, Logger: log})
+	mgr.SetSidecarState(factory.SidecarState)
+	// A sidecar that (re)connects is checked at once, so the console does
+	// not keep showing the failures recorded while it was away.
+	tunnel.SetOnConnect(func(pluginID string) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_, _ = mgr.CheckHealth(ctx, pluginID)
+	})
+	host := remote.NewHostHandler(remote.HostOptions{Host: remote.HostAdapter{HostFor: mgr.HostFor, SettingsWithSecrets: mgr.PluginSettings, ResolveAdapterViewerToken: mgr.ResolveAdapterViewerToken}, Auth: auth, Logger: log})
 	pairing := remote.NewPairing(a.db, grants, func(ctx context.Context) (int64, error) {
 		owner, err := a.users.Owner(ctx)
 		if err != nil {
@@ -275,24 +375,136 @@ func (a *App) buildPlugins(ctx context.Context, cfg config.Config) (*pluginRunti
 	subtitleProbe := adapters.NewSubtitleProbe(mgr, a.catalog)
 	a.closers = append(a.closers, subtitleProbe.Close)
 	markerCtx, cancelMarkers := context.WithCancel(context.Background())
-	markerBridge := adapters.AttachMarkers(markerCtx, mgr, a.markers, a.catalog, func(id string) bool {
-		for _, source := range a.cfg.Get().Markers.SourceOrder {
-			if source == id {
-				return true
+	markerBridge := adapters.AttachMarkers(markerCtx, mgr, a.markers, a.catalog, adapters.MarkerBridgeOptions{
+		Selected: func(id string) bool {
+			for _, source := range a.cfg.Get().Markers.SourceOrder {
+				if source == id {
+					return true
+				}
 			}
-		}
-		return false
+			return false
+		},
+		SkipDB: func() (enabled bool, apiKey, baseURL string) {
+			c := a.cfg.Get().Markers
+			return c.SkipDB, c.SkipDBAPIKey, ""
+		},
 	})
 	a.closers = append(a.closers, func() { cancelMarkers(); markerBridge.Wait() })
+
+	runCtx, cancelRun := context.WithCancel(context.Background())
+
+	itemsSvc, err := pluginitems.New(ctx, a.db, pluginitems.Options{
+		Caller:            mgr,
+		Health:            mgr,
+		MaxPluginItemsFor: mgr.MaxPluginItems,
+		Logger:            a.log.With("component", "pluginitems"),
+		IsLeader:          func() bool { return a.cluster == nil || a.cluster.IsLeader() },
+	})
+	if err != nil {
+		cancelRun()
+		return nil, err
+	}
+	a.closers = append(a.closers, itemsSvc.Close)
+
+	blobDir := filepath.Join(a.opts.DataDir, "blobcache")
+	blobs, err := blobcache.Open(blobDir, blobcache.Options{
+		Logger:    a.log.With("component", "blobcache"),
+		DiskUsage: a.opts.diskUsage,
+	})
+	if err != nil {
+		cancelRun()
+		return nil, err
+	}
+	a.closers = append(a.closers, func() { _ = blobs.Close() })
+
+	kindCatalog := adapters.AttachKindCatalog(runCtx, adapters.KindCatalogDeps{
+		TitleInLibrary: func(ctx context.Context, lib core.Library, key core.RatingKey) (bool, error) {
+			return a.catalog.TitleInFilter(ctx, libraryScopeFilter(lib, core.Filter{}), key)
+		},
+		Manager:   mgr,
+		Libraries: a.libraries,
+		Items:     itemsSvc,
+		Blobs:     blobs,
+		BlobDir:   blobDir,
+		Logger:    a.log,
+	})
+
+	var idx core.Indexer
+	var eng core.Engine
+	if a.opts.FixtureMedia != nil {
+		idx = a.opts.FixtureMedia
+		eng = a.opts.FixtureMedia
+	} else {
+		if a.sources != nil {
+			idx = a.sources
+		}
+		if a.media != nil {
+			eng = a.media
+		}
+	}
+	var deb adapters.DebridSourceBackend
+	if a.debrid != nil {
+		deb = a.debrid
+	}
+	var usenetServing func() bool
+	if a.opts.FixtureMedia == nil {
+		usenetServing = func() bool {
+			return a.fetcher == nil || a.fetcher.HasServingProvider()
+		}
+	}
+	kindResolver := adapters.NewKindResolver(adapters.KindResolverDeps{
+		Manager:       mgr,
+		Libraries:     a.libraries,
+		Items:         itemsSvc,
+		Blobs:         blobs,
+		Catalog:       kindCatalog,
+		Indexer:       idx,
+		Resolver:      a.resolver,
+		Debrid:        deb,
+		Engine:        eng,
+		UsenetServing: usenetServing,
+		Authorize: func(ctx context.Context, viewer *core.Viewer, key core.RatingKey) error {
+			_, err := a.pluginPlayableTitle(ctx, kindCatalog, viewer, key)
+			return err
+		},
+		Logger: a.log,
+	})
+	cachePut, cacheOpen, cacheDelete := blobs.HostBackends(kindCatalog.QuotaFor)
+	adapterTickets := frontendadapter.NewTicketIssuer()
+	mgr.SetKindBackends(plugins.KindBackends{
+		KindUpsert:      itemsSvc.KindUpsert,
+		KindUpsertStats: itemsSvc.KindUpsertWithStats,
+		KindDelete:      itemsSvc.KindDelete,
+		KindItems:       itemsSvc.KindItems,
+		KindItemsByID:   itemsSvc.KindItemsByID,
+		KindItemCount:   itemsSvc.PluginItemCount,
+		KindVisible:     a.adapterKindVisible(),
+		KindBrowse:      a.adapterKindBrowse(),
+		ResolveSources:  kindResolver.ResolveSources,
+		CachePut:        cachePut,
+		CacheOpen:       cacheOpen,
+		CacheDelete:     cacheDelete,
+		StreamURL:       a.adapterStreamURL(adapterTickets),
+		StreamPartURL:   a.adapterStreamPartURL(adapterTickets),
+	})
+
 	if err := mgr.Start(ctx); err != nil {
+		cancelRun()
 		return nil, err
 	}
 	a.bindStreamSources(mgr)
 	// Installed plugins that serve streams are run-time indexer rows: keep
 	// the running search manager in step with installs, removals and role
-	// switches.
-	mgr.OnSync(func(context.Context, plugins.Record) { a.reapplyAddonIndexers() })
-	mgr.OnRemove(func(context.Context, string) { a.reapplyAddonIndexers() })
+	// switches. Also refresh published library sections when plugin libraries
+	// appear or disappear.
+	mgr.OnSync(func(context.Context, plugins.Record) {
+		a.reapplyAddonIndexers()
+		a.publishLibrarySections()
+	})
+	mgr.OnRemove(func(context.Context, string) {
+		a.reapplyAddonIndexers()
+		a.publishLibrarySections()
+	})
 
 	if a.resolver != nil {
 		a.resolver.SetRankingHooks(adapters.Ranking{Manager: mgr, Registry: a.extendRT.registry})
@@ -315,8 +527,16 @@ func (a *App) buildPlugins(ctx context.Context, cfg config.Config) (*pluginRunti
 	})
 
 	if err := studioSvc.OpenStorage(ctx, a.db); err != nil {
+		cancelRun()
+		unsubscribe()
 		return nil, err
 	}
+	// Auto-import Live TV channels when a native channels plugin is newly installed.
+	mgr.OnInstall(func(_ context.Context, rec plugins.Record) {
+		if !rec.Manifest.SpeaksStremio() {
+			a.startPluginLiveTV(rec)
+		}
+	})
 	// Removing a plugin removes the drafts it was installed from.
 	mgr.OnRemove(func(ctx context.Context, id string) { studioSvc.ForgetPlugin(ctx, id) })
 
@@ -378,7 +598,6 @@ func (a *App) buildPlugins(ctx context.Context, cfg config.Config) (*pluginRunti
 		})
 	}
 
-	runCtx, cancelRun := context.WithCancel(context.Background())
 	go mgr.Run(runCtx)
 	go cat.Run(runCtx, catalogue.DefaultRefreshInterval)
 	a.closers = append(a.closers, func() {
@@ -388,7 +607,20 @@ func (a *App) buildPlugins(ctx context.Context, cfg config.Config) (*pluginRunti
 		stopNotify()
 		unsubscribe()
 	})
-	return &pluginRuntime{subtitleProbe: subtitleProbe, mgr: mgr, cat: cat, studio: studioSvc, tunnel: tunnel, pairing: pairing, pluginHost: host}, nil
+	return &pluginRuntime{
+		subtitleProbe:  subtitleProbe,
+		mgr:            mgr,
+		cat:            cat,
+		studio:         studioSvc,
+		tunnel:         tunnel,
+		pairing:        pairing,
+		pluginHost:     host,
+		pluginitems:    itemsSvc,
+		blobcache:      blobs,
+		kindCatalog:    kindCatalog,
+		kindResolver:   kindResolver,
+		adapterTickets: adapterTickets,
+	}, nil
 }
 
 // pluginHandlers mounts the owner plugin API under /api/plugins (WS7, WS11).
@@ -460,8 +692,8 @@ func (a *App) pluginTextResolver() extend.TextResolver {
 	return a.pluginsRT.mgr.TextResolver()
 }
 
-// startPluginLiveTV adds a Live TV source for a channels plugin installed
-// from Studio, so its lineup lands in the guide without a second setup step.
+// startPluginLiveTV adds a Live TV source for a newly installed channels
+// plugin, so its lineup lands in the guide without a second setup step.
 // It runs once per install; an owner who later removes the source keeps
 // that choice.
 func (a *App) startPluginLiveTV(rec plugins.Record) {
@@ -470,6 +702,8 @@ func (a *App) startPluginLiveTV(rec plugins.Record) {
 	}
 	kind := extend.PluginID(rec.ID, "channels")
 	go func() {
+		a.pluginLiveTVMu.Lock()
+		defer a.pluginLiveTVMu.Unlock()
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
 		// The source kind registers when the install syncs; wait for it.
@@ -493,4 +727,33 @@ func (a *App) startPluginLiveTV(rec plugins.Record) {
 			}
 		}
 	}()
+}
+
+// pluginPlayableTitle is the viewer check for a plugin library item: the
+// library must be visible to the viewer and active, and the item must pass
+// the viewer's rating and safety policy. Resolving a source and re-checking
+// a playing session both use it.
+func (a *App) pluginPlayableTitle(ctx context.Context, kindCatalog *adapters.KindCatalog, viewer *core.Viewer, key core.RatingKey) (*core.Title, error) {
+	if viewer == nil || viewer.ID <= 0 || a.users == nil || kindCatalog == nil {
+		return nil, core.ErrNotFound
+	}
+	u, err := a.users.PolicyUser(ctx, viewer.ID)
+	if err != nil || u == nil {
+		return nil, core.ErrNotFound
+	}
+	piv, err := kindCatalog.Item(ctx, key)
+	if err != nil {
+		return nil, core.ErrNotFound
+	}
+	if piv.Library.Hidden || !u.AllowsLibrary(piv.Library.ID) || !kindCatalog.IsPluginLibraryActive(ctx, piv.Library) {
+		return nil, core.ErrNotFound
+	}
+	if u.MaxContentRating != "" && piv.Title.ContentRating != "" && contentrating.Exceeds(piv.Title.ContentRating, u.MaxContentRating) {
+		return nil, core.ErrNotFound
+	}
+	if !experience.TitleAllowed(a.safety, u, &piv.Title) {
+		return nil, core.ErrNotFound
+	}
+	t := piv.Title
+	return &t, nil
 }

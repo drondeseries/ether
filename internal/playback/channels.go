@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/braedonsaunders/ether/internal/core"
+	"github.com/braedonsaunders/ether/internal/releasepolicy"
 )
 
 // PrepareChannel is an internal playout operation. One viewing session may
@@ -28,7 +29,7 @@ func (m *Manager) prepareChannelRelease(ctx context.Context, u *core.User, key c
 	if len(group) < 16 || len(group) > 128 || strings.ContainsAny(group, "/\\\x00\r\n") {
 		return nil, fmt.Errorf("invalid channel session")
 	}
-	id := identity{userID: u.ID, clientID: caps.ClientID, key: key, surface: playbackSurface(string(caps.Protocol))}
+	id := identity{userID: u.ID, clientID: caps.ClientID, key: key, surface: m.playbackSurface(string(caps.Protocol))}
 	m.mu.Lock()
 	if m.channelGroups == nil {
 		m.channelGroups = map[identity]string{}
@@ -57,10 +58,14 @@ func (m *Manager) prepareChannelRelease(ctx context.Context, u *core.User, key c
 }
 
 // reservationCountsLocked counts distinct viewing groups and ordinary sources.
-func (m *Manager) reservationCountsLocked(id identity) (user, total, children int) {
+func (m *Manager) reservationCountsLocked(id identity) (user, total, children, sourced int) {
 	group := m.channelGroups[id]
 	joining := strings.HasPrefix(id.clientID, "join/")
 	units := map[string]int64{}
+	// sourcedUnits are units that resolve a release (sessions and pending
+	// prepares, virtual channels included); passthrough IPTV groups and
+	// broadcasts never touch Usenet.
+	sourcedUnits := map[string]bool{}
 	broadcastUnits := map[string]bool{}
 	viewerUnits := map[string]bool{}
 	for g, slot := range m.externalGroups {
@@ -100,6 +105,7 @@ func (m *Manager) reservationCountsLocked(id identity) (user, total, children in
 			unit = fmt.Sprintf("client/%d/%s/%s", other.userID, other.surface, other.clientID)
 		}
 		units[unit] = other.userID
+		sourcedUnits[unit] = true
 	}
 	now := m.now()
 	for sid, s := range m.sessions {
@@ -122,6 +128,7 @@ func (m *Manager) reservationCountsLocked(id identity) (user, total, children in
 	}
 	total += len(broadcastUnits)
 	user += len(viewerUnits)
+	sourced = len(sourcedUnits)
 	return
 }
 
@@ -154,7 +161,12 @@ func (m *Manager) beginChannel(u *core.User, caps core.ClientCaps, group, output
 	}
 	cfg := m.config()
 	userLimit := UserStreamLimit(cfg, u)
-	serverLimit := ServerStreamLimit(cfg, m.opts.ConnectionsPerStream)
+	serverLimit, derived := serverStreamLimit(cfg, m.opts.ConnectionsPerStream)
+	if derived {
+		// The automatic limit protects Usenet connections; a channel
+		// reserved here plays from its IPTV source, never from Usenet.
+		serverLimit = 0
+	}
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
@@ -179,7 +191,7 @@ func (m *Manager) beginChannel(u *core.User, caps core.ClientCaps, group, output
 		id.clientID = "join/" + caps.ClientID
 		m.channelGroups[id] = output
 	}
-	userN, total, _ := m.reservationCountsLocked(id)
+	userN, total, _, _ := m.reservationCountsLocked(id)
 	if output != "" {
 		delete(m.channelGroups, id)
 	}
@@ -221,4 +233,67 @@ func (m *Manager) EndChannel(group string) {
 	delete(m.externalGroups, group)
 	m.mu.Unlock()
 	m.reg.poke()
+}
+
+func (m *Manager) channelSourceAllowed(s *session, r core.Release) bool {
+	if s.caps.BroadcastBitrateKbps <= 0 {
+		return true
+	}
+	if r.Info.FullSeason {
+		r.Size = 0
+	}
+	if s.title == nil || !releasepolicy.ChannelSourceAllowed(r, s.title.Runtime, s.caps.BroadcastBitrateKbps) {
+		return false
+	}
+	if policy, ok := m.deps.Resolver.(interface {
+		ChannelSourceAllowed(core.Release, core.ClientCaps, *core.Title) bool
+	}); ok {
+		return policy.ChannelSourceAllowed(r, s.caps, s.title)
+	}
+	return true
+}
+
+// ChannelReadyRelease is a bounded, local evidence lookup for substitute races.
+func (m *Manager) ChannelReadyRelease(ctx context.Context, u *core.User, key core.RatingKey, caps core.ClientCaps) (string, bool) {
+	ready, ok := m.deps.Resolver.(interface {
+		ReadyChannelRelease(context.Context, core.ResolveRequest) (core.Release, bool)
+	})
+	if !ok {
+		return "", false
+	}
+	stored, ok := m.deps.Catalog.(core.StoredTitleLookup)
+	if !ok {
+		return "", false
+	}
+	title, err := stored.StoredTitle(ctx, key)
+	if err != nil || title == nil {
+		return "", false
+	}
+	req := core.ResolveRequest{Title: title, Client: caps, User: u, Exclude: caps.BroadcastExclude}
+	r, ok := ready.ReadyChannelRelease(ctx, req)
+	if ok {
+		return r.ID, true
+	}
+	// A recent successful play survives a restart, but is eligible only if
+	// the resolver still has fresh verification and the current budget fits.
+	if m.resume == nil || u == nil {
+		return "", false
+	}
+	rec, err := m.resume.get(ctx, u.ID, key)
+	if err != nil || rec == nil || rec.size <= 0 || rec.duration <= 0 || m.now().Before(rec.updatedAt) || m.now().Sub(rec.updatedAt) > 5*time.Minute || !sourceFitsBitrate(rec.size, rec.duration, 0, caps.BroadcastBitrateKbps) {
+		return "", false
+	}
+	remembered, ok := m.deps.Resolver.(interface {
+		ReadyRememberedChannelRelease(context.Context, core.ResolveRequest, core.Release) (core.Release, bool)
+	})
+	if !ok {
+		return "", false
+	}
+	file := rec.release
+	file.Size, file.Info.FullSeason = rec.size, false
+	copyTitle := *title
+	copyTitle.Runtime = rec.duration
+	req.Title = &copyTitle
+	r, ok = remembered.ReadyRememberedChannelRelease(ctx, req, file)
+	return r.ID, ok
 }

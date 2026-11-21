@@ -2,11 +2,14 @@ package plextv
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // Friend is an account with access to this server and the server access
@@ -183,6 +186,482 @@ func (c *Client) SharedServers(ctx context.Context, ownerToken string) ([]Friend
 	return out, nil
 }
 
+type rawShare struct {
+	id       int64
+	username string
+	email    string
+	userID   int64
+}
+
+func (c *Client) listRawShares(ctx context.Context, ownerToken string) ([]rawShare, error) {
+	resp, err := c.do(ctx, request{
+		method: http.MethodGet,
+		path:   "/api/servers/" + url.PathEscape(c.id.ClientIdentifier) + "/shared_servers",
+		token:  ownerToken,
+		accept: "application/xml",
+	})
+	if err != nil {
+		return nil, err
+	}
+	root, err := parseXMLNode(resp.body)
+	if err != nil {
+		return nil, fmt.Errorf("plextv: decode shared servers: %w", err)
+	}
+	var out []rawShare
+	for _, n := range root.findAll("SharedServer") {
+		out = append(out, rawShare{
+			id:       n.intAttr("id"),
+			username: n.attr("username"),
+			email:    n.attr("email"),
+			userID:   n.intAttr("userID", "user_id"),
+		})
+	}
+	return out, nil
+}
+
+// ServerSectionIDs queries plex.tv for this server's registered library section IDs.
+func (c *Client) ServerSectionIDs(ctx context.Context, ownerToken string) ([]int64, error) {
+	if c.id.ClientIdentifier == "" {
+		return nil, errors.New("plextv: client identifier required")
+	}
+	resp, err := c.do(ctx, request{
+		method: http.MethodGet,
+		path:   "/api/servers/" + url.PathEscape(c.id.ClientIdentifier),
+		token:  ownerToken,
+		accept: "application/xml",
+	})
+	if err != nil {
+		return nil, err
+	}
+	root, err := parseXMLNode(resp.body)
+	if err != nil {
+		return nil, fmt.Errorf("plextv: decode server: %w", err)
+	}
+	var ids []int64
+	for _, s := range root.findAll("Section") {
+		if id := s.intAttr("id"); id > 0 {
+			ids = append(ids, id)
+		}
+	}
+	return ids, nil
+}
+
+type v2SharedServer struct {
+	ID                int64          `json:"id"`
+	MachineIdentifier string         `json:"machineIdentifier"`
+	AllLibraries      bool           `json:"allLibraries"`
+	LibrarySectionIDs []int64        `json:"librarySectionIds"`
+	Settings          map[string]any `json:"settings"`
+	Invited           struct {
+		ID       int64  `json:"id"`
+		Username string `json:"username"`
+		Email    string `json:"email"`
+		Title    string `json:"title"`
+	} `json:"invited"`
+}
+
+type v2PendingInvite struct {
+	Invited struct {
+		ID       int64  `json:"id"`
+		Username string `json:"username"`
+		Email    string `json:"email"`
+		Title    string `json:"title"`
+	} `json:"invited"`
+	SharedServers []v2SharedServer `json:"sharedServers"`
+}
+
+func (c *Client) findV2Share(ctx context.Context, ownerToken, usernameOrEmail string, userID int64) (*v2SharedServer, error) {
+	respAcc, err := c.do(ctx, request{
+		method: http.MethodGet,
+		path:   "/api/v2/shared_servers/owned/accepted",
+		token:  ownerToken,
+		accept: "application/json",
+	})
+	if err == nil {
+		var accepted []v2SharedServer
+		if json.Unmarshal(respAcc.body, &accepted) == nil {
+			for _, s := range accepted {
+				if s.MachineIdentifier == c.id.ClientIdentifier {
+					if userID > 0 && s.Invited.ID == userID {
+						return &s, nil
+					}
+					if usernameOrEmail != "" && (strings.EqualFold(s.Invited.Username, usernameOrEmail) ||
+						strings.EqualFold(s.Invited.Email, usernameOrEmail) ||
+						strings.EqualFold(s.Invited.Title, usernameOrEmail)) {
+						return &s, nil
+					}
+				}
+			}
+		}
+	}
+
+	respPend, err := c.do(ctx, request{
+		method: http.MethodGet,
+		path:   "/api/v2/shared_servers/invites/owned/pending",
+		token:  ownerToken,
+		accept: "application/json",
+	})
+	if err == nil {
+		var pending []v2PendingInvite
+		if json.Unmarshal(respPend.body, &pending) == nil {
+			for _, inv := range pending {
+				matchUser := (userID > 0 && inv.Invited.ID == userID) ||
+					(usernameOrEmail != "" && (strings.EqualFold(inv.Invited.Username, usernameOrEmail) ||
+						strings.EqualFold(inv.Invited.Email, usernameOrEmail) ||
+						strings.EqualFold(inv.Invited.Title, usernameOrEmail)))
+				for _, s := range inv.SharedServers {
+					if s.MachineIdentifier == c.id.ClientIdentifier && (matchUser ||
+						(userID > 0 && s.Invited.ID == userID) ||
+						(usernameOrEmail != "" && (strings.EqualFold(s.Invited.Username, usernameOrEmail) ||
+							strings.EqualFold(s.Invited.Email, usernameOrEmail) ||
+							strings.EqualFold(s.Invited.Title, usernameOrEmail)))) {
+						return &s, nil
+					}
+				}
+			}
+		}
+	}
+
+	return nil, nil
+}
+
+func (c *Client) resolveFriendByName(ctx context.Context, ownerToken, name string) (int64, string) {
+	type candidate struct {
+		id       int64
+		username string
+		titles   []string
+		email    string
+	}
+	byID := map[int64]int{}
+	byUser := map[string]int{}
+	var cands []candidate
+
+	compact := func(s string) string {
+		return strings.ToLower(strings.ReplaceAll(strings.TrimSpace(s), " ", ""))
+	}
+	pickHandle := func(cand candidate) string {
+		if em := strings.TrimSpace(cand.email); em != "" && !strings.Contains(em, " ") {
+			return em
+		}
+		if un := strings.TrimSpace(cand.username); un != "" && !strings.Contains(un, " ") {
+			return un
+		}
+		return ""
+	}
+	mergeInto := func(idx int, id int64, username, title, email string) {
+		if cands[idx].id <= 0 && id > 0 {
+			cands[idx].id = id
+			byID[id] = idx
+		}
+		if cands[idx].username == "" && username != "" {
+			cands[idx].username = username
+			byUser[strings.ToLower(username)] = idx
+		}
+		if cands[idx].email == "" && email != "" {
+			cands[idx].email = email
+		}
+		if title != "" {
+			cands[idx].titles = append(cands[idx].titles, title)
+		}
+	}
+	add := func(id int64, username, title, email string) {
+		username = strings.TrimSpace(username)
+		title = strings.TrimSpace(title)
+		email = strings.TrimSpace(email)
+		if id > 0 {
+			if idx, ok := byID[id]; ok {
+				mergeInto(idx, id, username, title, email)
+				return
+			}
+		}
+		if username != "" {
+			if idx, ok := byUser[strings.ToLower(username)]; ok {
+				mergeInto(idx, id, username, title, email)
+				return
+			}
+		}
+		if id <= 0 && username == "" {
+			return
+		}
+		idx := len(cands)
+		var titles []string
+		if title != "" {
+			titles = []string{title}
+		}
+		cands = append(cands, candidate{id: id, username: username, titles: titles, email: email})
+		if id > 0 {
+			byID[id] = idx
+		}
+		if username != "" {
+			byUser[strings.ToLower(username)] = idx
+		}
+	}
+
+	wantCompact := compact(name)
+	match := func() (int64, string, bool) {
+		var compactMatch candidate
+		compactCount := 0
+		for _, cand := range cands {
+			if strings.EqualFold(cand.username, name) || strings.EqualFold(cand.email, name) {
+				if cand.id > 0 || pickHandle(cand) != "" {
+					return cand.id, pickHandle(cand), true
+				}
+			}
+			for _, t := range cand.titles {
+				if strings.EqualFold(t, name) {
+					if cand.id > 0 || pickHandle(cand) != "" {
+						return cand.id, pickHandle(cand), true
+					}
+				}
+			}
+			matchedCompact := compact(cand.username) == wantCompact
+			if !matchedCompact {
+				for _, t := range cand.titles {
+					if compact(t) == wantCompact {
+						matchedCompact = true
+						break
+					}
+				}
+			}
+			if matchedCompact && (cand.id > 0 || pickHandle(cand) != "") {
+				compactMatch = cand
+				compactCount++
+			}
+		}
+		if compactCount == 1 {
+			return compactMatch.id, pickHandle(compactMatch), true
+		}
+		return 0, "", false
+	}
+
+	if users, err := c.Users(ctx, ownerToken); err == nil {
+		for _, u := range users {
+			if u.PlexID > 0 {
+				add(u.PlexID, u.Username, u.Title, u.Email)
+			}
+		}
+		if id, handle, ok := match(); ok {
+			return id, handle
+		}
+	}
+	if friends, err := c.AccessTokens(ctx, ownerToken); err == nil {
+		for _, f := range friends {
+			if !f.Owned && f.PlexID > 0 {
+				add(f.PlexID, f.Username, f.Title, f.Email)
+			}
+		}
+		if id, handle, ok := match(); ok {
+			return id, handle
+		}
+	}
+	if c.base != nil && c.base.String() == DefaultBaseURL {
+		if cFriends, err := (&CommunityClient{Client: c.hc, MinInterval: time.Millisecond, MaxRetries: -1}).Friends(ctx, ownerToken); err == nil {
+			for _, f := range cFriends {
+				id, _ := strconv.ParseInt(f.ID, 10, 64)
+				add(id, f.Username, f.DisplayName, "")
+			}
+			if id, handle, ok := match(); ok {
+				return id, handle
+			}
+		}
+	}
+	return 0, ""
+}
+
+// ShareServer grants usernameOrEmail access to the server's libraries on plex.tv.
+// If sectionIDs is empty, it sets allLibraries: true so all libraries are checked.
+// If userID > 0, it passes invitedId to Plex's modern v2 sharing API with
+// skipFriendship: true so existing friends immediately receive library access without
+// sending a duplicate friendship invite.
+// If the share already exists, it updates it so allLibraries remains granted.
+// It falls back to v1 XML if v2 is unavailable.
+func (c *Client) ShareServer(ctx context.Context, ownerToken, usernameOrEmail string, userID int64, sectionIDs []int64) error {
+	usernameOrEmail = strings.TrimSpace(usernameOrEmail)
+	if userID <= 0 && usernameOrEmail != "" {
+		if parsedID, err := strconv.ParseInt(usernameOrEmail, 10, 64); err == nil && parsedID > 0 {
+			userID = parsedID
+		}
+	}
+	if usernameOrEmail == "" && userID <= 0 {
+		return errors.New("plextv: username, email or user ID required")
+	}
+	if c.id.ClientIdentifier == "" {
+		return errors.New("plextv: client identifier required")
+	}
+	if userID <= 0 && strings.Contains(usernameOrEmail, " ") {
+		resolvedID, resolvedHandle := c.resolveFriendByName(ctx, ownerToken, usernameOrEmail)
+		if resolvedID > 0 {
+			userID = resolvedID
+		}
+		if resolvedHandle != "" {
+			usernameOrEmail = resolvedHandle
+		}
+		if userID <= 0 && strings.Contains(usernameOrEmail, " ") {
+			return fmt.Errorf("plextv: %q contains spaces and could not be matched to a Plex friend; enter their Plex username or email instead", usernameOrEmail)
+		}
+	}
+
+	allLibraries := len(sectionIDs) == 0
+	if allLibraries {
+		sectionIDs = []int64{}
+	}
+
+	// 1. Try modern Plex v2 API
+	payloadV2 := map[string]any{
+		"machineIdentifier": c.id.ClientIdentifier,
+		"allLibraries":      allLibraries,
+		"librarySectionIds": sectionIDs,
+		"skipFriendship":    true,
+		"settings": map[string]any{
+			"allowSync":         true,
+			"allowCameraUpload": false,
+			"allowChannels":     false,
+			"filterMovies":      "",
+			"filterTelevision":  "",
+			"filterMusic":       "",
+		},
+	}
+	if userID > 0 {
+		payloadV2["invitedId"] = userID
+	} else {
+		payloadV2["invitedEmail"] = usernameOrEmail
+	}
+
+	bodyV2, err := json.Marshal(payloadV2)
+	if err != nil {
+		return fmt.Errorf("plextv: marshal share payload: %w", err)
+	}
+
+	_, postV2Err := c.do(ctx, request{
+		method:      http.MethodPost,
+		path:        "/api/v2/shared_servers",
+		token:       ownerToken,
+		body:        bodyV2,
+		contentType: "application/json",
+		accept:      "application/json",
+	})
+	if postV2Err == nil {
+		return nil
+	}
+
+	// If v2 reported already sharing (422 / 400), check existing share via v2.
+	// Keep existing library grants and content restrictions; only widen access
+	// when the owner explicitly passed sectionIDs.
+	existing, _ := c.findV2Share(ctx, ownerToken, usernameOrEmail, userID)
+	if existing != nil && existing.ID > 0 {
+		targetAll := existing.AllLibraries
+		targetSections := existing.LibrarySectionIDs
+		if len(sectionIDs) > 0 {
+			targetAll = false
+			targetSections = sectionIDs
+		}
+
+		updatePayload := map[string]any{
+			"allLibraries":      targetAll,
+			"librarySectionIds": targetSections,
+		}
+		if len(existing.Settings) > 0 {
+			updatePayload["settings"] = existing.Settings
+		} else {
+			updatePayload["settings"] = map[string]any{
+				"allowSync":         true,
+				"allowCameraUpload": false,
+				"allowChannels":     false,
+				"filterMovies":      "",
+				"filterTelevision":  "",
+				"filterMusic":       "",
+			}
+		}
+		updateBody, err := json.Marshal(updatePayload)
+		if err == nil {
+			_, postUpdateErr := c.do(ctx, request{
+				method:      http.MethodPost,
+				path:        "/api/v2/shared_servers/" + strconv.FormatInt(existing.ID, 10),
+				token:       ownerToken,
+				body:        updateBody,
+				contentType: "application/json",
+				accept:      "application/json",
+			})
+			if postUpdateErr == nil {
+				return nil
+			}
+		}
+	}
+
+	// 2. Fall back to v1 XML API (for test servers or legacy environments)
+	v1SectionIDs := sectionIDs
+	if len(v1SectionIDs) == 0 {
+		v1SectionIDs, _ = c.ServerSectionIDs(ctx, ownerToken)
+	}
+
+	v1Target := usernameOrEmail
+	if (v1Target == "" || strings.Contains(v1Target, " ")) && userID > 0 {
+		v1Target = strconv.FormatInt(userID, 10)
+	}
+
+	payloadV1 := map[string]any{
+		"server_id": c.id.ClientIdentifier,
+		"shared_server": map[string]any{
+			"invited_email":       v1Target,
+			"library_section_ids": v1SectionIDs,
+		},
+		"sharing_settings": map[string]any{
+			"allowSync":         "1",
+			"allowCameraUpload": "0",
+			"allowChannels":     "0",
+			"filterMovies":      "",
+			"filterTelevision":  "",
+			"filterMusic":       "",
+		},
+	}
+	bodyV1, err := json.Marshal(payloadV1)
+	if err != nil {
+		return fmt.Errorf("plextv: marshal v1 share payload: %w", err)
+	}
+
+	_, postV1Err := c.do(ctx, request{
+		method:      http.MethodPost,
+		path:        "/api/servers/" + url.PathEscape(c.id.ClientIdentifier) + "/shared_servers",
+		token:       ownerToken,
+		body:        bodyV1,
+		contentType: "application/json",
+		accept:      "application/json, application/xml",
+	})
+	if postV1Err == nil {
+		return nil
+	}
+
+	// v1 PUT fallback
+	shares, listErr := c.listRawShares(ctx, ownerToken)
+	if listErr != nil {
+		return postV2Err
+	}
+	var v1ShareID int64
+	for _, s := range shares {
+		if (usernameOrEmail != "" && (strings.EqualFold(s.username, usernameOrEmail) || strings.EqualFold(s.email, usernameOrEmail))) ||
+			(userID > 0 && s.userID == userID) {
+			v1ShareID = s.id
+			break
+		}
+	}
+	if v1ShareID == 0 {
+		return postV2Err
+	}
+
+	_, putV1Err := c.do(ctx, request{
+		method:      http.MethodPut,
+		path:        "/api/servers/" + url.PathEscape(c.id.ClientIdentifier) + "/shared_servers/" + strconv.FormatInt(v1ShareID, 10),
+		token:       ownerToken,
+		body:        bodyV1,
+		contentType: "application/json",
+		accept:      "application/json, application/xml",
+	})
+	if putV1Err != nil {
+		return fmt.Errorf("plextv: update share %d: %w", v1ShareID, putV1Err)
+	}
+	return nil
+}
+
 // SharedUser is an entry of the owner's friends/home list (v2 server users).
 type SharedUser struct {
 	PlexID        int64
@@ -303,6 +782,11 @@ func (c *Client) Friends(ctx context.Context, serverToken string) ([]Friend, err
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
+		// An account token cannot use this endpoint. Preserve the specific
+		// error so the registrar can repair it instead of hiding it in a fallback.
+		if serverTokenRequired(err) {
+			return nil, err
+		}
 		c.log.Warn("access_tokens.xml failed, trying shared_servers", "err", err)
 		var err2 error
 		friends, err2 = c.SharedServers(ctx, serverToken)
@@ -381,4 +865,10 @@ func (c *Client) Friends(ctx context.Context, serverToken string) ([]Friend, err
 		f.Restricted = f.Restricted || u.Restricted
 	}
 	return friends, nil
+}
+
+// serverTokenRequired distinguishes a valid account credential from a revoked token.
+func serverTokenRequired(err error) bool {
+	var api *APIError
+	return errors.As(err, &api) && api.Code == 1080
 }

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -12,6 +13,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,6 +26,7 @@ import (
 	"golang.org/x/image/font"
 	"golang.org/x/image/font/opentype"
 	"golang.org/x/image/math/fixed"
+	_ "golang.org/x/image/webp"
 )
 
 type LibraryUse struct {
@@ -60,6 +63,7 @@ func (s *Service) Library(ctx context.Context) ([]LibraryAsset, error) {
 func (s *Service) libraryInfo(ctx context.Context, a Asset) (LibraryAsset, error) {
 	v := LibraryAsset{Asset: a, MIME: a.MIME, UsedBy: []LibraryUse{}}
 	if a.Status != "" && a.Status != "ready" {
+		v.CreatedAt = s.now().Unix()
 		return v, nil
 	}
 	if e := s.db.QueryRowContext(ctx, "SELECT created_at FROM onair_assets WHERE digest=?", a.Digest).Scan(&v.CreatedAt); e != nil {
@@ -131,23 +135,28 @@ func (s *Service) libraryAsset(ctx context.Context, d string) (LibraryAsset, err
 }
 
 // recordFacts probes media dimensions and duration and stores them on the row.
-func (s *Service) recordFacts(ctx context.Context, a Asset, b []byte) Asset {
+// b is the asset's bytes when the caller holds them; path is its file.
+func (s *Service) recordFacts(ctx context.Context, a Asset, b []byte, path string) Asset {
 	a.DurationMS, a.Width, a.Height = 0, 0, 0
 	if a.Kind == "image" {
-		if c, _, e := image.DecodeConfig(bytes.NewReader(b)); e == nil {
-			a.Width, a.Height = c.Width, c.Height
+		var r io.Reader
+		if b != nil {
+			r = bytes.NewReader(b)
+		} else if f, e := os.Open(path); e == nil {
+			defer f.Close()
+			r = f
+		}
+		if r != nil {
+			if c, _, e := image.DecodeConfig(r); e == nil {
+				a.Width, a.Height = c.Width, c.Height
+			}
 		}
 	}
 	if (a.Kind == "audio" || a.Kind == "video" || a.Kind == "reel") && s.o.Probe != nil {
-		if f, e := os.CreateTemp(s.o.Dir, "library-probe-*"); e == nil {
-			defer os.Remove(f.Name())
-			_, _ = f.Write(b)
-			_ = f.Close()
-			if info, e := s.o.Probe(ctx, f.Name()); e == nil {
-				a.DurationMS = info.Duration.Milliseconds()
-				if st := info.Video(); st != nil {
-					a.Width, a.Height = st.Width, st.Height
-				}
+		if info, e := s.o.Probe(ctx, path); e == nil {
+			a.DurationMS = info.Duration.Milliseconds()
+			if st := info.Video(); st != nil {
+				a.Width, a.Height = st.Width, st.Height
 			}
 		}
 	}
@@ -173,28 +182,206 @@ func (s *Service) backfillFacts() {
 	}
 	rows.Close()
 	for _, a := range pending {
-		var b []byte
-		if s.ctx.Err() != nil || s.db.QueryRowContext(s.ctx, "SELECT content FROM onair_assets WHERE digest=?", a.Digest).Scan(&b) != nil {
+		if s.ctx.Err() != nil {
+			return
+		}
+		path, e := s.assetPath(s.ctx, a.Digest)
+		if e != nil {
 			continue
 		}
-		s.recordFacts(s.ctx, a, b)
+		s.recordFacts(s.ctx, a, nil, path)
 	}
 }
+
+func encodeLibraryThumb(src image.Image) ([]byte, error) {
+	h := max(1, 480*src.Bounds().Dy()/max(1, src.Bounds().Dx()))
+	h = min(h, 4096)
+	im := image.NewRGBA(image.Rect(0, 0, 480, h))
+	draw.CatmullRom.Scale(im, im.Bounds(), src, src.Bounds(), draw.Src, nil)
+	var out bytes.Buffer
+	if e := jpeg.Encode(&out, im, &jpeg.Options{Quality: 85}); e != nil {
+		return nil, e
+	}
+	return out.Bytes(), nil
+}
+
+func (s *Service) reelLocalMediaPath(ctx context.Context, a LibraryAsset) string {
+	if a.Source != "" {
+		w, h := s.workingSize()
+		s.mu.Lock()
+		var candidate string
+		for _, m := range s.reelClipIndex {
+			if m.Link && m.Source == a.Source {
+				key := linkCacheKey(m.Source, w, h, m.LoudnessMatch, m.TrimSilence)
+				if ent, ok := s.linkCache[key]; ok && ent.Path != "" {
+					candidate = ent.Path
+					break
+				}
+			}
+		}
+		if candidate == "" {
+			for _, loudness := range []bool{true, false} {
+				for _, trim := range []bool{true, false} {
+					key := linkCacheKey(a.Source, w, h, loudness, trim)
+					if ent, ok := s.linkCache[key]; ok && ent.Path != "" {
+						candidate = ent.Path
+						break
+					}
+				}
+				if candidate != "" {
+					break
+				}
+			}
+		}
+		s.mu.Unlock()
+		if candidate != "" {
+			if st, err := os.Stat(candidate); err == nil && st.Size() > 0 {
+				return candidate
+			}
+		}
+	}
+	rows, err := s.db.QueryContext(ctx, "SELECT id FROM onair_reel_clips WHERE source_digest=?", a.Digest)
+	if err != nil {
+		return ""
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var clipID string
+		if rows.Scan(&clipID) == nil && clipID != "" {
+			p := filepath.Join(s.o.Dir, "reel-"+clipID+".mp4")
+			if st, err := os.Stat(p); err == nil && st.Size() > 0 {
+				return p
+			}
+		}
+	}
+	return ""
+}
+
+func validYouTubeID(id string) bool {
+	if len(id) < 6 || len(id) > 20 {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_') {
+			return false
+		}
+	}
+	return true
+}
+
+func linkThumbURL(raw, archiveOrigin string) (string, bool) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") {
+		return "", false
+	}
+	host := strings.ToLower(u.Hostname())
+	archiveHost := ""
+	if au, err := url.Parse(archiveOrigin); err == nil {
+		archiveHost = strings.ToLower(au.Hostname())
+	}
+	if host == "archive.org" || host == "www.archive.org" || (archiveHost != "" && host == archiveHost) {
+		parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+		if len(parts) >= 2 && (parts[0] == "details" || parts[0] == "download") && parts[1] != "" {
+			return archiveOrigin + "/services/img/" + url.PathEscape(parts[1]), archiveOrigin != "https://archive.org"
+		}
+	}
+	if host == "youtu.be" {
+		id := strings.Split(strings.Trim(u.Path, "/"), "/")[0]
+		if validYouTubeID(id) {
+			return "https://i.ytimg.com/vi/" + url.PathEscape(id) + "/hqdefault.jpg", false
+		}
+	}
+	if host == "youtube.com" || host == "www.youtube.com" || host == "m.youtube.com" {
+		id := strings.TrimSpace(u.Query().Get("v"))
+		if id == "" {
+			parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+			if len(parts) >= 2 && (parts[0] == "shorts" || parts[0] == "embed") {
+				id = parts[1]
+			}
+		}
+		if validYouTubeID(id) {
+			return "https://i.ytimg.com/vi/" + url.PathEscape(id) + "/hqdefault.jpg", false
+		}
+	}
+	return "", false
+}
+
+func (s *Service) fetchLinkPoster(ctx context.Context, raw string) ([]byte, error) {
+	thumbURL, customArchive := linkThumbURL(raw, s.archiveOrigin())
+	if thumbURL == "" {
+		return nil, ErrNotFound
+	}
+	tctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	client, closeIdle := s.importHTTPClient()
+	defer closeIdle()
+	var (
+		resp *http.Response
+		err  error
+	)
+	if customArchive {
+		req, reqErr := http.NewRequestWithContext(tctx, http.MethodGet, thumbURL, nil)
+		if reqErr != nil {
+			return nil, reqErr
+		}
+		resp, err = client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			return nil, ErrNotFound
+		}
+	} else {
+		resp, err = importGETValidated(tctx, client, thumbURL, nil, s.validateImportURL)
+		if err != nil {
+			return nil, ErrNotFound
+		}
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil || len(data) == 0 {
+		return nil, ErrNotFound
+	}
+	src, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return nil, ErrNotFound
+	}
+	return encodeLibraryThumb(src)
+}
+
 func (s *Service) libraryDerived(ctx context.Context, a LibraryAsset, wave bool) ([]byte, error) {
 	suffix := ".jpg"
 	if wave {
 		suffix = ".wave.json"
 	}
 	path := filepath.Join(s.o.Dir, "library-"+a.Digest+suffix)
-	if b, e := os.ReadFile(path); e == nil {
+	if b, e := os.ReadFile(path); e == nil && len(b) > 0 {
 		return b, nil
 	}
-	var data []byte
-	if e := s.db.QueryRowContext(ctx, "SELECT content FROM onair_assets WHERE digest=?", a.Digest).Scan(&data); e != nil {
+	source, e := s.assetPath(ctx, a.Digest)
+	if errors.Is(e, ErrNotFound) && a.Kind == "reel" {
+		if local := s.reelLocalMediaPath(ctx, a); local != "" {
+			source = local
+			e = nil
+		} else if !wave && a.Source != "" {
+			b, posterErr := s.fetchLinkPoster(ctx, a.Source)
+			if posterErr == nil && len(b) > 0 {
+				_ = os.WriteFile(path, b, 0600)
+				return b, nil
+			}
+		}
+	}
+	if e != nil {
 		return nil, e
 	}
 	var out bytes.Buffer
 	if !wave && (a.Kind == "image" || a.Kind == "font") {
+		data, e := os.ReadFile(source)
+		if e != nil {
+			return nil, e
+		}
 		var src image.Image
 		if a.MIME == "image/svg+xml" {
 			var err error
@@ -225,41 +412,24 @@ func (s *Service) libraryDerived(ctx context.Context, a LibraryAsset, wave bool)
 			d.DrawString("Aa")
 			src = im
 		}
-		h := max(1, 480*src.Bounds().Dy()/max(1, src.Bounds().Dx()))
-		h = min(h, 4096)
-		im := image.NewRGBA(image.Rect(0, 0, 480, h))
-		draw.CatmullRom.Scale(im, im.Bounds(), src, src.Bounds(), draw.Src, nil)
-		if e := jpeg.Encode(&out, im, &jpeg.Options{Quality: 85}); e != nil {
+		encoded, e := encodeLibraryThumb(src)
+		if e != nil {
 			return nil, e
 		}
+		out.Write(encoded)
 	} else {
 		if s.o.FFmpeg == nil {
 			return nil, fmt.Errorf("media tools unavailable")
 		}
-		f, e := os.CreateTemp(s.o.Dir, "library-media-*")
-		if e != nil {
-			return nil, e
-		}
-		defer os.Remove(f.Name())
-		_, e = f.Write(data)
-		_ = f.Close()
-		if e != nil {
-			return nil, e
-		}
 		cctx, cancel := context.WithTimeout(ctx, 35*time.Second)
 		defer cancel()
-		args := []string{"-nostdin", "-hide_banner", "-loglevel", "error", "-protocol_whitelist", "file,pipe", "-i", f.Name()}
 		if wave {
-			args = append(args, "-t", "30", "-vn", "-ac", "1", "-ar", "8000", "-f", "s16le", "pipe:1")
-		} else {
-			args = append(args, "-ss", fmt.Sprint(math.Min(1, math.Max(0, float64(a.DurationMS)/1000-0.05))), "-frames:v", "1", "-vf", "scale=480:-2", "-threads", "1", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1")
-		}
-		cmd := exec.CommandContext(cctx, s.o.FFmpeg(), args...)
-		cmd.Stdout = &out
-		if e = cmd.Run(); e != nil {
-			return nil, e
-		}
-		if wave {
+			args := []string{"-nostdin", "-hide_banner", "-loglevel", "error", "-protocol_whitelist", "file,pipe", "-i", source, "-t", "30", "-vn", "-ac", "1", "-ar", "8000", "-f", "s16le", "pipe:1"}
+			cmd := exec.CommandContext(cctx, s.o.FFmpeg(), args...)
+			cmd.Stdout = &out
+			if e = cmd.Run(); e != nil {
+				return nil, e
+			}
 			pcm := out.Bytes()
 			peaks := make([]float64, 1000)
 			samples := len(pcm) / 2
@@ -271,6 +441,29 @@ func (s *Service) libraryDerived(ctx context.Context, a LibraryAsset, wave bool)
 			b, _ := json.Marshal(map[string]any{"peaks": peaks, "durationMs": a.DurationMS})
 			out.Reset()
 			out.Write(b)
+		} else {
+			durSec := float64(a.DurationMS) / 1000
+			seek := 0.5
+			if durSec > 0 {
+				seek = math.Min(3, math.Max(0, math.Min(durSec*0.15, durSec-0.05)))
+			}
+			extract := func(ss float64) error {
+				out.Reset()
+				args := []string{"-nostdin", "-hide_banner", "-loglevel", "error", "-ss", fmt.Sprintf("%.2f", ss), "-protocol_whitelist", "file,pipe", "-i", source, "-frames:v", "1", "-vf", "scale=480:-2", "-threads", "1", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"}
+				cmd := exec.CommandContext(cctx, s.o.FFmpeg(), args...)
+				cmd.Stdout = &out
+				return cmd.Run()
+			}
+			e = extract(seek)
+			if (e != nil || out.Len() == 0) && seek > 0 {
+				e = extract(0)
+			}
+			if e != nil {
+				return nil, e
+			}
+			if out.Len() == 0 {
+				return nil, fmt.Errorf("video thumbnail unavailable")
+			}
 		}
 	}
 	b := out.Bytes()
@@ -408,12 +601,16 @@ func (s *Service) replaceLibraryAsset(w http.ResponseWriter, r *http.Request) {
 		_, e = tx.ExecContext(r.Context(), "DELETE FROM onair_assets WHERE digest=?", old.Digest)
 	}
 	if e == nil {
+		_, e = tx.ExecContext(r.Context(), "DELETE FROM onair_asset_replicas WHERE digest=?", old.Digest)
+	}
+	if e == nil {
 		e = tx.Commit()
 	}
 	if e != nil {
 		result(w, nil, e)
 		return
 	}
+	s.removeUnreferenced(r.Context(), old.Digest)
 	s.assetMu.Unlock()
 	locked = false
 	if s.o.Changed != nil {
@@ -439,8 +636,8 @@ func (s *Service) trimLibraryAsset(w http.ResponseWriter, r *http.Request) {
 		result(w, nil, fmt.Errorf("invalid clip interval"))
 		return
 	}
-	var b []byte
-	if e = s.db.QueryRowContext(r.Context(), "SELECT content FROM onair_assets WHERE digest=?", a.Digest).Scan(&b); e != nil {
+	source, e := s.assetPath(r.Context(), a.Digest)
+	if e != nil {
 		result(w, nil, e)
 		return
 	}
@@ -449,9 +646,8 @@ func (s *Service) trimLibraryAsset(w http.ResponseWriter, r *http.Request) {
 		result(w, nil, e)
 		return
 	}
-	defer os.Remove(f.Name())
-	_, _ = f.Write(b)
 	_ = f.Close()
+	os.Remove(f.Name())
 	ext := ".mp4"
 	if a.Kind == "audio" {
 		ext = ".m4a"
@@ -460,7 +656,7 @@ func (s *Service) trimLibraryAsset(w http.ResponseWriter, r *http.Request) {
 	defer os.Remove(out)
 	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
 	defer cancel()
-	args := []string{"-nostdin", "-y", "-loglevel", "error", "-protocol_whitelist", "file,pipe", "-i", f.Name(), "-ss", fmt.Sprint(p.Start), "-t", fmt.Sprint(p.End - p.Start), "-threads", "1"}
+	args := []string{"-nostdin", "-y", "-loglevel", "error", "-protocol_whitelist", "file,pipe", "-i", source, "-ss", fmt.Sprint(p.Start), "-t", fmt.Sprint(p.End - p.Start), "-threads", "1"}
 	if a.Kind == "audio" {
 		args = append(args, "-vn", "-c:a", "aac")
 	} else {

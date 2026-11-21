@@ -50,7 +50,7 @@ func TestFirstCharacterJumpbarOffsetsMatchTitleSortEveryLetter(t *testing.T) {
 			},
 		},
 	}
-	c, err := New(store.OpenTest(t), nil, cfg, nil)
+	c, err := New(store.OpenTest(t), nil, cfg, nil, WithLibraryPolicies(testPolicies(cfg.Exclusions, cfg.VisibilityDefault)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -278,6 +278,7 @@ func TestFirstCharacterJumpbarOffsetsMatchTitleSortEveryLetter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	cReopened.FinishStartup(ctx) // the fold backfill runs after the server listens
 	if got := cReopened.getMeta(ctx, sortTitleFoldedKey); got != sortTitleFoldedVersion {
 		t.Fatalf("expected %s=%s, got %q", sortTitleFoldedKey, sortTitleFoldedVersion, got)
 	}

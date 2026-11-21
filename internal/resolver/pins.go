@@ -16,36 +16,23 @@ import (
 
 // Owner pins
 //
-// A pin tells Resolve to try one specific release first for a movie or
-// episode, the way a viewer's Play Version pick does (ResolveRequest.Prefer):
-// it is fetched and health-checked like any candidate and, when it fails,
-// resolution falls back to normal ranking. A failing pin is never deleted;
-// its last status is recorded and surfaced to the owner.
+// A pin selects the source for playback. Resolve validates only that release;
+// rejection, proven failed health, blocklisting and failover exclusion are errors,
+// never permission to substitute another release. Pins override owner quality
+// and identity heuristics, but retain source safety gates below. Client codec
+// and HDR support are delivery decisions: playback can remux, transcode or
+// tone-map the pinned source, or explain why no delivery path exists.
+// Sampling timeouts alone allow an unverified start; real source reads remain
+// authoritative and the pin never permits automatic substitution.
 //
-// Gates. A pin overrides the owner's own policy: quality profile limits
-// (height, HDR/DV policy, imported quality gates, size range, minimum
-// custom format score) and identity heuristics (title/year matching,
-// blocked terms and groups, CAM, sample detection) do not apply, because
-// the owner matched the release to the title by hand. It still respects
-// what would make playback fail or misbehave regardless of policy:
-//   - a passworded torrent release, a blocklisted release, or one already tried in
-//     this playback (failover Exclude);
-//   - a season pack for an episode (playback cannot pick the episode);
-//   - a video codec the client cannot decode (direct play is impossible and
-//     offline downloads never transcode);
-//   - Dolby Vision without an HDR10 base layer on a client without Dolby
-//     Vision (it would play with wrong colours).
-//
-// Scope. A viewer's explicit Play Version pick wins over a pin, and pins do
-// not apply to offline downloads, which use their own compact profile. For
-// the version picker the pin is Auto, the release normal resolution tries
-// first.
+// An explicit viewer version choice overrides a pin. The logical Auto slot
+// still honours it. Offline downloads retain their own profile and ignore pins.
 
 // PinStatus is the outcome of the last time a pin was tried or checked.
 type PinStatus string
 
 const (
-	PinHealthy     PinStatus = "healthy"     // passed a health check and played
+	PinHealthy     PinStatus = "healthy"     // selected for playback; LastReason notes unverified starts
 	PinUnhealthy   PinStatus = "unhealthy"   // failed a health check or the NZB is gone
 	PinRejected    PinStatus = "rejected"    // a hard gate excluded it for a client
 	PinUnavailable PinStatus = "unavailable" // a transient failure (provider outage)
@@ -77,7 +64,7 @@ func (s *Service) Pin(ctx context.Context, key core.RatingKey, titleName string,
 	if rel.ID == "" {
 		return Pin{}, fmt.Errorf("resolver: empty release id")
 	}
-	if s.isBad(rel.ID) {
+	if s.isBadRelease(rel) {
 		return Pin{}, ErrPinBlocked
 	}
 	if titleName == "" {
@@ -106,26 +93,39 @@ func (s *Service) Pin(ctx context.Context, key core.RatingKey, titleName string,
 	s.con.mu.Lock()
 	s.con.pins[key] = p
 	s.con.mu.Unlock()
+	s.InvalidateDetailVariants()
 	s.notifyPin(key)
+	s.emitPinCreated(p, "owner")
 	return p, nil
 }
 
 // Unpin removes a title's pin; it reports whether there was one.
 func (s *Service) Unpin(ctx context.Context, key core.RatingKey) (bool, error) {
 	s.con.mu.Lock()
-	_, had := s.con.pins[key]
+	prev, had := s.con.pins[key]
 	delete(s.con.pins, key)
 	s.con.mu.Unlock()
+	if had {
+		s.InvalidateDetailVariants()
+	}
 	if s.db == nil {
+		if had {
+			s.emitPinRemoved(key, prev, true, "owner")
+		}
 		return had, nil
 	}
 	res, err := s.db.ExecContext(ctx, `DELETE FROM resolver_pins WHERE rating_key=?`, int64(key))
 	if err != nil {
 		return had, err
 	}
+	s.InvalidateDetailVariants()
 	s.notifyPin(key)
 	n, _ := res.RowsAffected()
-	return had || n > 0, nil
+	removed := had || n > 0
+	if removed {
+		s.emitPinRemoved(key, prev, had, "owner")
+	}
+	return removed, nil
 }
 
 // Pins lists every pin, newest first.
@@ -208,52 +208,67 @@ func (s *Service) reloadPin(ctx context.Context, key core.RatingKey) {
 	}
 	p, err := scanPin(s.db.QueryRowContext(ctx, `SELECT `+pinColumns+` FROM resolver_pins WHERE rating_key=?`, int64(key)))
 	s.con.mu.Lock()
-	defer s.con.mu.Unlock()
 	switch {
 	case err == nil:
 		s.con.pins[key] = p
 	case errors.Is(err, sql.ErrNoRows):
 		delete(s.con.pins, key) // unpinned on another node
 	}
+	s.con.mu.Unlock()
+	s.InvalidateDetailVariants()
 }
 
 // notePin records the outcome of trying a title's pin, when releaseID is
 // still the pinned release.
 func (s *Service) notePin(ctx context.Context, key core.RatingKey, releaseID string, status PinStatus, reason string) {
+	s.notePinForClient(ctx, key, releaseID, status, reason, "")
+}
+
+func (s *Service) notePinForClient(ctx context.Context, key core.RatingKey, releaseID string, status PinStatus, reason, client string) {
 	now := s.now()
 	s.con.mu.Lock()
 	p, ok := s.con.pins[key]
-	if ok && p.Release.ID == releaseID {
+	matched := ok && p.Release.ID == releaseID
+	if matched {
 		p.LastStatus, p.LastReason, p.LastCheckedAt = status, reason, now
 		s.con.pins[key] = p
 	}
 	s.con.mu.Unlock()
+	if matched {
+		s.emitPinStatusEvent(p, status, reason, client)
+	}
 	if !ok || s.db == nil {
 		return
 	}
-	_, err := s.db.ExecContext(ctx,
-		`UPDATE resolver_pins SET last_status=?, last_reason=?, last_checked_at=? WHERE rating_key=? AND release_id=?`,
-		string(status), reason, now.Unix(), int64(key), releaseID)
-	if err != nil {
-		s.log.Debug("resolver pin status not saved", "title", key, "err", err)
-		return
-	}
-	s.notifyPin(key)
+	s.persistBookkeeping(ctx, func(ctx context.Context) {
+		_, err := s.db.ExecContext(ctx,
+			`UPDATE resolver_pins SET last_status=?, last_reason=?, last_checked_at=? WHERE rating_key=? AND release_id=?`,
+			string(status), reason, now.Unix(), int64(key), releaseID)
+		if err != nil {
+			s.log.Debug("resolver pin status not saved", "title", key, "err", err)
+			return
+		}
+		s.notifyPin(key)
+	})
 }
 
 // notePinsBlocked marks pins of a newly blocklisted release as failing, so
 // the Pinned list shows why the pin is being skipped.
 func (s *Service) notePinsBlocked(ctx context.Context, releaseID, reason string) {
+	type hit struct {
+		key core.RatingKey
+		id  string
+	}
 	s.con.mu.Lock()
-	var keys []core.RatingKey
+	var hits []hit
 	for k, p := range s.con.pins {
 		if p.Release.ID == releaseID {
-			keys = append(keys, k)
+			hits = append(hits, hit{key: k, id: p.Release.ID})
 		}
 	}
 	s.con.mu.Unlock()
-	for _, k := range keys {
-		s.notePin(ctx, k, releaseID, PinUnhealthy, "blocklisted: "+reason)
+	for _, h := range hits {
+		s.notePin(ctx, h.key, h.id, PinUnhealthy, "blocklisted: "+reason)
 	}
 }
 
@@ -268,40 +283,49 @@ func (s *Service) pinForResolve(req core.ResolveRequest) (*Pin, string) {
 		return nil, ""
 	}
 	switch {
-	case req.Prefer != "" && req.Prefer != p.Release.ID:
+	case req.Prefer != "" && req.Prefer != p.Release.ID && !autoVersion(req.Prefer):
 		return nil, "skipped: viewer picked another version"
 	case req.Client.Download:
 		return nil, "skipped: downloads use their own profile"
 	}
-	for _, id := range req.Exclude {
-		if id == p.Release.ID {
-			return nil, "skipped: already tried in this playback"
-		}
-	}
-	if s.isBad(p.Release.ID) {
-		return nil, "skipped: pinned release is blocklisted"
-	}
 	return &p, ""
+}
+
+// PinnedReleaseID returns the authoritative playback source, if this request
+// uses an owner pin. Playback uses it to recheck warm/resume and failover paths
+// that can otherwise reuse a release without calling Resolve. An active viewer
+// remembered choice overrides the owner pin in the Auto slot.
+func (s *Service) PinnedReleaseID(req core.ResolveRequest) string {
+	if s.viewerTitleChoiceForResolve(req, nil) != nil || s.viewerShowChoiceForResolve(req) != nil {
+		return ""
+	}
+	if pin, _ := s.pinForResolve(req); pin != nil {
+		return pin.Release.ID
+	}
+	return ""
+}
+
+func autoVersion(prefer string) bool {
+	slot, ok := parseVersionSlot(prefer)
+	return ok && slot.Kind == "auto"
 }
 
 // pinRejectReason is the gate set for an owner pin (see the package
 // comment above): "" to accept.
-func (s *Service) pinRejectReason(rel core.Release, sreq core.SearchRequest, caps core.ClientCaps, exclude map[string]bool) string {
+func (s *Service) pinRejectReason(rel core.Release, sreq core.SearchRequest, _ core.ClientCaps, exclude map[string]bool) string {
 	switch {
 	case rel.Password && rel.Protocol == core.ProtocolTorrent:
 		return "passworded"
 	case exclude[rel.ID]:
 		return "excluded (already tried)"
-	case s.isBad(rel.ID):
+	case s.isBadRelease(rel):
 		return "marked bad"
-	case sreq.Type == core.TypeEpisode && rel.Info.FullSeason && rel.Protocol != core.ProtocolTorrent:
+	case nonVideoRelease(rel, nil, sreq):
+		return ReasonNotAVideoFile
+	case sreq.Type == core.TypeEpisode && rel.Info.FullSeason && rel.Protocol != core.ProtocolTorrent && rel.Protocol != core.ProtocolUsenet:
 		return "season pack (skipped in v1)"
-	case sreq.Type == core.TypeEpisode && rel.Info.FullSeason && !packCoversSeason(rel.Info, sreq.Season):
+	case sreq.Type == core.TypeEpisode && rel.Info.FullSeason && !packCoversSeasonCour(rel.Info, sreq):
 		return "season/episode mismatch"
-	case rel.Info.VideoCodec != "" && len(caps.VideoCodecs) > 0 && !caps.SupportsVideo(rel.Info.VideoCodec):
-		return "video codec unsupported by client"
-	case rel.Info.DolbyVision && !rel.Info.HDR10 && !caps.DolbyVision && len(caps.VideoCodecs) > 0:
-		return "dolby vision without hdr10 fallback on a client without dolby vision"
 	}
 	return ""
 }

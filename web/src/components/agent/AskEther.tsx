@@ -64,6 +64,7 @@ export function AskEther() {
   const navigateArmedRef = useRef(false);
   const seenNavigateRef = useRef<Set<string>>(new Set());
   const route = location.pathname;
+  const title = t("Ask Ether");
 
   const setCurrentThread = useCallback((id: string | undefined) => {
     threadIdRef.current = id;
@@ -332,11 +333,11 @@ export function AskEther() {
       <button
         type="button"
         onClick={() => setOpen((value) => !value)}
-        aria-label={t("Ask Ether")}
+        aria-label={title}
         aria-keyshortcuts="Meta+J"
         aria-expanded={open}
-        title={t("Ask Ether")}
-        className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-md text-fg-muted transition-colors hover:bg-surface-hover hover:text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+        title={title}
+        className="inline-flex h-9 shrink-0 px-2 items-center justify-center rounded-md text-fg-muted transition-colors hover:bg-surface-hover hover:text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
       >
         <Sparkles size={16} aria-hidden />
       </button>
@@ -348,7 +349,7 @@ export function AskEther() {
         title={
           <span className="inline-flex items-center gap-2">
             <Sparkles size={16} className="text-primary" aria-hidden />
-            {t("Ask Ether")}
+            {title}
           </span>
         }
         headerActions={
@@ -391,7 +392,7 @@ export function AskEther() {
             </section>
           </div>
         ) : (
-          <div className="flex min-h-0 flex-1 flex-col [&>div>header]:hidden">
+          <div className="flex min-h-0 flex-1 flex-col">
             <Suspense
               fallback={
                 <div className="grid flex-1 place-items-center">

@@ -98,6 +98,73 @@ func (s *Service) SourceStartups() []SourceStartup {
 	return out
 }
 
+// UsenetBackingOff reports whether every primary Usenet provider is currently
+// in circuit-breaker backoff (for example NNTP 481 simultaneous IP refusals).
+func (s *Service) UsenetBackingOff() bool {
+	return s.usenetBackingOff()
+}
+
+func (s *Service) usenetBackingOff() bool {
+	return s != nil && s.usenetServing != nil && !s.usenetServing()
+}
+
+// demoteBackingOffUsenet places non-Usenet releases ahead of Usenet releases
+// within each identity-safety tier while all Usenet providers are backing off,
+// keeping Usenet as a last-resort fallback when no other source exists.
+func (s *Service) demoteBackingOffUsenet(cands []candidate, trace *Trace) []candidate {
+	if !s.usenetBackingOff() || len(cands) < 2 {
+		return cands
+	}
+	hasUsenet, hasOther := false, false
+	for _, c := range cands {
+		if protocolOf(c.rel) == core.ProtocolUsenet {
+			hasUsenet = true
+		} else {
+			hasOther = true
+		}
+	}
+	if !hasUsenet || !hasOther {
+		return cands
+	}
+	partition := func(in []candidate) []candidate {
+		if len(in) < 2 {
+			return in
+		}
+		other := make([]candidate, 0, len(in))
+		usenet := make([]candidate, 0, len(in))
+		for _, c := range in {
+			if protocolOf(c.rel) == core.ProtocolUsenet {
+				usenet = append(usenet, c)
+			} else {
+				other = append(other, c)
+			}
+		}
+		return append(other, usenet...)
+	}
+	var strongConfirmed, strongUnverified, weak []candidate
+	for _, c := range cands {
+		switch {
+		case c.identityWeak:
+			weak = append(weak, c)
+		case c.audioUnverified:
+			strongUnverified = append(strongUnverified, c)
+		default:
+			strongConfirmed = append(strongConfirmed, c)
+		}
+	}
+	out := make([]candidate, 0, len(cands))
+	out = append(out, partition(strongConfirmed)...)
+	out = append(out, partition(strongUnverified)...)
+	out = append(out, partition(weak)...)
+	if trace != nil && len(out) > 0 && out[0].rel.ID != cands[0].rel.ID && protocolOf(out[0].rel) != core.ProtocolUsenet {
+		if i := out[0].trace; i >= 0 && i < len(trace.Candidates) {
+			trace.Candidates[i].Route = "usenet provider backing off"
+		}
+		trace.Routing = "debrid first: usenet provider backing off"
+	}
+	return out
+}
+
 // protocolOf is a release's routing source. An addon's HTTP stream is
 // read like a debrid file (HTTPS ranges from a CDN), so it routes with
 // debrid; it is never known to be cached, so only an explicit debrid
@@ -163,15 +230,32 @@ func (s *Service) routeSources(cands []candidate, t *core.Title, trace *Trace) [
 	if len(cands) < 2 {
 		return cands
 	}
+	usenetBackoff := s.usenetBackingOff()
+	if usenetBackoff {
+		cands = s.demoteBackingOffUsenet(cands, trace)
+	}
 	rcfg := s.resolverCfg()
 	mode := strings.ToLower(strings.TrimSpace(rcfg.SourcePreference))
+	if usenetBackoff && mode == PreferUsenet {
+		mode = PreferAuto
+	}
 	explicit := mode == PreferDebrid || mode == PreferUsenet
 	preferredProtocol := core.ProtocolUsenet
 	if mode == PreferDebrid {
 		preferredProtocol = core.ProtocolTorrent
 	}
+	if len(cands) > 0 && cands[0].keys.addonOrder > 0 && trace != nil && trace.Routing == "" {
+		if cands[0].rel.Indexer != "" {
+			trace.Routing = "first compatible result from " + cands[0].rel.Indexer + " (add-on order)"
+		} else {
+			trace.Routing = "first compatible result (add-on order)"
+		}
+	}
 	if explicit && rcfg.SourceAlwaysFirst {
 		return s.sourceAlwaysFirst(cands, preferredProtocol, trace)
+	}
+	if len(cands) > 0 && cands[0].keys.addonOrder > 0 {
+		return cands
 	}
 	// Automatic routing reuses a verified source. An explicit owner change
 	// still takes effect for equal-quality releases, even after prior plays.
@@ -190,7 +274,7 @@ func (s *Service) routeSources(cands []candidate, t *core.Title, trace *Trace) [
 	var group []candidate
 	var indexes []int
 	for i, c := range cands {
-		eligible := !(c.verified && c.rel.Score < lead.rel.Score) && pluginKeysEqual(c, lead) && c.bandwidth >= lead.bandwidth && (!c.verified || explicit) && sameQuality(c, lead) && c.rel.Score >= lead.rel.Score-margin
+		eligible := !(c.verified && c.rel.Score < lead.rel.Score) && pluginKeysEqual(c, lead) && c.bandwidth >= lead.bandwidth && (explicit || c.delivery >= lead.delivery) && (!c.verified || explicit) && sameQuality(c, lead) && c.rel.Score >= lead.rel.Score-margin
 		if !eligible {
 			if !explicit {
 				break
@@ -279,6 +363,7 @@ func (s *Service) routeSources(cands []candidate, t *core.Title, trace *Trace) [
 	}
 	out := make([]candidate, 0, len(cands))
 	out = append(out, cands[first])
+	out[0].sourcePreferred = true
 	// Hedge: the best of the other source second, so ranked validation
 	// checks both sources at once.
 	other := -1
@@ -308,6 +393,9 @@ func (s *Service) routeSources(cands []candidate, t *core.Title, trace *Trace) [
 			trace.Candidates[out[1].trace].Route = "hedge: checked alongside on " + sourceName(protocolOf(out[1].rel))
 		}
 		trace.Routing = sourceName(want) + " first: " + why
+	}
+	if usenetBackoff {
+		return s.demoteBackingOffUsenet(out, nil)
 	}
 	return out
 }
@@ -364,12 +452,25 @@ func (s *Service) sourceAlwaysFirst(cands []candidate, want string, trace *Trace
 	out := slices.Clone(cands)
 	sort.SliceStable(out, func(i, j int) bool {
 		a, b := out[i], out[j]
+		if !samePreferenceTier(a, b) {
+			return compareCandidates(a, b)
+		}
 		if a.policy.Fallback != b.policy.Fallback {
 			return a.policy.Fallback < b.policy.Fallback
 		}
 		if a.langOK != b.langOK {
 			return a.langOK
 		}
+		if a.keys.sourceBand != b.keys.sourceBand {
+			return a.keys.sourceBand < b.keys.sourceBand
+		}
+		if a.keys.addonOrder > 0 && b.keys.addonOrder > 0 {
+			if a.keys.addonOrder != b.keys.addonOrder {
+				return a.keys.addonOrder < b.keys.addonOrder
+			}
+			return !a.keys.pack && b.keys.pack
+		}
+
 		return preferred(a) && !preferred(b)
 	})
 	// A remembered success may break a score tie, but cannot jump ahead

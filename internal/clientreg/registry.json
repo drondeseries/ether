@@ -1,5 +1,340 @@
 {
   "version": 1,
+  "apps": [
+    {
+      "protocol": "plex",
+      "name": "Plex Web",
+      "devices": ["Browser"],
+      "directPlay": "browser",
+      "certification": "builtin"
+    },
+    {
+      "protocol": "plex",
+      "name": "Plex for Apple TV",
+      "identity": {"product": "Plex for Apple TV", "platform": "tvOS", "device": "Apple TV"},
+      "devices": ["Apple TV"],
+      "directPlay": "reported",
+      "certification": "builtin"
+    },
+    {
+      "protocol": "plex",
+      "name": "Plex for iOS",
+      "identity": {"product": "Plex for iOS", "platform": "iOS"},
+      "devices": ["iOS"],
+      "directPlay": "reported",
+      "certification": "builtin"
+    },
+    {
+      "protocol": "plex",
+      "name": "Plex for Android phones",
+      "product": "Plex for Android (Mobile)",
+      "identity": {"product": "Plex for Android (Mobile)", "platform": "Android"},
+      "devices": ["Android"],
+      "directPlay": "reported",
+      "certification": "builtin"
+    },
+    {
+      "protocol": "plex",
+      "name": "Plex for Android TV",
+      "product": "Plex for Android (TV)",
+      "identity": {"product": "Plex for Android (TV)", "platform": "Android", "device": "Android TV"},
+      "devices": ["Android TV", "Google TV", "NVIDIA Shield"],
+      "directPlay": "reported",
+      "certification": "builtin"
+    },
+    {
+      "protocol": "plex",
+      "name": "Plex HTPC",
+      "products": ["Plex HTPC", "Plex Media Player"],
+      "devices": ["Home theater PC"],
+      "directPlay": "reported",
+      "certification": "builtin"
+    },
+    {
+      "protocol": "plex",
+      "name": "Plex for Windows",
+      "devices": ["Home theater PC"],
+      "directPlay": "reported",
+      "certification": "builtin"
+    },
+    {
+      "protocol": "plex",
+      "name": "Plex for Mac",
+      "devices": ["Mac"],
+      "directPlay": "reported",
+      "certification": "builtin"
+    },
+    {
+      "protocol": "plex",
+      "name": "Plex for Linux",
+      "devices": ["Home theater PC"],
+      "directPlay": "reported",
+      "certification": "builtin"
+    },
+    {
+      "protocol": "plex",
+      "name": "Plex Desktop",
+      "devices": ["Home theater PC", "Mac"],
+      "directPlay": "reported",
+      "certification": "builtin"
+    },
+    {
+      "protocol": "plex",
+      "name": "Plex for Kodi",
+      "product": "PM4K",
+      "products": ["PM4K", "Plex for Kodi"],
+      "identity": {"product": "PM4K", "device": "Kodi"},
+      "devices": ["Kodi"],
+      "directPlay": "reported",
+      "certification": "builtin"
+    },
+    {
+      "protocol": "plex",
+      "name": "Plex for Roku",
+      "identity": {"product": "Plex for Roku", "platform": "Roku"},
+      "devices": ["Roku"],
+      "directPlay": "reported",
+      "certification": "builtin"
+    },
+    {
+      "protocol": "plex",
+      "name": "Plex for LG",
+      "identity": {"product": "Plex for LG", "platform": "webOS"},
+      "devices": ["LG webOS"],
+      "directPlay": "reported",
+      "certification": "builtin"
+    },
+    {
+      "protocol": "plex",
+      "name": "Plex for Samsung",
+      "identity": {"product": "Plex for Samsung", "platform": "Tizen"},
+      "devices": ["Samsung Tizen"],
+      "directPlay": "reported",
+      "certification": "builtin"
+    },
+    {
+      "protocol": "plex",
+      "name": "Plex for Vizio",
+      "devices": ["Smart TV"],
+      "directPlay": "reported",
+      "certification": "builtin"
+    },
+    {
+      "protocol": "plex",
+      "name": "Plex for Fire TV",
+      "devices": ["Fire TV"],
+      "directPlay": "reported",
+      "certification": "builtin"
+    },
+    {
+      "protocol": "plex",
+      "name": "Plex for Xbox",
+      "identity": {"product": "Plex for Xbox", "platform": "Xbox"},
+      "devices": ["Xbox"],
+      "directPlay": "reported",
+      "certification": "builtin"
+    },
+    {
+      "protocol": "plex",
+      "name": "Plex for PlayStation",
+      "identity": {"product": "Plex for PlayStation", "platform": "PlayStation"},
+      "devices": ["PlayStation"],
+      "directPlay": "reported",
+      "certification": "builtin"
+    },
+    {
+      "protocol": "plex",
+      "name": "Plezy",
+      "devices": ["Home theater PC", "Apple TV", "iOS", "Android TV", "Android"],
+      "directPlay": "builtin",
+      "certification": "builtin"
+    },
+    {
+      "protocol": "jellyfin",
+      "name": "Swiftfin",
+      "identity": {"product": "Swiftfin", "platform": "tvOS"},
+      "devices": ["Apple TV", "iOS"],
+      "directPlay": "reported",
+      "certification": "pending"
+    },
+    {
+      "protocol": "jellyfin",
+      "name": "Findroid",
+      "devices": ["Android"],
+      "subtitles": ["srt", "ass"],
+      "directPlay": "findroid",
+      "certification": "pending"
+    },
+    {
+      "protocol": "jellyfin",
+      "name": "Streamyfin",
+      "devices": ["Android"],
+      "videoCodecs": ["h264", "hevc", "vp8", "vp9", "av1"],
+      "subtitles": ["srt", "vtt", "ttml"],
+      "directPlay": "listed",
+      "note": "no-dv5",
+      "certification": "pending"
+    },
+    {
+      "protocol": "jellyfin",
+      "name": "Jellyfin Android TV",
+      "identity": {"product": "Jellyfin Android TV", "platform": "Android", "device": "Android TV"},
+      "devices": ["Android TV", "Google TV", "NVIDIA Shield"],
+      "directPlay": "reported",
+      "certification": "pending"
+    },
+    {
+      "protocol": "jellyfin",
+      "name": "JellyCon",
+      "devices": ["Kodi"],
+      "directPlay": "open",
+      "note": "h264-ac3",
+      "certification": "pending"
+    },
+    {
+      "protocol": "jellyfin",
+      "name": "Infuse",
+      "products": ["Infuse", "Infuse-Direct", "infuse-jellyfin"],
+      "devices": ["Apple TV", "iOS"],
+      "directPlay": "reported",
+      "note": "capture",
+      "certification": "pending"
+    },
+    {
+      "protocol": "jellyfin",
+      "name": "Jellyfin for Roku",
+      "identity": {"product": "Jellyfin for Roku", "platform": "Roku"},
+      "devices": ["Roku"],
+      "directPlay": "reported",
+      "certification": "pending"
+    },
+    {
+      "protocol": "emby",
+      "name": "Emby Web",
+      "devices": ["Browser"],
+      "directPlay": "browser",
+      "certification": "pending"
+    },
+    {
+      "protocol": "emby",
+      "name": "Emby for Android TV",
+      "identity": {"product": "Emby for Android TV", "platform": "Android", "device": "Android TV"},
+      "devices": ["Android TV"],
+      "directPlay": "reported",
+      "certification": "pending"
+    },
+    {
+      "protocol": "emby",
+      "name": "Emby for TV",
+      "devices": ["Apple TV"],
+      "directPlay": "reported",
+      "note": "unsupported-shell",
+      "certification": "unsupported"
+    },
+    {
+      "protocol": "emby",
+      "name": "Infuse",
+      "devices": ["Apple TV", "iOS"],
+      "directPlay": "reported",
+      "note": "capture",
+      "certification": "pending"
+    },
+    {
+      "protocol": "emby",
+      "name": "Emby SDK",
+      "devices": [],
+      "directPlay": "reported",
+      "note": "sdk",
+      "certification": "pending"
+    },
+    {
+      "protocol": "silo",
+      "name": "Silo for Apple TV",
+      "products": ["Silo for Apple TV", "silo-appletv"],
+      "identity": {"product": "Silo for Apple TV", "platform": "tvOS", "device": "Apple TV"},
+      "devices": ["Apple TV"],
+      "directPlay": "reported",
+      "certification": "pending"
+    },
+    {
+      "protocol": "silo",
+      "name": "Silo Apple",
+      "identity": {"product": "Silo Apple", "platform": "iOS"},
+      "devices": ["iOS", "Mac"],
+      "directPlay": "reported",
+      "certification": "pending"
+    },
+    {
+      "protocol": "silo",
+      "name": "Silo Android",
+      "identity": {"product": "Silo Android", "platform": "Android"},
+      "devices": ["Android", "Android TV"],
+      "directPlay": "reported",
+      "certification": "pending"
+    },
+    {
+      "protocol": "stremio",
+      "name": "Stremio",
+      "identity": {"product": "Stremio", "platform": "desktop"},
+      "devices": ["Android TV", "iOS", "Browser", "NVIDIA Shield", "Home theater PC"],
+      "directPlay": "stream",
+      "certification": "builtin"
+    },
+    {
+      "protocol": "stremio",
+      "name": "Nuvio",
+      "identity": {"product": "Nuvio", "platform": "android"},
+      "devices": ["Android", "iOS"],
+      "directPlay": "stream",
+      "certification": "builtin"
+    },
+    {
+      "protocol": "webdav",
+      "name": "Kodi",
+      "devices": ["Kodi", "Home theater PC", "Android TV"],
+      "directPlay": "player",
+      "certification": "builtin"
+    },
+    {
+      "protocol": "webdav",
+      "name": "VLC",
+      "devices": ["Home theater PC", "Mac", "Apple TV", "iOS", "Android", "Android TV"],
+      "directPlay": "player",
+      "certification": "builtin"
+    },
+    {
+      "protocol": "dlna",
+      "name": "DLNA renderer",
+      "devices": ["DLNA TV or receiver"],
+      "directPlay": "renderer",
+      "certification": "builtin"
+    },
+    {
+      "protocol": "webdav",
+      "name": "Files and media players",
+      "devices": ["Apple TV", "iOS", "Android"],
+      "directPlay": "player",
+      "certification": "builtin"
+    }
+  ],
+  "devices": [
+    {"name": "Apple TV", "identity": {"product": "Plex for Apple TV", "platform": "tvOS", "device": "Apple TV"}},
+    {"name": "iOS", "identity": {"product": "Plex for iOS", "platform": "iOS", "device": "iPhone"}},
+    {"name": "Android", "identity": {"product": "Plex for Android (Mobile)", "platform": "Android"}},
+    {"name": "Android TV", "identity": {"product": "Plex for Android (TV)", "platform": "Android", "device": "Android TV"}},
+    {"name": "Google TV", "identity": {"product": "Plex for Android (TV)", "platform": "Android", "device": "Google TV"}},
+    {"name": "NVIDIA Shield", "identity": {"product": "Plex for Android (TV)", "platform": "Android", "device": "SHIELD Android TV"}},
+    {"name": "Roku", "identity": {"product": "Roku"}},
+    {"name": "Fire TV", "identity": {"product": "Fire TV"}},
+    {"name": "LG webOS", "identity": {"product": "LG webOS"}},
+    {"name": "Samsung Tizen", "identity": {"product": "Samsung Tizen"}},
+    {"name": "Xbox", "identity": {"product": "Xbox"}},
+    {"name": "PlayStation", "identity": {"product": "PlayStation"}},
+    {"name": "Home theater PC", "identity": {"product": "HTPC"}},
+    {"name": "Kodi", "identity": {"product": "Kodi"}},
+    {"name": "Mac", "identity": {"product": "Plex for Mac", "platform": "macOS"}},
+    {"name": "Browser", "identity": {"product": "Plex Web"}}
+  ],
   "presets": {
     "text": {
       "subtitles": ["srt", "subrip", "webvtt", "vtt", "ass", "ssa"],
@@ -90,6 +425,45 @@
     }
   },
   "definitions": [
+    {
+      "id": "stremio-native-desktop",
+      "role": "policy",
+      "family": "Stremio desktop (mpv)",
+      "preset": "image",
+      "notes": "Stremio's desktop shell plays through mpv, which renders HDR and Dolby Vision itself and tone-maps for an SDR display. Profile 7 plays its HDR10 base.",
+      "dolbyVisionProfiles": [5, 8],
+      "match": {"all": [
+        {"field": "product", "op": "equals", "value": "stremio"},
+        {"field": "platform", "op": "equals", "value": "desktop"}
+      ]}
+    },
+    {
+      "id": "stremio-native-android",
+      "role": "policy",
+      "family": "Stremio native player (Android)",
+      "preset": "image",
+      "notes": "Stremio Android, Android TV and Nuvio play through ExoPlayer, libVLC or libmpv. Dolby Vision depends on the device decoder, which Ether cannot see, so it is off by default; profile 7 and 8.1 play their HDR10 base.",
+      "dolbyVisionProfiles": [8],
+      "match": {"all": [
+        {"any": [
+          {"field": "product", "op": "equals", "value": "stremio"},
+          {"field": "product", "op": "equals", "value": "nuvio"}
+        ]},
+        {"field": "platform", "op": "equals", "value": "android"}
+      ]}
+    },
+    {
+      "id": "nuvio-ios",
+      "role": "policy",
+      "family": "Nuvio (iOS)",
+      "preset": "text",
+      "notes": "Nuvio on iOS plays HDR10 natively; Dolby Vision stays off by default.",
+      "dolbyVisionProfiles": [8],
+      "match": {"all": [
+        {"field": "product", "op": "equals", "value": "nuvio"},
+        {"field": "platform", "op": "equals", "value": "ios"}
+      ]}
+    },
     {
       "id": "pm4k",
       "role": "policy",
@@ -225,7 +599,9 @@
         "any": [
           {"field": "identity", "op": "contains", "value": "htpc"},
           {"field": "identity", "op": "contains", "value": "kodi"},
-          {"field": "identity", "op": "contains", "value": "infuse"}
+          {"field": "identity", "op": "contains", "value": "infuse"},
+          {"field": "product", "op": "equals", "value": "plezy"},
+          {"field": "product", "op": "equals", "value": "vlc"}
         ]
       }
     },
@@ -235,6 +611,39 @@
       "family": "generic",
       "preset": "text",
       "match": {}
+    },
+    {
+      "id": "stremio-native-desktop",
+      "role": "playback",
+      "preset": "htpc",
+      "dolbyVision": true,
+      "match": {"all": [
+        {"field": "product", "op": "equals", "value": "stremio"},
+        {"field": "platform", "op": "equals", "value": "desktop"}
+      ]}
+    },
+    {
+      "id": "stremio-native-android",
+      "role": "playback",
+      "preset": "htpc",
+      "audio": ["aac", "ac3", "eac3", "mp3", "flac", "opus", "vorbis", "pcm"],
+      "match": {"all": [
+        {"any": [
+          {"field": "product", "op": "equals", "value": "stremio"},
+          {"field": "product", "op": "equals", "value": "nuvio"}
+        ]},
+        {"field": "platform", "op": "equals", "value": "android"}
+      ]}
+    },
+    {
+      "id": "nuvio-ios",
+      "role": "playback",
+      "preset": "apple",
+      "dolbyVision": false,
+      "match": {"all": [
+        {"field": "product", "op": "equals", "value": "nuvio"},
+        {"field": "platform", "op": "equals", "value": "ios"}
+      ]}
     },
     {
       "id": "pm4k",
@@ -386,7 +795,12 @@
       "id": "htpc",
       "role": "playback",
       "preset": "htpc",
-      "match": {"field": "product", "op": "equals", "value": "plezy"}
+      "match": {
+        "any": [
+          {"field": "product", "op": "equals", "value": "plezy"},
+          {"field": "product", "op": "equals", "value": "vlc"}
+        ]
+      }
     },
     {
       "id": "roku",
@@ -466,6 +880,12 @@
       "match": {}
     },
     {
+      "id": "shield-video",
+      "role": "patch",
+      "video": ["h264", "hevc", "vp9"],
+      "match": {"field": "identity", "op": "contains", "value": "shield"}
+    },
+    {
       "id": "fire-tv-4k-max",
       "role": "patch",
       "patchHeight": 2160,
@@ -497,7 +917,7 @@
     {
       "id": "plex-appletv-hdr10-base",
       "role": "quirk",
-      "quirks": ["plex-appletv-hdr10-base"],
+      "quirks": ["plex-appletv-hdr10-base", "plex-appletv-hls-mp3-to-aac"],
       "match": {
         "all": [
           {"field": "product", "op": "contains", "value": "plex"},
@@ -567,6 +987,44 @@
       }
     },
     {
+      "id": "plex-android-matroska-hls",
+      "role": "quirk",
+      "notes": "Plex for Android Matroska-in-HLS transport. Its master playlist must not declare CODECS or SUPPLEMENTAL-CODECS, or the app's media3 player drops the muxed subtitle track (listed, never drawn); see transcode.HLSVariantAttributes. The match also covers Plex for Android (TV), which shares the player code.",
+      "quirks": ["plex-android-matroska-hls"],
+      "match": {"field": "product", "op": "contains", "value": "plex for android"}
+    },
+    {
+      "id": "plex-android-mobile",
+      "role": "segmented-audio",
+      "notes": "Plex for Android (Mobile), also the app uncertified Android boxes run, lists E-AC-3, AC-3 and DTS in its HLS target whatever the device decodes. Segmented Matroska with copied E-AC-3 froze after the first segment on Pixel phones (PR #395) and plays converted to AAC. Direct play of the original file is the app's own decision and is untouched.",
+      "audio": ["eac3", "ac3", "dts", "dca", "dtshd"],
+      "match": {
+        "all": [
+          {"field": "product", "op": "contains", "value": "plex for android"},
+          {"field": "product", "op": "notContains", "value": "tv"},
+          {"field": "device", "op": "notContains", "value": "shield"},
+          {"field": "device", "op": "notContains", "value": "tv"}
+        ]
+      }
+    },
+    {
+      "id": "google-tv-no-dts",
+      "role": "segmented-audio",
+      "notes": "Chromecast with Google TV and onn. Google TV devices are Dolby-licensed but have no DTS or TrueHD decoder or passthrough; DTS is converted to E-AC-3 surround for them.",
+      "audio": ["dts", "dca", "dtshd", "truehd", "mlp"],
+      "match": {
+        "all": [
+          {"field": "product", "op": "contains", "value": "plex for android"},
+          {
+            "any": [
+              {"field": "device", "op": "prefix", "value": "chromecast"},
+              {"field": "device", "op": "prefix", "value": "onn"}
+            ]
+          }
+        ]
+      }
+    },
+    {
       "id": "probe-hls-without-codecs",
       "role": "quirk",
       "quirks": ["probe-hls-without-codecs"],
@@ -590,6 +1048,38 @@
           {"field": "platform", "op": "equals", "value": "android"}
         ]
       }
+    },
+    {
+      "id": "plex-promoted-rows-as-collections",
+      "role": "quirk",
+      "quirks": ["plex-promoted-rows-as-collections"],
+      "match": {
+        "any": [
+          {"field": "product", "op": "contains", "value": "infuse"}
+        ]
+      }
+    },
+    {
+      "id": "native-player-dynamic-range",
+      "role": "quirk",
+      "quirks": ["native-player-dynamic-range"],
+      "notes": "The app plays through its own native player (mpv, ExoPlayer, libVLC, KSPlayer), which renders HDR itself and tone-maps for an SDR display, so the playback record's HDR flags apply without a declared profile.",
+      "match": {"any": [
+        {"all": [
+          {"field": "product", "op": "equals", "value": "stremio"},
+          {"any": [
+            {"field": "platform", "op": "equals", "value": "desktop"},
+            {"field": "platform", "op": "equals", "value": "android"}
+          ]}
+        ]},
+        {"all": [
+          {"field": "product", "op": "equals", "value": "nuvio"},
+          {"any": [
+            {"field": "platform", "op": "equals", "value": "android"},
+            {"field": "platform", "op": "equals", "value": "ios"}
+          ]}
+        ]}
+      ]}
     }
   ]
 }

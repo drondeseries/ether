@@ -1,6 +1,7 @@
 package playback
 
 import (
+	"errors"
 	"time"
 
 	"github.com/braedonsaunders/ether/internal/core"
@@ -34,8 +35,10 @@ type experienceState struct {
 	baseAt  time.Time
 	basePos time.Duration
 
-	// Explicit buffering (Plex timelines).
+	// Explicit buffering (Plex timelines). A spell that began with a
+	// position jump is a seek, not a stall.
 	bufferingSince time.Time
+	bufferingSeek  bool
 	// Inferred stalls (Jellyfin, Emby, Silo).
 	lastAt  time.Time
 	lastPos time.Duration
@@ -43,20 +46,6 @@ type experienceState struct {
 
 	events   int
 	buffered time.Duration
-}
-
-// reportsBuffering says whether a protocol's timelines carry an explicit
-// buffering state. Others are inferred from positions.
-func reportsBuffering(p core.Protocol) bool { return p == "" || p == "plex" }
-
-// measuredProtocol reports whether a protocol sends playback timelines at
-// all; plain file and DLNA surfaces never show whether a picture appeared.
-func measuredProtocol(p core.Protocol) bool {
-	switch p {
-	case "", "plex", "jellyfin", "emby", "silo":
-		return true
-	}
-	return false
 }
 
 // noteRequest records a play request; the earliest one wins.
@@ -75,12 +64,20 @@ func (e *experienceState) observe(now time.Time, explicit bool, pos time.Duratio
 	}
 	if explicit {
 		if !e.bufferingSince.IsZero() && state != "buffering" {
-			e.buffered += min(max(0, now.Sub(e.bufferingSince)), bufferingCap)
-			e.bufferingSince = time.Time{}
+			if d, ok := e.explicitStall(now); ok {
+				e.events++
+				e.buffered += d
+			}
+			e.bufferingSince, e.bufferingSeek = time.Time{}, false
 		}
 		if state == "buffering" && e.bufferingSince.IsZero() {
-			e.events++
 			e.bufferingSince = now
+			// Players rebuffer after every seek or scrub: a buffering
+			// report whose position left the playback line is the seek.
+			e.bufferingSeek = !e.lastAt.IsZero() && (pos < e.lastPos-time.Second || pos-e.lastPos > now.Sub(e.lastAt)+stallSeekSlack)
+		}
+		if state == "playing" || state == "paused" {
+			e.lastAt, e.lastPos = now, pos
 		}
 		return
 	}
@@ -116,6 +113,7 @@ func (e *experienceState) observeStart(now time.Time, explicit bool, pos time.Du
 	if explicit {
 		if state == "playing" {
 			e.pictureAt = now
+			e.lastAt, e.lastPos = now, pos
 		}
 		return
 	}
@@ -150,10 +148,33 @@ func (e *experienceState) snapshot(now time.Time) *core.PlayExperience {
 			out.StartTime = max(0, e.pictureAt.Sub(e.requestedAt))
 		}
 	}
-	if !e.bufferingSince.IsZero() {
-		out.Buffering += min(max(0, now.Sub(e.bufferingSince)), bufferingCap)
+	if d, ok := e.explicitStall(now); ok {
+		out.BufferEvents++
+		out.Buffering += d
 	}
 	return out
+}
+
+// stallCount returns the number of mid-play stalls observed so far, including
+// an active explicit buffering spell once it crosses stallMinimum.
+func (e *experienceState) stallCount(now time.Time) int {
+	n := e.events
+	if _, ok := e.explicitStall(now); ok {
+		n++
+	}
+	return n
+}
+
+// explicitStall reports a Plex buffering spell as a stall: one that began
+// mid-play (not with a seek) and lasted at least stallMinimum, the same
+// floor inferred stalls use. Shorter blips and post-seek rebuffering are not
+// counted.
+func (e *experienceState) explicitStall(now time.Time) (time.Duration, bool) {
+	if e.bufferingSince.IsZero() || e.bufferingSeek {
+		return 0, false
+	}
+	d := min(max(0, now.Sub(e.bufferingSince)), bufferingCap)
+	return d, d >= stallMinimum
 }
 
 // NotePlayRequest records when a frontend's play request for a prepared
@@ -171,8 +192,18 @@ func (m *Manager) NotePlayRequest(id string, at time.Time) {
 // it reported playing (a stalled start the server ended).
 func (m *Manager) NoteFailedStart(id, reason string) {
 	if s := m.lookup(id); s != nil && reason != "" {
+		clean := OwnerError(errors.New(reason))
 		s.mu.Lock()
-		s.exp.failure = reason
+		s.exp.failure = clean
 		s.mu.Unlock()
+		m.log.Warn("playback start failed", "session", s.id, "reason", clean)
+		m.recordTimeline(s, TimelineEvent{
+			Kind:    "error",
+			Level:   "error",
+			Failing: true,
+			Message: "Playback failed before first frame",
+			Detail:  clean,
+		})
+		m.emitSessionFailed(s, s.snapshot(m.now()), "start", errors.New(clean))
 	}
 }

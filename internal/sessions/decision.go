@@ -1,11 +1,11 @@
 package sessions
 
 import (
-	"fmt"
 	"slices"
 	"strings"
 
 	"github.com/braedonsaunders/ether/internal/core"
+	"github.com/braedonsaunders/ether/internal/frontend"
 	"github.com/braedonsaunders/ether/internal/transcode"
 )
 
@@ -23,6 +23,9 @@ type DecisionRequest struct {
 	// PreserveSourceOnFailure lets a broker avoid stopping a reused source
 	// when an attempted decision cannot be served without a transcoder.
 	PreserveSourceOnFailure bool
+	// NoVideoTranscode keeps a direct-playable source on DirectPlay rather than
+	// letting optional PreferRemux promote it into a video encode.
+	NoVideoTranscode bool
 }
 
 // Decide preserves the playback remux override for on-demand sources and
@@ -41,7 +44,7 @@ func Decide(playback core.Playback, transcoder core.Transcoder, r DecisionReques
 			if playback != nil && !r.PreserveSourceOnFailure {
 				playback.Stop(ps.ID)
 			}
-			return core.Decision{}, fmt.Errorf("this client requires media conversion; install or configure FFmpeg")
+			return core.Decision{}, &frontend.NoCompatiblePathError{RejectedPaths: []frontend.RejectedPlaybackPath{{Path: "conversion", Reasons: []string{"media conversion requires FFmpeg"}}}}
 		}
 	}
 	// Usenet sources can change during failover. Copy-only remux gives MDE
@@ -52,7 +55,8 @@ func Decide(playback core.Playback, transcoder core.Transcoder, r DecisionReques
 	if rr, ok := playback.(core.RemuxRequirer); ok && rr.RequiresRemux(ps.ID) {
 		requiresRemux = true
 	}
-	preferRemux := r.PreferRemux && onDemand && ps.Resolution.Release.Protocol != core.ProtocolTorrent &&
+	healthSafety := onDemand && !ps.Resolution.HealthVerified
+	preferRemux := (r.PreferRemux || healthSafety) && onDemand && ps.Resolution.Release.Protocol != core.ProtocolTorrent &&
 		ps.Resolution.Release.Protocol != core.ProtocolHTTP
 	// Keep native Dolby Vision file playback on Android when the decision
 	// accepted the container, tracks and DV profile. Optional source-change
@@ -62,6 +66,20 @@ func Decide(playback core.Playback, transcoder core.Transcoder, r DecisionReques
 		strings.EqualFold(r.Caps.Platform, "Android") && transcode.SupportsDVProfile(r.Caps, v.DolbyVisionProfile) {
 		preferRemux = false
 	}
+	// Keep native file playback when the client Direct Plays the file's video
+	// codec (for example 4K HEVC HDR10 on webOS/VIDAA TVs) while its segmented
+	// streaming target only accepts another codec (such as H.264). Optional
+	// source-change remuxing must not push Direct Play into an unplayable HEVC
+	// HLS copy or an unnecessary 4K transcode (#408). A required remux or an
+	// explicit client rejection of direct play still wins.
+	if v := ps.Info.Video(); v != nil && v.Codec != "" && r.Options.DirectPlay &&
+		len(r.Caps.TranscodeVideoCodecs) > 0 && !slices.Contains(r.Caps.TranscodeVideoCodecs, v.Codec) {
+		preferRemux = false
+	}
+	if healthSafety && !r.PreferRemux && r.Caps.Profiles != nil && len(r.Caps.Profiles.DirectPlay) > 0 && len(r.Caps.Profiles.Transcoding) == 0 {
+		preferRemux = false
+	}
+	original := dec
 	if (preferRemux || requiresRemux) && r.Options.DirectStream && onDemand && dec.Kind == core.DecisionDirectPlay && transcoder != nil {
 		dec.Kind = core.DecisionRemux
 		dec.VideoCopy, dec.AudioCopy = true, true
@@ -81,11 +99,28 @@ func Decide(playback core.Playback, transcoder core.Transcoder, r DecisionReques
 			dec.Container = transcode.HLSContainer(r.Caps, videoCodec, audioCodec)
 		}
 		dec.Reason = "Direct stream preserves playback across source changes."
-		if len(r.Caps.TranscodeAudioCodecs) > 0 && audioCodec != "" && !slices.Contains(r.Caps.TranscodeAudioCodecs, audioCodec) {
+		if healthSafety {
+			dec.Reason = "remux for failover safety: health unverified"
+		}
+		videoCopyOK := videoCodec == "" || transcode.SegmentedVideoCopyOK(r.Caps, videoCodec)
+		audioCopyOK := audioCodec == "" || transcode.SegmentedAudioCopyOK(r.Caps, audioCodec)
+		if !videoCopyOK || !audioCopyOK {
 			opts := r.Options
 			opts.DirectPlay = false
+			if !videoCopyOK {
+				opts.DirectStream = false
+			}
 			dec = transcoder.Decide(ps.Info, r.Caps, opts)
 		}
+	}
+	// Optional health safety must never force quality loss or an encoder on a
+	// client that can only play the original representation. Likewise, when
+	// video transcoding is off, an optional PreferRemux must never push a
+	// direct-playable file into a video encode.
+	if original.Kind == core.DecisionDirectPlay && !requiresRemux &&
+		((healthSafety && !r.PreferRemux && (!dec.VideoCopy || !dec.AudioCopy)) ||
+			(r.NoVideoTranscode && !dec.VideoCopy)) {
+		dec = original
 	}
 	return dec, nil
 }
@@ -105,22 +140,18 @@ func (b *Broker) recordPlaybackDecision(playID string, dec core.Decision) {
 	}
 }
 
-// HLSDecision applies the v39 start-time decision rules. A client may reject
-// direct play after its initial decision; in that case reconsider is called
-// before selecting the segmented output. forcedStream, when supplied, applies
-// adapter output constraints only when a still-direct decision is forced to HLS.
-func HLSDecision(dec core.Decision, allowDirect bool, reconsider func() core.Decision, forcedStream func(core.Decision) core.Decision) core.Decision {
-	if dec.Kind == core.DecisionDirectPlay && !allowDirect {
-		dec = reconsider()
+// HLSDecision lives in internal/frontend (host_sessions_experience.go).
+var HLSDecision = frontend.HLSDecision
+
+// playMethod maps a broker decision to the MediaBrowser PlayMethod vocabulary.
+func playMethod(kind core.DecisionKind) string {
+	switch kind {
+	case core.DecisionDirectPlay:
+		return "DirectPlay"
+	case core.DecisionRemux:
+		return "DirectStream"
+	case core.DecisionTranscode:
+		return "Transcode"
 	}
-	if dec.Kind == core.DecisionDirectPlay {
-		dec.Kind, dec.VideoCopy, dec.AudioCopy, dec.Container = core.DecisionRemux, true, true, "mpegts"
-		if forcedStream != nil {
-			dec = forcedStream(dec)
-		}
-	}
-	if dec.Container == "" {
-		dec.Container = "mpegts"
-	}
-	return dec
+	return ""
 }

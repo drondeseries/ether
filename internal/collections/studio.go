@@ -26,6 +26,9 @@ func (s *Service) ListSpecs(ctx context.Context) ([]core.CollectionSpec, error) 
 	out := make([]core.CollectionSpec, 0, len(rows))
 	var snap *snapshot
 	for _, r := range rows {
+		if strings.HasPrefix(r.slug, "plugin:") {
+			continue
+		}
 		if _, ok := localFacetSpec(r.spec); ok {
 			// A listing waits briefly for the catalogue index's first
 			// build, which reads the whole catalogue; past that the stored
@@ -35,6 +38,9 @@ func (s *Service) ListSpecs(ctx context.Context) ([]core.CollectionSpec, error) 
 		}
 	}
 	for _, r := range rows {
+		if strings.HasPrefix(r.slug, "plugin:") {
+			continue
+		}
 		v := r.view()
 		if key, ok := localFacetSpec(r.spec); ok && snap != nil {
 			v.ItemCount = len(snap.facetKeys(key))
@@ -43,6 +49,24 @@ func (s *Service) ListSpecs(ctx context.Context) ([]core.CollectionSpec, error) 
 			}
 		}
 		out = append(out, v)
+	}
+	return out, nil
+}
+
+// ListSpecsLight returns every collection's stored descriptor without waiting
+// on the catalogue index or recomputing facet item counts (used by Home
+// Designer's AvailableRows, which only reads id, name, enabled and mediaType).
+func (s *Service) ListSpecsLight(ctx context.Context) ([]core.CollectionSpec, error) {
+	rows, err := s.loadRows(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]core.CollectionSpec, 0, len(rows))
+	for _, r := range rows {
+		if strings.HasPrefix(r.slug, "plugin:") {
+			continue
+		}
+		out = append(out, r.view())
 	}
 	return out, nil
 }
@@ -374,21 +398,22 @@ func (s *Service) artworkFor(ctx context.Context, row *specRow, keys []core.Rati
 	return data, ct, stamp, nil
 }
 
+// subtitleFor is the small caps line on a generated collection poster.
+// It names the kind, never a count: the poster is shared by every viewer,
+// and each sees a different number of titles after their own access and
+// rating rules, so a baked-in count ("100 FILMS") disagreed with the count
+// their app shows.
 func subtitleFor(sp core.CollectionSpec, n int) string {
-	kind := "TITLES"
 	switch sp.MediaType {
 	case MediaMovie:
-		kind = "FILMS"
 		if n == 1 {
-			kind = "FILM"
+			return "FILM"
 		}
+		return "FILMS"
 	case MediaShow:
-		kind = "SERIES"
+		return "SERIES"
 	}
-	if n <= 0 {
-		return "COLLECTION"
-	}
-	return fmt.Sprintf("%d %s", n, kind)
+	return "COLLECTION"
 }
 
 // tmdbCollectionPoster finds the poster of the spec's TMDB collection.

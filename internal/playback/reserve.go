@@ -116,16 +116,10 @@ func (m *Manager) maintainReserve(s *session, position time.Duration, state stri
 	}
 	reserve := min(m.swapLatency.target(), cfg.PlaybackReadAhead())
 	tm := g.timeMapSnapshot()
-	lo := tm.KeyframeOffsetAt(position)
-	if len(tm.Points) == 0 {
-		lo = tm.OffsetAt(max(0, position-6*time.Second))
-	}
-	// A byte cap can cover much less media time at high bitrates. Never
-	// record the full requested horizon when the admitted bytes cannot reach
-	// it, and do not spend the entire cap behind the current playhead.
-	currentOffset := tm.OffsetAt(position)
-	if currentOffset-lo >= maxBytes {
-		lo = currentOffset
+	lo := tm.WarmOffsetAt(position)
+	// A small configured reserve must still reach the current position.
+	if current := tm.OffsetAt(position); current-lo >= maxBytes {
+		lo = current
 	}
 	wantedUntil := min(info.Duration, position+reserve)
 	hi := tm.OffsetAt(min(info.Duration, wantedUntil+4*time.Second))
@@ -151,7 +145,7 @@ func (m *Manager) maintainReserve(s *session, position time.Duration, state stri
 	if r.cancel != nil {
 		r.cancel()
 	}
-	ctx, cancel := context.WithTimeout(g.ctx, 45*time.Second)
+	ctx, cancel := context.WithTimeout(core.WithWarmReadWindow(core.WithReadOrigin(g.ctx, "playback.reserve", "resume"), g.warmReads), 45*time.Second)
 	r.generation = g
 	r.until = until
 	r.running = true
@@ -190,6 +184,7 @@ func (m *Manager) maintainReserve(s *session, position time.Duration, state stri
 		defer g.release()
 		// These are source-byte hints, not proof that output has been decoded
 		// or received. RecoveryBuffer reports contiguous published segments.
+		m.log.Debug("source reserve planned", "session", s.id, "position", position, "offset", lo, "bytes", n, "indexPoints", len(tm.Points), "estimatedOffset", tm.OffsetAt(position))
 		err := m.deps.Engine.Prefetch(ctx, g.releaseID(), g.res.NZB, lo, n)
 		r.mu.Lock()
 		if r.generation == g && r.until == until {
@@ -207,7 +202,7 @@ func (m *Manager) maintainReserve(s *session, position time.Duration, state stri
 // transfers once to failover; otherwise the parent/session cancellation closes
 // it and revokes its loopback grant. Speculation never changes watch state.
 func (m *Manager) prepareSpeedAlternate(g *generation) {
-	if m.config().Cache.DisableSpeculation {
+	if m.config().Cache.DisableSpeculation || g.sess.isKind() {
 		return
 	}
 	d := &g.standby
@@ -250,36 +245,57 @@ func (m *Manager) prepareSpeedAlternate(g *generation) {
 		s.mu.Unlock()
 		alts = orderLowerBitrateFirst(alts, g.res.Release)
 		started := time.Now()
-		var prepared *generation
-		for attempt := 0; attempt < min(m.opts.MaxAttempts, 3) && ctx.Err() == nil; attempt++ {
-			res, err := m.nextResolution(ctx, s, tried, alts)
-			if err != nil {
+		currentBps := mediaBps(g.infoSnapshot(), g.src.Size())
+		// Keep the resolver's quality order among candidates that can help.
+		alts = slices.DeleteFunc(alts, func(r core.Release) bool {
+			return r.Size > 0 && g.infoSnapshot().Duration > 0 && float64(r.Size)/g.infoSnapshot().Duration.Seconds() >= currentBps
+		})
+
+		accept := func(next *generation) error {
+			if hls, ok := m.deps.HLSLookup(s.id); ok {
+				if p, ok := hls.(interface{ SwapWouldCopyVideo(core.MediaInfo) bool }); ok && !p.SwapWouldCopyVideo(next.infoSnapshot()) {
+					return core.ErrNotAvailable
+				}
+			}
+			bps := replacementBps(next, g.infoSnapshot().Duration)
+			if bps <= 0 || bps >= currentBps {
+				return core.ErrNotAvailable
+			}
+			if err := m.warmAlternateWindow(ctx, g, next); err != nil {
+				m.rememberOpenFailure(s, next.res.Release, err)
+				return err
+			}
+			return nil
+		}
+		fallback := func(size int64) core.MediaInfo { return core.MediaInfo{Size: size, Estimated: true} }
+		prepared, failed, _ := m.raceAlternates(ctx, s, tried, alts, fallback, failoverRaceWidth, accept, nil)
+		// Some providers resolve their payload on demand rather than exposing
+		// a fetchable alternate. Keep their bounded, sequential preparation.
+		if prepared == nil {
+			tried = append(tried, failed...)
+			for attempt := 0; attempt < min(m.opts.MaxAttempts, failoverRaceWidth) && ctx.Err() == nil; attempt++ {
+				res, err := m.nextResolution(ctx, s, tried, alts)
+				if err != nil {
+					break
+				}
+				tried = append(tried, res.Release.ID)
+				next, err := m.openGeneration(ctx, s, res, fallback)
+				if err != nil {
+					failed = append(failed, res.Release.ID)
+					continue
+				}
+				if m.preflightSwap(ctx, s, next) != nil || accept(next) != nil {
+					m.dropGeneration(next)
+					failed = append(failed, res.Release.ID)
+					continue
+				}
+				prepared = next
 				break
 			}
-			tried = append(tried, res.Release.ID)
-			next, err := m.openGeneration(ctx, s, res, func(size int64) core.MediaInfo { return core.MediaInfo{Size: size, Estimated: true} })
-			if err != nil {
-				continue
-			}
-			bps := mediaBps(next.infoSnapshot(), next.src.Size())
-			if bps <= 0 || bps >= mediaBps(g.infoSnapshot(), g.src.Size()) || m.preflightSwap(ctx, s, next) != nil {
-				m.dropGeneration(next)
-				continue
-			}
-			// Read real upcoming bytes before calling an alternate ready. A
-			// successful header probe does not establish that its first articles
-			// or seek target exist (the Friends failure was at byte 1,433,600).
-			if err := m.warmAlternateWindow(ctx, g, next); err != nil {
-				m.log.Debug("alternate preparation failed", "session", s.id, "release", next.releaseID(), "err", err)
-				if permanentSourceFailure(err) {
-					m.markBad(next.releaseID(), "missing media while preparing alternate")
-				}
-				m.dropGeneration(next)
-				continue
-			}
-			prepared = next
-			break
 		}
+		s.mu.Lock()
+		s.tried = append(s.tried, failed...)
+		s.mu.Unlock()
 		if prepared == nil {
 			return
 		}

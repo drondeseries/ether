@@ -1,12 +1,18 @@
 import type {
   ActionResponse,
+  BadgeEntry,
+  BadgeTitleRef,
+  BadgeUsage,
   CandidateFacts,
   CatalogItem,
   CatalogResponse,
   ConfigureResponse,
   EtherEvent,
+  EventCorrelation,
   EventResponse,
   FieldOption,
+  FlowActionRequest,
+  FlowActionResponse,
   Manifest,
   MaybePromise,
   MarkersResponse,
@@ -21,13 +27,21 @@ import type {
   ViewResponse,
   ViewSpecDocument,
 } from "./types.ts";
-import type {
-  CatalogTitleSummary,
-  EtherHost,
-  FolderEntry,
-  HostFetchRequest,
-  HostFetchResponse,
-  ViewerWatchEntry,
+import {
+  encodeText,
+  HEADER_IDEMPOTENCY_KEY,
+  MAX_KIND_VISIBLE_IDS,
+  MaxBadgeEntriesPerCall,
+  MaxBadgeLabelLen,
+  MaxBadgeLabelsPerTitle,
+  PosterBadgeQuotaTitles,
+  type CatalogTitleSummary,
+  type EtherHost,
+  type FolderEntry,
+  type HostFetchRequest,
+  type HostFetchResponse,
+  type KVUsage,
+  type ViewerWatchEntry,
 } from "./host.ts";
 import { plugin, type PluginDefinition, type PluginInstance } from "./router.ts";
 
@@ -37,17 +51,122 @@ export interface RecordedLog {
   attrs?: Record<string, unknown>;
 }
 
+const BADGE_SET_KEY_RE = /^[a-z][a-z0-9_]{0,31}$/;
+const BADGE_LABEL_RE = /^[A-Z0-9 +&'./-]+$/;
+const IMDB_ID_RE = /^tt[0-9]+$/;
+
+function checkBadgeSetKey(setKey: string): void {
+  if (typeof setKey !== "string" || !BADGE_SET_KEY_RE.test(setKey)) {
+    throw new Error("badge set key must match ^[a-z][a-z0-9_]{0,31}$");
+  }
+}
+
+function normalizeBadgeLabel(raw: string): string {
+  if (typeof raw !== "string") {
+    throw new Error("badge label must be a string");
+  }
+  let upper = "";
+  for (let i = 0; i < raw.length; i++) {
+    const code = raw.charCodeAt(i);
+    upper += code >= 97 && code <= 122 ? String.fromCharCode(code - 32) : raw[i]!;
+  }
+  if (
+    upper.length < 1 ||
+    upper.length > MaxBadgeLabelLen ||
+    upper.trim().length === 0 ||
+    !BADGE_LABEL_RE.test(upper)
+  ) {
+    throw new Error(
+      `badge label must be 1..${MaxBadgeLabelLen} characters from [A-Z0-9 +&'./-]`,
+    );
+  }
+  return upper;
+}
+
+function resolveBadgeTitleKey(
+  title: BadgeTitleRef,
+  catalog: Map<string, CatalogTitleSummary>,
+): string {
+  if (!title || (title.type !== "movie" && title.type !== "show")) {
+    throw new Error('badge title.type must be "movie" or "show"');
+  }
+  let tmdb = 0;
+  if (title.tmdb !== undefined) {
+    if (!Number.isSafeInteger(title.tmdb) || title.tmdb <= 0) {
+      throw new Error("badge title.tmdb must be a positive integer");
+    }
+    tmdb = title.tmdb;
+  }
+  let imdb = "";
+  if (title.imdb !== undefined && title.imdb !== "") {
+    const norm = String(title.imdb).trim().toLowerCase();
+    if (!IMDB_ID_RE.test(norm)) {
+      throw new Error("badge title.imdb must match tt<digits>");
+    }
+    imdb = norm;
+  }
+  if (tmdb === 0 && imdb === "") {
+    throw new Error("badge title requires tmdb or imdb");
+  }
+  if (tmdb > 0) {
+    for (const item of catalog.values()) {
+      if (item.type === title.type && item.tmdbId === tmdb) {
+        return String(item.id);
+      }
+    }
+  }
+  if (imdb !== "") {
+    for (const item of catalog.values()) {
+      if (item.type === title.type && item.imdbId?.toLowerCase() === imdb) {
+        return String(item.id);
+      }
+    }
+  }
+  return tmdb > 0 ? `tmdb:${title.type}:${tmdb}` : `imdb:${title.type}:${imdb}`;
+}
+
+function countDistinctBadgeTitles(badges: Map<string, Map<string, string[]>>): number {
+  const seen = new Set<string>();
+  for (const setMap of badges.values()) {
+    for (const titleKey of setMap.keys()) {
+      seen.add(titleKey);
+    }
+  }
+  return seen.size;
+}
+
+export interface RecordedPublishedEvent {
+  key: string;
+  payload: Record<string, unknown>;
+  correlation?: EventCorrelation;
+}
+
 export interface MockHostState {
   kv: Map<string, string>;
+  badges: Map<string, Map<string, string[]>>;
+  badgeQuotaTitles: number;
   secrets: Map<string, string>;
   catalog: Map<string, CatalogTitleSummary>;
   history: Map<number, ViewerWatchEntry[]>;
   watchState: Map<string, boolean>;
   collections: Record<string, unknown>[];
+  kinds: Map<string, import("./types.ts").KindItem[]>;
+  /** External IDs hidden by mock library Rules, keyed by kind (#615). */
+  kindHiddenIds: Map<string, Set<string>>;
+  /** Optional custom predicate simulating library Rules + viewer policy (#615). */
+  kindPolicyFilter?: (kind: string, item: import("./types.ts").KindItem) => boolean;
+  sources: import("./types.ts").SourceCandidate[];
+  blobs: Map<string, Uint8Array>;
+  limits: import("./types.ts").RuntimeLimits;
   folders: Map<string, FolderEntry[]>;
+  publishedEvents: RecordedPublishedEvent[];
   notifications: string[];
   logs: RecordedLog[];
   httpHandler: (req: HostFetchRequest) => HostFetchResponse | Promise<HostFetchResponse>;
+  /** The most recent frontend.streamUrl call: [viewerId, itemRef]. */
+  lastStreamUrl?: [number, string];
+  /** Zero-based part index of the most recent part-scoped frontend.streamUrl call. */
+  lastStreamUrlPart?: number;
 }
 
 export interface MockHostClient extends EtherHost {
@@ -57,12 +176,30 @@ export interface MockHostClient extends EtherHost {
 export function createMockHostClient(initial?: Partial<MockHostState>): MockHostClient {
   const state: MockHostState = {
     kv: initial?.kv ?? new Map<string, string>(),
+    badges: initial?.badges ?? new Map<string, Map<string, string[]>>(),
+    badgeQuotaTitles: initial?.badgeQuotaTitles ?? PosterBadgeQuotaTitles,
     secrets: initial?.secrets ?? new Map<string, string>(),
     catalog: initial?.catalog ?? new Map<string, CatalogTitleSummary>(),
     history: initial?.history ?? new Map<number, ViewerWatchEntry[]>(),
     watchState: initial?.watchState ?? new Map<string, boolean>(),
     collections: initial?.collections ?? [],
+    kinds: initial?.kinds ?? new Map(),
+    kindHiddenIds: initial?.kindHiddenIds ?? new Map(),
+    kindPolicyFilter: initial?.kindPolicyFilter,
+    sources: initial?.sources ?? [],
+    blobs: initial?.blobs ?? new Map(),
+    limits: initial?.limits ?? {
+      memoryBytes: 32 * 1024 * 1024,
+      readBytes: 8 * 1024 * 1024,
+      fetchBytes: 8 * 1024 * 1024 * 1024,
+      archiveMemberBytes: 8 * 1024 * 1024 * 1024,
+      archiveExpandedBytes: 32 * 1024 * 1024 * 1024,
+      archiveMembers: 65535,
+      deadline: "12h",
+      poolSize: 2,
+    },
     folders: initial?.folders ?? new Map<string, FolderEntry[]>(),
+    publishedEvents: initial?.publishedEvents ?? [],
     notifications: initial?.notifications ?? [],
     logs: initial?.logs ?? [],
     httpHandler:
@@ -76,6 +213,9 @@ export function createMockHostClient(initial?: Partial<MockHostState>): MockHost
 
   return {
     state,
+    runtime: {
+      limits: () => ({ ...state.limits }),
+    },
     kv: {
       get: (key: string) => state.kv.get(key) ?? null,
       put: (key: string, value: string) => {
@@ -88,6 +228,73 @@ export function createMockHostClient(initial?: Partial<MockHostState>): MockHost
         Array.from(state.kv.keys())
           .filter((k) => k.startsWith(prefix))
           .sort(),
+      usage: (): KVUsage => {
+        let used = 0;
+        for (const v of state.kv.values()) {
+          used += encodeText(v).byteLength;
+        }
+        const keys = state.kv.size;
+        return {
+          bytes: used + keys * 256,
+          keys,
+          quotaBytes: 50 * 1024 * 1024,
+          quotaKeys: 10000,
+        };
+      },
+    },
+    badges: {
+      set: (setKey: string, entries: BadgeEntry[]) => {
+        checkBadgeSetKey(setKey);
+        if (!Array.isArray(entries)) {
+          throw new Error("badges.set entries must be an array");
+        }
+        if (entries.length > MaxBadgeEntriesPerCall) {
+          throw new Error(`badges.set accepts at most ${MaxBadgeEntriesPerCall} entries per call`);
+        }
+        const nextSet = new Map<string, string[]>(state.badges.get(setKey) ?? []);
+        for (const entry of entries) {
+          if (!entry || !Array.isArray(entry.labels)) {
+            throw new Error("badge entry labels must be an array");
+          }
+          if (entry.labels.length > MaxBadgeLabelsPerTitle) {
+            throw new Error(
+              `badge entry may have at most ${MaxBadgeLabelsPerTitle} labels per title`,
+            );
+          }
+          const titleKey = resolveBadgeTitleKey(entry.title, state.catalog);
+          if (entry.labels.length === 0) {
+            nextSet.delete(titleKey);
+            continue;
+          }
+          const labels = Array.from(new Set(entry.labels.map(normalizeBadgeLabel)));
+          nextSet.set(titleKey, labels);
+        }
+        const preview = new Map(state.badges);
+        if (nextSet.size === 0) {
+          preview.delete(setKey);
+        } else {
+          preview.set(setKey, nextSet);
+        }
+        const totalTitles = countDistinctBadgeTitles(preview);
+        if (totalTitles > state.badgeQuotaTitles) {
+          throw new Error(
+            `poster badge quota exceeded (${totalTitles} > ${state.badgeQuotaTitles} titles)`,
+          );
+        }
+        if (nextSet.size === 0) {
+          state.badges.delete(setKey);
+        } else {
+          state.badges.set(setKey, nextSet);
+        }
+      },
+      clear: (setKey: string) => {
+        checkBadgeSetKey(setKey);
+        state.badges.delete(setKey);
+      },
+      usage: (): BadgeUsage => ({
+        titles: countDistinctBadgeTitles(state.badges),
+        quotaTitles: state.badgeQuotaTitles,
+      }),
     },
     secret: {
       get: (name: string) => state.secrets.get(name) ?? "",
@@ -121,12 +328,18 @@ export function createMockHostClient(initial?: Partial<MockHostState>): MockHost
       },
     },
     folders: {
+      hashStart: () => { throw new Error("Set a folders.hashStart mock"); },
+      hashPoll: () => { throw new Error("Set a folders.hashPoll mock"); },
+      hashCancel: () => { throw new Error("Set a folders.hashCancel mock"); },
+      hash: () => { throw new Error("Set a folders.hash mock for file identification tests"); },
       list: (root: string, path = "") => {
         const key = path ? `${root}/${path}` : root;
         return state.folders.get(key) ?? [];
       },
       stat: (root: string, path: string) => {
-        const list = state.folders.get(root) ?? [];
+        const slash = path.lastIndexOf("/");
+        const parent = slash > 0 ? `${root}/${path.slice(0, slash)}` : root;
+        const list = state.folders.get(parent) ?? state.folders.get(root) ?? [];
         const found = list.find((f) => f.path === path || f.name === path);
         return found ?? { name: path, path, dir: false, size: 0 };
       },
@@ -134,6 +347,153 @@ export function createMockHostClient(initial?: Partial<MockHostState>): MockHost
     notify: {
       owner: (text: string) => {
         state.notifications.push(text);
+      },
+    },
+    kinds: {
+      upsert: (kind, items) => {
+        const kept = new Map((state.kinds.get(kind) ?? []).map((it) => [it.id, it]));
+        for (const it of items) kept.set(it.id, it);
+        state.kinds.set(kind, [...kept.values()]);
+        return items.length;
+      },
+      delete: (kind, externalIds) => {
+        const drop = new Set(externalIds);
+        state.kinds.set(kind, (state.kinds.get(kind) ?? []).filter((it) => !drop.has(it.id)));
+      },
+      items: (kind, cursor = "", limit = 200) => {
+        const all = state.kinds.get(kind) ?? [];
+        const start = cursor ? all.findIndex((it) => it.id === cursor) + 1 : 0;
+        const pageItems = all.slice(start, start + limit);
+        const page: import("./types.ts").KindPage = { items: pageItems };
+        if (pageItems.length && start + limit < all.length) page.nextCursor = pageItems[pageItems.length - 1]?.id;
+        return page;
+      },
+      visible: (kind, ids, viewerToken) => {
+        if (!viewerToken || !viewerToken.trim()) {
+          throw new Error("kinds.visible: no authenticated frontend adapter viewer token on this request");
+        }
+        if (ids.length > MAX_KIND_VISIBLE_IDS) {
+          throw new Error(`kinds.visible: batch larger than ${MAX_KIND_VISIBLE_IDS} ids`);
+        }
+        const byId = new Map<string, import("./types.ts").KindItem>();
+        for (const it of state.kinds.get(kind) ?? []) byId.set(it.id, it);
+        const hidden = state.kindHiddenIds.get(kind);
+        const seen = new Set<string>();
+        const out: string[] = [];
+        for (const id of ids) {
+          if (!id || seen.has(id)) continue;
+          seen.add(id);
+          const it = byId.get(id);
+          if (!it) continue;
+          if (hidden?.has(id)) continue;
+          if (state.kindPolicyFilter && !state.kindPolicyFilter(kind, it)) continue;
+          out.push(id);
+        }
+        return out;
+      },
+      browse: (kind, query = {}, viewerToken) => {
+        if (!viewerToken || !viewerToken.trim()) {
+          throw new Error("kinds.browse: no authenticated frontend adapter viewer token on this request");
+        }
+        const hidden = state.kindHiddenIds.get(kind);
+        const needle = (query.query ?? "").trim().toLowerCase();
+        const limit = query.limit && query.limit > 0 ? query.limit : 200;
+        let matched = (state.kinds.get(kind) ?? []).filter((it) => {
+          if (hidden?.has(it.id)) return false;
+          if (state.kindPolicyFilter && !state.kindPolicyFilter(kind, it)) return false;
+          if (query.parentId && it.parentId !== query.parentId) return false;
+          if (query.level && it.level !== query.level) return false;
+          if (needle) {
+            const hay = `${it.title ?? ""} ${it.summary ?? ""}`.toLowerCase();
+            if (!hay.includes(needle)) return false;
+          }
+          const facetHave = (k: string): string[] => {
+            const raw = it.fields?.[k];
+            return Array.isArray(raw)
+              ? raw.map((v) => String(v).toLowerCase())
+              : raw != null
+                ? [String(raw).toLowerCase()]
+                : [];
+          };
+          if (query.facets) {
+            for (const [k, want] of Object.entries(query.facets)) {
+              if (!want?.length) continue;
+              if (!want.some((w) => facetHave(k).includes(w.toLowerCase()))) return false;
+            }
+          }
+          if (query.allFacets) {
+            for (const [k, want] of Object.entries(query.allFacets)) {
+              if (!want?.length) continue;
+              if (!want.every((w) => facetHave(k).includes(w.toLowerCase()))) return false;
+            }
+          }
+          if (query.excludeFacets) {
+            for (const [k, want] of Object.entries(query.excludeFacets)) {
+              if (!want?.length) continue;
+              if (want.some((w) => facetHave(k).includes(w.toLowerCase()))) return false;
+            }
+          }
+          return true;
+        });
+        if (query.desc) matched = [...matched].reverse();
+        const start = query.cursor ? matched.findIndex((it) => it.id === query.cursor) + 1 : 0;
+        const pageItems = matched.slice(start, start + limit);
+        const page: import("./types.ts").KindPage = { items: pageItems };
+        if (pageItems.length && start + limit < matched.length) {
+          page.nextCursor = pageItems[pageItems.length - 1]?.id;
+        }
+        return page;
+      },
+      resolveSources: () => [...state.sources],
+    },
+    cache: {
+      put: async (_libraryKey, _name, data) => {
+        const digest = await globalThis.crypto.subtle.digest("SHA-256", data as BufferSource);
+        const hex = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+        const ref = `blob:${hex}`;
+        state.blobs.set(ref, new Uint8Array(data));
+        return ref;
+      },
+      open: (blobRef) => {
+        const b = state.blobs.get(blobRef);
+        if (!b) throw new Error(`blob ${blobRef} not found`);
+        return new Uint8Array(b);
+      },
+      read: (blobRef, range) => {
+        const cap = state.limits.readBytes ?? 8 * 1024 * 1024;
+        if (range.offset < 0 || range.length <= 0 || range.length > cap) {
+          throw new Error(`Data range needs nonnegative offset and length 1..${cap}`);
+        }
+        const b = state.blobs.get(blobRef);
+        if (!b) throw new Error(`blob ${blobRef} not found`);
+        return b.slice(range.offset, range.offset + range.length);
+      },
+      delete: (blobRef) => {
+        state.blobs.delete(blobRef);
+      },
+    },
+    frontend: {
+      streamUrl: (viewerId: number, itemRef: string, partIndex?: number) => {
+        if (partIndex !== undefined && (!Number.isSafeInteger(partIndex) || partIndex < 0)) {
+          throw new Error("stream url: partIndex must be a non-negative integer");
+        }
+        state.lastStreamUrl = [viewerId, itemRef];
+        state.lastStreamUrlPart = partIndex;
+        const base = `/ether/v1/kind-media/mock-${viewerId}`;
+        return partIndex === undefined ? base : `${base}?part=${partIndex}`;
+      },
+    },
+    events: {
+      publish: (
+        key: string,
+        payload?: Record<string, unknown>,
+        correlation?: EventCorrelation,
+      ) => {
+        state.publishedEvents.push({
+          key,
+          payload: payload ? { ...payload } : {},
+          ...(correlation !== undefined ? { correlation: { ...correlation } } : {}),
+        });
       },
     },
     log: (level: string, message: string, attrs?: Record<string, unknown>) => {
@@ -281,6 +641,10 @@ export interface TestHarness<S = Record<string, unknown>> {
   ): Promise<{ status: number; body: SubtitlesResponse }>;
   markers(type: string, id: string): Promise<{ status: number; body: MarkersResponse }>;
   event(events: EtherEvent[]): Promise<{ status: number; body: EventResponse }>;
+  flowAction(
+    key: string,
+    req: Omit<FlowActionRequest, "key">,
+  ): Promise<{ status: number; body: FlowActionResponse }>;
   view(page?: string, query?: Record<string, string>): Promise<{ status: number; body: ViewResponse }>;
   action(action: string, input?: Record<string, unknown>): Promise<{ status: number; body: ActionResponse }>;
   tool(name: string, input?: Record<string, unknown>): Promise<{ status: number; body: ToolResponse }>;
@@ -392,6 +756,21 @@ export function createTestHarness<S = Record<string, unknown>>(
         body: JSON.stringify({ events }),
       });
       return { status: res.status, body: res.body as EventResponse };
+    },
+    async flowAction(key, req) {
+      const decl = instance.manifest.ether?.contributes?.flowActions?.find((a) => a.key === key);
+      const path = decl?.route ?? `/ether/v1/flow-actions/${encodeURIComponent(key)}`;
+      const headers: Record<string, string> = {};
+      if (req.idempotencyKey) {
+        headers[HEADER_IDEMPOTENCY_KEY] = req.idempotencyKey;
+      }
+      const res = await instance.dispatch({
+        method: "POST",
+        path,
+        headers,
+        body: JSON.stringify(req),
+      });
+      return { status: res.status, body: res.body as FlowActionResponse };
     },
     async view(page = "home", query) {
       const cleanPage = page.replace(/^\/+/, "") || "home";

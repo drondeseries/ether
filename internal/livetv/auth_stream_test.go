@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"path"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -27,7 +29,12 @@ func (p *authLiveProbeFixture) ProbeLive(ctx context.Context, input string) (*co
 		res.Body.Close()
 		p.body = string(b)
 	}
-	return p.fixtureLiveProber.ProbeLive(ctx, input)
+	info, err := p.fixtureLiveProber.ProbeLive(ctx, input)
+	if info != nil {
+		// An audible input, so silent-source deferral does not reorder candidates.
+		info.Streams = append(info.Streams, core.StreamInfo{Type: "audio", Codec: "aac", Channels: 2})
+	}
+	return info, err
 }
 
 func (p *authLiveProbeFixture) Decide(core.MediaInfo, core.ClientCaps, core.DecideOptions) core.Decision {
@@ -81,7 +88,7 @@ func TestProviderAuthReachesProbeKeyMediaButNotAnonymousBackup(t *testing.T) {
 		t.Fatal(err)
 	}
 	u := &core.User{ID: 1}
-	first, err := s.Tune(context.Background(), u, c.ID, core.ClientCaps{Product: "Plex for Apple TV"})
+	first, err := s.Tune(context.Background(), u, c.ID, core.ClientCaps{ProbeLiveWithoutCodecs: true})
 	if err != nil || !strings.HasPrefix(p.input, "http://127.0.0.1:") || strings.Contains(p.input, up.URL) || strings.Contains(p.input, "fixture-secret") {
 		t.Fatalf("live probe did not read through the relay: %q %v", p.input, err)
 	}
@@ -92,12 +99,17 @@ func TestProviderAuthReachesProbeKeyMediaButNotAnonymousBackup(t *testing.T) {
 	req.Header.Set("X-Plex-Token", "viewer-only")
 	playlist := httptest.NewRecorder()
 	s.ServePlaylist(playlist, req, first.ID, u)
-	for _, path := range []string{"/key", "/media.ts"} {
-		out := httptest.NewRecorder()
-		s.ServeResource(out, req, first.ID, stableID(up.URL+path), u)
-		if out.Code != 200 {
-			t.Fatalf("authenticated %s failed: %d", path, out.Code)
-		}
+	keyURI := hlsURI.FindStringSubmatch(playlist.Body.String())
+	if playlist.Code != 200 || keyURI == nil || strings.Contains(playlist.Body.String(), up.URL) {
+		t.Fatalf("owned playlist: %d %s", playlist.Code, playlist.Body.String())
+	}
+	keyURL, _ := url.Parse(keyURI[1])
+	key := httptest.NewRecorder()
+	s.ServeResource(key, req, first.ID, path.Base(keyURL.Path), u)
+	media := httptest.NewRecorder()
+	s.ServeRelaySegment(media, req, first.ID, 0, u)
+	if key.Code != 200 || key.Body.String() != "0123456789abcdef" || media.Code != 200 || media.Body.String() != "media fixture" {
+		t.Fatalf("authenticated key/media failed: %d %d", key.Code, media.Code)
 	}
 	if mediaRequests.Load() != 1 {
 		t.Fatal("media did not reach the authenticated provider")

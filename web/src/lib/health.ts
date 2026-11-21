@@ -13,6 +13,8 @@ export type HealthLevel = "ok" | "warn" | "error" | "off" | "unknown";
 
 export interface HealthItem {
   id:
+    | "debrid"
+    | "iptv"
     | "usenet"
     | "indexers"
     | "cache"
@@ -102,6 +104,19 @@ export function usenetProblem(state: unknown, lastError?: unknown): string | nul
   const err = str(lastError);
   if (!s || s === "ok") return null;
   const lower = err.toLowerCase();
+  if (s !== "auth_failed" && lower.includes("ip address")) {
+    return t("Account in use from another IP address.");
+  }
+  if (
+    s !== "auth_failed" &&
+    (lower.includes("simultaneous") ||
+      lower.includes("too many") ||
+      lower.includes("connection limit") ||
+      lower.includes("already logged in") ||
+      lower.includes("in use"))
+  ) {
+    return t("Account connection limit reached.");
+  }
   if (
     s === "auth_failed" ||
     lower.includes("authentication failed") ||
@@ -220,6 +235,85 @@ export function usenetHealth(v: unknown, debrid?: unknown, indexers?: unknown): 
   };
 }
 
+/**
+ * Debrid accounts from the "debrid" status section. Null when no account is
+ * configured, so pages show only the sources the owner uses.
+ */
+export function debridHealth(v: unknown): HealthItem | null {
+  const base = { id: "debrid" as const, label: t("Debrid"), href: "/sources/debrid" };
+  const err = errorOf(v);
+  if (err) return { ...base, level: "error", summary: err, details: [] };
+  if (!isPlainObject(v) || !Array.isArray(v.providers)) return null;
+  const accounts = v.providers.filter(isPlainObject).filter((p) => str(p.state) !== "disabled");
+  if (accounts.length === 0) return null;
+  const bad = accounts.filter((p) => str(p.state) !== "ok");
+  const details = accounts.map((p) =>
+    t("{name}: {state}", {
+      name: str(p.name) || str(p.id),
+      state: str(p.state) === "ok" ? t("healthy") : str(p.lastError) || str(p.state),
+    }),
+  );
+  if (bad.length === 0)
+    return {
+      ...base,
+      level: "ok",
+      summary: tn(accounts.length, "{count} account healthy", "{count} accounts healthy"),
+      details,
+    };
+  return {
+    ...base,
+    level: bad.length === accounts.length ? "error" : "warn",
+    summary:
+      accounts.length === 1
+        ? str(bad[0]!.lastError) || t("Account needs attention")
+        : tn(
+            accounts.length,
+            "{bad} of {count} account needs attention",
+            "{bad} of {count} accounts need attention",
+            {
+              bad: bad.length,
+            },
+          ),
+    details,
+    statusLabel: t("Needs attention"),
+  };
+}
+
+/**
+ * IPTV channel sources (Live TV sources list). Null when none is configured.
+ */
+export function iptvHealth(
+  sources: { name?: string; lastError?: string }[] | null,
+): HealthItem | null {
+  if (!sources || sources.length === 0) return null;
+  const base = { id: "iptv" as const, label: t("IPTV"), href: "/sources/iptv" };
+  const bad = sources.filter((s) => !!s.lastError);
+  const details = sources.map((s) =>
+    t("{name}: {state}", { name: s.name ?? "", state: s.lastError || t("healthy") }),
+  );
+  if (bad.length === 0)
+    return {
+      ...base,
+      level: "ok",
+      summary: tn(sources.length, "{count} source healthy", "{count} sources healthy"),
+      details,
+    };
+  return {
+    ...base,
+    level: bad.length === sources.length ? "error" : "warn",
+    summary: tn(
+      sources.length,
+      "{bad} of {count} source failing to refresh",
+      "{bad} of {count} sources failing to refresh",
+      {
+        bad: bad.length,
+      },
+    ),
+    details,
+    statusLabel: t("Needs attention"),
+  };
+}
+
 /** A debrid account is enabled (from the "debrid" status section). */
 function debridOn(v: unknown): boolean {
   return isPlainObject(v) && v.enabled === true;
@@ -230,7 +324,7 @@ function debridOn(v: unknown): boolean {
  * section it also warns when debrid is on but no enabled indexer returns
  * torrents: every play would then fail with nothing to stream.
  */
-export function indexersHealth(v: unknown, debrid?: unknown): HealthItem {
+export function indexersHealth(v: unknown, debrid?: unknown, now = new Date()): HealthItem {
   const base = {
     id: "indexers" as const,
     label: t("Indexers"),
@@ -251,57 +345,94 @@ export function indexersHealth(v: unknown, debrid?: unknown): HealthItem {
       summary: t("No indexers enabled"),
       details: [t("Ether has nothing to search until an indexer is enabled.")],
     };
-  const noTorrent = debridOn(debrid) && !enabled.some((r) => r.torrent === true);
+  const nowSec = now.getTime() / 1000;
+  const isMissing = (r: Record<string, unknown>) => r.missingDefinition === true;
+  const isPaused = (r: Record<string, unknown>) => !isMissing(r) && num(r.pausedUntil) > nowSec;
+  const missing = enabled.filter(isMissing).length;
+  const paused = enabled.filter(isPaused).length;
+  const noTorrent = debridOn(debrid) && !enabled.some((r) => r.torrent === true && !isMissing(r));
   let exhausted = 0;
   let remaining = 0;
   let limited = 0;
   let used = 0;
   let limit = 0;
   const details = rows.map((r) => {
+    const rowEnabled = r.enabled !== false;
+    const rowMissing = isMissing(r);
+    const rowPaused = isPaused(r);
     const hl = num(r.hitsLimit);
     const hr = num(r.hitsRemaining);
-    if (hl > 0) {
+    if (hl > 0 && rowEnabled && !rowMissing) {
       limited++;
       remaining += hr;
       used += num(r.hitsUsed);
       limit += hl;
-      if (hr <= 0) exhausted++;
+      if (hr <= 0 && !rowPaused) exhausted++;
     }
-    const parts = [
-      hl > 0 ? t("{left}/{limit} searches left", { left: hr, limit: hl }) : t("unlimited searches"),
-    ];
-    if (num(r.grabsLimit) > 0)
+    const parts: string[] = [];
+    if (rowMissing) {
+      parts.push(t("definition missing"));
+    } else {
       parts.push(
-        t("{left}/{limit} grabs left", { left: num(r.grabsRemaining), limit: num(r.grabsLimit) }),
+        hl > 0
+          ? t("{left}/{limit} searches left", { left: hr, limit: hl })
+          : t("unlimited searches"),
       );
+      if (num(r.grabsLimit) > 0)
+        parts.push(
+          t("{left}/{limit} grabs left", { left: num(r.grabsRemaining), limit: num(r.grabsLimit) }),
+        );
+      if (rowPaused) parts.push(t("paused after failures"));
+    }
     return `${str(r.indexer) || str(r.name)}: ${parts.join(" · ")}`;
   });
+  const broken = missing + paused + exhausted;
   let level: HealthLevel = "ok";
-  if (exhausted > 0 && exhausted === rows.length) level = "error";
-  else if (exhausted > 0) level = "warn";
+  if (broken >= enabled.length) level = "error";
+  else if (broken > 0) level = "warn";
   let summary =
-    limited === 0
-      ? tn(rows.length, "{count} indexer · no daily limits", "{count} indexers · no daily limits")
-      : exhausted > 0
-        ? tn(
-            rows.length,
-            "{exhausted} of {count} indexer out of searches today",
-            "{exhausted} of {count} indexers out of searches today",
-            { exhausted },
-          )
+    missing > 0
+      ? enabled.length === 1 && missing === 1
+        ? t("Definition missing")
         : tn(
-            rows.length,
-            "{count} indexer · {remaining} searches left today",
-            "{count} indexers · {remaining} searches left today",
-            { remaining },
-          );
+            enabled.length,
+            "{missing} of {count} indexer missing its definition",
+            "{missing} of {count} indexers missing their definition",
+            { missing },
+          )
+      : paused > 0
+        ? tn(
+            enabled.length,
+            "{paused} of {count} indexer paused after failures",
+            "{paused} of {count} indexers paused after failures",
+            { paused },
+          )
+        : limited === 0
+          ? tn(
+              rows.length,
+              "{count} indexer · no daily limits",
+              "{count} indexers · no daily limits",
+            )
+          : exhausted > 0
+            ? tn(
+                rows.length,
+                "{exhausted} of {count} indexer out of searches today",
+                "{exhausted} of {count} indexers out of searches today",
+                { exhausted },
+              )
+            : tn(
+                rows.length,
+                "{count} indexer · {remaining} searches left today",
+                "{count} indexers · {remaining} searches left today",
+                { remaining },
+              );
   if (noTorrent) {
     details.unshift(
       t(
         "Debrid streams torrents, but no enabled indexer returns them. Add a Stremio addon or Torznab indexer.",
       ),
     );
-    if (level !== "error") {
+    if (level === "ok") {
       level = "warn";
       summary = t("No torrent indexer for debrid");
     }
@@ -347,11 +478,53 @@ function yearCorrectionDetail(v: unknown): string {
   return "";
 }
 
+/** The library-tier migration's progress (catalog status tierMigration). */
+export type TierMigration = {
+  state?: string;
+  paused?: boolean;
+  remove?: number;
+  removed?: number;
+  finishedAt?: string;
+  lastError?: string;
+};
+
+/**
+ * One line for the tier migration, or "" when there is nothing to show
+ * (never armed, or finished more than a week ago).
+ */
+export function tierMigrationLine(v: unknown, now = new Date()): string {
+  if (!isPlainObject(v)) return "";
+  const m = v as TierMigration;
+  const state = typeof m.state === "string" ? m.state : "";
+  if (!state) return "";
+  const done = num(m.removed);
+  if (state === "done") {
+    const at = parseTime(m.finishedAt);
+    if (!at || now.getTime() - at.getTime() > 7 * 86400000) return "";
+    return t("Library tidied: {count} long-tail titles moved to search-only", {
+      count: formatNumber(done),
+    });
+  }
+  if (state === "waiting_backup") {
+    return t("Waiting for a backup before tidying the library: {error}", {
+      error: typeof m.lastError === "string" ? m.lastError : "",
+    });
+  }
+  if (state === "error" && typeof m.lastError === "string" && m.lastError) {
+    return t("Tidying the library stopped: {error}", { error: m.lastError });
+  }
+  const line = t("Tidying the library: {done} of {total} long-tail titles moved to search-only", {
+    done: formatNumber(done),
+    total: formatNumber(Math.max(done, num(m.remove))),
+  });
+  return m.paused ? `${line} · ${t("Paused")}` : line;
+}
+
 export function catalogHealth(v: unknown, now = new Date()): HealthItem {
   const base = {
     id: "catalog" as const,
     label: t("Catalog"),
-    href: "/catalog",
+    href: "/libraries",
   };
   const err = errorOf(v);
   if (err) return { ...base, level: "error", summary: err, details: [] };
@@ -370,16 +543,34 @@ export function catalogHealth(v: unknown, now = new Date()): HealthItem {
   ];
   const yearLine = yearCorrectionDetail(v.yearCorrection);
   if (yearLine) details.push(yearLine);
-  if (typeof sync.lastError === "string" && sync.lastError) {
-    const message = t("Last sync error: {error}", { error: sync.lastError });
-    details.push(message);
-    return { ...base, level: "warn", summary: message, details };
+  const tierLine = tierMigrationLine(v.tierMigration, now);
+  if (tierLine) details.push(tierLine);
+  const lastError =
+    typeof sync.lastError === "string" && sync.lastError
+      ? t("Last sync error: {error}", { error: sync.lastError })
+      : "";
+  // While a retry is running the previous attempt's error is history,
+  // not a state to fix: show the sync in progress (the error stays in
+  // the details) and let the retry's own result decide. A transient
+  // failure right after startup must not alarm anyone (#407).
+  if (sync.running !== true && lastError) {
+    details.push(lastError);
+    return { ...base, level: "warn", summary: lastError, details };
   }
+  if (lastError) details.push(lastError);
   if (sync.running === true) {
+    const total = movies + shows;
+    const checked = formatNumber(num(sync.titlesSeen));
     return {
       ...base,
       level: "ok",
-      summary: t("Syncing… {count} titles seen", { count: formatNumber(num(sync.titlesSeen)) }),
+      summary:
+        total > 0
+          ? t("{count} titles · syncing ({checked} checked)", {
+              count: formatNumber(total),
+              checked,
+            })
+          : t("Syncing… {checked} checked", { checked }),
       details,
     };
   }
@@ -420,6 +611,32 @@ export function remoteHealth(v: unknown): HealthItem {
     details.push(t("Public address {address}", { address: str(v.publicAddress) }));
   details.push(presence.connected ? t("Connected to plex.tv") : t("Not connected to plex.tv"));
   if (v.listed === false) details.push(t("Not yet published to plex.tv"));
+  if (v.serverTokenRequired === true) {
+    const diagnostic = isPlainObject(v.tokenDiagnostics) ? v.tokenDiagnostics : {};
+    const registrationDetails: string[] = [];
+    if (Number(diagnostic.sameNameServers) > 0 || Number(diagnostic.matchingDevices) > 1)
+      registrationDetails.push(
+        t(
+          "plex.tv lists duplicate servers. Remove the duplicate devices in Authorized Devices, then sign out and claim this server again.",
+        ),
+      );
+    else if (diagnostic.resourcesStatus === 401 || diagnostic.resourcesStatus === 403)
+      registrationDetails.push(t("plex.tv rejects this server's sign-in"));
+    else if (diagnostic.resourcesStatus === 200 && diagnostic.matchingDevices === 0)
+      registrationDetails.push(t("Not yet published to plex.tv"));
+    return {
+      ...base,
+      level: "warn",
+      summary: t("Shared users can't sync: plex.tv needs this server's own token"),
+      details: [
+        ...details,
+        ...registrationDetails,
+        t(
+          "Ether will retry repairing the server token automatically. If this continues, sign in again on the Plex page with the account that owns this server.",
+        ),
+      ],
+    };
+  }
   if (v.tokenRejected === true)
     return {
       ...base,
@@ -788,7 +1005,7 @@ export function computeHealth(
   const plexOn = opts?.plexEnabled !== false;
   const items: HealthItem[] = [
     usenetHealth(s.providers, s.debrid, s.indexers),
-    indexersHealth(s.indexers, s.debrid),
+    indexersHealth(s.indexers, s.debrid, now),
     cacheHealth(s.cache),
     catalogHealth(s.catalog, now),
     databaseHealth(s.database, now),
@@ -820,9 +1037,11 @@ export interface NowPlaying {
   channelId: string;
   channelName: string;
   channelNumber: string;
+  userId?: number;
   user: string;
   device: string;
   product: string;
+  platform?: string;
   decision: string;
   decisionReason: string;
   qualityFallback?: string;
@@ -847,6 +1066,8 @@ export interface NowPlaying {
   ip: string;
   /** Delivered bitrate now (or the encode's target), kbps; 0 when unknown. */
   bitrateKbps: number;
+  /** Overall bitrate of the source media in kbps, when probed or derivable. */
+  sourceKbps?: number;
   /** Short human descriptions, e.g. "HEVC 2160p HDR10" → "H.264 1080p SDR". */
   sourceVideo: string;
   outputVideo: string;
@@ -857,6 +1078,10 @@ export interface NowPlaying {
   ratingKey: number;
   /** Selected subtitle, e.g. "English SRT" or "English PGS (burned)". */
   subtitle: string;
+  /** Viewer-experience accounting on the live session, when playback was requested. */
+  startMs?: number | null;
+  bufferEvents?: number | null;
+  bufferMs?: number | null;
 }
 
 function pick(o: Record<string, unknown>, ...keys: string[]): unknown {
@@ -873,7 +1098,20 @@ export function normalizeSessions(v: unknown): NowPlaying[] {
     const channel = pick(s, "liveChannel", "LiveChannel");
     const liveChannel = isPlainObject(channel) ? channel : null;
     const resolution = (pick(s, "Resolution", "resolution") ?? {}) as Record<string, unknown>;
-    const release = isPlainObject(resolution.release) ? resolution.release : {};
+    const releaseObj = pick(resolution, "release", "Release");
+    const release = isPlainObject(releaseObj) ? releaseObj : {};
+    const expObj = pick(s, "experience", "Experience");
+    const exp =
+      isPlainObject(expObj) && pick(expObj, "requested", "Requested") === true ? expObj : null;
+    const expPictured = exp ? pick(exp, "pictured", "Pictured") === true : false;
+    const expStartNs = exp ? num(pick(exp, "startTime", "StartTime")) : -1;
+    const startMs = exp
+      ? expPictured && expStartNs >= 0
+        ? Math.round(expStartNs / 1e6)
+        : null
+      : undefined;
+    const bufferEvents = exp ? num(pick(exp, "bufferEvents", "BufferEvents")) : undefined;
+    const bufferMs = exp ? Math.round(num(pick(exp, "buffering", "Buffering")) / 1e6) : undefined;
     const durationNs = num(pick(info, "duration", "Duration"));
     const offsetMs = pick(s, "viewOffset", "ViewOffset", "positionMs", "PositionMs");
     const durationMs = durationNs / 1e6;
@@ -884,6 +1122,13 @@ export function normalizeSessions(v: unknown): NowPlaying[] {
     else if (typeof offsetMs === "number" && Number.isFinite(offsetMs) && durationMs > 0)
       progress = Math.max(0, Math.min(1, offsetMs / durationMs));
     const size = num(pick(info, "size", "Size"));
+    const infoBitrateKbps = num(pick(info, "bitrateKbps", "BitrateKbps"));
+    const sourceKbps =
+      infoBitrateKbps > 0
+        ? infoBitrateKbps
+        : size > 0 && durationMs > 0
+          ? Math.round((size * 8) / durationMs)
+          : 0;
     const bufferedBytes = num(pick(s, "BufferedBytes", "bufferedBytes"));
     const bufferedUntilNs = num(pick(s, "BufferedUntil", "bufferedUntil"));
     let buffered = 0;
@@ -891,6 +1136,8 @@ export function normalizeSessions(v: unknown): NowPlaying[] {
       buffered = Math.min(1, bufferedUntilNs / 1e6 / durationMs);
     else if (size > 0 && bufferedBytes > 0)
       buffered = Math.min(1, (progress ?? 0) + bufferedBytes / size);
+    const userId = num(pick(s, "UserID", "userId"));
+    const platform = str(pick(client, "platform", "Platform"));
     return {
       node: str(s.node),
       processor: isPlainObject(s.encoder) ? str(s.encoder.processor) : undefined,
@@ -902,18 +1149,20 @@ export function normalizeSessions(v: unknown): NowPlaying[] {
       channelId: liveChannel ? str(pick(liveChannel, "id", "ID")).trim() : "",
       channelName: liveChannel ? str(pick(liveChannel, "name", "Name")).trim() : "",
       channelNumber: liveChannel ? str(pick(liveChannel, "number", "Number")).trim() : "",
+      ...(userId ? { userId } : {}),
       user: str(pick(s, "Username", "username")) || t("Someone"),
       device:
         str(pick(client, "deviceName", "device")) ||
         str(pick(client, "product")) ||
         t("Unknown device"),
       product: str(pick(client, "product")),
+      ...(platform ? { platform } : {}),
       decision: str(pick(s, "Decision", "decision")),
       decisionReason: str(pick(s, "decisionReason", "DecisionReason")),
       qualityFallback: str(pick(s, "qualityFallback", "QualityFallback")),
       videoCopy: pick(s, "decisionVideoCopy", "DecisionVideoCopy") === true,
       audioCopy: pick(s, "decisionAudioCopy", "DecisionAudioCopy") === true,
-      remote: pick(client, "remote") === true,
+      remote: pick(client, "remote", "Remote") === true,
       bytesServed: num(pick(s, "BytesServed", "bytesServed")),
       size,
       buffered,
@@ -921,11 +1170,14 @@ export function normalizeSessions(v: unknown): NowPlaying[] {
       startedAt: parseTime(pick(s, "StartedAt", "startedAt")),
       durationMs,
       progress,
-      release: str(release.name),
+      release: str(pick(release, "name", "Name")) || str(pick(s, "release", "Release")),
       origin: str(pick(s, "origin", "Origin")),
       failovers: num(pick(s, "Failovers", "failovers")),
-      ip: str(pick(s, "ip", "IP", "Ip")) || str(pick(client, "ip", "address")),
+      ip:
+        str(pick(s, "ip", "IP", "Ip")) ||
+        str(pick(client, "clientIp", "ClientIP", "ip", "address")),
       bitrateKbps: num(pick(s, "bitrateKbps", "BitrateKbps")),
+      ...(sourceKbps ? { sourceKbps } : {}),
       sourceVideo: str(pick(s, "sourceVideo", "SourceVideo")),
       outputVideo: str(pick(s, "outputVideo", "OutputVideo")),
       sourceAudio: str(pick(s, "sourceAudio", "SourceAudio")),
@@ -933,6 +1185,7 @@ export function normalizeSessions(v: unknown): NowPlaying[] {
       container: str(pick(s, "container", "Container")),
       ratingKey: num(pick(s, "ratingKey", "RatingKey")),
       subtitle: str(pick(s, "subtitle", "Subtitle")),
+      ...(exp ? { startMs, bufferEvents, bufferMs } : {}),
     };
   });
 }

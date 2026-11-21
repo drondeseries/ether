@@ -13,6 +13,7 @@ package state
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -22,6 +23,7 @@ import (
 	"time"
 
 	"github.com/braedonsaunders/ether/internal/core"
+	"github.com/braedonsaunders/ether/internal/frontend"
 	"github.com/braedonsaunders/ether/internal/store"
 )
 
@@ -77,6 +79,9 @@ CREATE UNIQUE INDEX state_history_imported ON state_history(user_id, rating_key,
 	// A viewer's latest watch-state write is one index probe: Plex Home's
 	// cached rows are stamped with it (experience.HomeRevision).
 	store.Register("state_updated", 1, `CREATE INDEX state_watch_updated ON state_watch(user_id, updated_at);`)
+	// Views without a date (imports) for the On Deck window, which keeps
+	// them; state_watch_last_viewed serves the dated ones.
+	store.Register("state_watch_undated", 1, `CREATE INDEX state_watch_undated ON state_watch(user_id, rating_key) WHERE last_viewed_at<=0;`)
 	store.Register("state", 6, `ALTER TABLE state_playlists ADD COLUMN smart_uri TEXT NOT NULL DEFAULT '';`)
 
 }
@@ -129,22 +134,12 @@ type Event struct {
 }
 
 // Origin identifies the surface and client that made a watch-state change.
-type Origin struct {
-	HistoryTitle        *core.Title
-	Surface             core.Protocol
-	SessionID, ClientID string
-	DeviceID            int64
-}
-type originKey struct{}
+type Origin = frontend.WatchOrigin
 
-// WithOrigin attaches the authenticated request origin to committed events.
 func WithOrigin(ctx context.Context, origin Origin) context.Context {
-	return context.WithValue(ctx, originKey{}, origin)
+	return frontend.WithWatchOrigin(ctx, origin)
 }
-func originFrom(ctx context.Context) Origin {
-	origin, _ := ctx.Value(originKey{}).(Origin)
-	return origin
-}
+func originFrom(ctx context.Context) Origin { return frontend.WatchOriginFrom(ctx) }
 
 // Options tune a State. Now is injectable for tests.
 type Options struct {
@@ -163,10 +158,9 @@ type Options struct {
 
 // State implements core.State and core.Playlists.
 type State struct {
-	plexTimeline plexTimelineStore
-	db           *sql.DB
-	log          *slog.Logger
-	now          func() time.Time
+	db  *sql.DB
+	log *slog.Logger
+	now func() time.Time
 
 	// wmu serialises this process's read-modify-write updates of watch rows
 	// so they do not retry against each other. Correctness across processes
@@ -272,14 +266,14 @@ type progressWrite struct {
 }
 
 func (w progressWrite) completes() bool {
-	if len(w.state) > 5 && w.state[:5] == "plex-" {
-		return w.state == "plex-complete"
+	if strings.HasPrefix(w.state, "explicit-") {
+		return w.state == "explicit-complete"
 	}
 	return w.state != "progress" && w.duration > 0 && float64(w.offset) >= WatchedThreshold*float64(w.duration)
 }
 
 func mergeProgress(old, w progressWrite) progressWrite {
-	if len(w.state) > 5 && w.state[:5] == "plex-" && len(old.state) > 5 && old.state[:5] == "plex-" {
+	if strings.HasPrefix(w.state, "explicit-") && strings.HasPrefix(old.state, "explicit-") {
 		carry := old.before
 		if old.completes() {
 			copy := old
@@ -434,19 +428,32 @@ func (s *State) GetMany(ctx context.Context, userID int64, keys []core.RatingKey
 	if len(keys) == 0 {
 		return out, nil
 	}
-	// Chunked IN queries keep the statement under SQLite's variable limit.
-	for start := 0; start < len(keys); start += 400 {
-		end := min(start+400, len(keys))
-		chunk := keys[start:end]
+	// A single array bind keeps watch reads constant for large episode lists
+	// without exceeding either driver's parameter limit.
+	{
 		q := `SELECT rating_key, view_offset_ns, duration_ns, view_count, last_viewed_at, user_rating, updated_at, counted, watch_at, rating_at
 			FROM state_watch WHERE user_id=? AND rating_key IN (`
 		args := []any{userID}
-		for i, k := range chunk {
-			if i > 0 {
-				q += ","
+		if len(keys) > 256 {
+			ints := make([]int64, len(keys))
+			for i, k := range keys {
+				ints[i] = int64(k)
 			}
-			q += "?"
-			args = append(args, int64(k))
+			encoded, _ := json.Marshal(ints)
+			if store.DialectOf(s.db) == store.Postgres {
+				q += `SELECT CAST(value AS BIGINT) FROM json_array_elements_text(CAST(? AS JSON))`
+			} else {
+				q += `SELECT value FROM json_each(?)`
+			}
+			args = append(args, string(encoded))
+		} else {
+			for i, k := range keys {
+				if i > 0 {
+					q += ","
+				}
+				q += "?"
+				args = append(args, int64(k))
+			}
 		}
 		q += ")"
 		rows, err := s.db.QueryContext(ctx, q, args...)
@@ -507,26 +514,36 @@ func (s *State) PageUserData(ctx context.Context, userID int64, keys []core.Rati
 	if s == nil || s.db == nil || userID <= 0 || len(keys) == 0 {
 		return out, nil
 	}
-	for start := 0; start < len(keys); start += 200 {
-		chunk := keys[start:min(start+200, len(keys))]
+	{
 		var b strings.Builder
-		args := make([]any, 0, 4+len(chunk)*4)
+		args := make([]any, 0, 9)
+		numeric := make([]int64, len(keys))
+		text := make([]string, len(keys))
+		for n, k := range keys {
+			numeric[n] = int64(k)
+			text[n] = k.String()
+		}
+		nums, _ := json.Marshal(numeric)
+		texts, _ := json.Marshal(text)
 		writeIn := func(prefix string, asText bool, extra ...any) {
 			b.WriteString(prefix)
 			args = append(args, extra...)
-			for i, key := range chunk {
-				if i > 0 {
-					b.WriteByte(',')
-				}
-				b.WriteByte('?')
+			source := "SELECT value FROM json_each(?)"
+			data := string(nums)
+			if asText {
+				data = string(texts)
+			}
+			if store.DialectOf(s.db) == store.Postgres {
+				source = "SELECT CAST(value AS BIGINT) FROM json_array_elements_text(CAST(? AS JSON))"
 				if asText {
-					args = append(args, key.String())
-				} else {
-					args = append(args, int64(key))
+					source = "SELECT value FROM json_array_elements_text(CAST(? AS JSON))"
 				}
 			}
+			b.WriteString(source)
 			b.WriteByte(')')
+			args = append(args, data)
 		}
+
 		writeIn(`SELECT 'w', rating_key, view_offset_ns, duration_ns, view_count, last_viewed_at, user_rating, updated_at, counted, watch_at, rating_at FROM state_watch WHERE user_id=? AND rating_key IN (`, false, userID)
 		// Rating keys are kind*10^15 plus a payload, so they do not fit in
 		// PostgreSQL INTEGER (int4). SQLite INTEGER is already 64-bit;
@@ -622,7 +639,11 @@ func (s *State) updateAt(ctx context.Context, userID int64, keys []core.RatingKe
 	s.gen.Add(1)
 	for _, ev := range events {
 		ev.Origin = originFrom(ctx)
-		s.emit(ev)
+		if deferred, ok := ctx.Value(acceptedEventsKey{}).(*[]Event); ok {
+			*deferred = append(*deferred, ev)
+		} else {
+			s.emit(ev)
+		}
 	}
 	return nil
 }
@@ -725,14 +746,14 @@ func unixTime(ns int64) time.Time {
 // timeout is held and written later (see Options.Availability); it then
 // returns nil.
 func (s *State) Progress(ctx context.Context, userID int64, key core.RatingKey, offset, duration time.Duration, state string) error {
-	if skip, _ := ctx.Value(plexSkipKey{}).(bool); skip {
+	if skip := frontend.TimelineStored(ctx); skip {
 		return nil
 	}
 	if offset < 0 {
 		offset = 0
 	}
 	w := progressWrite{offset: offset, duration: duration, state: state, origin: originFrom(ctx)}
-	w.timelineState, _ = ctx.Value(plexStatusKey{}).(string)
+	w.timelineState = frontend.TimelineStatus(ctx)
 	if s.pending != nil {
 		w.at = s.now().UTC()
 		return s.pending.put(progressKey{userID, key}, pendingWrite{kind: "progress", progress: w})
@@ -755,8 +776,8 @@ func (s *State) LegacyProgress(ctx context.Context, userID int64, key core.Ratin
 // progressAt applies one timeline update (at zero: now).
 func (s *State) progressAt(ctx context.Context, userID int64, key core.RatingKey, w progressWrite) error {
 	ctx = WithOrigin(ctx, w.origin)
-	if len(w.state) > 5 && w.state[:5] == "plex-" {
-		return s.plexProgressAt(ctx, userID, key, w)
+	if strings.HasPrefix(w.state, "explicit-") {
+		return s.explicitProgressAt(ctx, userID, key, w)
 	}
 	reported, duration, state := w.offset, w.duration, w.state
 	return s.updateAt(ctx, userID, []core.RatingKey{key}, w.at, func(cur *row, now time.Time) (bool, bool, []Event) {
@@ -930,6 +951,16 @@ func (s *State) WatchSample(ctx context.Context, userID int64, limit int) (sampl
 		}
 	}
 	return sampled, inProgress, watched, truncated, rows.Err()
+}
+
+// PendingKeys are the keys with a watch write for userID that reads overlay
+// but the database does not hold yet. A count read from the database alone
+// must judge these keys through GetMany or PageUserData.
+func (s *State) PendingKeys(userID int64) []core.RatingKey {
+	if s == nil || s.pending == nil {
+		return nil
+	}
+	return s.pending.userKeys(userID)
 }
 
 // InProgress returns items with a resume point, most recently viewed first.

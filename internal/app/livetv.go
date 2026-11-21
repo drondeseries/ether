@@ -3,13 +3,16 @@ package app
 import (
 	"context"
 	"errors"
+	"time"
+
 	"github.com/braedonsaunders/ether/internal/admin"
 	"github.com/braedonsaunders/ether/internal/config"
 	"github.com/braedonsaunders/ether/internal/core"
+	"github.com/braedonsaunders/ether/internal/egress"
 	"github.com/braedonsaunders/ether/internal/livetv"
 	"github.com/braedonsaunders/ether/internal/markers"
 	"github.com/braedonsaunders/ether/internal/playback"
-	"time"
+	"github.com/braedonsaunders/ether/internal/plexguide"
 )
 
 func (a *App) buildLiveTV() error {
@@ -28,7 +31,7 @@ func (a *App) buildLiveTV() error {
 	if a.transcoder != nil {
 		ffmpeg = a.transcoder.FFmpegPath()
 	}
-	svc, err := livetv.New(livetv.Options{VODChanged: func() {
+	svc, err := livetv.New(livetv.Options{ActivityChanged: a.onair.SetEnabled, SessionsChanged: a.notifySessionsChanged, SourcesChanged: a.publishDashboard, VODChanged: func() {
 		if a.resolver != nil {
 			a.resolver.SourcesChanged(context.Background())
 		}
@@ -40,11 +43,21 @@ func (a *App) buildLiveTV() error {
 	}, ScanPolicy: func() markers.BreakScanPolicy {
 		c := a.cfg.Read().LiveTV
 		return markers.BreakScanPolicy{DailyBytes: c.BreakScanDailyBytes, ReleaseBytes: c.BreakScanReleaseBytes, LargeReleaseBytes: c.BreakScanLargeReleaseBytes, AllowLarge: c.BreakScanAllowLarge}
-	}}, GuideAI: a.llm, Reels: a.onairReelSnapshot, Graphics: a.onair, InputUser: a.liveTVInputUser, StyleScreens: a.onair.StyleScreens, PersonalChanged: func(viewer int64) {
-		if srv := a.currentPlexServer(); srv != nil {
-			srv.NotifyLiveLineupFor(viewer)
+	}}, GuideAI: a.llm, Reels: a.onairReelSnapshot, Graphics: a.onair, InputUser: a.liveTVInputUser, StyleScreens: a.onair.StyleScreens, AudioTrack: a.liveTVAudioTrack, PersonalChanged: func(viewer int64) {
+		a.frontends.notifyLiveLineup(viewer)
+	}, Picker: a.personalize, Watchlist: a.watchlist, State: a.state, Users: a.users, Logger: a.log.With("component", "livetv"), Events: a.eventBus, GuideProvider: &guide.Client{DB: a.db, HTTPClient: egress.Client(egress.CapDirect, 20*time.Second), Token: func() string { return a.cfg.Read().Plex.Token }}, Now: parityClock(), Showcase: parityShowcase(), DB: a.db, Sealer: a.cfg, Catalog: a.catalog, Collections: a.collections, Playback: a.playback, Transcoder: tc, Availability: avail, CheckAvailability: func(ctx context.Context, key core.RatingKey) (bool, bool) {
+		if a.resolver == nil {
+			return false, false
 		}
-	}, Picker: a.personalize, Watchlist: a.watchlist, State: a.state, Users: a.users, Logger: a.log.With("component", "livetv"), PlexGuideToken: func() string { return a.cfg.Read().Plex.Token }, Now: parityClock(), DB: a.db, Sealer: a.cfg, Catalog: a.catalog, Collections: a.collections, Playback: a.playback, Transcoder: tc, Availability: avail, Allowed: a.safety.Allowed, CanPlay: a.safety.CanPlay, LogoIndexURL: func() string { return a.cfg.Read().LiveTV.LogoIndexURL }, HealthSweepMinutes: func() int { return a.cfg.Read().LiveTV.HealthSweepMinutes }, StreamLimit: func(u *core.User) int { return playback.UserStreamLimit(a.cfg.Read(), a.safety.UserPolicy(u)) }, Warm: func(ctx context.Context, key core.RatingKey, at time.Duration) error {
+		title, err := a.catalog.Get(ctx, key)
+		if err != nil {
+			return false, false
+		}
+		if a.availability != nil {
+			ctx = a.availability.ChannelCheckContext(ctx)
+		}
+		return a.resolver.CheckChannelAvailability(ctx, title)
+	}, Allowed: a.safety.Allowed, CanPlay: a.safety.CanPlay, ConfirmAdmission: a.safety.ConfirmAdmission, LogoIndexURL: func() string { return a.cfg.Read().LiveTV.LogoIndexURL }, HealthSweepMinutes: func() int { return a.cfg.Read().LiveTV.HealthSweepMinutes }, LatencyProfile: func() string { return a.cfg.Read().LiveTV.LatencyProfile }, Stability: func() string { return a.cfg.Read().LiveTV.Stability }, StreamLimit: func(u *core.User) int { return playback.UserStreamLimit(a.cfg.Read(), a.safety.UserPolicy(u)) }, Warm: func(ctx context.Context, key core.RatingKey, at time.Duration) error {
 		if !a.registrar.Status().PlexPass {
 			return core.ErrUnauthorized
 		}
@@ -52,19 +65,22 @@ func (a *App) buildLiveTV() error {
 		if err != nil {
 			return err
 		}
-		a.playback.Prewarm(ctx, u, key, core.ClientCaps{Product: "Ether Live TV", ClientID: "ether-channel-prewarm", MaxHeight: 1080, VideoCodecs: []string{"h264", "hevc"}, AudioCodecs: []string{"aac", "ac3", "eac3"}, Containers: []string{"mp4", "mkv"}}, core.PrewarmOptions{Reason: core.PrewarmDetail, StartOffset: at, DuringPlayback: true, PrefetchBytes: 32 << 20})
+		a.playback.Prewarm(ctx, u, key, core.ClientCaps{Product: "Ether Live TV", ClientID: "ether-channel-prewarm", MaxHeight: 1080, MaxBitrateKbps: 6000, BroadcastBitrateKbps: 6000, VideoCodecs: []string{"h264", "hevc"}, AudioCodecs: []string{"aac", "ac3", "eac3"}, Containers: []string{"mp4", "mkv"}}, core.PrewarmOptions{Reason: core.PrewarmDetail, StartOffset: at, DuringPlayback: true, PrefetchBytes: 32 << 20})
 		return nil
 	}})
 	if err != nil {
 		return err
 	}
 	a.livetv = svc
+	svc.SetOnChange(func() {
+		a.frontends.notifyLiveLineup(0)
+	})
 	a.cfg.Subscribe(func(config.Config) {
 		if err := svc.RefreshGuide(context.Background()); err != nil {
 			a.log.Warn("live guide configuration refresh failed", "error", err)
 		}
 	})
-	a.onair.Start()
+	a.onair.SetEnabled(svc.Enabled())
 	a.closers = append(a.closers, func() { svc.Close() })
 	return nil
 }
@@ -82,4 +98,18 @@ func (a *App) liveTVInputUser(ctx context.Context) (*core.User, error) {
 		return &core.User{ID: core.SetupOwnerID, Username: "setup-owner", IsOwner: true}, nil
 	}
 	return nil, err
+}
+
+// liveTVAudioTrack chooses a channel programme's audio with the user's stream
+// preferences, the same rules normal playback applies.
+func (a *App) liveTVAudioTrack(ctx context.Context, user *core.User, key core.RatingKey, info core.MediaInfo, original string) int {
+	if a.trackprefs == nil || user == nil {
+		return -1
+	}
+	sel, err := a.trackprefs.Select(ctx, user.ID, key, info, original)
+	if err != nil {
+		a.log.Warn("livetv: stream preferences for channel audio", "err", err, "key", key)
+		return -1
+	}
+	return sel.Audio
 }

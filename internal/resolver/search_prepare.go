@@ -29,6 +29,7 @@ type searchPreparation struct {
 	disabled   bool
 	checks     candidateChecks
 	byID       map[string]*candidateCheck
+	byIdentity map[string]*candidateCheck
 	identities map[string]bool
 	releases   map[string]core.Release
 	all        []core.Release
@@ -47,8 +48,21 @@ const earlyCheckLimit = 32
 
 func newSearchPreparation(ctx context.Context, s *Service, req core.ResolveRequest, search core.SearchRequest, profile core.QualityProfile, pin string) *searchPreparation {
 	return &searchPreparation{ctx: ctx, svc: s, req: req, search: search, profile: profile,
-		disabled: pin != "" || req.Prefer != "" || s.resolverCfg().OptimisticStart || usesPluginRanking(profile),
-		byID:     map[string]*candidateCheck{}, identities: map[string]bool{}, releases: map[string]core.Release{}, seen: map[string]bool{}}
+		disabled:   pin != "" || req.Prefer != "" || s.resolverCfg().OptimisticStart || usesPluginRanking(profile),
+		byID:       map[string]*candidateCheck{},
+		byIdentity: map[string]*candidateCheck{},
+		identities: map[string]bool{},
+		releases:   map[string]core.Release{},
+		seen:       map[string]bool{}}
+}
+
+func discoveryIdentity(rel core.Release) string {
+	if rel.Protocol == core.ProtocolUsenet {
+		if cid := rel.EffectiveContentID(); cid != "" {
+			return "cid|" + cid
+		}
+	}
+	return rel.Protocol + "|" + strings.ToLower(strings.TrimSpace(rel.Name)) + "|" + strconv.FormatInt(rel.Size, 10) + "|" + strings.ToLower(rel.InfoHash)
 }
 
 func (p *searchPreparation) arrived(batch []core.Release) {
@@ -57,9 +71,13 @@ func (p *searchPreparation) arrived(batch []core.Release) {
 	if p.disabled || p.ctx.Err() != nil {
 		return
 	}
+	batch = expandReleaseFallbacks(batch)
 	var added []core.Release
 	reorder := false
 	for _, r := range batch {
+		if releaseparse.IsPlaceholderResult(r.Name) {
+			continue
+		}
 		r = withTarget(r, p.search)
 		if p.seen[r.ID] {
 			if p.svc.knownCached(r) {
@@ -81,7 +99,7 @@ func (p *searchPreparation) arrived(batch []core.Release) {
 		p.first = time.Now()
 	}
 	if len(added) > 0 {
-		ranked, _, err := p.svc.rankCandidates(p.ctx, p.req, p.search, p.profile, added, nil, "")
+		ranked, _, err := p.svc.rankCandidatesLocal(p.ctx, p.req, p.search, p.profile, added, nil, "", false)
 		if err != nil {
 			return
 		}
@@ -90,7 +108,7 @@ func (p *searchPreparation) arrived(batch []core.Release) {
 	if len(added) == 0 && !reorder {
 		return
 	}
-	p.ranked = p.svc.orderCandidates(p.ranked, p.profile, p.req.Title, nil)
+	p.ranked = p.svc.orderCandidates(p.ranked, p.req.Title, nil)
 	// Allow concurrent indexers to contribute before spending probe budget.
 	// A completed search proceeds directly to normal ranked validation.
 	if time.Since(p.first) >= discoveryWindow {
@@ -114,6 +132,9 @@ func (p *searchPreparation) startFeed() {
 // as a hedge once the first has run past healthHedgeDelay, so a healthy
 // title normally costs one grab.
 func (p *searchPreparation) pumpLocked() {
+	if channelAvailabilityCheck(p.ctx) {
+		return
+	}
 	if p.closed {
 		return
 	}
@@ -133,9 +154,18 @@ func (p *searchPreparation) pumpLocked() {
 		}
 	}
 	var hedgeAt time.Time
+	limit := earlyCheckLimit
+	if core.IsSpeculative(p.ctx) {
+		limit = min(limit, speculativeHealthAttempts)
+	}
 	for _, c := range p.ranked {
-		if active >= 4 || len(p.byID) >= earlyCheckLimit {
+		if active >= 4 || len(p.byID) >= limit {
 			break
+		}
+		if c.rel.OpensOnDemand() {
+			// Each open makes the add-on fetch the release: ranked
+			// validation opens it, alone, if it is reached (ondemand.go).
+			continue
 		}
 		if prior := p.byID[c.rel.ID]; prior != nil {
 			select {
@@ -147,10 +177,10 @@ func (p *searchPreparation) pumpLocked() {
 			}
 			continue
 		}
-		// Usenet reposts share a name and size, so one check covers them.
-		// Torrents with the same name can be different swarms, and only one
-		// may be cached: the info hash keeps each its own check.
-		identity := c.rel.Protocol + "|" + strings.ToLower(strings.TrimSpace(c.rel.Name)) + "|" + strconv.FormatInt(c.rel.Size, 10) + "|" + strings.ToLower(c.rel.InfoHash)
+		// Usenet copies sharing content identity or exact name+size share one
+		// check. Torrents with the same name can be different swarms, and only
+		// one may be cached: the info hash keeps each its own check.
+		identity := discoveryIdentity(c.rel)
 		if p.identities[identity] {
 			continue
 		}
@@ -173,6 +203,7 @@ func (p *searchPreparation) pumpLocked() {
 			check.retrySpeculative = func(ctx context.Context) validation { return p.svc.validateOne(ctx, c.rel) }
 		}
 		p.byID[c.rel.ID] = check
+		p.byIdentity[identity] = check
 		active++
 		if spendsGrab(c.rel) {
 			activeGrabs++
@@ -215,6 +246,12 @@ func (p *searchPreparation) refillAfter(check *candidateCheck) {
 const (
 	discoveryWindow      = 500 * time.Millisecond
 	criticalPathDeadline = 4 * time.Second
+	// playStartDeadline bounds how long a viewer's Play waits on indexers that
+	// have not answered. After it, Play validates what has arrived (foreground
+	// checks may add a torrent to the debrid account) while the stragglers
+	// finish into the search cache. Without it one slow indexer held Play to
+	// its 30 s timeout, past the client's own decision budget.
+	playStartDeadline = 6 * time.Second
 )
 
 func (p *searchPreparation) readyResults() []core.Release {
@@ -228,7 +265,7 @@ func (p *searchPreparation) readyResultsAfter(window time.Duration) []core.Relea
 		return nil
 	}
 	if len(p.ranked) > 1 {
-		p.ranked = p.svc.orderCandidates(p.ranked, p.profile, p.req.Title, nil)
+		p.ranked = p.svc.orderCandidates(p.ranked, p.req.Title, nil)
 	}
 	p.pumpLocked()
 	margin := p.svc.resolverCfg().SourceScoreMargin
@@ -238,6 +275,9 @@ func (p *searchPreparation) readyResultsAfter(window time.Duration) []core.Relea
 	lead := -1
 	for i, c := range p.ranked {
 		f := p.byID[c.rel.ID]
+		if f == nil {
+			f = p.byIdentity[discoveryIdentity(c.rel)]
+		}
 		if f == nil {
 			if lead < 0 {
 				lead = i
@@ -256,6 +296,8 @@ func (p *searchPreparation) readyResultsAfter(window time.Duration) []core.Relea
 				continue
 			}
 			leadUncachedTorrent := lead >= 0 &&
+				p.ranked[lead].keys.addonOrder == 0 &&
+				c.keys.sourceBand == p.ranked[lead].keys.sourceBand &&
 				protocolOf(p.ranked[lead].rel) == core.ProtocolTorrent &&
 				!p.svc.knownCached(p.ranked[lead].rel)
 			if lead >= 0 && !(leadUncachedTorrent && p.svc.knownCached(c.rel)) && (!equivalentHedge(p.ranked[lead], c, margin) || time.Since(p.first) < rankedSourceGrace) {
@@ -279,7 +321,7 @@ func (p *searchPreparation) readyResultsAfter(window time.Duration) []core.Relea
 func (p *searchPreparation) searchLive(ctx context.Context, indexer core.StreamingIndexer, req core.SearchRequest) ([]core.Release, bool, error) {
 	if p.disabled {
 		r, e := indexer.SearchWith(ctx, req, p.arrived)
-		return r, false, e
+		return filterOutPlaceholders(r), false, e
 	}
 	// Detach from Play cancel so a first healthy hit can start while the
 	// remaining indexers finish into the search cache (better versions and
@@ -303,10 +345,16 @@ func (p *searchPreparation) searchLive(ctx context.Context, indexer core.Streami
 		defer p.svc.bgWG.Done()
 		defer cancel()
 		r, e := indexer.SearchWith(searchCtx, req, p.arrived)
-		done <- answer{r, e}
-		if p.partial.Load() && e == nil && len(r) > 0 && !coverage.Incomplete() {
+		r = filterOutPlaceholders(r)
+		// Publish every complete answer before notifying the caller. Completion
+		// can race with the early-play ticker: checking partial here could
+		// miss an early return chosen just after the check, losing the cache.
+		// Normalizing before send also keeps the caller from mutating the
+		// same release slice while this worker writes the cache.
+		if e == nil && len(r) > 0 && !coverage.Incomplete() {
 			p.svc.rememberSearchResults(req, r)
 		}
+		done <- answer{r, e}
 	}()
 	ticker := time.NewTicker(25 * time.Millisecond)
 	defer ticker.Stop()
@@ -315,13 +363,19 @@ func (p *searchPreparation) searchLive(ctx context.Context, indexer core.Streami
 		case a := <-done:
 			return a.releases, false, a.err
 		case <-ticker.C:
-			if ready := p.readyResults(); len(ready) > 0 {
+			ready := p.readyResults()
+			why := "source discovery finished on playable candidate"
+			if len(ready) == 0 {
+				ready = p.overdueResults(ctx)
+				why = "source discovery stopped waiting on slow indexers"
+			}
+			if len(ready) > 0 {
 				if ctx.Err() != nil {
 					cancel()
 					<-done
 					return nil, false, ctx.Err()
 				}
-				p.svc.log.Info("source discovery finished on playable candidate", "candidates", len(ready), "elapsed", time.Since(p.first))
+				p.svc.log.Info(why, "candidates", len(ready), "elapsed", time.Since(p.first))
 				p.partial.Store(true)
 				// SearchWith keeps running on bgCtx; the worker defers cancel.
 				p.svc.keepSearchCancel(cancel)
@@ -335,6 +389,22 @@ func (p *searchPreparation) searchLive(ctx context.Context, indexer core.Streami
 	}
 }
 
+// overdueResults hands a viewer's Play everything that has arrived once
+// playStartDeadline has passed with no early check healthy (early checks run
+// on the background budget, so an uncached torrent waits for foreground
+// validation). Speculative and background work keeps waiting for the fleet.
+func (p *searchPreparation) overdueResults(ctx context.Context) []core.Release {
+	if core.SpeculativeIndexerWork(ctx) || core.IsBackgroundCheck(ctx) {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.disabled || p.first.IsZero() || len(p.all) == 0 || time.Since(p.first) < playStartDeadline {
+		return nil
+	}
+	return append([]core.Release(nil), p.all...)
+}
+
 // keepSearchCancel marks cancel as owned by the background search so an
 // early Play start is not a leaked context.
 func (s *Service) keepSearchCancel(context.CancelFunc) {}
@@ -342,13 +412,20 @@ func (s *Service) keepSearchCancel(context.CancelFunc) {}
 func (p *searchPreparation) attach(cs []candidate) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for i := range cs {
-		r := cs[i].rel
+	attachOne := func(c *candidate) {
+		r := c.rel
 		if original, ok := p.releases[r.ID]; ok && original.Name == r.Name && original.Size == r.Size && original.NZBURL == r.NZBURL && original.Protocol == r.Protocol {
-			cs[i].prepared = p.byID[r.ID]
+			c.prepared = p.byID[r.ID]
+		}
+	}
+	for i := range cs {
+		attachOne(&cs[i])
+		for j := range cs[i].fallbacks {
+			attachOne(&cs[i].fallbacks[j])
 		}
 	}
 }
+
 func (p *searchPreparation) close() {
 	p.mu.Lock()
 	p.closed = true

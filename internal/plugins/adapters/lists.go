@@ -20,8 +20,12 @@ import (
 	"github.com/braedonsaunders/ether/internal/stremio"
 )
 
-// MaxPluginListItems bounds one list source refresh.
+// MaxPluginListItems bounds the maximum items an explicit source config may request.
 const MaxPluginListItems = stremio.MaxCatalogItems
+
+// DefaultPluginListItems bounds an unbounded list refresh per run so multi-thousand-item
+// Stremio/MDBList catalogues page incrementally without exhausting runtime timeouts.
+const DefaultPluginListItems = 500
 
 // Bridge tracks the source kinds registered for each plugin so enable,
 // disable, update and uninstall cleanly replace or remove them.
@@ -46,6 +50,9 @@ func Attach(mgr *plugins.Manager, cols *collections.Service, pers *personalize.E
 		tv:       tv,
 		listIDs:  map[string][]string{},
 		livetvID: map[string]string{},
+	}
+	if cols != nil && pers != nil {
+		cols.SetOnBuilt(pers.InvalidateOwnerRows)
 	}
 	if tv != nil && mgr != nil {
 		tv.SetStreamOpener(b.openPluginStream)
@@ -258,8 +265,11 @@ func catalogExtras(params map[string]string) map[string]string {
 }
 
 // maxItems is how many items one refresh reads: the source's own limit,
-// within the list's, within MaxPluginListItems.
+// within the list's, within DefaultPluginListItems when neither sets one.
 func (k *listSourceKind) maxItems(src core.CollectionSource) int {
+	if k.meta.MaxItems <= 0 && src.MaxItems <= 0 {
+		return DefaultPluginListItems
+	}
 	n := MaxPluginListItems
 	if k.meta.MaxItems > 0 && k.meta.MaxItems < n {
 		n = k.meta.MaxItems
@@ -302,11 +312,19 @@ func (k *listSourceKind) catalogs(kinds []string) []stremio.Catalog {
 // match are counted with the unmatched ones, never guessed by title.
 func (k *listSourceKind) Gather(g *collections.Gather) {
 	if k.mgr == nil {
+		if g.Strict {
+			g.Fail(fmt.Errorf("catalogue source unavailable"))
+			return
+		}
 		g.Warn("%s is unavailable", k.label())
 		return
 	}
 	rec, err := k.mgr.Get(g.Ctx, k.pluginID)
 	if err != nil {
+		if g.Strict {
+			g.Fail(err)
+			return
+		}
 		g.Warn("%s: %v", k.label(), err)
 		return
 	}
@@ -317,6 +335,8 @@ func (k *listSourceKind) Gather(g *collections.Gather) {
 	}
 	extra := catalogExtras(g.Src.Params)
 	metadata := rec.Manifest.HasCapability(plugins.CapMetadata)
+	stremioManifest := rec.Manifest.Stremio()
+	foreignStremio := rec.Manifest.SpeaksStremio()
 	var refs []collections.ExternalRef
 	read, total, unidentified := false, 0, 0
 	for _, cat := range k.catalogs(g.Kinds) {
@@ -340,6 +360,12 @@ func (k *listSourceKind) Gather(g *collections.Gather) {
 			if !fetcher.recorded {
 				k.mgr.RecordFailure(g.Ctx, rec.ID, fmt.Sprintf("catalog %s/%s: %v", cat.Type, cat.ID, err))
 			}
+			// If earlier pages already yielded items, keep them and warn instead
+			// of discarding the whole list when a deep skip page fails.
+			if g.Strict && len(metas) == 0 && !read {
+				g.Fail(err)
+				return
+			}
 			g.Warn("%s: %v", k.label(), err)
 		}
 		if err == nil || len(metas) > 0 {
@@ -350,7 +376,15 @@ func (k *listSourceKind) Gather(g *collections.Gather) {
 				break
 			}
 			total++
-			if ref, ok := catalogRef(m, cat.Type, metadata, rec.ID); ok {
+			canMeta := metadata
+			if canMeta && foreignStremio && m.ID != "" {
+				metaType := strings.ToLower(m.Type)
+				if metaType != stremio.TypeMovie && metaType != stremio.TypeSeries {
+					metaType = cat.Type
+				}
+				canMeta = stremioManifest.TakesID(stremio.ResourceMeta, metaType, m.ID)
+			}
+			if ref, ok := catalogRef(m, cat.Type, canMeta, rec.ID); ok {
 				refs = append(refs, ref)
 			} else {
 				unidentified++

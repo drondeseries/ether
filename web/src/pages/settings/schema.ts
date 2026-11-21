@@ -7,25 +7,13 @@ export const SERVER: FieldGroup[] = localized(() => [
   {
     id: "identity",
     title: t("What viewers see"),
-    description: t("The names apps show for this server and its libraries."),
+    description: t("The name apps show for this server."),
     fields: [
       {
         key: "friendlyName",
         label: t("Server name"),
         kind: "text",
         help: t("How the server appears in apps."),
-      },
-      {
-        key: "moviesLibraryName",
-        label: t("Movies library name"),
-        kind: "text",
-        help: t("Name shown in Plex. A rename inside Plex does not stick."),
-      },
-      {
-        key: "tvShowsLibraryName",
-        label: t("TV Shows library name"),
-        kind: "text",
-        help: t("Name shown in Plex. A rename inside Plex does not stick."),
       },
     ],
   },
@@ -73,13 +61,6 @@ export const SERVER: FieldGroup[] = localized(() => [
         kind: "list",
         placeholder: "https://home.example.com",
         help: t("Exact addresses allowed to frame the owner page. Empty means nowhere."),
-      },
-      {
-        key: "trustedProxyCIDRs",
-        label: t("Trusted proxy networks"),
-        kind: "list",
-        placeholder: "10.0.0.0/8",
-        help: t("Networks whose forwarding headers Ether trusts. Empty trusts none."),
       },
     ],
   },
@@ -251,7 +232,7 @@ export const PLEX: FieldGroup[] = localized(() => [
   },
 ]);
 
-/** plex.* addresses and certificate every app uses (Apps › Overview › Away from home). */
+/** plex.* addresses, certificate, and server.trustedProxyCIDRs (Apps › Overview › Away from home). */
 export const AWAY: FieldGroup[] = localized(() => [
   {
     id: "address",
@@ -263,7 +244,9 @@ export const AWAY: FieldGroup[] = localized(() => [
         key: "publicHost",
         label: t("Public host name"),
         kind: "text",
-        help: t("Optional. Leave empty to detect your public address."),
+        help: t(
+          "Optional. Enter a name like plex.example.com, or the full https:// address of your reverse proxy. Leave empty to detect your public address.",
+        ),
       },
       {
         key: "publicPort",
@@ -280,6 +263,21 @@ export const AWAY: FieldGroup[] = localized(() => [
         kind: "list",
         placeholder: "https://ether.example.com:443",
         help: t("Extra addresses apps should try, comma-separated."),
+      },
+    ],
+  },
+  {
+    id: "proxy",
+    fields: [],
+    more: [
+      {
+        key: "trustedProxyCIDRs",
+        label: t("Trusted reverse proxies"),
+        kind: "list",
+        placeholder: "192.168.1.5, 10.0.0.0/8",
+        help: t(
+          "IP addresses or CIDR ranges of reverse proxies on other machines (such as Caddy or Nginx) whose forwarded client IP headers Ether should trust. Proxies on this computer are already trusted.",
+        ),
       },
     ],
   },
@@ -364,6 +362,14 @@ export const PLAY_VERSIONS: FieldGroup[] = localized(() => [
         help: t("Listed after Auto in the app's version menu."),
       },
       {
+        key: "alternativesPerResolution",
+        label: t("Offer alternatives at every resolution"),
+        kind: "bool",
+        help: t(
+          "Apply the alternatives count to each available resolution, up to seven versions total. Auto stays first; profile and device limits still apply.",
+        ),
+      },
+      {
         key: "offerHigherVersions",
         label: t("Offer higher versions"),
         kind: "bool",
@@ -442,6 +448,20 @@ export const RELEASE_BLOCKS: FieldGroup[] = localized(() => [
 ]);
 
 export const TRANSCODE: FieldGroup[] = localized(() => {
+  const VIDEO_TRANSCODING = {
+    key: "videoTranscoding",
+    label: t("Video transcoding"),
+    kind: "select" as const,
+    defaultValue: "on",
+    help: t(
+      "Turn off to never re-encode video for movies and shows. Direct play, remuxing, and audio or subtitle conversion still work. Live TV is unaffected.",
+    ),
+    options: [
+      { value: "on", label: t("On") },
+      { value: "off", label: t("Off") },
+    ],
+  };
+
   const HW_ACCEL = {
     key: "hwAccel",
     label: t("Hardware acceleration"),
@@ -535,7 +555,7 @@ export const TRANSCODE: FieldGroup[] = localized(() => {
       description: t(
         "Ether plays the file directly when the app can. It converts the video on this computer only when it has to.",
       ),
-      fields: [HW_ACCEL],
+      fields: [VIDEO_TRANSCODING, HW_ACCEL],
       more: [
         {
           key: "vaapiDevice",
@@ -640,7 +660,23 @@ export const OPENSUBTITLES: FieldGroup[] = localized(() => [
       { key: "apiKey", label: t("API key"), kind: "secret" },
       { key: "username", label: t("Username"), kind: "text" },
       { key: "password", label: t("Password"), kind: "secret" },
+      {
+        key: "automaticPreferred",
+        label: t("Download a subtitle automatically when playback starts"),
+        kind: "bool",
+        help: t(
+          "When a viewer's subtitle setting asks for subtitles and none in their language is available, Ether downloads one once the video starts playing. Uses one OpenSubtitles download per title per viewer, so standard accounts may run out sooner.",
+        ),
+      },
     ],
+  },
+]);
+
+export const SUBDL: FieldGroup[] = localized(() => [
+  {
+    title: "SubDL",
+    description: t("Fetch subtitles from SubDL when a release doesn't include them."),
+    fields: [{ key: "apiKey", label: t("API key"), kind: "secret" }],
   },
 ]);
 
@@ -652,7 +688,7 @@ export const UPDATES: FieldGroup[] = localized(() => [
         key: "enabled",
         label: t("Check for updates"),
         kind: "bool",
-        help: t("Checks the signed release feed once a day."),
+        help: t("Checks the signed release feed every few hours."),
       },
       {
         key: "channel",
@@ -826,7 +862,7 @@ export const DOWNLOADS: FieldGroup[] = localized(() => [
         min: 0,
         step: 1,
         unit: "p",
-        help: t("Downloads are capped at this height. 0 uses 1080p."),
+        help: t("Downloads are capped at this resolution. 0 uses 1080p."),
       },
       {
         key: "maxConcurrent",
@@ -926,6 +962,7 @@ export const EXTRAS: FieldGroup[] = localized(() => [
     title: t("Trailers"),
     description: t("Play a trailer before a movie or episode."),
     fields: [
+      { key: "themeMusic", label: t("Theme music"), kind: "bool" },
       {
         key: "enabled",
         label: t("Trailers and Cinema Trailers"),
@@ -953,6 +990,13 @@ export const EXTRAS: FieldGroup[] = localized(() => [
       },
       { key: "resolverTimeout", label: t("Give up after"), kind: "duration" },
       {
+        key: "trailerCacheMaxBytes",
+        label: t("Trailer cache limit"),
+        kind: "bytes",
+        unit: "MiB",
+        help: t("Trailers are cached when opened. 0 uses 512 MiB."),
+      },
+      {
         key: "prewarmBytes",
         label: t("Pre-buffer the feature"),
         kind: "bytes",
@@ -963,27 +1007,24 @@ export const EXTRAS: FieldGroup[] = localized(() => [
   },
 ]);
 
-/** Preset keys as the server names them; proper nouns are not translated. */
-export function identityOptions(includeCustom: boolean, includeEther = true) {
-  const options = [
-    ...(includeEther ? [{ value: "ether", label: "Ether" }] : []),
-    { value: "sonarr", label: "Sonarr" },
-    { value: "radarr", label: "Radarr" },
-    { value: "prowlarr", label: "Prowlarr" },
-    { value: "nzbhydra2", label: "NZBHydra2" },
-    { value: "sabnzbd", label: "SABnzbd" },
-    { value: "nzbget", label: "NZBGet" },
-  ];
-  return includeCustom ? [...options, { value: "custom", label: t("Custom") }] : options;
-}
-
-/**
- * Search-side presets: SABnzbd and NZBGet never send a Newznab query, so a
- * search presented as one is a client that cannot exist. They stay available
- * for grabs only; the per-indexer override excludes them as well.
- */
-export function searchIdentityOptions(includeCustom: boolean, includeEther = true) {
-  return identityOptions(includeCustom, includeEther).filter(
-    (o) => o.value !== "sabnzbd" && o.value !== "nzbget",
-  );
-}
+export const LIVE_LATENCY: FieldGroup[] = localized(() => [
+  {
+    id: "live-latency",
+    title: t("Live TV"),
+    fields: [
+      {
+        key: "latencyProfile",
+        label: t("Live TV delay"),
+        kind: "select",
+        options: [
+          { value: "auto", label: t("Automatic") },
+          { value: "low", label: t("Prefer low delay") },
+          { value: "stable", label: t("Prefer stability") },
+        ],
+        help: t(
+          "Choose how close to live everyone watches. Less delay can mean more interruptions.",
+        ),
+      },
+    ],
+  },
+]);

@@ -10,7 +10,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/braedonsaunders/ether/internal/contentrating"
 	"github.com/braedonsaunders/ether/internal/core"
+	"github.com/braedonsaunders/ether/internal/reqmemo"
 )
 
 // Owner-facing API (internal/admin: viewers, Home Designer, insights).
@@ -23,10 +25,10 @@ const previewWait = 45 * time.Second
 // viewer in this context (the same assembly as HomeHubsFor and
 // SectionHubsFor), plus the rows the front end adds itself (Continue
 // Watching and Recently Added in sections, Recent Playlists on Home),
-// marked source "plex". Rows hidden by a layout policy are included last
-// with Hidden set; Plex never receives them.
+// marked source "plex". Rows hidden by a layout policy or absent despite an
+// "always" policy are included last with Hidden set; Plex never receives them.
 //
-// section is "" or "home", "movies", "shows", or a library section id.
+// section is "" or "home", "library:<id>", or a library section id.
 // The daypart and weekend flag are derived from hc.Now in server local
 // time (hc.Device is kept as given).
 func (e *Engine) PreviewHome(ctx context.Context, user *core.User, hc core.HubContext, sectionArg string, limit int) (*core.HomePreview, error) {
@@ -37,7 +39,7 @@ func (e *Engine) PreviewHome(ctx context.Context, user *core.User, hc core.HubCo
 	if e.opts.UserPolicy != nil {
 		user = e.opts.UserPolicy(user)
 	}
-	sid, section, err := e.resolveSection(sectionArg)
+	sid, section, err := e.resolveSection(ctx, sectionArg)
 	if err != nil {
 		return nil, err
 	}
@@ -66,7 +68,7 @@ func (e *Engine) PreviewHome(ctx context.Context, user *core.User, hc core.HubCo
 		}
 		if !hasCW {
 			items := e.continueItems(ctx, user, limit)
-			p.Rows = append([]core.HomeRow{plexRow("home.continue", "Continue Watching", KindContinue,
+			p.Rows = append([]core.HomeRow{legacyRow("home.continue", "Continue Watching", KindContinue,
 				"Titles you're part-way through (Plex's own row).", items)}, p.Rows...)
 		}
 		if row, ok := e.playlistsRow(ctx, user); ok {
@@ -74,29 +76,33 @@ func (e *Engine) PreviewHome(ctx context.Context, user *core.User, hc core.HubCo
 		}
 	} else {
 		prefix := sectionPrefix(section)
-		sid := fmt.Sprint(hc.SectionID)
+		sidStr := fmt.Sprint(hc.SectionID)
 		var cw []candItem
 		for _, it := range e.continueItems(ctx, user, 50) {
 			if (section == core.TypeMovie) == (it.t.Type == core.TypeMovie) {
 				cw = append(cw, it)
 			}
 		}
+		cw = e.filterLibraryCandItems(ctx, hc.SectionID, cw)
 		if len(cw) > limit {
 			cw = cw[:limit]
 		}
-		head := []core.HomeRow{plexRow(prefix+".inprogress."+sid, "Continue Watching", KindContinue,
+		head := []core.HomeRow{legacyRow(prefix+".inprogress."+sidStr, "Continue Watching", KindContinue,
 			"Titles you're part-way through in this library (Plex's own row).", cw)}
-		ra := e.recentlyAdded(ctx, user, section, limit)
-		head = append(head, plexRow(prefix+".recentlyadded."+sid, "Recently Added", KindRecentlyAdded,
+		ra := e.recentlyAddedForSection(ctx, user, section, hc.SectionID, limit)
+		head = append(head, legacyRow(prefix+".recentlyadded."+sidStr, "Recently Added", KindRecentlyAdded,
 			"The newest additions to this library (Plex's own row).", ra))
 		p.Rows = append(head, p.Rows...)
 	}
 	if e.extraHomeRows != nil {
 		p.Rows = append(p.Rows, rowsFromHubs(e.extraHomeRows(ctx, user, hc, sectionName(section), limit))...)
 	}
+	emptiedByRestrictions := map[string]bool{}
 	if e.opts.Allowed != nil {
+		kept := p.Rows[:0]
 		for i := range p.Rows {
-			row := &p.Rows[i]
+			row := p.Rows[i]
+			before := len(row.Items)
 			items := make([]core.Title, 0, len(row.Items))
 			reasons := map[core.RatingKey]string{}
 			for _, title := range row.Items {
@@ -110,47 +116,376 @@ func (e *Engine) PreviewHome(ctx context.Context, user *core.User, hc core.HubCo
 			row.Items = items
 			row.Hub.Items = items
 			row.ItemReasons = reasons
+			if before > 0 && len(items) == 0 && row.Kind != KindContinue && row.Kind != KindPlaylists {
+				if row.Kind != "" {
+					emptiedByRestrictions[row.Kind] = true
+				}
+				if row.HubID != "" {
+					emptiedByRestrictions[row.HubID] = true
+				}
+				if !row.Hidden {
+					continue
+				}
+			}
+			kept = append(kept, row)
 		}
+		p.Rows = kept
 	}
 	def := e.opts.MaxHomeRows
 	if section != "" {
 		def = e.opts.MaxSectionRows
 	}
-	p.Rows = arrangeLayout(p.Rows, e.layoutForContext(ctx), user.ID, hc, sectionName(section), def)
+	layoutDoc := e.layoutForContext(ctx)
+	target := layoutTargetForMedia(section, hc.SectionID)
+	p.Rows = arrangeLayoutFor(p.Rows, layoutDoc, user.ID, hc, target, def)
+	p.Rows = e.appendAbsentAlwaysRows(ctx, p.Rows, layoutDoc, user, hc, section, target, emptiedByRestrictions)
 	return &p, nil
 }
 
-// resolveSection maps a preview section name to a library section.
-func (e *Engine) resolveSection(name string) (int, core.MediaType, error) {
-	var want core.MediaType
-	switch strings.ToLower(strings.TrimSpace(name)) {
-	case "", "home", "foryou", "for-you":
-		return 0, "", nil
-	case "movies", "movie":
-		want = core.TypeMovie
-	case "shows", "show", "tv":
-		want = core.TypeShow
-	default:
-		id, err := strconv.Atoi(name)
-		if t, ok := e.opts.Sections[id]; err == nil && ok {
-			return id, t, nil
-		}
-		return 0, "", &ValidationError{Problems: []Problem{{"section", "must be home, movies, shows or a library section id"}}}
+func isPersonalKind(kind string) bool {
+	switch kind {
+	case KindFavorites, KindContinue, KindUpNext, KindTop10, KindBecause, KindPerson,
+		KindBridge, KindTrendingTaste, KindCrowd, KindCrowdTrending, KindHiddenGems,
+		KindNewThisWeek, KindComfort, KindDifferent, KindFranchise, KindLLM,
+		KindTraktRecs, KindTraktWatch, KindPlaylists,
+		KindTasteCluster, KindEra, KindWorld, KindOccasion, KindAcclaimed, KindTopGenre, KindStudio,
+		KindNewSeasons, KindFinishShow, KindStartNew, KindAiringTaste, KindNetwork:
+		return true
 	}
-	ids := make([]int, 0, len(e.opts.Sections))
-	for id := range e.opts.Sections {
-		ids = append(ids, id)
-	}
-	sort.Ints(ids)
-	for _, id := range ids {
-		if e.opts.Sections[id] == want {
-			return id, want, nil
-		}
-	}
-	return 0, "", &ValidationError{Problems: []Problem{{"section", "no " + string(want) + " library"}}}
+	return false
 }
 
-func plexRow(hubID, title, kind, reason string, items []candItem) core.HomeRow {
+func (e *Engine) resolvePolicyIdentity(ctx context.Context, raw string, user *core.User, hc core.HubContext, section core.MediaType, d core.HomeLayout) (hubID, kind, title, source string) {
+	if strings.HasPrefix(raw, "plugin:") {
+		kind = raw
+		hubID = raw
+		source = core.RowSourceOwner
+		title = raw
+		if rk, ok := e.RowKindRegistry().Lookup(raw); ok {
+			if lbl := strings.TrimSpace(rk.Descriptor().Title); lbl != "" {
+				title = lbl
+			}
+		}
+		if cr, ok := e.cachedOwnerCollection(user, hc, section, d, raw); ok && cr.Hub.Title != "" {
+			title = cr.Hub.Title
+		}
+		return hubID, kind, title, source
+	}
+	if collID := collectionRowID(raw); collID != "" {
+		kind = KindCollectionPrefix + collID
+		hubID = "collection." + collID
+		source = core.RowSourceOwner
+		title = collID
+		if cr, ok := e.cachedOwnerCollection(user, hc, section, d, collID); ok {
+			if cr.Hub.Title != "" {
+				title = cr.Hub.Title
+			}
+			if cr.Hub.ID != "" {
+				hubID = cr.Hub.ID
+			}
+			return hubID, kind, title, source
+		}
+		for _, sp := range e.collectionSpecs(ctx) {
+			if sp.ID == collID && sp.Name != "" {
+				title = sp.Name
+				break
+			}
+		}
+		return hubID, kind, title, source
+	}
+	if _, ok := kindByName[raw]; ok {
+		kind = raw
+	} else if k := hubKind(raw); k != raw {
+		kind = k
+	} else if k := parseHubKind("home." + raw); k != "other" {
+		kind = k
+	} else {
+		kind = raw
+	}
+	info := infoFor(kind)
+	source = info.source
+	title = info.title
+	switch {
+	case strings.HasPrefix(raw, "home."), strings.HasPrefix(raw, "movie."), strings.HasPrefix(raw, "tv."), strings.HasPrefix(raw, "live."):
+		hubID = raw
+	case kind == KindPlaylists:
+		hubID = "home.playlists"
+	case kind == KindContinue && section == "":
+		hubID = "home.continue"
+	default:
+		hubID = sectionPrefix(section) + "." + info.slug
+	}
+	return hubID, kind, title, source
+}
+
+func (e *Engine) collectionSpecs(ctx context.Context) []core.CollectionSpec {
+	source, ok := e.opts.Collections.(core.CollectionSpecSource)
+	if !ok {
+		return nil
+	}
+	if light, ok := e.opts.Collections.(lightCollectionSpecSource); ok {
+		specs, _ := light.ListSpecsLight(ctx)
+		return specs
+	}
+	specs, _ := source.ListSpecs(ctx)
+	return specs
+}
+
+func (e *Engine) appendAbsentAlwaysRows(ctx context.Context, rows []core.HomeRow, d core.HomeLayout, user *core.User, hc core.HubContext, section core.MediaType, target string, emptied map[string]bool) []core.HomeRow {
+	if user == nil {
+		return rows
+	}
+	type activePol struct {
+		pol   core.RowPolicy
+		layer string
+	}
+	var policies []activePol
+	gPage, vPage := pagesForTarget(d, user.ID, target)
+	if vPage != nil {
+		for _, pol := range vPage.Rows {
+			if pol.Status == "always" && !strings.ContainsAny(pol.Row, "*?[") {
+				policies = append(policies, activePol{pol: pol, layer: "override"})
+			}
+		}
+	}
+	if gPage != nil {
+		for _, pol := range gPage.Rows {
+			if pol.Status != "always" || strings.ContainsAny(pol.Row, "*?[") {
+				continue
+			}
+			hubID, kind, _, _ := e.resolvePolicyIdentity(ctx, pol.Row, user, hc, section, d)
+			eff, effLayer := effectiveHomePolicy(d, user.ID, target, core.HomeRow{HubID: hubID, Kind: kind})
+			if eff == nil || eff.Status != "always" || effLayer != "global" || eff.Row != pol.Row {
+				continue
+			}
+			policies = append(policies, activePol{pol: pol, layer: "global"})
+		}
+	}
+	if len(policies) == 0 {
+		return rows
+	}
+	var model *userModel
+	modelLoaded := false
+	getModel := func() *userModel {
+		if !modelLoaded {
+			model = e.modelFor(ctx, user, false)
+			modelLoaded = true
+		}
+		return model
+	}
+	for _, ap := range policies {
+		pol := ap.pol
+		matched := false
+		for _, r := range rows {
+			if matchRank(pol.Row, r.HubID, hubStem(r.HubID), r.Kind) > 0 {
+				matched = true
+				break
+			}
+		}
+		if matched {
+			continue
+		}
+		hubID, kind, title, source := e.resolvePolicyIdentity(ctx, pol.Row, user, hc, section, d)
+		code, reason := e.absentAlwaysReason(ctx, pol, ap.layer, hubID, kind, user, hc, section, d, emptied, getModel)
+		polCopy := pol
+		placement := "Always included by " + ap.layer
+		if ap.layer == "override" {
+			placement = "Viewer override"
+		}
+		if pol.Slot > 0 {
+			placement = fmt.Sprintf("%s anchor at slot %d", ap.layer, pol.Slot)
+		}
+		rows = append(rows, core.HomeRow{
+			HubID:        hubID,
+			Title:        title,
+			Kind:         kind,
+			Source:       source,
+			Items:        []core.Title{},
+			Hub:          core.Hub{ID: hubID, Title: title},
+			Hidden:       true,
+			HiddenCode:   code,
+			HiddenReason: reason,
+			Layer:        ap.layer,
+			Policy:       &polCopy,
+			PolicyLayer:  ap.layer,
+			AnchorSlot:   pol.Slot,
+			Pinned:       pol.Slot > 0,
+			Placement:    placement,
+		})
+	}
+	return rows
+}
+
+func (e *Engine) absentAlwaysReason(ctx context.Context, pol core.RowPolicy, layer, hubID, kind string, user *core.User, hc core.HubContext, section core.MediaType, d core.HomeLayout, emptied map[string]bool, getModel func() *userModel) (code, reason string) {
+	if c, why := policyHiddenReason(&pol, layer, user.ID, hc); why != "" {
+		return c, why
+	}
+	surf := sectionName(section)
+	if collID := collectionRowID(pol.Row); collID != "" {
+		cr, hasCR := e.cachedOwnerCollection(user, hc, section, d, collID)
+		for _, sp := range e.collectionSpecs(ctx) {
+			if sp.ID != collID {
+				continue
+			}
+			if !sp.Enabled {
+				return "collection_disabled", "Collection is disabled in Collection Studio"
+			}
+			var targetUser *core.User
+			if user != nil && user.ID > 0 {
+				targetUser = user
+			}
+			if (sp.Targets.Users.All || len(sp.Targets.Users.IDs) > 0) && !sp.Targets.Users.Includes(targetUser) {
+				return "collection_not_shared", "Collection is not shared with this viewer"
+			}
+			if !slices.Contains(collectionSections(sp.MediaType), surf) {
+				return "wrong_surface", "Not available on this page"
+			}
+			if !hasCR && !(layer == "override" && pol.When != nil) {
+				sc := sp.Targets.Schedule
+				if draft, ok := d.CollectionSchedules[collID]; ok {
+					sc = draft
+				}
+				if !sc.Allows(hc.Device, hc.Now) {
+					return "outside_collection_schedule", "Outside collection schedule"
+				}
+			}
+			break
+		}
+		if hasCR {
+			if !collectionScheduleAllows(d, user.ID, section, hc, cr) {
+				return "outside_collection_schedule", "Outside collection schedule"
+			}
+			if len(cr.Hub.Items) > 0 && e.opts.FilterAvailable != nil && len(e.opts.FilterAvailable(ctx, cr.Hub.Items)) == 0 {
+				return "filtered_by_availability", "No available titles right now"
+			}
+		}
+		if emptied[kind] || emptied[hubID] || emptied[pol.Row] {
+			return "filtered_by_restrictions", "No titles allowed for this viewer"
+		}
+		return "collection_empty", "Collection has no titles for this viewer"
+	}
+	if _, knownKind := kindByName[kind]; knownKind && !fitsSurface(kind, surf) {
+		return "wrong_surface", "Not available on this page"
+	}
+	if emptied[kind] || emptied[hubID] || emptied[pol.Row] {
+		return "filtered_by_restrictions", "No titles allowed for this viewer"
+	}
+	m := getModel()
+	if m != nil && e.opts.FilterAvailable != nil {
+		prefix := sectionPrefix(section)
+		allowed := e.allowedFor(user)
+		for _, c := range m.rows {
+			if matchRank(pol.Row, prefix+"."+c.id, c.id, c.kind) == 0 {
+				continue
+			}
+			var raw []core.Title
+			src := c.items
+			if section != "" && c.typed != nil {
+				if typed, ok := c.typed[section]; ok {
+					src = typed
+				}
+			}
+			for _, it := range src {
+				if section != "" && baseType(it.t.Type) != section {
+					continue
+				}
+				if allowed != nil && !allowed(it.t.Type) {
+					continue
+				}
+				if !contentrating.Allowed(it.t.ContentRating, user.MaxContentRating) {
+					continue
+				}
+				raw = append(raw, it.t)
+			}
+			if len(raw) > 0 && len(e.opts.FilterAvailable(ctx, raw)) == 0 {
+				return "filtered_by_availability", "No available titles right now"
+			}
+		}
+	}
+	if user.ID <= 0 && isPersonalKind(kind) {
+		return "typical_viewer_personal", "Hidden for Typical viewer: personal row"
+	}
+	conf := 0.0
+	if m != nil && m.taste != nil {
+		conf = m.taste.Confidence
+	}
+	switch {
+	case kind == KindShowcase && conf >= coldStartConfidence:
+		return "cold_start_only", "Only shown for new viewers while learning their taste"
+	case kind == KindTraktRecs || kind == KindTraktWatch:
+		return "needs_trakt", "No Trakt titles for this viewer"
+	case kind == KindLLM:
+		if e.llm == nil {
+			return "ai_unavailable", "AI recommendations are not configured"
+		}
+		if conf < minPersonalConfidence {
+			return "needs_watch_history", "Needs more watch history for this viewer"
+		}
+		return "ai_unavailable", "No AI themed rows ready for this viewer"
+	case kind == KindPlaylists:
+		return "no_playlists", "Viewer has no playlists"
+	case kind == KindFavorites:
+		return "no_favorites", "Viewer has no favorites"
+	case kind == KindUpNext:
+		return "no_in_progress", "No next episodes in progress for this viewer"
+	case kind == KindFinishShow:
+		return "no_in_progress", "No stalled series in progress for this viewer"
+	case kind == KindTop10 && conf < top10Confidence:
+		return "needs_watch_history", "Needs more watch history for this viewer"
+	case kind == KindDifferent && conf < 0.2:
+		return "needs_watch_history", "Needs more watch history for this viewer"
+	case isPersonalKind(kind) && conf < minPersonalConfidence:
+		return "needs_watch_history", "Needs more watch history for this viewer"
+	default:
+		return "no_matching_titles", "No matching titles for this viewer"
+	}
+}
+
+// resolveSection maps a preview section name ("home", "library:<id>", or "<id>")
+// to a library section. Section-level "movies" and "shows" names are rejected.
+func (e *Engine) resolveSection(ctx context.Context, name string) (int, core.MediaType, error) {
+	secs := e.allSections(ctx)
+	trimmed := strings.ToLower(strings.TrimSpace(name))
+	switch trimmed {
+	case "", "home", "foryou", "for-you":
+		return 0, "", nil
+	}
+	if id, ok := parseLibrarySection(trimmed); ok {
+		if t, found := secs[id]; found {
+			return id, t, nil
+		}
+		return 0, "", &ValidationError{Problems: []Problem{{"section", "must be home or library:<id>"}}}
+	}
+	if id, err := strconv.Atoi(trimmed); err == nil && id > 0 {
+		if t, ok := secs[id]; ok {
+			return id, t, nil
+		}
+	}
+	return 0, "", &ValidationError{Problems: []Problem{{"section", "must be home or library:<id>"}}}
+}
+
+func (e *Engine) filterLibraryCandItems(ctx context.Context, sectionID int, items []candItem) []candItem {
+	if sectionID <= 0 || len(items) == 0 || e.opts.LibraryMembers == nil {
+		return items
+	}
+	keys := make([]core.RatingKey, len(items))
+	for i, it := range items {
+		keys[i] = it.t.Key
+	}
+	members, _, scoped, err := e.opts.LibraryMembers(ctx, core.LibraryID(sectionID), keys)
+	if err != nil || !scoped {
+		return items
+	}
+	out := make([]candItem, 0, len(items))
+	for _, it := range items {
+		if members[it.t.Key] {
+			out = append(out, it)
+		}
+	}
+	return out
+}
+
+func legacyRow(hubID, title, kind, reason string, items []candItem) core.HomeRow {
 	titles := make([]core.Title, len(items))
 	reasons := map[core.RatingKey]string{}
 	for i, it := range items {
@@ -188,14 +523,18 @@ func (e *Engine) playlistsRow(ctx context.Context, user *core.User) (core.HomeRo
 		names = append(names, p.Title)
 	}
 	sort.Strings(names)
-	r := plexRow("home.playlists", "Recent Playlists", KindPlaylists,
+	r := legacyRow("home.playlists", "Recent Playlists", KindPlaylists,
 		"The viewer's playlists (Plex's own row): "+strings.Join(names, ", ")+".", nil)
 	return r, true
 }
 
-func (e *Engine) recentlyAdded(ctx context.Context, user *core.User, t core.MediaType, limit int) []candItem {
+func (e *Engine) recentlyAddedForSection(ctx context.Context, user *core.User, t core.MediaType, sectionID int, limit int) []candItem {
 	ctx = core.WithCatalogViewer(ctx, user)
-	q := core.BrowseQuery{Filter: core.Filter{Type: t, KnownAddedDate: true, MaxContentRating: user.MaxContentRating}, Sort: core.SortAdded, Desc: true, Limit: limit}
+	fetchLimit := limit
+	if sectionID > 0 && e.opts.LibraryMembers != nil {
+		fetchLimit = max(limit*4, 50)
+	}
+	q := core.BrowseQuery{Filter: core.Filter{Type: t, KnownAddedDate: true, MaxContentRating: user.MaxContentRating}, Sort: core.SortAdded, Desc: true, Limit: fetchLimit}
 	page, err := e.catalog.Browse(ctx, q)
 	if err != nil {
 		return nil
@@ -203,6 +542,10 @@ func (e *Engine) recentlyAdded(ctx context.Context, user *core.User, t core.Medi
 	out := make([]candItem, 0, len(page.Items))
 	for _, it := range page.Items {
 		out = append(out, candItem{t: it})
+	}
+	out = e.filterLibraryCandItems(ctx, sectionID, out)
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
 	}
 	return out
 }
@@ -301,6 +644,10 @@ func (e *Engine) SetTasteOverrides(ctx context.Context, user *core.User, os []co
 	return e.Taste(ctx, user)
 }
 
+type lightCollectionSpecSource interface {
+	ListSpecsLight(ctx context.Context) ([]core.CollectionSpec, error)
+}
+
 // AvailableRows lists the row kinds layout policies can target, plus owner
 // collection rows recently served, each with the pages it can appear on
 // (Sections) and its designer group.
@@ -318,7 +665,12 @@ func (e *Engine) AvailableRows(ctx context.Context) ([]core.RowDescriptor, error
 		}
 	}
 	if source, ok := e.opts.Collections.(core.CollectionSpecSource); ok {
-		specs, err := source.ListSpecs(ctx)
+		var specs []core.CollectionSpec
+		if light, ok := e.opts.Collections.(lightCollectionSpecSource); ok {
+			specs, err = light.ListSpecsLight(ctx)
+		} else {
+			specs, err = source.ListSpecs(ctx)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -348,8 +700,9 @@ func (e *Engine) AvailableRows(ctx context.Context) ([]core.RowDescriptor, error
 		}
 		hc := core.NewHubContext(e.now(), "", "", "")
 		hc.Device = core.DeviceTV
+		mctx := reqmemo.With(ctx)
 		for _, section := range allSurfaces {
-			for _, hub := range e.extraHomeRows(ctx, &core.User{IsOwner: true}, hc, section, 1) {
+			for _, hub := range e.extraHomeRows(mctx, &core.User{IsOwner: true}, hc, section, 1) {
 				if i, ok := index[hub.ID]; ok {
 					if !slices.Contains(extra[i].Sections, section) {
 						extra[i].Sections = append(extra[i].Sections, section)
@@ -378,6 +731,36 @@ func collectionSections(mediaType string) []string {
 		return []string{surfHome, surfShows}
 	}
 	return append([]string(nil), allSurfaces...)
+}
+
+// insightTitle returns an owner-friendly label for a row insight without
+// unresolved `<Placeholder>` tokens: a single served dynamic row keeps its
+// concrete title (e.g. "Acclaimed Thrillers"), while multi-variant dynamic
+// kinds fall back to a clean family title (e.g. "Acclaimed by Genre").
+func insightTitle(kind string, info kindInfo, st *rowStat) string {
+	if strings.HasPrefix(kind, KindCollectionPrefix) && st != nil && st.title != "" {
+		return st.title
+	}
+	if info.dynamic && st != nil && len(st.titles) == 1 && st.title != "" {
+		return st.title
+	}
+	switch kind {
+	case KindShowcase:
+		return "Acclaimed by Genre"
+	case KindEra:
+		return "Best by Decade"
+	case KindWorld:
+		return "World Cinema for You"
+	case KindTopGenre:
+		return "Top-Rated by Genre"
+	case KindBridge:
+		return "Where Favourites Meet"
+	case KindStudio:
+		return "More by Studio"
+	case KindNetwork:
+		return "More by Network"
+	}
+	return info.title
 }
 
 // RowInsights reports, per row kind, how often it was shown and played
@@ -412,15 +795,14 @@ func (e *Engine) RowInsights(ctx context.Context, days int) ([]core.RowInsight, 
 	out := make([]core.RowInsight, 0, len(kinds))
 	for k := range kinds {
 		info := infoFor(k)
-		ri := core.RowInsight{HubID: k, Title: info.title, Plays7d: played[k]}
-		if st := shows[k]; st != nil {
+		st := shows[k]
+		ri := core.RowInsight{HubID: k, Title: insightTitle(k, info, st), Plays7d: played[k]}
+		if st != nil {
 			ri.Impressions7d = int(st.shows)
-			if strings.HasPrefix(k, KindCollectionPrefix) && st.title != "" {
-				ri.Title = st.title
-			}
 		}
 		if ri.Impressions7d > 0 {
-			ri.PlayRate = round3(float64(ri.Plays7d) / float64(ri.Impressions7d))
+			rate := min(1.0, float64(ri.Plays7d)/float64(ri.Impressions7d))
+			ri.PlayRate = round3(rate)
 		}
 		out = append(out, ri)
 	}
@@ -466,6 +848,9 @@ func (e *Engine) activity(ctx context.Context, since time.Time) (*activityResult
 	for _, p := range plays {
 		byUser[p.userID] = append(byUser[p.userID], p)
 	}
+	many, hasMany := e.catalog.(interface {
+		CachedGetMany(context.Context, []core.RatingKey) (map[core.RatingKey]core.Title, error)
+	})
 	for _, u := range users {
 		if e.state == nil {
 			break
@@ -489,17 +874,27 @@ func (e *Engine) activity(ctx context.Context, since time.Time) (*activityResult
 		if in.statuses, err = e.state.GetMany(ctx, u.ID, keys); err != nil {
 			return nil, err
 		}
-		lookups := 0
+		var want []core.RatingKey
+		wantSeen := map[core.RatingKey]bool{}
 		for _, k := range keys {
-			if in.statuses[k].Duration > 0 || lookups >= 300 {
+			if in.statuses[k].Duration > 0 || len(want) >= 300 {
 				continue
 			}
 			tk := tasteKey(k)
-			if _, ok := in.titles[tk]; ok {
+			if wantSeen[tk] {
 				continue
 			}
-			lookups++
-			if t, err := e.catalog.Get(ctx, tk); err == nil && t != nil {
+			wantSeen[tk] = true
+			want = append(want, tk)
+		}
+		var batch map[core.RatingKey]core.Title
+		if hasMany && len(want) > 0 {
+			batch, _ = many.CachedGetMany(ctx, want)
+		}
+		for _, tk := range want {
+			if bt, ok := batch[tk]; ok {
+				in.titles[tk] = bt
+			} else if t, err := e.catalog.Get(ctx, tk); err == nil && t != nil {
 				in.titles[tk] = *t
 			}
 		}
@@ -643,13 +1038,57 @@ func (e *Engine) RecentActivity(ctx context.Context, userID int64, limit int) ([
 		}
 		en.completed = en.completed || h.Completed
 	}
+	// Plex records resume positions independently of completed viewing history.
+	// Include those positions in owner activity without manufacturing a Plex
+	// history event or marking the title watched.
+	progressing, err := e.state.InProgress(ctx, userID, limit)
+	if err != nil {
+		return nil, err
+	}
+	for _, ws := range progressing {
+		if ws.ViewOffset <= 0 {
+			continue
+		}
+		en := byKey[ws.Key]
+		if en == nil {
+			en = &entry{}
+			byKey[ws.Key] = en
+			order = append(order, ws.Key)
+		}
+		if !ws.LastViewedAt.Before(en.at) {
+			en.at = ws.LastViewedAt
+			en.completed = false
+		}
+	}
+	sort.Slice(order, func(i, j int) bool {
+		a, b := byKey[order[i]].at, byKey[order[j]].at
+		if a.Equal(b) {
+			return order[i] < order[j]
+		}
+		return a.After(b)
+	})
+	if len(order) > limit {
+		order = order[:limit]
+	}
 	statuses, err := e.state.GetMany(ctx, userID, order)
 	if err != nil {
 		return nil, err
 	}
+	// One batched read for the page's titles; a title it lacks is read alone.
+	var batch map[core.RatingKey]core.Title
+	if many, ok := e.catalog.(interface {
+		CachedGetMany(context.Context, []core.RatingKey) (map[core.RatingKey]core.Title, error)
+	}); ok {
+		batch, _ = many.CachedGetMany(ctx, order)
+	}
 	for _, k := range order {
-		t, err := e.catalog.Get(ctx, k)
-		if err != nil || t == nil {
+		var t *core.Title
+		if bt, ok := batch[k]; ok {
+			t = &bt
+		} else if t, err = e.catalog.Get(ctx, k); err != nil {
+			continue
+		}
+		if t == nil {
 			continue
 		}
 		en := byKey[k]

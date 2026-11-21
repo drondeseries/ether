@@ -411,6 +411,9 @@ func (d *DownloadRemuxer) convertDownload(ctx context.Context, req core.Download
 		opts.SubtitleStream = -1
 	}
 	dec := d.m.Decide(req.Info, downloadProfile(req.Caps), opts)
+	if d.m.VideoTranscodingOff() && !dec.VideoCopy {
+		return "", 0, ErrVideoTranscodingDisabled
+	}
 	if dec.Kind == core.DecisionDirectPlay {
 		dec.Kind = core.DecisionRemux
 		dec.VideoCopy, dec.AudioCopy = true, true

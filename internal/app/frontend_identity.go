@@ -3,8 +3,11 @@ package app
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"errors"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/braedonsaunders/ether/internal/core"
@@ -13,8 +16,12 @@ import (
 )
 
 type surfaceIdentity struct {
+	app         *App
+	policy      core.FrontendHostPolicy
 	settings    func() frontend.Settings
+	hostConfig  func() frontend.HostConfig
 	surface     frontend.Protocol
+	users       core.Auth
 	resolver    *identity.Resolver
 	local       *identity.Local
 	grants      *identity.Grants
@@ -29,6 +36,52 @@ func (s surfaceIdentity) Resolve(ctx context.Context, credential string) (*core.
 	}
 	return s.resolver.Resolve(ctx, string(s.surface), credential)
 }
+
+func (s surfaceIdentity) Accept(ctx context.Context, token string) (*core.Viewer, frontend.CredentialAcceptance, error) {
+	if !s.policy.ExternalIdentity || core.IsGrantCredential(token) {
+		return nil, frontend.CredentialAcceptance{}, core.ErrUnauthorized
+	}
+	if acc, ok := s.users.(frontend.CredentialAcceptor); ok {
+		return acc.Accept(ctx, token)
+	}
+	u, err := s.Resolve(ctx, token)
+	return u, frontend.CredentialAcceptance{}, err
+}
+
+func (s surfaceIdentity) ReceiptCurrent(ctx context.Context, r frontend.CredentialAcceptance) error {
+	if !s.policy.ExternalIdentity {
+		return core.ErrUnauthorized
+	}
+	if acc, ok := s.users.(frontend.CredentialAcceptor); ok {
+		return acc.ReceiptCurrent(ctx, r)
+	}
+	return core.ErrUnauthorized
+}
+
+func (s surfaceIdentity) IssueDelegation(ctx context.Context, userID int64) (string, error) {
+	if !s.policy.ExternalIdentity {
+		return "", core.ErrUnauthorized
+	}
+	if del, ok := s.users.(frontend.DelegationAuth); ok {
+		return del.IssueDelegation(ctx, userID)
+	}
+	return "", core.ErrUnauthorized
+}
+
+func (s surfaceIdentity) ActiveUser(ctx context.Context, id int64) (*core.User, error) {
+	if act, ok := s.users.(frontend.ActiveUserSource); ok {
+		return act.ActiveUser(ctx, id)
+	}
+	return nil, core.ErrUnauthorized
+}
+
+func (s surfaceIdentity) Users(ctx context.Context) ([]core.User, error) {
+	if s.users == nil {
+		return nil, nil
+	}
+	return s.users.Users(ctx)
+}
+
 func (s surfaceIdentity) ViewerTimes(ctx context.Context, credential string, target int64) (frontend.ViewerTimes, error) {
 	if s.times == nil || target <= 0 {
 		return frontend.ViewerTimes{}, core.ErrUnauthorized
@@ -45,14 +98,14 @@ func (s surfaceIdentity) ViewerTimes(ctx context.Context, credential string, tar
 
 // ResolveDevice binds validation to the stored surface and device without writes.
 func (s surfaceIdentity) ResolveDevice(ctx context.Context, credential string, device core.Device) (*core.Viewer, time.Time, error) {
-	if s.surface == "" || s.surface == "plex" || s.grants == nil {
+	if s.surface == "" || s.policy.ExternalIdentity || s.grants == nil {
 		return nil, time.Time{}, core.ErrUnauthorized
 	}
 	return s.grants.ResolveDevice(ctx, string(s.surface), credential, device)
 }
 
 func (s surfaceIdentity) ResolveGrantDevice(ctx context.Context, credential, claim string) (*core.Viewer, core.Device, time.Time, error) {
-	if s.surface == "" || s.surface == "plex" || s.grants == nil {
+	if s.surface == "" || s.policy.ExternalIdentity || s.grants == nil {
 		return nil, core.Device{}, time.Time{}, core.ErrUnauthorized
 	}
 	return s.grants.ResolveGrantDevice(ctx, string(s.surface), credential, claim)
@@ -63,19 +116,19 @@ func (s surfaceIdentity) allow(ctx context.Context, limiter *identity.LoginLimit
 	if !ok || ip.IsUnspecified() || ip.IsMulticast() {
 		return core.ErrUnauthorized
 	}
-	allowed, err := limiter.Allow(ctx, key, ip)
+	allowed, retry, err := limiter.AllowWithRetry(ctx, key, ip)
 	if err != nil {
 		return err
 	}
 	if !allowed {
-		return frontend.ErrRateLimited
+		return &frontend.IdentityRateLimitError{RetryAfter: retry}
 	}
 	return nil
 }
 
 // PublicViewers returns only active local sign-in names when the owner enables the picker.
 func (s surfaceIdentity) PublicViewers(ctx context.Context) ([]frontend.PublicViewer, error) {
-	if s.surface == "plex" || s.settings == nil || s.local == nil {
+	if s.policy.ExternalIdentity || s.settings == nil || s.local == nil {
 		return []frontend.PublicViewer{}, nil
 	}
 	enabled, _ := s.settings()["publicViewerPicker"].(bool)
@@ -88,25 +141,142 @@ func (s surfaceIdentity) PublicViewers(ctx context.Context) ([]frontend.PublicVi
 	return s.local.PublicViewers(ctx)
 }
 func (s surfaceIdentity) SignIn(ctx context.Context, username, password string, device core.Device) (string, error) {
-	if s.surface == "plex" {
+	if s.policy.ExternalIdentity {
 		return "", core.ErrUnauthorized
 	}
+	remoteIP := ""
+	if ip, ok := frontend.ClientIP(ctx); ok && ip.IsValid() {
+		remoteIP = ip.String()
+	}
+	clientName := device.Product
+	if clientName == "" {
+		clientName = device.Client
+		if clientName == "" {
+			clientName = device.DeviceName
+		}
+	}
 	if err := s.allow(ctx, s.login, username); err != nil {
+		s.app.emitLoginFailed(username, "password", "rate_limited", clientName, string(s.surface), remoteIP)
 		return "", err
 	}
 	if core.IsGrantCredential(password) {
 		if s.grants == nil {
+			s.app.emitLoginFailed(username, "grant", "unavailable", clientName, string(s.surface), remoteIP)
 			return "", core.ErrUnauthorized
 		}
-		return s.grants.SignInWithGrant(ctx, string(s.surface), username, password, device)
+		tok, err := s.grants.SignInWithGrant(ctx, string(s.surface), username, password, device)
+		if err != nil {
+			s.app.emitLoginFailed(username, "grant", "invalid_credentials", clientName, string(s.surface), remoteIP)
+			return "", err
+		}
+		var viewerID int64
+		if v, rerr := s.Resolve(ctx, tok); rerr == nil && v != nil {
+			viewerID = v.ID
+			if v.Username != "" {
+				username = v.Username
+			}
+		}
+		s.app.emitLoginSucceeded(viewerID, username, "grant", clientName, string(s.surface), remoteIP)
+		return tok, nil
 	}
 	viewer, link, err := s.local.Authenticate(ctx, username, password)
 	if err != nil {
+		s.app.emitLoginFailed(username, "password", "invalid_credentials", clientName, string(s.surface), remoteIP)
 		return "", err
 	}
 	// The grant is the sign-in. Login timestamps are recorded after the
 	// response so a large catalogue database cannot hold the client open.
-	return s.grants.Issue(ctx, viewer, &link, string(s.surface), device)
+	tok, err := s.grants.Issue(ctx, viewer, &link, string(s.surface), device)
+	if err != nil {
+		s.app.emitLoginFailed(username, "password", "grant_issue_failed", clientName, string(s.surface), remoteIP)
+		return "", err
+	}
+	s.app.emitLoginSucceeded(viewer, username, "password", clientName, string(s.surface), remoteIP)
+	return tok, nil
+}
+func (s surfaceIdentity) SignInWithPlex(ctx context.Context, plexToken string, device core.Device) (string, error) {
+	if s.policy.ExternalIdentity || s.grants == nil || s.login == nil || s.users == nil {
+		return "", core.ErrUnauthorized
+	}
+	ip, ok := frontend.ClientIP(ctx)
+	if !ok || ip.IsUnspecified() || ip.IsMulticast() {
+		return "", core.ErrUnauthorized
+	}
+	remoteIP := ip.String()
+	clientName := device.Product
+	if clientName == "" {
+		clientName = device.Client
+		if clientName == "" {
+			clientName = device.DeviceName
+		}
+	}
+	exceeded, err := s.login.IPExceeded(ctx, ip)
+	if err != nil {
+		return "", err
+	}
+	if exceeded {
+		s.app.emitLoginFailed("", "plex", "rate_limited", clientName, string(s.surface), remoteIP)
+		return "", s.allow(ctx, s.login, ip.String())
+	}
+	if s.hostConfig != nil {
+		if cfgTok := strings.TrimSpace(s.hostConfig().Plex.Token); cfgTok != "" && subtle.ConstantTimeCompare([]byte(strings.TrimSpace(plexToken)), []byte(cfgTok)) == 1 {
+			if err := s.allow(ctx, s.login, ip.String()); err != nil {
+				s.app.emitLoginFailed("", "plex", "rate_limited", clientName, string(s.surface), remoteIP)
+				return "", err
+			}
+			s.app.emitLoginFailed("", "plex", "invalid_credentials", clientName, string(s.surface), remoteIP)
+			return "", core.ErrUnauthorized
+		}
+	}
+	plexAuth, ok := s.users.(plexAccountAuthenticator)
+	if !ok {
+		if err := s.allow(ctx, s.login, ip.String()); err != nil {
+			return "", err
+		}
+		s.app.emitLoginFailed("", "plex", "unavailable", clientName, string(s.surface), remoteIP)
+		return "", core.ErrUnauthorized
+	}
+	user, plexID, authErr := plexAuth.AuthenticatePlexAccount(ctx, plexToken)
+	key := ip.String()
+	if plexID != 0 {
+		key = "plex:" + strconv.FormatInt(plexID, 10)
+	}
+	if err := s.allow(ctx, s.login, key); err != nil {
+		s.app.emitLoginFailed("", "plex", "rate_limited", clientName, string(s.surface), remoteIP)
+		return "", err
+	}
+	if authErr != nil {
+		if errors.Is(authErr, frontend.ErrPlexNotShared) {
+			s.app.emitLoginFailed("", "plex", "not_shared", clientName, string(s.surface), remoteIP)
+			return "", frontend.ErrPlexNotShared
+		}
+		if errors.Is(authErr, frontend.ErrPlexUnreachable) {
+			s.app.emitLoginFailed("", "plex", "plex_unreachable", clientName, string(s.surface), remoteIP)
+			return "", frontend.ErrPlexUnreachable
+		}
+		if errors.Is(authErr, context.Canceled) {
+			return "", authErr
+		}
+		s.app.emitLoginFailed("", "plex", "invalid_credentials", clientName, string(s.surface), remoteIP)
+		return "", core.ErrUnauthorized
+	}
+	if user == nil || user.ID <= 0 {
+		s.app.emitLoginFailed("", "plex", "invalid_credentials", clientName, string(s.surface), remoteIP)
+		return "", core.ErrUnauthorized
+	}
+	var linkID *int64
+	if linker, ok := s.users.(interface {
+		PlexLinkID(context.Context, int64, int64) *int64
+	}); ok {
+		linkID = linker.PlexLinkID(ctx, user.ID, plexID)
+	}
+	tok, err := s.grants.Issue(ctx, user.ID, linkID, string(s.surface), device)
+	if err != nil {
+		s.app.emitLoginFailed(user.Username, "plex", "grant_issue_failed", clientName, string(s.surface), remoteIP)
+		return "", err
+	}
+	s.app.emitLoginSucceeded(user.ID, user.Username, "plex", clientName, string(s.surface), remoteIP)
+	return tok, nil
 }
 func (s surfaceIdentity) IssueRefresh(ctx context.Context, access string, device core.Device) (string, error) {
 	return s.grants.IssueRefresh(ctx, string(s.surface), access, device)
@@ -122,7 +292,7 @@ func (s surfaceIdentity) Refresh(ctx context.Context, token string, device core.
 	return access, refresh, err
 }
 func (s surfaceIdentity) QuickConnectInitiate(ctx context.Context, device core.Device) (string, string, error) {
-	if s.surface == "plex" {
+	if s.policy.ExternalIdentity {
 		return "", "", core.ErrUnauthorized
 	}
 	if err := s.allow(ctx, s.login, "quickconnect-init"); err != nil {
@@ -131,7 +301,7 @@ func (s surfaceIdentity) QuickConnectInitiate(ctx context.Context, device core.D
 	return s.quick.Initiate(ctx, string(s.surface), device)
 }
 func (s surfaceIdentity) QuickConnectPoll(ctx context.Context, secret string) (string, error) {
-	if s.surface == "plex" {
+	if s.policy.ExternalIdentity {
 		return "", core.ErrUnauthorized
 	}
 	if err := s.allow(ctx, s.poll, secret); err != nil {
@@ -146,7 +316,7 @@ func (s surfaceIdentity) QuickConnectPoll(ctx context.Context, secret string) (s
 
 // QuickConnectPollDevice redeems or replays a secret for one device.
 func (s surfaceIdentity) QuickConnectPollDevice(ctx context.Context, secret string, device core.Device) (string, error) {
-	if s.surface == "plex" {
+	if s.policy.ExternalIdentity {
 		return "", core.ErrUnauthorized
 	}
 	if err := s.allow(ctx, s.poll, secret); err != nil {
@@ -168,7 +338,7 @@ func (s surfaceIdentity) NoteSignIn(ctx context.Context, viewerID int64) error {
 }
 
 func (s surfaceIdentity) QuickConnectStatus(ctx context.Context, secret string) (bool, error) {
-	if s.surface == "plex" {
+	if s.policy.ExternalIdentity {
 		return false, core.ErrUnauthorized
 	}
 	if err := s.allow(ctx, s.poll, secret); err != nil {
@@ -178,7 +348,7 @@ func (s surfaceIdentity) QuickConnectStatus(ctx context.Context, secret string) 
 }
 
 func (s surfaceIdentity) QuickConnectDetails(ctx context.Context, secret string) (frontend.QuickConnectDetails, error) {
-	if s.surface == "plex" {
+	if s.policy.ExternalIdentity {
 		return frontend.QuickConnectDetails{}, core.ErrUnauthorized
 	}
 	if err := s.allow(ctx, s.poll, secret); err != nil {
@@ -191,16 +361,27 @@ func (s surfaceIdentity) QuickConnectDetails(ctx context.Context, secret string)
 	return frontend.QuickConnectDetails{Approved: details.Approved, Code: details.Code, Secret: secret, Device: details.Device, CreatedAt: details.CreatedAt, ExpiresAt: details.ExpiresAt}, nil
 }
 func (s surfaceIdentity) QuickConnectApprove(ctx context.Context, viewer *core.Viewer, code string) error {
-	if s.surface == "plex" || viewer == nil || viewer.ID <= 0 {
+	if s.policy.ExternalIdentity || s.quick == nil || s.login == nil {
+		return frontend.ErrIdentityUnavailable
+	}
+	if viewer == nil || viewer.ID <= 0 || viewer.Delegated {
 		return core.ErrUnauthorized
 	}
 	if err := s.allow(ctx, s.login, "quickconnect-approve"); err != nil {
 		return err
 	}
-	return s.quick.ApproveSurface(ctx, string(s.surface), code, viewer.ID)
+	err := s.quick.ApproveSurface(ctx, string(s.surface), code, viewer.ID)
+	switch {
+	case errors.Is(err, identity.ErrQuickConnectExpired):
+		return frontend.ErrQuickConnectExpired
+	case errors.Is(err, identity.ErrQuickConnectUsed):
+		return frontend.ErrQuickConnectUsed
+	default:
+		return err
+	}
 }
 func (s surfaceIdentity) Revoke(ctx context.Context, credential string) error {
-	if s.surface == "plex" {
+	if s.policy.ExternalIdentity {
 		return core.ErrUnauthorized
 	}
 	viewer, err := s.Resolve(ctx, credential)
@@ -226,8 +407,12 @@ func (s surfaceIdentity) AuthenticateAppPassword(ctx context.Context, username, 
 	}
 	// Valid app passwords authenticate each API/Range request. Charging those
 	// against the interactive sign-in budget would lock out a normal startup.
-	if core.IsGrantCredential(password) && username == frontend.XtreamUsername(password) {
-		viewer, err := s.Resolve(ctx, password)
+	credential, short := frontend.XtreamGrantCredential(username, password)
+	if !short {
+		credential = password
+	}
+	if short || len(username) <= 128 && len(password) <= 128 && core.IsGrantCredential(password) && username == frontend.XtreamUsername(password) {
+		viewer, err := s.Resolve(ctx, credential)
 		if err == nil && viewer != nil {
 			return viewer, nil
 		}
@@ -236,4 +421,97 @@ func (s surfaceIdentity) AuthenticateAppPassword(ctx context.Context, username, 
 		return nil, err
 	}
 	return nil, core.ErrUnauthorized
+}
+
+// RedeemWebCode is available only on the Jellyfin surface and shares its normal
+// sign-in rate limits and device grant lifecycle.
+func (s surfaceIdentity) RedeemWebCode(ctx context.Context, code, browser, existing string) (string, int64, error) {
+	if s.surface != "jellyfin" || s.grants == nil || s.login == nil {
+		return "", 0, core.ErrUnauthorized
+	}
+	if err := s.allow(ctx, s.login, "ether-web"); err != nil {
+		return "", 0, err
+	}
+	return s.grants.RedeemWebCode(ctx, code, browser, existing)
+}
+
+// RedeemDeviceWebCode exchanges a console handoff for the bound surface.
+func (s surfaceIdentity) RedeemDeviceWebCode(ctx context.Context, code string, device core.Device) (string, error) {
+	if s.grants == nil || s.policy.ExternalIdentity {
+		return "", core.ErrUnauthorized
+	}
+	if err := s.allow(ctx, s.login, "ether-web"); err != nil {
+		return "", err
+	}
+	token, _, err := s.grants.RedeemDeviceWebCode(ctx, code, string(s.surface), device, "")
+	return token, err
+}
+
+func (s surfaceIdentity) GrantScope(ctx context.Context, token string, device core.Device) (string, error) {
+	if s.grants == nil || s.policy.ExternalIdentity {
+		return "", core.ErrUnauthorized
+	}
+	return s.grants.GrantScope(ctx, string(s.surface), token, device)
+}
+func (s surfaceIdentity) GrantScopeCurrent(ctx context.Context, scope string, device core.Device) (*core.Viewer, error) {
+	if s.grants == nil || s.policy.ExternalIdentity {
+		return nil, core.ErrUnauthorized
+	}
+	return s.grants.GrantScopeCurrent(ctx, string(s.surface), scope, device)
+}
+func (s surfaceIdentity) plexConfigured() bool {
+	if s.users == nil {
+		return false
+	}
+	if owner, err := s.users.Owner(context.Background()); err == nil && owner != nil && owner.PlexID != 0 {
+		return true
+	}
+	if s.hostConfig != nil {
+		p := s.hostConfig().Plex
+		if p.Claimed || p.OwnerPlexID != 0 {
+			return true
+		}
+	}
+	return false
+}
+func (s surfaceIdentity) AuthenticationFeatures() frontend.AuthenticationFeatures {
+	native := !s.policy.ExternalIdentity && s.grants != nil && s.login != nil
+	return frontend.AuthenticationFeatures{
+		Password:          native && s.local != nil,
+		QuickConnect:      native && s.quick != nil && s.poll != nil,
+		PlexAccountSignIn: native && s.plexConfigured(),
+		HouseholdProfiles: native && s.plexHomeProfilesSupported(),
+	}
+}
+
+// IssueOriginWebCode is invoked only after the adapter validates a published
+// HTTPS destination and proves the caller's current device grant.
+func (s surfaceIdentity) IssueOriginWebCode(ctx context.Context, access string, device core.Device, origin string) (string, error) {
+	if s.surface != "vela" || s.grants == nil || s.policy.ExternalIdentity {
+		return "", core.ErrUnauthorized
+	}
+	if err := s.allow(ctx, s.login, "ether-web"); err != nil {
+		return "", err
+	}
+	v, _, err := s.grants.ResolveDevice(ctx, string(s.surface), access, device)
+	if err != nil {
+		return "", err
+	}
+	return s.grants.IssueOriginWebCode(ctx, v.ID, string(s.surface), origin)
+}
+func (s surfaceIdentity) RedeemOriginWebCode(ctx context.Context, code string, device core.Device, origin string) (string, error) {
+	if s.surface != "vela" || s.grants == nil || s.policy.ExternalIdentity {
+		return "", core.ErrUnauthorized
+	}
+	if err := s.allow(ctx, s.login, "ether-web"); err != nil {
+		return "", err
+	}
+	token, _, err := s.grants.RedeemOriginWebCode(ctx, code, string(s.surface), device, origin)
+	return token, err
+}
+
+// plexAccountAuthenticator validates a plex.tv account token for native
+// surface sign-in without accepting server, delegation or grant credentials.
+type plexAccountAuthenticator interface {
+	AuthenticatePlexAccount(context.Context, string) (*frontend.User, int64, error)
 }

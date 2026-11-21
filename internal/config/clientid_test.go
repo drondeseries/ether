@@ -1,178 +1,181 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
 
 func TestClientIdentityResolve(t *testing.T) {
-	ether := identityPresets[IdentityEther].UserAgent
-	stack := ClientIdentity{TVSearch: IdentitySonarr, MovieSearch: IdentityRadarr}
-	tests := []struct {
+	ether := DefaultUserAgent()
+	if !strings.HasPrefix(ether, "Ether/") || !strings.HasSuffix(ether, "(+https://github.com/braedonsaunders/ether)") {
+		t.Fatalf("DefaultUserAgent() = %q", ether)
+	}
+	headers := map[string]string{"X-Api-Client": "ether"}
+
+	cases := []struct {
 		name     string
 		policy   ClientIdentity
 		override string
-		purpose  string
-		tv       bool
 		want     string
 	}{
-		{"empty policy keeps ether", ClientIdentity{}, "", IdentitySearch, true, ether},
-		{"empty policy movie search", ClientIdentity{}, "", IdentitySearch, false, ether},
-		{"empty policy tv grab", ClientIdentity{}, "", IdentityGrab, true, ether},
-		{"empty policy movie grab", ClientIdentity{}, "", IdentityGrab, false, ether},
-		{"stack tv search", stack, "", IdentitySearch, true, "Sonarr/4.0.20.3014 (ubuntu 26.04)"},
-		{"stack movie search", stack, "", IdentitySearch, false, "Radarr/6.4.4.10685 (ubuntu 26.04)"},
-		// An unset field is the Ether identity; nothing is copied from another.
-		{"unset tv grab stays ether", stack, "", IdentityGrab, true, ether},
-		{"unset movie grab stays ether", stack, "", IdentityGrab, false, ether},
-		{
-			"tv grab only",
-			ClientIdentity{TVGrab: IdentityNZBGet},
-			"", IdentityGrab, true, "nzbget/26.3",
-		},
-		{
-			"tv grab does not touch the searches",
-			ClientIdentity{TVGrab: IdentityNZBGet},
-			"", IdentitySearch, true, ether,
-		},
-		{
-			"tv grab does not touch the movie grab",
-			ClientIdentity{TVSearch: IdentitySonarr, MovieSearch: IdentityRadarr, TVGrab: IdentityNZBGet},
-			"", IdentityGrab, false, ether,
-		},
-		{
-			"movie grab only",
-			ClientIdentity{MovieGrab: IdentitySABnzbd},
-			"", IdentityGrab, false, "SABnzbd/5.1.3",
-		},
-		{
-			"movie grab does not touch the movie search",
-			ClientIdentity{TVSearch: IdentitySonarr, MovieGrab: IdentitySABnzbd},
-			"", IdentitySearch, false, ether,
-		},
-		{
-			"tv search only leaves the other three on ether",
-			ClientIdentity{TVSearch: IdentitySonarr},
-			"", IdentitySearch, false, ether,
-		},
-		{"indexer override wins for search", stack, IdentityProwlarr, IdentitySearch, true, "Prowlarr/2.7.0.5723 (ubuntu 26.04)"},
-		{"indexer override wins for grab", stack, IdentityProwlarr, IdentityGrab, false, "Prowlarr/2.7.0.5723 (ubuntu 26.04)"},
-		{"unknown selector keeps ether", ClientIdentity{TVSearch: "nope"}, "", IdentitySearch, true, ether},
+		{"empty policy uses ether default", ClientIdentity{}, "", ether},
+		{"blank policy uses ether default", ClientIdentity{UserAgent: "   "}, "", ether},
+		{"global user agent", ClientIdentity{UserAgent: "MyClient/2.0"}, "", "MyClient/2.0"},
+		{"indexer override wins over empty policy", ClientIdentity{}, "IndexerUA/1.0", "IndexerUA/1.0"},
+		{"indexer override wins over global", ClientIdentity{UserAgent: "GlobalUA/1.0"}, "IndexerUA/1.0", "IndexerUA/1.0"},
+		{"blank indexer override inherits global", ClientIdentity{UserAgent: "GlobalUA/1.0"}, "  ", "GlobalUA/1.0"},
 	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			got := tc.policy.Resolve(tc.override, tc.purpose, tc.tv)
-			if got.UserAgent != tc.want {
-				t.Fatalf("user agent = %q, want %q", got.UserAgent, tc.want)
-			}
-		})
-	}
-}
-
-func TestClientIdentityCustom(t *testing.T) {
-	headers := map[string]string{"X-Api-Client": "ether"}
-	p := ClientIdentity{TVSearch: IdentityCustom, UserAgent: "MyClient/2.0", Headers: headers}
-	got := p.Resolve("", IdentitySearch, true)
-	if got.Preset != IdentityCustom || got.UserAgent != "MyClient/2.0" || got.Headers["X-Api-Client"] != "ether" {
-		t.Fatalf("custom identity = %+v", got)
-	}
-	// A custom identity with no user agent falls back to Ether's.
-	if ua := (ClientIdentity{TVSearch: IdentityCustom}).Resolve("", IdentitySearch, true).UserAgent; ua != "Ether/1.0" {
-		t.Fatalf("empty custom user agent = %q", ua)
+	for _, tc := range cases {
+		p := tc.policy
+		p.Headers = headers
+		got := p.Resolve(tc.override)
+		if got.UserAgent != tc.want {
+			t.Errorf("%s: got %q, want %q", tc.name, got.UserAgent, tc.want)
+		}
+		if got.Headers["X-Api-Client"] != "ether" {
+			t.Errorf("%s: headers not preserved: %+v", tc.name, got.Headers)
+		}
 	}
 }
 
 func TestClientIdentityValidate(t *testing.T) {
-	cases := []struct {
+	bad := []struct {
 		name   string
 		policy ClientIdentity
 		field  string
 	}{
-		{"unknown tv search", ClientIdentity{TVSearch: "nzbgeon"}, "tvSearch"},
-		{"unknown movie search", ClientIdentity{MovieSearch: "nzbgeon"}, "movieSearch"},
-		{"unknown tv grab", ClientIdentity{TVGrab: "nzbgeon"}, "tvGrab"},
-		{"sabnzbd as a tv search", ClientIdentity{TVSearch: IdentitySABnzbd}, "tvSearch"},
-		{"nzbget as a movie search", ClientIdentity{MovieSearch: IdentityNZBGet}, "movieSearch"},
-		{"unknown movie grab", ClientIdentity{MovieGrab: "nzbgeon"}, "movieGrab"},
-		{"custom without a user agent", ClientIdentity{TVSearch: IdentityCustom}, "userAgent"},
 		{"line break in user agent", ClientIdentity{UserAgent: "a\r\nb"}, "userAgent"},
+		{"control char in user agent", ClientIdentity{UserAgent: "bad\x07ua"}, "userAgent"},
+		{"overlong user agent", ClientIdentity{UserAgent: strings.Repeat("a", 513)}, "userAgent"},
 		{"line break in a header", ClientIdentity{Headers: map[string]string{"X-Test": "a\nb"}}, "headers"},
+		{"control char in a header", ClientIdentity{Headers: map[string]string{"X-Test": "a\x7fb"}}, "headers"},
 		{"transport header", ClientIdentity{Headers: map[string]string{"Accept-Encoding": "gzip"}}, "headers"},
 		{"host header", ClientIdentity{Headers: map[string]string{"Host": "other"}}, "headers"},
 		{"user agent header", ClientIdentity{Headers: map[string]string{"User-Agent": "x"}}, "headers"},
 		{"bad header name", ClientIdentity{Headers: map[string]string{"X Test": "v"}}, "headers"},
 		{"duplicate header names", ClientIdentity{Headers: map[string]string{"X-Test": "v", "x-test": "w"}}, "headers"},
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			errs := tc.policy.Validate()
-			if len(errs) == 0 {
-				t.Fatal("expected an error")
+	for _, tc := range bad {
+		errs := tc.policy.Validate()
+		found := false
+		for _, e := range errs {
+			if e.Field == tc.field {
+				found = true
 			}
-			for _, e := range errs {
-				if e.Field == tc.field {
-					return
-				}
-			}
-			t.Fatalf("no error for %q in %+v", tc.field, errs)
-		})
+		}
+		if !found {
+			t.Errorf("%s: expected error on %q, got %+v", tc.name, tc.field, errs)
+		}
 	}
 }
 
 func TestClientIdentityValidateAccepts(t *testing.T) {
-	headers := map[string]string{"X-Api-Client": "ether"}
-	for i := 1; i < 16; i++ {
-		headers["X-Test-"+strings.Repeat("a", i)] = "v"
-	}
 	ok := ClientIdentity{
-		TVSearch: IdentitySonarr, MovieSearch: IdentityRadarr,
-		TVGrab: IdentityNZBGet, MovieGrab: IdentitySABnzbd,
-		// Dormant custom values survive while no selector is Custom.
-		UserAgent: "MyClient/2.0",
-		Headers:   headers,
+		UserAgent: "CustomClient/1.2 (+https://example.com)",
+		Headers:   map[string]string{"X-Custom": "ok"},
 	}
 	if errs := ok.Validate(); len(errs) != 0 {
 		t.Fatalf("unexpected errors: %+v", errs)
 	}
 	if errs := (ClientIdentity{}).Validate(); len(errs) != 0 {
-		t.Fatalf("empty policy: %+v", errs)
+		t.Fatalf("empty policy rejected: %+v", errs)
 	}
 }
 
-func TestValidIndexerIdentity(t *testing.T) {
-	for _, name := range []string{IdentityEther, IdentitySonarr, IdentityRadarr, IdentityProwlarr, IdentityNZBHydra2, IdentitySABnzbd, IdentityNZBGet} {
-		if !ValidIndexerIdentity(name) {
-			t.Errorf("%q rejected", name)
+func TestClientIdentityUpgradeMigration(t *testing.T) {
+	t.Run("movieSearch radarr and indexer sonarr upgrade to exact UA strings", func(t *testing.T) {
+		dir := t.TempDir()
+		raw := `{
+			"clientIdentity": {
+				"tvSearch": "ether",
+				"movieSearch": "radarr",
+				"tvGrab": "nzbget",
+				"headers": {"X-Owner": "kept"}
+			},
+			"indexers": [
+				{"id": "ix-sonarr", "name": "SonarrIdx", "url": "https://a.example", "clientIdentity": "sonarr"},
+				{"id": "ix-ether", "name": "EtherIdx", "url": "https://b.example", "clientIdentity": "ether"},
+				{"id": "ix-custom", "name": "CustomIdx", "url": "https://c.example", "clientIdentity": "custom"},
+				{"id": "ix-unset", "name": "UnsetIdx", "url": "https://d.example"}
+			]
+		}`
+		if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(raw), 0o600); err != nil {
+			t.Fatal(err)
 		}
-	}
-	for _, name := range []string{"", IdentityCustom, "nope"} {
-		if ValidIndexerIdentity(name) {
-			t.Errorf("%q accepted", name)
+		store, err := Open(dir)
+		if err != nil {
+			t.Fatal(err)
 		}
-	}
-}
+		cfg := store.Get()
+		if got, want := cfg.ClientIdentity.UserAgent, "Radarr/6.4.4.10685 (ubuntu 26.04)"; got != want {
+			t.Fatalf("global userAgent = %q, want %q", got, want)
+		}
+		if got := cfg.ClientIdentity.Headers["X-Owner"]; got != "kept" {
+			t.Fatalf("headers lost on upgrade: %+v", cfg.ClientIdentity.Headers)
+		}
+		wantIx := map[string]string{
+			"ix-sonarr": "Sonarr/4.0.20.3014 (ubuntu 26.04)",
+			"ix-ether":  "",
+			"ix-custom": "",
+			"ix-unset":  "",
+		}
+		for _, ix := range cfg.Indexers {
+			if got, want := ix.UserAgent, wantIx[ix.ID]; got != want {
+				t.Fatalf("indexer %s userAgent = %q, want %q", ix.ID, got, want)
+			}
+		}
+		// Retired keys must be removed from the rewritten config.json.
+		saved, err := os.ReadFile(filepath.Join(dir, "config.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, retired := range []string{`"tvSearch"`, `"movieSearch"`, `"tvGrab"`, `"movieGrab"`} {
+			if strings.Contains(string(saved), retired) {
+				t.Fatalf("retired field %s still in config.json:\n%s", retired, saved)
+			}
+		}
+	})
 
-func TestIdentityPresets(t *testing.T) {
-	presets := IdentityPresets()
-	want := []string{IdentityEther, IdentitySonarr, IdentityRadarr, IdentityProwlarr, IdentityNZBHydra2, IdentitySABnzbd, IdentityNZBGet}
-	if len(presets) != len(want) {
-		t.Fatalf("presets = %d, want %d", len(presets), len(want))
-	}
-	for i, key := range want {
-		if presets[i].Key != key {
-			t.Fatalf("preset %d = %q, want %q", i, presets[i].Key, key)
+	t.Run("ether and unset stay empty", func(t *testing.T) {
+		cfg, changed, err := decodeStartupConfig(Defaults(t.TempDir()), []byte(`{
+			"clientIdentity": {"tvSearch": "ether", "movieSearch": ""},
+			"indexers": [{"id": "i1", "name": "Idx", "url": "https://a.example", "clientIdentity": "ether"}]
+		}`))
+		if err != nil {
+			t.Fatal(err)
 		}
-		if got, want := presets[i].UserAgent, identityPresets[key].UserAgent; got != want {
-			t.Fatalf("%s user agent = %q, want %q", key, got, want)
+		if !changed {
+			t.Fatal("expected retired fields to report changed=true")
 		}
-	}
-	// Display must not be able to change the wire table.
-	for _, p := range presets {
-		for name := range p.Headers {
-			p.Headers[name] = "mutated"
+		if cfg.ClientIdentity.UserAgent != "" {
+			t.Fatalf("ether upgraded to non-empty userAgent %q", cfg.ClientIdentity.UserAgent)
 		}
-	}
-	if got := identityPresets[IdentitySonarr].Headers["Accept"]; got != servarrAccept {
-		t.Fatalf("preset headers were mutated: %q", got)
-	}
+		if len(cfg.Indexers) != 1 || cfg.Indexers[0].UserAgent != "" {
+			t.Fatalf("ether indexer override not cleared: %+v", cfg.Indexers)
+		}
+	})
+
+	t.Run("slot order wins and custom keeps existing userAgent", func(t *testing.T) {
+		cfg, _, err := decodeStartupConfig(Defaults(t.TempDir()), []byte(`{
+			"clientIdentity": {"tvGrab": "sabnzbd", "movieGrab": "nzbget"}
+		}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := cfg.ClientIdentity.UserAgent, "SABnzbd/5.1.3"; got != want {
+			t.Fatalf("slot order userAgent = %q, want %q", got, want)
+		}
+
+		customCfg, _, err := decodeStartupConfig(Defaults(t.TempDir()), []byte(`{
+			"clientIdentity": {"tvSearch": "custom", "movieSearch": "radarr", "userAgent": "MyOwn/3.1"}
+		}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := customCfg.ClientIdentity.UserAgent; got != "MyOwn/3.1" {
+			t.Fatalf("custom userAgent overwritten: %q", got)
+		}
+	})
 }

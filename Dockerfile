@@ -12,14 +12,29 @@
 #   scripts/fetch-ffmpeg.sh linux-$(go env GOARCH) && docker build .
 # docker buildx per-arch builds pass TARGETARCH automatically.
 
+# ---- build the web console (embedded by go:embed) --------------------------
+FROM --platform=$BUILDPLATFORM node:25-alpine AS web
+ENV NODE_OPTIONS="--max-old-space-size=4096"
+# Node 25 no longer bundles Corepack. Keep pnpm on the same major as CI.
+RUN npm install --global pnpm@10
+WORKDIR /src/web
+COPY web/package.json web/pnpm-lock.yaml web/.pnpmfile.cjs ./
+RUN pnpm install --frozen-lockfile
+# Style Studio/On Air and schema typechecks import shared data from internal/.
+COPY internal/onair/ /src/internal/onair/
+COPY internal/config/schema/testdata/ /src/internal/config/schema/testdata/
+COPY web/ ./
+RUN pnpm build && test -f /src/internal/admin/dist/index.html
+
 # ---- build the server (pure Go) -------------------------------------------
-FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.27.4-alpine AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 # go.mod replaces qjs with the vendored sandbox fork; it must exist before download.
 COPY third_party/ third_party/
 RUN go mod download
 COPY . .
+COPY --from=web /src/internal/admin/dist/ internal/admin/dist/
 ARG TARGETOS TARGETARCH
 ARG VERSION=dev
 ARG COMMIT=
@@ -28,7 +43,7 @@ ARG ETHER_UPDATE_PUBLIC_KEY=
 # BuildKit keeps the input out of image metadata; the resulting binary embeds it.
 RUN --mount=type=secret,id=ETHER_TMDB_BUNDLED_KEY \
     ETHER_TMDB_BUNDLED_KEY="$(cat /run/secrets/ETHER_TMDB_BUNDLED_KEY 2>/dev/null || true)" && \
-    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build \
+    CGO_ENABLED=0 GOEXPERIMENT=simd GOOS=$TARGETOS GOARCH=$TARGETARCH go build \
       -trimpath \
       -ldflags "-s -w \
         -X github.com/braedonsaunders/ether/internal/updater.Version=${VERSION} \
@@ -92,6 +107,9 @@ ENV ETHER_DATA_DIR=/config \
 # work with host networking; EXPOSE is documentation here.
 EXPOSE 32400/tcp 32410-32414/udp
 VOLUME ["/config", "/cache"]
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10m --retries=3 \
+  CMD ["/usr/lib/ether/ether", "healthcheck"]
 
 # Starts as root only to hand the volumes to PUID:PGID (default 999, the
 # ether account) and drop privileges; see packaging/docker/entrypoint.sh.

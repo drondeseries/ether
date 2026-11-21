@@ -3,10 +3,10 @@ package newznab
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
-	"strings"
 	"sync"
 
 	"github.com/braedonsaunders/ether/internal/config"
@@ -25,6 +25,14 @@ func init() {
 var (
 	apiMaxAttr  = regexp.MustCompile(`(?i)apimax\W{0,4}(\d{1,9})`)
 	grabMaxAttr = regexp.MustCompile(`(?i)grabmax\W{0,4}(\d{1,9})`)
+
+	// errLocalBudget marks a request Ether refused locally (daily limit,
+	// background share, or active Retry-After pause) before contacting the
+	// indexer, distinguishing it from a remote HTTP 429 response.
+	errLocalBudget = errors.New("newznab: held back by local budget")
+	// errSpeculativeShare marks a request held back specifically by the
+	// warm-up or viewer detail share while playback budget remains.
+	errSpeculativeShare = errors.New("newznab: discovery share reached")
 )
 
 // reportedLimits reads the account's daily API request and NZB grab
@@ -128,45 +136,57 @@ func (c *Client) dailyLimitOrAssumed(kind string) int {
 	return n
 }
 
-// speculativeShare is the percentage of an indexer's daily limit that
-// work nobody is waiting on may spend: unattended warm-ups (preloads,
-// prefetches, watchlist and cache-fill checks, detail warm-ups not yet
-// promoted to Play), detail-page version discovery and availability grabs.
-// Playback keeps the rest.
-const speculativeShare = 10
-
-// Usage labels whose requests draw on the speculative share. Availability
-// searches have their own allowance (internal/availability); their grabs
-// share this one.
+// Unattended warm-ups may spend 10% of each indexer's daily limit.
+// Viewer-triggered detail-page discovery has a separate 15% allowance:
+// neither class can exhaust the other's share. Availability searches have
+// their own allowance (internal/availability); their grabs stay in the
+// warm-up share. Playback is never refused by either share.
 const (
-	speculativeHitPurposes  = "'warmup','detail'"
-	speculativeGrabPurposes = "'warmup','detail','availability'"
+	warmupShare        = 10
+	detailShare        = 15
+	warmupHitPurposes  = "'warmup'"
+	warmupGrabPurposes = "'warmup','availability'"
+	detailPurposes     = "'detail'"
 )
 
 // usagePurpose is the purpose a request is recorded and budgeted under: ctx's
 // tag, except that a warm-up a viewer promoted to Play is playback from then
-// on. Unpromoted warm-ups stay warm-ups, so the speculative share counts only
-// speculative requests.
+// on, while unpromoted speculative work never escapes into playback.
 func usagePurpose(ctx context.Context) string {
 	p := core.IndexerPurpose(ctx)
+	// A detached refill with no viewer waiting must never spend the
+	// viewer's detail allowance, even if its caller retained that tag.
+	if p == core.IndexerPurposeDetail && core.IsUnattendedSearch(ctx) {
+		return core.IndexerPurposeWarmup
+	}
 	if p == core.IndexerPurposeWarmup && !core.IsUnattendedSearch(ctx) {
 		return core.IndexerPurposePlayback
+	}
+	if p == core.IndexerPurposePlayback && core.IsSpeculative(ctx) {
+		return core.IndexerPurposeWarmup
 	}
 	return p
 }
 
-// speculativeRoom refuses a speculative request once today's speculative
-// requests of kind reached their share. Purpose is inherited: a fallback
-// query, caps-free retry or rescue started by speculative work keeps its
-// label (Manager.SearchRescueWith), so it is counted and refused here too.
-// The count is today's newznab_usage rows.
+// speculativeRoom checks only the request's own purpose set, using one
+// query against newznab_usage's (indexer_id, day, purpose) primary key.
+// Fallbacks and rescues inherit their originating class, so they cannot
+// escape its allowance. Playback and owner actions bypass these shares.
 func (c *Client) speculativeRoom(ctx context.Context, kind string) error {
-	purposes := speculativeHitPurposes
+	purposes, share, label := warmupHitPurposes, warmupShare, "background"
 	col := "hits"
 	if kind == "grab" {
-		purposes, col = speculativeGrabPurposes, "grabs"
+		purposes, col = warmupGrabPurposes, "grabs"
 	}
-	if !strings.Contains(purposes, "'"+usagePurpose(ctx)+"'") {
+	switch usagePurpose(ctx) {
+	case core.IndexerPurposeDetail:
+		purposes, share, label = detailPurposes, detailShare, "detail"
+	case core.IndexerPurposeWarmup:
+	case core.IndexerPurposeAvailability:
+		if kind != "grab" {
+			return nil
+		}
+	default:
 		return nil
 	}
 	db := c.db
@@ -180,8 +200,8 @@ func (c *Client) speculativeRoom(ctx context.Context, kind string) error {
 	if err := db.QueryRowContext(ctx, `SELECT COALESCE(SUM(`+col+`),0) FROM newznab_usage WHERE indexer_id=? AND day=? AND purpose IN (`+purposes+`)`, c.indexerID(), c.today()).Scan(&used); err != nil {
 		return err
 	}
-	if used >= max(1, c.dailyLimitOrAssumed(kind)*speculativeShare/100) {
-		return fmt.Errorf("indexer %q background %s share: %w", c.Name(), kind, core.ErrBudgetExhausted)
+	if used >= max(1, c.dailyLimitOrAssumed(kind)*share/100) {
+		return fmt.Errorf("indexer %q %s %s share: %w: %w: %w", c.Name(), label, kind, errLocalBudget, errSpeculativeShare, core.ErrBudgetExhausted)
 	}
 	return nil
 }

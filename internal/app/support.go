@@ -23,22 +23,39 @@ func (a *App) supportDeps() diagnostics.Deps {
 	started := time.Now()
 	container := containerHint()
 	return diagnostics.Deps{
-		Now:          parityClock(),
-		Version:      a.opts.Version,
-		Commit:       updater.Commit,
-		BuildDate:    updater.Date,
-		Platform:     runtime.GOOS + "/" + runtime.GOARCH,
-		Container:    container,
-		InstallType:  supportInstallType(container),
-		Uptime:       func() time.Duration { return time.Since(started) },
-		Secrets:      func() []string { return supportSecrets(a.cfg.Get()) },
-		Settings:     func() (diagnostics.Settings, error) { return supportSettings(a.cfg.Get()), nil },
-		Sessions:     a.supportSessions,
-		Hardware:     a.supportHardware,
-		Storage:      a.supportStorage,
-		Connectivity: func() (diagnostics.ConnectivityFact, error) { return supportConnectivity(a.cfg.Get()), nil },
-		Viewer:       a.supportViewer,
-		LogExtract:   a.supportLogs,
+		Now:         parityClock(),
+		Version:     a.opts.Version,
+		Commit:      updater.Commit,
+		BuildDate:   updater.Date,
+		Platform:    runtime.GOOS + "/" + runtime.GOARCH,
+		Container:   container,
+		InstallType: supportInstallType(container),
+		Uptime:      func() time.Duration { return time.Since(started) },
+		Secrets:     func() []string { return supportSecrets(a.cfg.Get()) },
+		Settings:    func() (diagnostics.Settings, error) { return a.supportSettings(a.cfg.Get()), nil },
+		Sessions:    a.supportSessions,
+		Hardware:    a.supportHardware,
+		Storage:     a.supportStorage,
+		Connectivity: func() (diagnostics.ConnectivityFact, error) {
+			fact := supportConnectivity(a.cfg.Get())
+			if a.registrar != nil {
+				st := a.registrar.Status()
+				if d := st.TokenDiagnostics; d != nil {
+					fact.PlexRegistration = map[string]any{
+						"serverTokenRequired": st.ServerTokenRequired, "tokenPresent": d.TokenPresent,
+						"serverResourcesStatus": d.ResourcesStatus, "ownerResourcesStatus": d.OwnerResourcesStatus,
+						"ownerCredentialAvailable": d.OwnerCredentialAvailable,
+						"matchingDevices":          d.MatchingDevices, "sameNameServers": d.SameNameServers,
+						"tokenMatchesDevice": d.TokenMatchesDevice, "owned": d.Owned,
+						"provides": d.Provides, "product": d.Product, "sourceTitlePresent": d.SourceTitlePresent,
+						"claimResponseShapes": d.ClaimResponseShapes,
+					}
+				}
+			}
+			return fact, nil
+		},
+		Viewer:     a.supportViewer,
+		LogExtract: a.supportLogs,
 	}
 }
 
@@ -50,7 +67,7 @@ func supportSecrets(cfg config.Config) []string {
 	return out
 }
 
-func supportSettings(cfg config.Config) diagnostics.Settings {
+func (a *App) supportSettings(cfg config.Config) diagnostics.Settings {
 	name, height, hdr := profileFacts(cfg, cfg.Quality.Default)
 	out := diagnostics.Settings{
 		LogLevel:              cfg.Server.LogLevel,
@@ -60,6 +77,7 @@ func supportSettings(cfg config.Config) diagnostics.Settings {
 		ProfileName:           name,
 		ProfileMaxHeight:      height,
 		ProfileAllowHDR:       hdr,
+		VideoTranscoding:      cfg.Transcode.VideoTranscoding,
 		HWAccel:               cfg.Transcode.HWAccel,
 		MaxTranscodes:         cfg.Transcode.MaxTranscodes,
 		RemoteMaxBitrateKbps:  cfg.Transcode.RemoteMaxBitrateKbps,
@@ -70,9 +88,14 @@ func supportSettings(cfg config.Config) diagnostics.Settings {
 		ReleaseMode:           cfg.Availability.EffectiveMode(),
 		ShowUpcomingEpisodes:  cfg.Catalog.ShowUpcomingEpisodes,
 		ShowUpcomingMovies:    cfg.Catalog.ShowUpcomingMovies,
-		VisibilityDefault:     cfg.Catalog.VisibilityDefault,
+		VisibilityDefault:     "show",
 	}
-	for _, r := range cfg.Catalog.Exclusions {
+	pol := a.loadLibraryPolicies(context.Background())
+	if pol.MovieDefault == "hide" && pol.ShowDefault == "hide" {
+		out.VisibilityDefault = "hide"
+	}
+	allRules := append(append([]core.LibraryExclusion{}, pol.MovieRules...), pol.ShowRules...)
+	for _, r := range allRules {
 		if len(out.CatalogRules) >= 100 {
 			out.CatalogRulesTruncated = true
 			break
@@ -147,6 +170,7 @@ func (a *App) supportStorage() (diagnostics.StorageFact, error) {
 	cfg := a.cfg.Get()
 	fact := diagnostics.StorageFact{CacheBudgetBytes: cfg.Cache.BudgetBytes}
 	collectDatabaseStorage(a.db, &fact)
+	collectStorageDetail(a.db, a.opts.DataDir, cfg.Catalog, &fact)
 	fact.Filesystem = supportFilesystem(a.opts.DataDir)
 	if a.cache != nil {
 		dir := a.cache.Directory()
@@ -293,11 +317,7 @@ func (a *App) supportViewer(userID int64) (diagnostics.ViewerFacts, error) {
 	if err != nil {
 		return diagnostics.ViewerFacts{}, err
 	}
-	server := a.currentPlexServer()
-	if server == nil {
-		return diagnostics.ViewerFacts{}, errors.New("Plex unavailable")
-	}
-	v, err := server.SupportViewer(ctx, user)
+	v, err := a.frontends.supportViewer(ctx, user)
 	if err != nil {
 		return v, err
 	}

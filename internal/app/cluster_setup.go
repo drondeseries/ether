@@ -13,6 +13,7 @@ import (
 
 	"github.com/braedonsaunders/ether/internal/clusterconfig"
 	"github.com/braedonsaunders/ether/internal/config"
+	"github.com/braedonsaunders/ether/internal/hoststat"
 	"github.com/braedonsaunders/ether/internal/service"
 	"github.com/braedonsaunders/ether/internal/startup"
 	"github.com/braedonsaunders/ether/internal/updater"
@@ -55,6 +56,9 @@ func serveWithConstructor(ctx context.Context, opts Options, construct func(cont
 	if log == nil {
 		log = slog.Default()
 	}
+	// Bound the heap before anything allocates in earnest: a
+	// container/RAM-aware soft limit, unless GOMEMLIMIT was set.
+	hoststat.ApplyMemoryLimit(log)
 	if opts.DataDir == "" {
 		opts.DataDir = config.DefaultDataDir()
 	}
@@ -67,7 +71,7 @@ func serveWithConstructor(ctx context.Context, opts Options, construct func(cont
 	defer lock.Release()
 	opts.lock = lock
 	front := newFrontDoor(startup.NewTracker(opts.Version, time.Now), log)
-	defer front.close()
+	defer func() { front.close() }()
 	opts.front = front
 	rc := newRecovery(opts.DataDir, front, log)
 	front.recovery.Store(ptr(rc.handler()))
@@ -115,7 +119,16 @@ func serveWithConstructor(ctx context.Context, opts Options, construct func(cont
 		// A cluster transition deliberately replaces this App within the same
 		// process. Close its watcher cleanly before starting the replacement.
 		_ = finish(err == nil || errors.Is(err, errClusterSetup) || errors.Is(err, service.ErrRestartRequested))
+		portChanged := errors.Is(err, service.ErrRestartRequested) && a.cfg.Get().Server.Port != front.port
 		a.Close()
+		if portChanged && ctx.Err() == nil {
+			front.close()
+			front = newFrontDoor(startup.NewTracker(opts.Version, time.Now), log)
+			opts.front = front
+			rc = newRecovery(opts.DataDir, front, log)
+			front.recovery.Store(ptr(rc.handler()))
+			continue
+		}
 		// A restore this start applied but never confirmed (Run stopped
 		// before serving) puts the original data back.
 		if a.rollbackUnconfirmed(err) && ctx.Err() == nil {

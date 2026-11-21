@@ -80,7 +80,14 @@ type Options struct {
 	// NotInterestedSnapshot returns signals and their atomically-read shared revision.
 	CatalogRulesRevision  func(*core.User) int64
 	NotInterestedSnapshot func(context.Context, *core.User) ([]NotInterestedSignal, uint64, error)
-	FilterAvailable       func(context.Context, []core.Title) []core.Title
+	// LibraryMembers reports which of keys belong to the library behind a
+	// section (HubContext.SectionID), using the same membership as that
+	// library's All browse, plus a revision that changes when the library's
+	// sources/rules/membership definition change. scoped is false for the
+	// canonical built-in libraries, whose sections keep type-only behaviour.
+	// Nil leaves every section unscoped (type-only).
+	LibraryMembers  func(ctx context.Context, id core.LibraryID, keys []core.RatingKey) (members map[core.RatingKey]bool, revision int64, scoped bool, err error)
+	FilterAvailable func(context.Context, []core.Title) []core.Title
 	// Owner previews use the same effective viewer and title policy as Plex.
 	UserPolicy func(*core.User) *core.User
 	Allowed    func(*core.User, *core.Title) bool
@@ -107,6 +114,9 @@ type Options struct {
 	// Sections maps library section ids to their type, for per-user
 	// allowed sections (default 1 = movies, 2 = shows).
 	Sections map[int]core.MediaType
+	// LibrarySections returns dynamic library section ids -> media types
+	// (custom movie/show libraries created at runtime). Optional.
+	LibrarySections func(context.Context) map[int]core.MediaType
 	// ServerName is the friendly name shown in "Popular on <name>".
 	ServerName func() string
 	// ImageURL builds browser-loadable artwork URLs for the owner UI
@@ -249,6 +259,8 @@ type Engine struct {
 	memoMu sync.Mutex
 	memo   map[memoKey]*memoEntry
 
+	shared sharedBrowses // catalogue browses shared by unrestricted viewers
+
 	presentationMu sync.Mutex
 	presentations  map[memoKey]presentation
 
@@ -318,6 +330,9 @@ func New(opts Options) (*Engine, error) {
 		queue: make(chan int64, 1024), events: make(chan state.Event, 4096), evSync: make(chan chan struct{}),
 	}
 	e.rec = newRecorder(st, e.log, opts.ImpressionBuffer, opts.FlushEvery)
+	if err := e.migrateLibraryLayouts(context.Background()); err != nil {
+		return nil, err
+	}
 	var err error
 	e.homeLayout, err = st.homeLayout(context.Background())
 	if err != nil {
@@ -380,6 +395,58 @@ func (e *Engine) serverName() string {
 		return n
 	}
 	return "This Server"
+}
+
+func (e *Engine) allSections(ctx context.Context) map[int]core.MediaType {
+	if ctx == nil {
+		ctx = e.ctx
+	}
+	out := make(map[int]core.MediaType, len(e.opts.Sections))
+	for id, mt := range e.opts.Sections {
+		out[id] = mt
+	}
+	if e.opts.LibrarySections != nil {
+		for id, mt := range e.opts.LibrarySections(ctx) {
+			if id > 0 && (mt == core.TypeMovie || mt == core.TypeShow) {
+				out[id] = mt
+			}
+		}
+	}
+	return out
+}
+
+func (e *Engine) firstSectionID(ctx context.Context, want core.MediaType) int {
+	secs := e.allSections(ctx)
+	ids := make([]int, 0, len(secs))
+	for id, mt := range secs {
+		if mt == want && id > 0 {
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) == 0 {
+		if want == core.TypeShow {
+			return 2
+		}
+		return 1
+	}
+	sort.Ints(ids)
+	return ids[0]
+}
+
+func (e *Engine) sectionMediaType(ctx context.Context, id int) (core.MediaType, bool) {
+	if id <= 0 {
+		return "", false
+	}
+	if ctx == nil {
+		ctx = e.ctx
+	}
+	if e.opts.LibrarySections != nil {
+		if mt, ok := e.opts.LibrarySections(ctx)[id]; ok && (mt == core.TypeMovie || mt == core.TypeShow) {
+			return mt, true
+		}
+	}
+	mt, ok := e.opts.Sections[id]
+	return mt, ok
 }
 
 // ---- core.Recommender / core.ContextualRecommender ----------------------------
@@ -579,7 +646,7 @@ func (e *Engine) enrichRelated(ctx context.Context, user *core.User, key core.Ra
 func (e *Engine) HomeHubsFor(ctx context.Context, user *core.User, hc core.HubContext, limit int) ([]core.Hub, error) {
 	ctx = core.WithCatalogViewer(ctx, user)
 	p := e.home(ctx, user, hc, "", limit, false)
-	p.Rows = arrangeLayout(p.Rows, e.layoutForContext(ctx), userID(user), hc, sectionName(""), e.opts.MaxHomeRows)
+	p.Rows = arrangeLayoutFor(p.Rows, e.layoutForContext(ctx), userID(user), hc, surfHome, e.opts.MaxHomeRows)
 	return toHubs(p.Rows), nil
 }
 
@@ -588,8 +655,12 @@ func (e *Engine) HomeHubsFor(ctx context.Context, user *core.User, hc core.HubCo
 // Added).
 func (e *Engine) SectionHubsFor(ctx context.Context, user *core.User, t core.MediaType, hc core.HubContext, limit int) ([]core.Hub, error) {
 	ctx = core.WithCatalogViewer(ctx, user)
+	if hc.SectionID == 0 {
+		hc.SectionID = e.firstSectionID(ctx, t)
+	}
 	p := e.home(ctx, user, hc, t, limit, false)
-	p.Rows = arrangeLayout(p.Rows, e.layoutForContext(ctx), userID(user), hc, sectionName(t), e.opts.MaxSectionRows)
+	target := layoutTargetForMedia(t, hc.SectionID)
+	p.Rows = arrangeLayoutFor(p.Rows, e.layoutForContext(ctx), userID(user), hc, target, e.opts.MaxSectionRows)
 	return toHubs(p.Rows), nil
 }
 
@@ -623,6 +694,9 @@ func (e *Engine) homeWithPolicy(ctx context.Context, user *core.User, hc core.Hu
 	if hc.Now.IsZero() {
 		hc.Now = e.now().In(e.loc)
 	}
+	if section != "" && hc.SectionID == 0 {
+		hc.SectionID = e.firstSectionID(ctx, section)
+	}
 	u := core.User{}
 	if user != nil {
 		u = *user
@@ -650,16 +724,21 @@ func (e *Engine) homeWithPolicy(ctx context.Context, user *core.User, hc core.Hu
 	layoutVer := e.layoutVersion()
 	day := dayOf(hc.Now, e.loc)
 	intent, intentVer := e.intentFor(u.ID, hc.Now)
-	tune := resolveTuning(layoutDoc, u.ID, sectionName(section))
-	// Movies / TV Shows pages keep what the Home leads with off the page
+	target := layoutTargetForMedia(section, hc.SectionID)
+	tune := resolveTuning(layoutDoc, u.ID, target)
+	// Library Recommended pages keep what the Home leads with off the page
 	// (the draft layout's switch and Home in a preview).
 	var lead *homeLead
-	if section != "" && resolveDedupeHome(layoutDoc, u.ID, sectionName(section)) {
+	if section != "" && resolveDedupeHome(layoutDoc, u.ID, target) {
 		lead = e.homeLeadFor(ctx, &u, hc, layoutDoc, limit, wait, allow)
 	}
 	key := memoKey{user: u.ID, section: section, bucket: hc.Bucket(), day: day, hour: hc.Now.Hour(), limit: limit, model: m.version,
 		layout: layoutVer, stats: stats.at.UnixNano(), owner: ownerVer, cw: progressSig(inprog),
-		limits: u.MaxContentRating + "|" + fmt.Sprint(u.AllowedSections, u.IsOwner), intent: intentVer, tuning: tune.key(), exclusions: exclusionSig}
+		limits: u.MaxContentRating + "|" + fmt.Sprint(u.AllowedLibraries, u.IsOwner), intent: intentVer, tuning: tune.key(), exclusions: exclusionSig}
+	// A section is one library: same-type libraries never share an assembly.
+	if section != "" && hc.SectionID > 0 {
+		key.library = core.LibraryID(hc.SectionID)
+	}
 	if lead != nil {
 		key.lead = lead.sig
 	}
@@ -669,7 +748,12 @@ func (e *Engine) homeWithPolicy(ctx context.Context, user *core.User, hc core.Hu
 		policyContinue = e.continueFrom(ctx, inprog)
 	}
 	hidden := map[core.RatingKey]bool{}
-	if e.opts.FilterAvailable != nil || allow != nil {
+	// A custom library's section rows come only from that library's titles:
+	// membership is applied to the full candidate pools here, before
+	// assembly ranks and truncates rows, via the same hidden gate as
+	// availability and viewer policy.
+	libraryScoped := section != "" && key.library != 0 && e.opts.LibraryMembers != nil
+	if e.opts.FilterAvailable != nil || allow != nil || libraryScoped {
 		var pool []core.Title
 		seen := map[core.RatingKey]bool{}
 		for _, row := range append(append([]*candRow{}, m.rows...), owner...) {
@@ -699,6 +783,29 @@ func (e *Engine) homeWithPolicy(ctx context.Context, user *core.User, hc core.Hu
 					seen[t.Key] = true
 					if ctx.Err() != nil || !allow(ctx, &u, t) {
 						hidden[t.Key] = true
+					}
+				}
+			}
+		}
+		if libraryScoped {
+			poolKeys := make([]core.RatingKey, 0, len(pool))
+			seenKey := map[core.RatingKey]bool{}
+			for i := range pool {
+				if k := pool[i].Key; !seenKey[k] {
+					seenKey[k] = true
+					poolKeys = append(poolKeys, k)
+				}
+			}
+			members, revision, scoped, err := e.opts.LibraryMembers(ctx, key.library, poolKeys)
+			if err != nil {
+				e.log.Warn("personalize: library membership unavailable", "library", key.library, "err", err)
+				return p
+			}
+			if scoped {
+				key.libraryRev = revision
+				for _, k := range poolKeys {
+					if !members[k] {
+						hidden[k] = true
 					}
 				}
 			}
@@ -761,6 +868,8 @@ func (e *Engine) homeWithPolicy(ctx context.Context, user *core.User, hc core.Hu
 type memoKey struct {
 	user       int64
 	section    core.MediaType
+	library    core.LibraryID // the section's library; 0 = Home or unknown
+	libraryRev int64          // that library's membership/rules revision
 	bucket     string
 	day        int
 	hour       int // layout schedules have hour windows
@@ -773,7 +882,7 @@ type memoKey struct {
 	limits     string
 	intent     uint64 // live session-intent version (#32); 0 = none
 	tuning     string // the page's resolved dials
-	lead       uint64 // what the Home leads with (Movies/TV dedupe); 0 = none
+	lead       uint64 // what the Home leads with (library Home-dedupe); 0 = none
 	exclusions string // current explicit recommendation exclusions
 }
 
@@ -889,12 +998,13 @@ func progressSig(sts []core.WatchStatus) string {
 // allowedFor returns the media types a viewer's allowed sections cover
 // (nil = everything).
 func (e *Engine) allowedFor(u *core.User) func(core.MediaType) bool {
-	if u == nil || u.IsOwner || len(u.AllowedSections) == 0 {
+	if u == nil || u.IsOwner || len(u.AllowedLibraries) == 0 {
 		return nil
 	}
+	secs := e.allSections(e.ctx)
 	ok := map[core.MediaType]bool{}
-	for _, id := range u.AllowedSections {
-		if t, found := e.opts.Sections[id]; found {
+	for _, id := range u.AllowedLibraries {
+		if t, found := secs[int(id)]; found {
 			ok[t] = true
 		}
 	}
@@ -945,4 +1055,30 @@ func userID(u *core.User) int64 {
 		return 0
 	}
 	return u.ID
+}
+
+// BackgroundBusy is how many viewer models are being rebuilt or waiting on
+// a debounced rebuild: the performance gate waits for none before each
+// measured request.
+func (e *Engine) BackgroundBusy() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return len(e.flights) + len(e.debounce)
+}
+
+// FlushDebounced starts every debounced rebuild now instead of after its
+// delay, so the performance gate can wait for it rather than for the timer.
+func (e *Engine) FlushDebounced() {
+	e.mu.Lock()
+	var users []int64
+	for user, t := range e.debounce {
+		if t.Stop() {
+			delete(e.debounce, user)
+			users = append(users, user)
+		}
+	}
+	e.mu.Unlock()
+	for _, user := range users {
+		e.request(user)
+	}
 }

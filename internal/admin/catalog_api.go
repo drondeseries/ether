@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/braedonsaunders/ether/internal/artwork"
 	"github.com/braedonsaunders/ether/internal/catalog"
 	"github.com/braedonsaunders/ether/internal/config"
 	"github.com/braedonsaunders/ether/internal/core"
@@ -85,6 +86,7 @@ func (h *Handler) handleCatalogBrowse(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 400, "invalid_filter", "Invalid rules")
 			return
 		}
+		q.Filter.PreviewRules, _ = libraryfilter.PreviewableRules(q.Filter.PreviewRules)
 		if _, err := libraryfilter.CompilePolicy(q.Filter.PreviewRules, q.Filter.PreviewFallback); err != nil {
 			writeError(w, 400, "invalid_filter", "Invalid rules")
 			return
@@ -98,6 +100,21 @@ func (h *Handler) handleCatalogBrowse(w http.ResponseWriter, r *http.Request) {
 		q.Filter.Type = mediaTypeParam(p.Get("type"))
 	}
 	q.Filter.LocalOnly = true
+	if rawLib := p.Get("libraryId"); rawLib != "" {
+		libID, err := strconv.ParseInt(rawLib, 10, 64)
+		if err != nil || libID <= 0 {
+			writeError(w, 400, "invalid_filter", "Invalid library id")
+			return
+		}
+		if h.deps.LibraryBrowseFilter != nil {
+			sf, err := h.deps.LibraryBrowseFilter(r.Context(), core.LibraryID(libID), q.Filter)
+			if err != nil {
+				writeError(w, 404, "not_found", "Library not found")
+				return
+			}
+			q.Filter = sf
+		}
+	}
 
 	if p.Has("q") {
 		q.Filter.Query = strings.TrimSpace(p.Get("q"))
@@ -264,8 +281,54 @@ func CardFor(t core.Title) TitleCard {
 		poster = t.StillPath
 	}
 	c.Poster = ImageURL(poster, 342)
+	if c.Poster == "" {
+		c.Poster = GeneratedPosterURL(&t, 342)
+	}
 	c.Backdrop = ImageURL(t.BackdropPath, 780)
 	return c
+}
+
+// GeneratedPosterURL is the console URL of Ether's poster for a movie or
+// show with no artwork, or "" for any other title. The URL describes the
+// whole image, so it is stable and caches like a TMDB path.
+func GeneratedPosterURL(t *core.Title, w int) string {
+	p, ok := artwork.ForTitle(t)
+	if !ok {
+		return ""
+	}
+	q := p.Query()
+	q.Set("w", strconv.Itoa(w))
+	return "/ether/api/image/generated?" + q.Encode()
+}
+
+func (h *Handler) handleGeneratedImage(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	p, ok := artwork.TitlePosterFromQuery(q)
+	if !ok || h.deps.TitlePosters == nil {
+		writeError(w, http.StatusNotFound, "not_found", "image not found")
+		return
+	}
+	p.Width, _ = strconv.Atoi(q.Get("w"))
+	etag := `"g` + strconv.Itoa(p.Width) + p.Stamp() + `"`
+	if match := r.Header.Get("If-None-Match"); match != "" && match == etag {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	data, ct, err := h.deps.TitlePosters.Title(r.Context(), p)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "render", "could not draw the poster")
+		return
+	}
+	hdr := w.Header()
+	hdr.Set("Content-Type", ct)
+	hdr.Set("Content-Security-Policy", imageCSP)
+	hdr.Set("Cache-Control", "public, max-age=2592000, immutable")
+	hdr.Set("ETag", etag)
+	hdr.Set("Content-Length", strconv.Itoa(len(data)))
+	w.WriteHeader(http.StatusOK)
+	if r.Method != http.MethodHead {
+		_, _ = w.Write(data)
+	}
 }
 
 func cardsFor(ts []core.Title) []TitleCard {
@@ -294,8 +357,21 @@ func (h *Handler) handleCatalogSearch(w http.ResponseWriter, r *http.Request) {
 	if limit <= 0 || limit > 100 {
 		limit = 20
 	}
-	// The console search finds titles hidden from browsing only.
-	items, err := h.deps.CatalogHelper.SearchTitles(core.WithExplicitSearch(r.Context()), q.Get("q"), mediaTypeParam(q.Get("type")), limit)
+	ctx := core.WithExplicitSearch(r.Context())
+	var (
+		items []core.Title
+		err   error
+	)
+	if (q.Get("all") == "1" || q.Get("all") == "true") && h.deps.CatalogHelper != nil {
+		if all, ok := h.deps.CatalogHelper.(CatalogUnfilteredSearch); ok {
+			items, err = all.SearchAllTitles(ctx, q.Get("q"), mediaTypeParam(q.Get("type")), limit)
+		} else {
+			items, err = h.deps.CatalogHelper.SearchTitles(ctx, q.Get("q"), mediaTypeParam(q.Get("type")), limit)
+		}
+	} else {
+		// The console search finds titles hidden from browsing only.
+		items, err = h.deps.CatalogHelper.SearchTitles(ctx, q.Get("q"), mediaTypeParam(q.Get("type")), limit)
+	}
 	if err != nil {
 		h.writeServiceError(w, err)
 		return
@@ -426,7 +502,9 @@ func (h *Handler) handleCatalogTitle(w http.ResponseWriter, r *http.Request) {
 		Tagline: t.Tagline, Language: t.Language, Status: t.Status, Studios: t.Studios, Countries: t.Countries,
 		ReleaseDate: airDate(t.Released), HomeRelease: airDate(t.HomeReleased), LastAirDate: airDate(t.LastAirDate),
 		Seasons: t.ChildCount, Episodes: t.LeafCount}
-	d.HomeReleaseAgeAdmitted = h.deps.Config.Get().Availability.EffectiveMode() == config.ModeDigital && catalog.HomeReleaseAgeAdmitted(t, time.Now()) && (!t.HomeReleaseChecked || t.HomeReleased.IsZero() || t.HomeReleased.After(time.Now()))
+	av := h.deps.Config.Get().Availability
+	now := time.Now()
+	d.HomeReleaseAgeAdmitted = av.ModeFor(string(t.Type)) == config.ModeDigital && catalog.HomeReleaseAgeAdmitted(t, now) && (!t.HomeReleaseChecked || t.HomeReleased.IsZero() || catalog.HomeReleaseAdmission(t.HomeReleased, av.HomeReleaseOffsetDays).After(now))
 	if t.OriginalTitle != t.Title {
 		d.OriginalTitle = t.OriginalTitle
 	}
@@ -537,17 +615,27 @@ func (h *Handler) handleVisibilityPreview(w http.ResponseWriter, r *http.Request
 	var body struct {
 		Exclusions        []core.LibraryExclusion `json:"exclusions"`
 		VisibilityDefault string                  `json:"visibilityDefault"`
+		LibraryID         core.LibraryID          `json:"libraryId"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 128<<10)).Decode(&body); err != nil {
 		writeError(w, 400, "bad_json", "Invalid filter")
 		return
 	}
-	if _, err := libraryfilter.CompilePolicy(body.Exclusions, body.VisibilityDefault); err != nil {
+	kept, _ := libraryfilter.PreviewableRules(body.Exclusions)
+	if _, err := libraryfilter.CompilePolicy(kept, body.VisibilityDefault); err != nil && (body.LibraryID == 0 || body.LibraryID == core.LibraryMovies || body.LibraryID == core.LibraryShows) {
 		writeError(w, 400, "invalid_filter", "Could not preview catalogue")
 		return
 	}
-	p, err := h.deps.CatalogVisibility(r.Context(), body.Exclusions, body.VisibilityDefault)
+	p, err := h.deps.CatalogVisibility(r.Context(), body.Exclusions, body.VisibilityDefault, body.LibraryID)
 	if err != nil {
+		if isNotFound(err) {
+			writeError(w, 404, "not_found", "Library not found")
+			return
+		}
+		if libraryfilter.IsInvalidFilter(err) {
+			writeError(w, 400, "invalid_filter", "Could not preview catalogue")
+			return
+		}
 		writeError(w, 500, "preview_failed", "Could not preview catalogue")
 		return
 	}

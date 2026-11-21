@@ -17,10 +17,12 @@ type broadcastKey struct {
 	viewerID  int64
 }
 type broadcastRegistry struct {
-	mu       sync.Mutex
-	outputs  map[broadcastKey]*broadcast
-	closed   bool
-	yielding atomic.Int32
+	mu        sync.Mutex
+	outputs   map[broadcastKey]*broadcast
+	retiring  map[*broadcast]broadcastKey
+	closed    bool
+	yielding  atomic.Int32
+	onAcquire func()
 }
 type broadcastLease struct {
 	mu        sync.Mutex
@@ -32,24 +34,63 @@ type broadcastLease struct {
 	once      sync.Once
 }
 
-func (r *broadcastRegistry) acquire(ctx context.Context, key broadcastKey, id string, decision core.Decision, create func() (*broadcast, error)) (*broadcastLease, error) {
-	// Keep the requested channel warm while yielding other grace-period
-	// encoders. A same-channel reopen must retain its encoded live window.
+func (r *broadcastRegistry) hasActive() bool {
 	r.mu.Lock()
-	existing := r.outputs[key]
+	defer r.mu.Unlock()
+	return len(r.outputs) > 0
+}
+
+func (r *broadcastRegistry) hasViewers(channelID string) bool {
+	if channelID == "" {
+		return false
+	}
+	r.mu.Lock()
+	var matches []*broadcast
+	for key, b := range r.outputs {
+		if key.channelID == channelID && b != nil {
+			matches = append(matches, b)
+		}
+	}
 	r.mu.Unlock()
-	needsEncoder := true
-	if existing != nil {
-		existing.mu.Lock()
-		needsEncoder = existing.closed || existing.renditions[id] == nil
-		existing.mu.Unlock()
+	for _, b := range matches {
+		b.mu.Lock()
+		active := !b.closed && b.viewers > 0
+		b.mu.Unlock()
+		if active {
+			return true
+		}
 	}
-	// Joining an encoded rendition allocates no encoder or server stream unit.
-	// Preserve other warm channels instead of needlessly forcing their next tune
-	// through cold startup. Actual new encoders still yield unused outputs.
-	if needsEncoder {
-		r.yieldIdle(existing)
+	return false
+}
+
+func (r *broadcastRegistry) watchedChannelIDs() map[string]bool {
+	r.mu.Lock()
+	type entry struct {
+		channelID string
+		b         *broadcast
 	}
+	entries := make([]entry, 0, len(r.outputs))
+	for key, b := range r.outputs {
+		if key.channelID != "" && b != nil {
+			entries = append(entries, entry{channelID: key.channelID, b: b})
+		}
+	}
+	r.mu.Unlock()
+	out := map[string]bool{}
+	for _, ent := range entries {
+		ent.b.mu.Lock()
+		active := !ent.b.closed && ent.b.viewers > 0
+		ent.b.mu.Unlock()
+		if active {
+			out[ent.channelID] = true
+		}
+	}
+	return out
+}
+
+func (r *broadcastRegistry) acquire(ctx context.Context, key broadcastKey, id string, decision core.Decision, create func() (*broadcast, error), caps ...core.ClientCaps) (*broadcastLease, error) {
+	// Provider admission and stream-limit handling yield idle outputs only
+	// when capacity is needed. A new rendition alone must not evict warm TV.
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
@@ -69,6 +110,7 @@ func (r *broadcastRegistry) acquire(ctx context.Context, key broadcastKey, id st
 		}
 	}
 	running := b != nil
+	onAcquire := r.onAcquire
 	if b == nil {
 		var err error
 		b, err = create()
@@ -81,7 +123,10 @@ func (r *broadcastRegistry) acquire(ctx context.Context, key broadcastKey, id st
 		b.start()
 	}
 	r.mu.Unlock()
-	if _, err := b.addRendition(ctx, id, decision); err != nil {
+	if onAcquire != nil {
+		onAcquire()
+	}
+	if _, err := b.addRendition(ctx, id, decision, caps...); err != nil {
 		return nil, err
 	}
 	b.logger.Debug("broadcast viewer attached", "running", running, "rendition", id)
@@ -206,10 +251,19 @@ func (r *broadcastRegistry) yieldIdle(except *broadcast) bool {
 	r.mu.Lock()
 	var idle []*broadcast
 	for key, b := range r.outputs {
-		if b != except && b.unwatched(now) {
+		b.mu.Lock()
+		// Claim the idle output under the same lock used to attach viewers.
+		if b != except && b.viewers == 0 && !b.closed && now.Sub(b.created) >= 2*time.Second {
+			b.closed = true
+			b.cancel()
 			delete(r.outputs, key)
+			if r.retiring == nil {
+				r.retiring = map[*broadcast]broadcastKey{}
+			}
+			r.retiring[b] = key
 			idle = append(idle, b)
 		}
+		b.mu.Unlock()
 	}
 	r.mu.Unlock()
 	for _, b := range idle {
@@ -217,7 +271,38 @@ func (r *broadcastRegistry) yieldIdle(except *broadcast) bool {
 		b.logger.Debug("broadcast yielded its stream to a tuned channel")
 		// close waits for the output's goroutines; never block the caller's
 		// frame clock on it.
-		go func() { defer r.yielding.Add(-1); b.close() }()
+		go func() {
+			defer r.yielding.Add(-1)
+			b.close()
+			r.mu.Lock()
+			delete(r.retiring, b)
+			r.mu.Unlock()
+		}()
 	}
 	return len(idle) > 0 || r.yielding.Load() > 0
+}
+
+// A failed cold tune keeps no grace-period encoder running for an absent viewer.
+func (r *broadcastRegistry) discardCold(b *broadcast) {
+	r.mu.Lock()
+	b.startMu.Lock()
+	b.mu.Lock()
+	unused := b.viewers == 0
+	if unused {
+		b.closed = true
+		b.cancel()
+	}
+	b.mu.Unlock()
+	if unused {
+		for key, output := range r.outputs {
+			if output == b {
+				delete(r.outputs, key)
+			}
+		}
+	}
+	b.startMu.Unlock()
+	r.mu.Unlock()
+	if unused {
+		b.wg.Wait()
+	}
 }

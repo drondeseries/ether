@@ -6,6 +6,7 @@ import (
 	"github.com/braedonsaunders/ether/internal/core"
 	"log/slog"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,12 +26,28 @@ import (
 // track per representation (video, audio); ffmpeg's dash muxer writes short
 // chunks that the session regroups into numbered segments by timestamp.
 type Session struct {
+	// Explicit quality sessions retire the old run before starting a rung.
+	serialRungs             bool
+	copyOrigin              bool // continuous copy uses a measured presentation origin
+	diagnosticsEnabled      bool
+	preparation             []core.HLSPreparationEvent
+	diagnosticRecords       []core.HLSDiagnosticRecord
+	outputCodecs            map[int]string
+	outputInit              map[int]string
+	outputAudioChannels     map[int]int
+	resumeWarm              *Session
+	resumeWarmAt            int
+	resumeWarmUsed          bool
+	speculative             bool
+	androidMatroskaHLS      bool // immutable client HLS contract, retained across source swaps
+	healTimestamps          bool // positively sampled MPEG-TS clock discontinuity
 	qsvCodec                string
 	qsvQuality              bool
 	qsvMode                 string
 	qsvRetried              bool
 	normalizeNegativeDTS    bool
 	encoder                 *encoderLifetime
+	mediaGeneration         string // immutable HLS resource namespace for this session instance
 	id                      string
 	m                       *Manager
 	dir                     string
@@ -49,6 +66,7 @@ type Session struct {
 	created             time.Time
 	lastAccess          atomic.Int64 // unix nanos
 	pauseUntil          atomic.Int64 // bounded authenticated player pause
+	stoppedAt           atomic.Int64 // authenticated player stop; fetches after it do not revive
 	mu                  sync.Mutex
 	closed              bool
 	// Coordinated state transitions use mu; blocking process reaping releases it.
@@ -65,6 +83,8 @@ func (s *Session) IndependentSegments() bool { return s.segmentsIndependent }
 // sessionInput owns one aspect of the session. Fields are guarded by Session.mu.
 type sessionInput struct {
 	silenceAudio           bool // one replacement run only; later live reconnects retry source audio
+	textSubtitleStreams    []int
+	textSubtitleSource     string
 	softSubtitleStream     *int
 	softSubtitleInputIndex int
 	rtxConfig              config.RTXVideo
@@ -72,6 +92,7 @@ type sessionInput struct {
 	rtxDiscontinuities     map[int]bool
 	loopInput              bool
 	liveInput              bool
+	liveFromBacklog        bool
 	inputLease             core.EncoderInputLease
 	inputHeaders           map[string]string
 	input                  string
@@ -81,6 +102,7 @@ type sessionInput struct {
 	clockInput          string
 	info                core.MediaInfo
 	decision            core.Decision
+	softwareDecode      bool // decoder failed; retain hardware encoder
 	forceCPU            bool // hardware encoder failed; stay on CPU
 	copyFallback        bool // copied video failed its packet conversion; encode this session
 	copyDiscontinuities map[int]bool
@@ -91,6 +113,18 @@ type sessionInput struct {
 	liveFailures        int
 	liveRecovering      bool
 	liveDiscontinuities map[int]bool
+	liveTarget          time.Duration                 // fixed before the first live media playlist
+	liveRejected        map[string]bool               // sources that exceeded this session target
+	liveDurations       map[int]map[int]time.Duration // live: each published segment's real length (session_playlist.go)
+
+	// Header recovery survives input swaps and HTTP retries.
+	headerInputs          map[string]int // deterministic header attempts, retained across swaps
+	headerRestarts        restartBudget
+	headerLastFailure     time.Time
+	headerRecovering      bool
+	headerFallbackPending string
+	headerRejected        map[string]bool
+
 	// contract is the delivered video a static-header session keeps
 	// across failovers; nil for every other session (contract.go).
 	contract       *videoContract
@@ -109,6 +143,8 @@ type sessionEncoding struct {
 	pendingTrack   int
 	reaping        <-chan struct{} // previous encoder exit barrier; waited without mu
 	resumeAt       int             // segment to restart at after a throttle stop; -1 none
+	handoff        *run            // previous rendition, retained only until replacement publishes
+	handoffAt      time.Time
 	cur            *run
 	runSeq         int
 	endSeg         int // last segment of the input once a run hit EOF; -1 unknown
@@ -157,6 +193,11 @@ type sessionDelivery struct {
 	playlist []byte
 	listed   []int      // unknown duration: per-track listed prefix; never shrinks
 	dash     *dashState // DASH sessions only
+	// fmp4VideoTrack is the video track id and media timescale from the
+	// published init segment, so an empty in-GOP alias fragment carries a
+	// well-formed traf/tfdt (emptyFMP4) and advances the player's clock.
+	fmp4VideoTrack emptyFMP4Tracks
+	fmp4TrackKnown bool
 	// fmp4Edits is, per HLS fMP4 init scope, the edits of the first init
 	// published there: the clock later runs are held to (fmp4_edit.go).
 	fmp4Edits map[clockScope]map[string]trackEdit
@@ -192,30 +233,33 @@ type mkvDelivery struct {
 
 // run is one ffmpeg process producing segments from startSeg on.
 type run struct {
+	textSubtitles map[int]*textSubtitleRead
+
 	rtx          bool
 	rtxConfirmed atomic.Bool
 
-	seq        int
-	reason     string
-	startSeg   int
-	spec       runSpec
-	proc       Process
-	watchWork  *encoderWork
-	stopWork   *encoderWork
-	hw         bool
-	maxDone    int // last segment finished (DASH: on every track)
-	produced   int // segments finished (DASH: on the slowest track)
-	finished   bool
-	stopped    bool // stopped deliberately, not a failure
-	stalled    bool // watchdog interrupted a run with no progress
-	paused     bool
-	pausedDone int // maxDone when Pause was applied; later growth means it did not hold
-	err        error
-	stderr     *tailBuffer
-	started    time.Time
-	mode       SegMode // plan mode this run produces
-	planEnd    int     // first segment NOT produced by this run (mode change); -1 none
-	track      int     // session track (HLS rung / DASH video rep) encoded
+	seq           int
+	reason        string
+	startSeg      int
+	spec          runSpec
+	proc          Process
+	watchWork     *encoderWork
+	stopWork      *encoderWork
+	hw            bool
+	maxDone       int // last segment finished (DASH: on every track)
+	produced      int // segments finished (DASH: on the slowest track)
+	finished      bool
+	stopped       bool // stopped deliberately, not a failure
+	stalled       bool // watchdog interrupted a run with no progress
+	paused        bool
+	pausedDone    int // maxDone when Pause was applied; later growth means it did not hold
+	err           error
+	stderr        *tailBuffer
+	started       time.Time
+	traceBufferAt time.Time // rate limit optional playback buffer telemetry
+	mode          SegMode   // plan mode this run produces
+	planEnd       int       // first segment NOT produced by this run (mode change); -1 none
+	track         int       // session track (HLS rung / DASH video rep) encoded
 
 	progressMu sync.Mutex
 	progress   Progress
@@ -247,17 +291,22 @@ var _ core.SessionActivity = (*Session)(nil)
 func (s *Session) PlaybackState(state string) {
 	switch state {
 	case "paused":
+		s.stoppedAt.Store(0)
 		if s.pauseUntil.Swap(time.Now().Add(core.PausedSessionRetention).UnixNano()) == 0 {
 			s.log.Info("player paused; retaining output", "retention", core.PausedSessionRetention)
 		}
 		s.Touch()
 	case "playing":
+		s.stoppedAt.Store(0)
 		s.Touch()
 		if s.pauseUntil.Swap(0) != 0 {
 			s.log.Info("player resumed")
 		}
 	case "stopped":
 		s.pauseUntil.Store(0)
+		if s.stoppedAt.Swap(time.Now().UnixNano()) == 0 {
+			s.log.Info("player stopped")
+		}
 	}
 }
 
@@ -310,22 +359,94 @@ func (s *Session) EncoderStatus() *core.EncoderStatus {
 		phase = "running"
 	}
 	processor, filters := "none", "none"
+	var hwDecoder, hwEncoder string
 	if !r.spec.Decision.VideoCopy {
 		processor, filters = "cpu", "cpu"
 		if r.hw {
 			processor = "gpu"
+			hwEncoder = plexHWEncoderName(r.spec.Accel.Name)
 		}
 		v := r.spec.Info.Video()
-		graph := planVideo(r.spec, v).graph
+		vp := planVideo(r.spec, v)
 		for _, f := range []string{"tonemap_cuda", "scale_cuda", "scale_vt", "tonemap_vaapi", "scale_vaapi", "vpp_qsv"} {
-			if strings.Contains(graph, f+"=") {
+			if strings.Contains(vp.graph, f+"=") {
 				filters = "gpu"
 				break
 			}
 		}
+		if r.hw && !r.spec.SoftwareDecode {
+			hwDecoder = plexHWDecoderName(vp.inputArgs)
+		}
 	}
 	b := s.recoveryBufferLocked()
-	return &core.EncoderStatus{Decision: r.spec.Decision, Processor: processor, Filters: filters, Phase: phase, Reason: r.reason, StartedAt: r.started, UpdatedAt: p.Updated, Speed: p.Speed, OutputTime: p.OutTime, ReadyUntil: b.ReadyUntil}
+	var minOffset time.Duration
+	if b.ReadyUntil > 0 {
+		minOffset = b.Position
+	}
+	rung, i := "", r.track
+	if s.isDASH() {
+		i = rungForDashTrack(i) // DASH track 1 is audio: rung 0
+	}
+	if i > 0 && i < len(s.rungs) {
+		rung = s.rungs[i].id
+	}
+	return &core.EncoderStatus{
+		Decision:           r.spec.Decision,
+		Rung:               rung,
+		Processor:          processor,
+		Filters:            filters,
+		Phase:              phase,
+		Reason:             r.reason,
+		StartedAt:          r.started,
+		UpdatedAt:          p.Updated,
+		Speed:              p.Speed,
+		OutputTime:         p.OutTime,
+		ReadyUntil:         b.ReadyUntil,
+		MinOffsetAvailable: minOffset,
+		HWDecoder:          hwDecoder,
+		HWEncoder:          hwEncoder,
+	}
+}
+
+func plexHWEncoderName(accel string) string {
+	switch accel {
+	case AccelVideoToolbox:
+		return "videotoolbox"
+	case AccelNVENC:
+		return "nvenc"
+	case AccelVAAPI:
+		return "vaapi"
+	case AccelQSV:
+		return "qsv"
+	default:
+		return ""
+	}
+}
+
+func plexHWDecoderName(inputArgs []string) string {
+	for i := 0; i+1 < len(inputArgs); i++ {
+		if inputArgs[i] != "-hwaccel" {
+			continue
+		}
+		switch strings.ToLower(inputArgs[i+1]) {
+		case "cuda", "nvdec":
+			return "nvdec"
+		case "videotoolbox":
+			return "videotoolbox"
+		case "vaapi":
+			return "vaapi"
+		case "qsv":
+			if runtime.GOOS == "windows" {
+				return "d3d11va"
+			}
+			return "vaapi"
+		case "d3d11va":
+			return "d3d11va"
+		case "dxva2":
+			return "dxva2"
+		}
+	}
+	return ""
 }
 
 // HWAccelerated reports whether the current run encodes on hardware.
@@ -354,7 +475,15 @@ func (s *Session) Protocol() string { return s.proto }
 
 func (s *Session) isDASH() bool { return s.proto == core.ProtocolDASH }
 
-func (s *Session) segName(n int) string { return s.m.opts.segmentURI(n, s.container) }
+func (s *Session) segName(n int) string {
+	container := s.container
+	// PMS Android Matroska HLS still uses .ts URLs. The enhanced player
+	// chooses its HLS extractor from the transport declaration.
+	if s.androidMatroskaHLS && container == ContainerMatroska {
+		container = ContainerMPEGTS
+	}
+	return s.scopeMediaName(s.m.opts.segmentURI(n, container))
+}
 
 // runDirLocked is where the wanted track's ffmpeg run writes segments:
 // the session dir for the primary rung, a rung subdir for other rungs
@@ -410,3 +539,6 @@ func (s *Session) PlaybackDelivered() bool {
 	defer s.mu.Unlock()
 	return s.playbackDelivered
 }
+
+// TimelineOrigin is the title time represented by playlist time zero.
+func (s *Session) TimelineOrigin() time.Duration { return s.base }

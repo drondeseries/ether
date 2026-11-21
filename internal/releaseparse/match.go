@@ -99,9 +99,20 @@ var tokenCanon = map[string]string{
 	"ii": "2", "iii": "3", "iv": "4", "vi": "6", "vii": "7", "viii": "8", "ix": "9",
 	"one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
 	"six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10",
+	"eleven": "11", "twelve": "12", "thirteen": "13", "fourteen": "14", "fifteen": "15",
+	"sixteen": "16", "seventeen": "17", "eighteen": "18", "nineteen": "19", "twenty": "20",
+	"thirty": "30", "forty": "40", "fifty": "50", "sixty": "60", "seventy": "70", "eighty": "80", "ninety": "90",
 	"versus": "vs", "part": "pt", "volume": "vol",
 	"mister": "mr", "doctor": "dr", "saint": "st", "brothers": "bros",
 	"international": "intl",
+}
+
+var tensTokens = map[string]int{
+	"20": 20, "30": 30, "40": 40, "50": 50, "60": 60, "70": 70, "80": 80, "90": 90,
+}
+
+var unitsTokens = map[string]int{
+	"1": 1, "2": 2, "3": 3, "4": 4, "5": 5, "6": 6, "7": 7, "8": 8, "9": 9,
 }
 
 var regionalSuffixes = map[string]string{
@@ -153,8 +164,16 @@ func canonicalTokens(norm string) []string {
 			} else {
 				tok = "10"
 			}
-		} else if c, ok := tokenCanon[tok]; ok && (i > 0 || len(collapsed) == 1) {
+		} else if c, ok := tokenCanon[tok]; ok && (i > 0 || len(collapsed) == 1 || tensTokens[c] > 0) {
 			tok = c
+		}
+		if n := len(out); n > 0 {
+			if tens, ok := tensTokens[out[n-1]]; ok {
+				if unit, uok := unitsTokens[tok]; uok {
+					out[n-1] = string(rune('0'+tens/10)) + string(rune('0'+unit))
+					continue
+				}
+			}
 		}
 		out = append(out, tok)
 	}
@@ -241,6 +260,13 @@ func TitlesMatch(a, b string) bool {
 	ca := strings.Join(canonicalTokens(na), " ")
 	cb := strings.Join(canonicalTokens(nb), " ")
 	if ca != "" && ca == cb {
+		return true
+	}
+	// Titles that differ only in how words are joined are the same title:
+	// K-Pop/KPop, Spider-Man/Spiderman, X-Men/XMen, WALL-E/WALLE, and an
+	// apostrophe written as a dot (JoJo.s/JoJo's). Different words, extra
+	// words and sequel numbers still differ once spaces are removed.
+	if ja, jb := strings.ReplaceAll(na, " ", ""), strings.ReplaceAll(nb, " ", ""); len(ja) >= 3 && ja == jb {
 		return true
 	}
 	// Compare exact romanisations without relaxing sequel or word identity.
@@ -335,6 +361,9 @@ func TitleAliases(title string) []string {
 			add(collapsed)
 		}
 	}
+	if strings.Contains(raw, "/") {
+		add(strings.ReplaceAll(raw, "/", " "))
+	}
 	// Strip trailing parenthetical disambiguator, e.g. "The Office (US)" -> "The Office".
 	if i := strings.LastIndex(raw, "("); i > 0 && strings.HasSuffix(raw, ")") {
 		inner := strings.TrimSpace(raw[i+1 : len(raw)-1])
@@ -362,6 +391,20 @@ func TitleMatches(parsed core.ReleaseInfo, want string) bool {
 	return TitlesMatch(parsed.Title, want)
 }
 
+// TitleMatchesAny reports whether parsed matches want or any of the supplied
+// alternative titles.
+func TitleMatchesAny(parsed core.ReleaseInfo, want string, alts []string) bool {
+	if TitlesMatch(parsed.Title, want) {
+		return true
+	}
+	for _, alt := range alts {
+		if TitlesMatch(parsed.Title, alt) {
+			return true
+		}
+	}
+	return false
+}
+
 // YearMatches reports whether two years agree within ±1 (zero = unknown).
 func YearMatches(got, want int) bool {
 	if got == 0 || want == 0 {
@@ -377,7 +420,7 @@ func EpisodeMatches(parsed core.ReleaseInfo, season, episode int) bool {
 	if parsed.FullSeason || len(parsed.Episodes) == 0 {
 		return false
 	}
-	seasonOK := len(parsed.Seasons) == 0
+	seasonOK := len(parsed.Seasons) == 0 && season != 0
 	for _, s := range parsed.Seasons {
 		if s == season {
 			seasonOK = true
@@ -435,13 +478,91 @@ func HasUsableInfo(info core.ReleaseInfo) bool {
 
 // EpisodeMatchesAbsolute reports whether parsed info is the episode whose
 // number counted from the series start is absolute: an anime release
-// numbered that way ("Show - 1071") and naming no season.
+// numbered that way ("Show - 1071" or "Show S10E01 (0337)").
 func EpisodeMatchesAbsolute(parsed core.ReleaseInfo, absolute int) bool {
-	if absolute <= 0 || parsed.FullSeason || len(parsed.Seasons) > 0 {
+	if absolute <= 0 || parsed.FullSeason {
 		return false
 	}
 	for _, e := range parsed.AbsoluteEpisodes {
 		if e == absolute {
+			return true
+		}
+	}
+	return false
+}
+
+// AbsoluteConflict reports whether parsed info names absolute episode
+// numbers and none of them is the wanted absolute count: the release
+// names a different episode, whatever season numbering it also carries.
+// A cour-numbered release's number is cour-local, not series-absolute,
+// so cour releases never conflict on it.
+func AbsoluteConflict(parsed core.ReleaseInfo, absolute int) bool {
+	return parsed.Cour == 0 && absolute > 0 && len(parsed.AbsoluteEpisodes) > 0 && !EpisodeMatchesAbsolute(parsed, absolute)
+}
+
+// EpisodeMatchesNumbering accepts canonical season numbering or verified
+// absolute numbering. Some anime releases put the absolute number in Eyyyy;
+// allow that only in season 1 or at 100+, never for specials or cour resets.
+func EpisodeMatchesNumbering(parsed core.ReleaseInfo, season, episode, absolute int) bool {
+	if AbsoluteConflict(parsed, absolute) {
+		return false
+	}
+	if EpisodeMatches(parsed, season, episode) {
+		return true
+	}
+	if season <= 0 || absolute <= 0 || parsed.FullSeason || parsed.Cour > 0 ||
+		(len(parsed.Seasons) == 1 && parsed.Seasons[0] == 0) {
+		return false
+	}
+	if len(parsed.AbsoluteEpisodes) > 0 {
+		return EpisodeMatchesAbsolute(parsed, absolute)
+	}
+	if len(parsed.Seasons) != 1 || parsed.Seasons[0] <= 0 {
+		return false
+	}
+	for _, n := range parsed.Episodes {
+		if n == absolute && (parsed.Seasons[0] == 1 || n >= 100) {
+			return true
+		}
+	}
+	return false
+}
+
+// EpisodeMatchesRequest reports whether parsed info matches req's canonical
+// episode, verified absolute count, anime cour mapping, or configured release
+// numbering aliases. Shared by the resolver and Stremio stream name selection.
+func EpisodeMatchesRequest(info core.ReleaseInfo, req core.SearchRequest) bool {
+	abs := req.AbsoluteEpisode
+	if abs <= 0 && req.Season == 1 {
+		abs = req.Episode
+	}
+	// A release naming a different absolute episode is a different
+	// episode, even when its season numbering matches a configured
+	// alias (e.g. S17E005 = absolute 633 must not satisfy absolute 583).
+	if AbsoluteConflict(info, abs) {
+		return false
+	}
+	if info.Cour == 1 && req.Cour > 1 {
+		return false
+	}
+	if info.Cour > 1 {
+		if req.Cour == info.Cour && req.CourEpisode > 0 &&
+			(EpisodeMatches(info, req.Season, req.CourEpisode) ||
+				(req.CourTVDBSeason > 0 && EpisodeMatches(info, req.CourTVDBSeason, req.CourEpisode))) {
+			return true
+		}
+		return false
+	}
+	if EpisodeMatchesNumbering(info, req.Season, req.Episode, abs) {
+		return true
+	}
+	if req.CourTVDBSeason > 0 && req.CourTVDBEpisode > 0 && info.Cour == 0 && len(info.Seasons) > 0 &&
+		(len(info.AbsoluteEpisodes) == 0 || abs <= 0 || EpisodeMatchesAbsolute(info, abs)) &&
+		EpisodeMatches(info, req.CourTVDBSeason, req.CourTVDBEpisode) {
+		return true
+	}
+	for _, n := range core.EpisodeAliases(req) {
+		if EpisodeMatches(info, n.Season, n.Episode) {
 			return true
 		}
 	}

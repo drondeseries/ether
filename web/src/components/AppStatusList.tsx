@@ -1,6 +1,6 @@
 import { copyText } from "./CopyButton";
 import { Button, Tooltip } from "@braedonsaunders/appkit-ui";
-import { AlertTriangle, CheckCircle2, XCircle, Copy, CircleHelp } from "lucide-react";
+import { AlertTriangle, CheckCircle2, CircleDashed, XCircle, Copy, CircleHelp } from "lucide-react";
 import type { ComponentProps } from "react";
 import { SettingsRow } from "./SettingsRow";
 import { t } from "../i18n";
@@ -11,13 +11,21 @@ export function StatusRow({
   ...props
 }: ComponentProps<typeof SettingsRow> & { state?: string }) {
   const Icon =
-    state === "reachable" ? CheckCircle2 : state === "unreachable" ? XCircle : AlertTriangle;
+    state === "reachable"
+      ? CheckCircle2
+      : state === "unreachable"
+        ? XCircle
+        : state === "warning"
+          ? AlertTriangle
+          : CircleDashed;
   const color =
     state === "reachable"
       ? "text-success"
       : state === "unreachable"
         ? "text-danger"
-        : "text-warning";
+        : state === "warning"
+          ? "text-warning"
+          : "text-fg-muted";
   return (
     <SettingsRow
       {...props}
@@ -69,18 +77,22 @@ export function ConnectionStatusRow({
   title,
   detail,
   address,
+  label: stateLabel,
 }: {
   state?: string;
   title: string;
   detail: string;
   address?: string;
+  /** Overrides the state word, e.g. a check that ran but could not confirm. */
+  label?: string;
 }) {
   const label =
-    state === "reachable"
+    stateLabel ??
+    (state === "reachable"
       ? t("Reachable")
       : state === "unreachable"
         ? t("Can't reach it")
-        : t("Not checked yet");
+        : t("Not checked yet"));
   return (
     <StatusRow
       state={state}

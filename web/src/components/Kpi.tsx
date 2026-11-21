@@ -44,12 +44,16 @@ export function Kpi({
             {label}
           </div>
           <div className="mt-3 truncate text-2xl font-semibold tabular-nums text-fg">{value}</div>
-          {/* The detail line is always reserved, so every KPI row is the same height. */}
-          <div className="mt-1 h-4 truncate text-xs text-fg-muted">{detail}</div>
+          {/* The detail line is always reserved, so every KPI row is at least the same height. */}
+          <div className="mt-1 min-h-4 text-xs leading-snug text-fg-muted">{detail}</div>
         </div>
         {icon ? (
           <span
-            className={cn("grid size-9 shrink-0 place-items-center rounded-lg", TONE[tone])}
+            className={cn(
+              // Phones keep the width for the value; the chip only decorates.
+              "hidden size-9 shrink-0 place-items-center rounded-lg sm:grid",
+              TONE[tone],
+            )}
             aria-hidden
           >
             {icon}

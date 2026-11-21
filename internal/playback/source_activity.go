@@ -36,11 +36,20 @@ func (m *Manager) SourcePlaybackProgress(ctx context.Context, id, revision strin
 		s.mu.Unlock()
 		return err
 	}
+	prevState := s.viewerState
+	prevPausedAt := s.pausedAt
+	prevPos := s.viewerPosition
+	prevProgressAt := s.lastProgressAt
+	firstPos := s.viewerAt.IsZero() || s.viewerState != state
 	s.viewerPosition = position
 	s.viewerAt = time.Now()
-	s.viewerState = state
-	if measuredProtocol(s.caps.Protocol) {
-		s.exp.observe(now, reportsBuffering(s.caps.Protocol), position, state)
+	s.lastProgressAt = now
+	s.setViewerStateLocked(state, now)
+	if state == "paused" || state == "stopped" {
+		s.invalidateDirectRetryLocked()
+	}
+	if !s.caps.NoPlaybackTelemetry {
+		s.exp.observe(now, !s.caps.InferBuffering, position, state)
 	}
 	s.lastActive = now
 	s.stopAt = time.Time{}
@@ -49,6 +58,11 @@ func (m *Manager) SourcePlaybackProgress(ctx context.Context, id, revision strin
 		pausedRelease = s.cur.releaseID()
 	}
 	s.mu.Unlock()
+	m.observeProgressDomainEvents(s, prevState, prevPausedAt, prevPos, prevProgressAt, state, position, now)
+	m.noteTimelineStall(s, now)
+	if firstPos {
+		m.emitEvent("progress", s, nil)
+	}
 	m.startSubtitleCheck(s)
 	m.noteCause(pausedRelease, core.CacheCausePaused)
 	m.maintainReserve(s, position, state)

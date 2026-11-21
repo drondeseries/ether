@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/braedonsaunders/ether/internal/core"
+	"github.com/braedonsaunders/ether/internal/releasepolicy"
 	"github.com/braedonsaunders/ether/internal/reqmemo"
 	"github.com/braedonsaunders/ether/internal/store"
 )
@@ -182,6 +183,13 @@ type resumeStore struct {
 	// beforeLiveNote, when set, runs after the row commits and before the
 	// in-memory copy is published. Tests use it to expire the row in that window.
 	beforeLiveNote func()
+
+	// orphanSeen holds the index and probe rows the last orphan sweep found
+	// with no resume row (guarded by orphanMu); see sweepOrphans.
+	orphanMu   sync.Mutex
+	orphanSeen map[orphanRow]bool
+	// orphanNext is when ReconcilePins sweeps next (its goroutine only).
+	orphanNext time.Time
 }
 
 type resumeLive struct {
@@ -302,7 +310,6 @@ func newResumeStore(db *sql.DB, dataDir string) (*resumeStore, error) {
 		return nil, err
 	}
 	s := &resumeStore{db: db, dir: dir, payload: payload}
-	s.sweep(ctx)
 	return s, nil
 }
 
@@ -312,31 +319,45 @@ const sweepMinAge = time.Hour
 
 // sweep removes temp files left by a crash mid-write and NZB files no
 // resume record references (e.g. the process died between writing the
-// file and inserting its row). It runs once at startup.
+// file and inserting its row). It runs after listening.
 func (s *resumeStore) sweep(ctx context.Context) {
-	entries, err := os.ReadDir(s.dir)
+	f, err := os.Open(s.dir)
 	if err != nil {
 		return
 	}
+	defer f.Close()
 	cutoff := time.Now().Add(-sweepMinAge)
-	for _, e := range entries {
-		name := e.Name()
-		if e.IsDir() {
-			continue
+	tick := time.NewTicker(5 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		entries, err := f.ReadDir(32)
+		if len(entries) == 0 && err != nil {
+			return
 		}
-		info, err := e.Info()
-		if err != nil || info.ModTime().After(cutoff) {
-			continue
-		}
-		switch {
-		case strings.HasPrefix(name, "nzb-") && strings.HasSuffix(name, ".tmp"):
-			var owners int
-			if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM playback_payload_owners WHERE domain=?`, s.payload.domain).Scan(&owners); err == nil && owners == 0 {
-				_ = os.Remove(filepath.Join(s.dir, name))
+		for _, e := range entries {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
 			}
-		case strings.HasSuffix(name, ".nzb"):
-			hash := strings.TrimSuffix(name, ".nzb")
-			s.gcNZB(ctx, hash)
+			name := e.Name()
+			if e.IsDir() {
+				continue
+			}
+			info, err := e.Info()
+			if err != nil || info.ModTime().After(cutoff) {
+				continue
+			}
+			switch {
+			case strings.HasPrefix(name, "nzb-") && strings.HasSuffix(name, ".tmp"):
+				var owners int
+				if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM playback_payload_owners WHERE domain=?`, s.payload.domain).Scan(&owners); err == nil && owners == 0 {
+					_ = os.Remove(filepath.Join(s.dir, name))
+				}
+			case strings.HasSuffix(name, ".nzb"):
+				hash := strings.TrimSuffix(name, ".nzb")
+				s.gcNZB(ctx, hash)
+			}
 		}
 	}
 }
@@ -533,7 +554,22 @@ func (s *resumeStore) rememberedResolution(userID int64, key core.RatingKey, pro
 	if !ok || got.res == nil || got.profile != profileKey || got.releaseID == "" {
 		return nil
 	}
-	if !rememberedOriginalAudioCurrent(profile, got.originalLanguage, original, got.res.Release) || !rememberedCodecCurrent(got.res.Release, caps) || !sourceFitsBitrate(got.size, got.duration, 0, caps.MaxBitrateKbps) {
+	if caps.BroadcastBitrateKbps > 0 && (got.size <= 0 || got.duration <= 0) {
+		return nil
+	}
+	if caps.BroadcastBitrateKbps > 0 {
+		file := got.res.Release
+		file.Size = got.size
+		if got.probe != nil {
+			if video := got.probe.info.Video(); video != nil && video.Height > file.Info.Height {
+				file.Info.Height = video.Height
+			}
+		}
+		if !releasepolicy.ChannelSourceAllowed(file, got.duration, caps.BroadcastBitrateKbps) {
+			return nil
+		}
+	}
+	if !rememberedOriginalAudioCurrent(profile, got.originalLanguage, original, got.res.Release) || !rememberedCodecCurrent(got.res.Release, caps) || !sourceFitsBitrate(got.size, got.duration, 0, caps.MaxBitrateKbps) || !sourceFitsBitrate(got.size, got.duration, 0, caps.BroadcastBitrateKbps) {
 		return nil
 	}
 	if got.probe != nil && !rememberedInfoCodecCurrent(got.probe.info, caps) {
@@ -713,9 +749,6 @@ func saveResumeRowTx(ctx context.Context, tx *sql.Tx, rec resumeRecord, hash str
 	if _, err := tx.ExecContext(ctx, `DELETE FROM playback_index WHERE user_id=? AND rating_key=? AND release_id<>?`, rec.userID, int64(rec.key), rec.release.ID); err != nil {
 		return "", err
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM playback_probe WHERE user_id=? AND rating_key=? AND release_id<>?`, rec.userID, int64(rec.key), rec.release.ID); err != nil {
-		return "", err
-	}
 	var oldHash string
 	err = tx.QueryRowContext(ctx, `SELECT nzb_hash FROM playback_resume WHERE user_id=? AND rating_key=?`,
 		rec.userID, int64(rec.key)).Scan(&oldHash)
@@ -794,6 +827,7 @@ func (s *resumeStore) manyLookups(ctx context.Context, userID int64) bool {
 func forgetResume(ctx context.Context, userID int64, key core.RatingKey) {
 	reqmemo.Forget(ctx, resumeMemoKey(userID, key))
 	reqmemo.Forget(ctx, resumeKeysMemoKey(userID))
+	reqmemo.ForgetPrefix(ctx, resumeMemoKey(userID, key)+":probe:")
 }
 
 // resumeKeySetAfter is how many titles a read request looks up one by one
@@ -805,29 +839,29 @@ const resumeKeySetAfter = 8
 // reads which titles have a record at all, once: a Home or list page asks
 // for every title it shows, and most have none.
 func (s *resumeStore) get(ctx context.Context, userID int64, key core.RatingKey) (*resumeRecord, error) {
-	if reqmemo.Active(ctx) && s.manyLookups(ctx, userID) {
-		set, err := reqmemo.Do(ctx, resumeKeysMemoKey(userID), func() (resumeKeySet, error) {
-			rows, err := s.db.QueryContext(ctx, `SELECT rating_key FROM playback_resume WHERE user_id=? LIMIT ?`, userID, resumeKeySetMax+1)
-			if err != nil {
-				return resumeKeySet{}, err
-			}
-			defer rows.Close()
-			set := resumeKeySet{has: map[core.RatingKey]bool{}}
-			for rows.Next() {
-				var k int64
-				if err := rows.Scan(&k); err != nil {
+	rec, err := reqmemo.Do(ctx, resumeMemoKey(userID, key), func() (*resumeRecord, error) {
+		if reqmemo.Active(ctx) && s.manyLookups(ctx, userID) {
+			set, err := reqmemo.Do(ctx, resumeKeysMemoKey(userID), func() (resumeKeySet, error) {
+				rows, err := s.db.QueryContext(ctx, `SELECT rating_key FROM playback_resume WHERE user_id=? LIMIT ?`, userID, resumeKeySetMax+1)
+				if err != nil {
 					return resumeKeySet{}, err
 				}
-				set.has[core.RatingKey(k)] = true
+				defer rows.Close()
+				set := resumeKeySet{has: map[core.RatingKey]bool{}}
+				for rows.Next() {
+					var k int64
+					if err := rows.Scan(&k); err != nil {
+						return resumeKeySet{}, err
+					}
+					set.has[core.RatingKey(k)] = true
+				}
+				set.complete = len(set.has) <= resumeKeySetMax
+				return set, rows.Err()
+			})
+			if err == nil && set.complete && !set.has[key] {
+				return nil, nil
 			}
-			set.complete = len(set.has) <= resumeKeySetMax
-			return set, rows.Err()
-		})
-		if err == nil && set.complete && !set.has[key] {
-			return nil, nil
 		}
-	}
-	rec, err := reqmemo.Do(ctx, resumeMemoKey(userID, key), func() (*resumeRecord, error) {
 		row := s.db.QueryRowContext(ctx, `SELECT `+resumeColumns+` FROM playback_resume WHERE user_id=? AND rating_key=?`,
 			userID, int64(key))
 		rec, err := scanResume(row)
@@ -875,15 +909,9 @@ func (s *resumeStore) delete(ctx context.Context, userID int64, key core.RatingK
 	if err != nil {
 		return err
 	}
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM playback_resume WHERE user_id=? AND rating_key=?`, userID, int64(key)); err != nil {
-		return err
-	}
 	// The record expired: nothing prunes its keyframe index any more (a
 	// later save only replaces other releases' indexes for a live record).
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM playback_index WHERE user_id=? AND rating_key=?`, userID, int64(key)); err != nil {
-		return err
-	}
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM playback_probe WHERE user_id=? AND rating_key=?`, userID, int64(key)); err != nil {
+	if err := s.deleteRows(ctx, userID, key, true); err != nil {
 		return err
 	}
 	s.gcNZB(ctx, hash)
@@ -891,29 +919,76 @@ func (s *resumeStore) delete(ctx context.Context, userID int64, key core.RatingK
 	return nil
 }
 
+// deleteRows deletes a viewer's resume row for a title and, with caches, the
+// keyframe indexes and probes of every release of it.
+func (s *resumeStore) deleteRows(ctx context.Context, userID int64, key core.RatingKey, caches bool) error {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM playback_resume WHERE user_id=? AND rating_key=?`, userID, int64(key)); err != nil {
+		return err
+	}
+	if !caches {
+		return nil
+	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM playback_index WHERE user_id=? AND rating_key=?`, userID, int64(key)); err != nil {
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, `DELETE FROM playback_probe WHERE user_id=? AND rating_key=?`, userID, int64(key))
+	return err
+}
+
 // invalidateTitle drops a reusable source choice after an owner changes
 // release policy. This table contains source identities, not watch progress.
-// Keep the content-addressed payload and index caches for ordinary pruning.
-func (s *resumeStore) invalidateTitle(ctx context.Context, key core.RatingKey) error {
+// Each dropped choice takes its keyframe indexes and probes along, except
+// for a viewer with a session of the title on this node (a reopen of the
+// playing release reads them; the orphan sweep collects them after it ends),
+// and payloads no row references any more are collected.
+func (s *resumeStore) invalidateTitle(ctx context.Context, key core.RatingKey, sessions map[resumeKey]bool) error {
 	reqmemo.ForgetPrefix(ctx, "playback:resume:")
-	if key.Kind() != core.KindShow && key.Kind() != core.KindSeason {
-		_, err := s.db.ExecContext(ctx, `DELETE FROM playback_resume WHERE rating_key=?`, int64(key))
-		if err == nil {
-			s.forgetFreshKey(key)
+	var drop []resumeRecord
+	single := key.Kind() != core.KindShow && key.Kind() != core.KindSeason
+	if single {
+		rows, err := s.db.QueryContext(ctx, `SELECT user_id, nzb_hash FROM playback_resume WHERE rating_key=?`, int64(key))
+		if err != nil {
+			return err
 		}
-		return err
-	}
-	records, err := s.all(ctx)
-	if err != nil {
-		return err
-	}
-	for _, rec := range records {
-		if titleIncludes(key, rec.key) {
-			if _, err := s.db.ExecContext(ctx, `DELETE FROM playback_resume WHERE user_id=? AND rating_key=?`, rec.userID, int64(rec.key)); err != nil {
+		for rows.Next() {
+			rec := resumeRecord{key: key}
+			if err := rows.Scan(&rec.userID, &rec.nzbHash); err != nil {
+				rows.Close()
 				return err
 			}
-			s.forgetFresh(rec.userID, rec.key)
+			drop = append(drop, rec)
 		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return err
+		}
+	} else {
+		records, err := s.all(ctx)
+		if err != nil {
+			return err
+		}
+		for _, rec := range records {
+			if titleIncludes(key, rec.key) {
+				drop = append(drop, rec)
+			}
+		}
+	}
+	hashes := map[string]bool{}
+	for _, rec := range drop {
+		if err := s.deleteRows(ctx, rec.userID, rec.key, !sessions[resumeKey{rec.userID, rec.key}]); err != nil {
+			return err
+		}
+		s.forgetFresh(rec.userID, rec.key)
+		if rec.nzbHash != "" {
+			hashes[rec.nzbHash] = true
+		}
+	}
+	if single {
+		s.forgetFreshKey(key)
+	}
+	for h := range hashes {
+		s.gcNZB(ctx, h)
 	}
 	return nil
 }
@@ -978,4 +1053,11 @@ func (s *resumeStore) loadIndex(ctx context.Context, userID int64, key core.Rati
 		points = points[:maxResumeKeyframes]
 	}
 	return points, nil
+}
+
+// FinishStartup performs optional orphan housekeeping after listening.
+func (m *Manager) FinishStartup(ctx context.Context) {
+	if m.resume != nil {
+		m.resume.sweep(ctx)
+	}
 }

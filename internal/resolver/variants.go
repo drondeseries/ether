@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/braedonsaunders/ether/internal/core"
+	"github.com/braedonsaunders/ether/internal/langtag"
+	"github.com/braedonsaunders/ether/internal/releaseparse"
 )
 
 var _ core.VariantResolver = (*Service)(nil)
@@ -27,6 +29,16 @@ const (
 // single Auto media; the detail page's PreResolve populates the cache, so
 // a later load shows versions.
 func (s *Service) Variants(ctx context.Context, req core.ResolveRequest, max int) ([]core.ReleaseVariant, error) {
+	if core.LocalResponse(ctx) {
+		// Detail responses expose stable logical choices immediately. Only
+		// the background snapshot may attach policy-checked concrete sources;
+		// a cold snapshot must never make the client's version menu disappear.
+		return s.VersionSlots(ctx, req, max, true)
+	}
+	return s.variants(ctx, req, max)
+}
+
+func (s *Service) variants(ctx context.Context, req core.ResolveRequest, max int) ([]core.ReleaseVariant, error) {
 	if req.Title == nil {
 		return nil, fmt.Errorf("resolver: nil title")
 	}
@@ -35,22 +47,38 @@ func (s *Service) Variants(ctx context.Context, req core.ResolveRequest, max int
 	}
 	media := titleMedia(req.Title)
 	q := s.qualityCfg()
-	req.Client, _ = applyClientRules(q, req.Client, req.User, media)
-	profile := SelectProfileForMedia(q, req.Client, req.User, media)
+	libProfile := s.libProfileForTitle(ctx, req.Title)
+	req.Client, _ = applyClientRules(q, req.Client, req.User, media, libProfile)
+	profile := SelectProfileForTitle(q, req.Client, req.User, req.Title, libProfile)
 	sreq := searchRequestFor(req.Title)
 	results, ok := s.peekSearchCache(searchCacheKey(sreq))
+	titleVC := s.viewerTitleChoiceForResolve(req, nil)
+	showVC := s.viewerShowChoiceForResolve(req)
+	ownerPin, hasOwnerPin := s.PinFor(req.Title.Key)
+	if req.Client.Download {
+		hasOwnerPin = false
+	}
 	if !ok || len(results) == 0 {
-		return nil, nil
+		if titleVC == nil {
+			return nil, nil
+		}
+		results = withRelease(nil, titleVC.Release)
+		if hasOwnerPin && !s.isBadRelease(ownerPin.Release) {
+			results = withRelease(results, ownerPin.Release)
+		}
 	}
-	// An owner pin that applies to this client is what normal resolution
-	// tries first, so it is Auto (pins.go).
+	// An owner pin that applies to this client is kept in the candidate pool,
+	// while an active viewer remembered choice takes precedence in Auto.
 	pinID := ""
-	if pin, _ := s.pinForResolve(req); pin != nil {
-		pinID = pin.Release.ID
-		results = withRelease(results, pin.Release)
+	if hasOwnerPin && !s.isBadRelease(ownerPin.Release) {
+		pinID = ownerPin.Release.ID
+		results = withRelease(results, ownerPin.Release)
 	}
-	// Auto is exactly what normal resolution would pick: strict profile.
-	strict, _, err := s.rankCandidates(ctx, req, sreq, profile, results, nil, pinID)
+	if titleVC != nil {
+		results = withRelease(results, titleVC.Release)
+	}
+	// Auto uses the same preferences and hard rules as normal resolution.
+	strict, _, err := s.rankCandidatesLocal(ctx, req, sreq, profile, results, nil, pinID, true)
 	if err != nil {
 		return nil, err
 	}
@@ -67,15 +95,88 @@ func (s *Service) Variants(ctx context.Context, req core.ResolveRequest, max int
 	allowTaller := s.resolverCfg().OfferHigherVersions
 	if allowTaller {
 		if relaxed, ok := relaxedVariantProfile(profile, req.Client); ok {
-			pool, _, err = s.rankCandidates(ctx, req, sreq, relaxed, results, nil, pinID)
+			pool, _, err = s.rankCandidatesLocal(ctx, req, sreq, relaxed, results, nil, pinID, false)
 			if err != nil {
 				return nil, err
 			}
 		}
 	}
-	vs := pickVariants(req.Title, req.Client, profile, strict[0].rel, pool, strict, s.sameQualityAlternatives(), max, allowTaller)
-	labelPlayedAuto(req.Title, vs, req.PlayedRelease, results, s.LookupRelease)
+	strict = acceptableVariantAudio(clearIdentityVariants(strict))
+	pool = acceptableVariantAudio(clearIdentityVariants(pool))
+	autoRel := strict[0].rel
+	autoRemembered := false
+	if titleVC != nil || showVC != nil {
+		if picked, remembered := s.slotAutoWithSource(req, strict, pool, titleVC, showVC); remembered && picked.ID != "" {
+			autoRel, autoRemembered = picked, true
+		}
+	}
+	var vs []core.ReleaseVariant
+	rcfg := s.resolverCfg()
+	wanted := wantedAudio(profile, req.User, s.catalogLanguage())
+	if rcfg.AlternativesPerSource || rcfg.AlternativesPerResolution {
+		vs = pickResolutionVariants(req.Title, profile, autoRel, pool, s.sameQualityAlternatives(), max, allowTaller, rcfg.AlternativesPerResolution, rcfg.AlternativesPerSource, wanted)
+	} else {
+		vs = pickVariants(req.Title, req.Client, profile, autoRel, pool, strict, s.sameQualityAlternatives(), max, allowTaller, wanted)
+	}
+	// A historical play must not put a now-rejected namesake back into Auto.
+	played := req.PlayedRelease
+	if autoRemembered {
+		played = ""
+	}
+	if played != "" {
+		r, found := s.LookupRelease(played)
+		for _, result := range results {
+			if result.ID == played {
+				r, found = result, true
+				break
+			}
+		}
+		if found {
+			identity := s.localEpisodeIdentity(ctx, req.Title, sreq, results)
+			if identity.reject(r, req.Title, sreq) != "" || (identity.ambiguous(r, req.Title, sreq) && !strict[0].identityWeak) {
+				played = ""
+			}
+		}
+	}
+	labelPlayedAuto(req.Title, vs, played, results, s.LookupRelease, wanted)
+	// Every client version picker gets the same honest preference shortfall.
+	for i := range vs {
+		if info, ok := s.probedMediaFor(vs[i].Release); ok {
+			vs[i].Info = info
+		}
+		vs[i].Remembered = i == 0 && autoRemembered
+		vs[i].Pinned = hasOwnerPin && vs[i].Release.ID == ownerPin.Release.ID
+		vs[i].Availability, vs[i].AvailabilityNote = s.classifyVariantAvailability(ctx, req.Title.Key, vs[i].Release, vs[i].Info, false, ok)
+		for _, c := range pool {
+			if c.rel.ID != vs[i].Release.ID {
+				continue
+			}
+			if c.belowScore {
+				vs[i].Label += fmt.Sprintf(" — below profile minimum (score %d of %d)", c.counted, *profile.MinCustomFormatScore)
+			} else if c.fallback {
+				vs[i].Label += " — below preferred quality"
+			}
+			break
+		}
+	}
 	return vs, nil
+}
+
+// acceptableVariantAudio keeps unwanted single-language dubs as a last resort,
+// matching ranking's accepted-audio rules without spending any indexer budget.
+func acceptableVariantAudio(ranked []candidate) []candidate {
+	for _, c := range ranked {
+		if c.langOK {
+			out := make([]candidate, 0, len(ranked))
+			for _, candidate := range ranked {
+				if candidate.langOK {
+					out = append(out, candidate)
+				}
+			}
+			return out
+		}
+	}
+	return ranked
 }
 
 // labelPlayedAuto aligns Auto with the release this viewer actually played
@@ -83,7 +184,7 @@ func (s *Service) Variants(ctx context.Context, req core.ResolveRequest, max int
 // alternative row in Auto's own tier) or an earlier Auto pick ranks
 // differently now. Explicit versions in another quality tier or cut keep
 // Auto's own label and attributes.
-func labelPlayedAuto(t *core.Title, vs []core.ReleaseVariant, played string, results []core.Release, lookup func(string) (core.Release, bool)) {
+func labelPlayedAuto(t *core.Title, vs []core.ReleaseVariant, played string, results []core.Release, lookup func(string) (core.Release, bool), wanted []string) {
 	if played == "" || len(vs) == 0 || !vs[0].Auto || vs[0].Release.ID == played {
 		return
 	}
@@ -104,7 +205,7 @@ func labelPlayedAuto(t *core.Title, vs []core.ReleaseVariant, played string, res
 		}
 	}
 	apply := func(r core.Release) {
-		info := estimateVariantInfo(t, sizedForEpisode(r))
+		info := estimateVariantInfo(t, sizedForEpisode(r), wanted)
 		for _, v := range vs[1:] {
 			if strings.EqualFold(strings.TrimSpace(v.Release.Name), strings.TrimSpace(r.Name)) && v.Release.Name != "" {
 				info = v.Info
@@ -195,7 +296,7 @@ func variantKey(info core.ReleaseInfo) string {
 // distinct cut, and any remaining distinct tiers. Tiers are best-scored
 // first within each slot and deduplicated by (edition, quality tier); the
 // alternatives come from the strict profile pool, in rank order.
-func pickVariants(t *core.Title, caps core.ClientCaps, profile core.QualityProfile, auto core.Release, pool, strict []candidate, alternatives, max int, allowTaller bool) []core.ReleaseVariant {
+func pickVariants(t *core.Title, caps core.ClientCaps, profile core.QualityProfile, auto core.Release, pool, strict []candidate, alternatives, max int, allowTaller bool, wanted []string) []core.ReleaseVariant {
 	usedRel := map[string]bool{}
 	usedKey := map[string]bool{}
 	var out []core.ReleaseVariant
@@ -210,7 +311,7 @@ func pickVariants(t *core.Title, caps core.ClientCaps, profile core.QualityProfi
 			Edition: rel.Info.Edition,
 			Auto:    isAuto,
 			Release: rel,
-			Info:    estimateVariantInfo(t, sizedForEpisode(rel)),
+			Info:    estimateVariantInfo(t, sizedForEpisode(rel), wanted),
 		}
 	}
 	add := func(rel core.Release, kind string, isAuto bool) bool {
@@ -249,9 +350,12 @@ func pickVariants(t *core.Title, caps core.ClientCaps, profile core.QualityProfi
 		seenEdition[ed] = true
 		add(c.rel, "edition", false)
 	}
-	// Remaining distinct tiers fill any open slots.
+	// Preferred distinct tiers fill open slots first. Newly eligible soft
+	// tiers use only space left after Auto's same-quality alternatives.
 	for _, c := range pool {
-		add(c.rel, "tier", false)
+		if !c.belowScore && !c.fallback {
+			add(c.rel, "tier", false)
+		}
 	}
 
 	// Same-quality alternatives sit right after Auto, so plain Play and the
@@ -267,6 +371,10 @@ func pickVariants(t *core.Title, caps core.ClientCaps, profile core.QualityProfi
 			kept = append(kept, rel)
 		}
 		alts = kept
+	}
+	tierMax = min(tierMax, max-len(alts))
+	for _, c := range pool {
+		add(c.rel, "tier", false)
 	}
 	if len(alts) == 0 {
 		return out
@@ -366,7 +474,7 @@ func bestCompat(pool []candidate, caps core.ClientCaps, used map[string]bool) (c
 		if rel.Info.HDR10 || rel.Info.DolbyVision {
 			continue
 		}
-		sc := rel.Score / 10 // overall rank as tiebreak
+		sc := 0.0 // ties keep the pool's rank order
 		if rel.Info.Height == target {
 			sc += 100
 		} else if rel.Info.Height == 720 {
@@ -518,7 +626,7 @@ func qualityPhrase(info core.ReleaseInfo) string {
 // estimateVariantInfo derives the expected MediaInfo from a parsed release
 // name: resolution, codecs, HDR/DV, channels, and a bitrate from the
 // release size over the title runtime (typical bitrates when unknown).
-func estimateVariantInfo(t *core.Title, rel core.Release) core.MediaInfo {
+func estimateVariantInfo(t *core.Title, rel core.Release, wanted []string) core.MediaInfo {
 	info := rel.Info
 	// Bitrate guesses need a height. The picture shown on a detail page must
 	// not: an unparsed name is not 1080p, and inventing E-AC-3 5.1 is how a
@@ -551,20 +659,47 @@ func estimateVariantInfo(t *core.Title, rel core.Release) core.MediaInfo {
 			video.Profile = "main 10"
 		}
 	}
-	video.DolbyVision = info.DolbyVision
+	if info.DolbyVision {
+		video.DolbyVision = true
+		// Unprobed Dolby Vision variants still need a realistic DOVIProfile so
+		// Plex MDE clients with DOVIProfile limitations evaluate estimated
+		// siblings on the same footing as probed variants instead of mistaking
+		// an omitted DOVIProfile for plain HDR10.
+		switch {
+		case info.Source == core.SourceRemux || info.Source == core.SourceBluRay:
+			video.DolbyVisionProfile = 7
+			video.DolbyVisionCompatibilityID = 6
+		case !info.HDR10:
+			video.DolbyVisionProfile = 5
+		default:
+			video.DolbyVisionProfile = 8
+			video.DolbyVisionCompatibilityID = 1
+		}
+	}
 
 	audioCodec := info.AudioCodec
 	channels := channelInfo{}
 	if info.Channels != "" {
 		channels = channelsFromString(info.Channels)
 	}
-	audio := core.StreamInfo{
-		Index: 1, Type: "audio", Codec: audioCodec,
-		Channels: channels.count, ChannelLayout: channels.layout,
-		SampleRate: 48000, Default: true,
-	}
+	original := ""
 	if t != nil {
-		audio.Language = t.Language
+		original = t.Language
+	}
+	var audioStreams []core.StreamInfo
+	if audioCodec != "" || len(info.Languages) > 0 {
+		audioStreams = estimateAudioStreams(info, original, rel.SourceLanguage, wanted)
+		for i := range audioStreams {
+			if channels.count > 0 {
+				audioStreams[i].Channels = channels.count
+				audioStreams[i].ChannelLayout = channels.layout
+			}
+			if audioCodec != "" {
+				audioStreams[i].Codec = audioCodec
+				audioStreams[i].SampleRate = 48000
+				audioStreams[i].BitrateKbps = audioKbpsGuess(audioCodec, channels.count)
+			}
+		}
 	}
 
 	var dur time.Duration
@@ -584,9 +719,12 @@ func estimateVariantInfo(t *core.Title, rel core.Release) core.MediaInfo {
 	if size <= 0 && dur > 0 && bitrate > 0 {
 		size = int64(float64(bitrate) * 1000 / 8 * dur.Seconds())
 	}
-	audio.BitrateKbps = audioKbpsGuess(audioCodec, channels.count)
-	if bitrate > audio.BitrateKbps {
-		video.BitrateKbps = bitrate - audio.BitrateKbps
+	audioRate := audioKbpsGuess(audioCodec, channels.count)
+	if len(audioStreams) > 0 {
+		audioRate = audioStreams[0].BitrateKbps
+	}
+	if bitrate > audioRate {
+		video.BitrateKbps = bitrate - audioRate
 	}
 
 	container := info.Container
@@ -597,9 +735,7 @@ func estimateVariantInfo(t *core.Title, rel core.Release) core.MediaInfo {
 	if claimedH > 0 || codec != "" {
 		streams = append(streams, video)
 	}
-	if audioCodec != "" {
-		streams = append(streams, audio)
-	}
+	streams = append(streams, audioStreams...)
 	return core.MediaInfo{
 		Container:   container,
 		Duration:    dur,
@@ -608,6 +744,128 @@ func estimateVariantInfo(t *core.Title, rel core.Release) core.MediaInfo {
 		Streams:     streams,
 		Estimated:   true,
 	}
+}
+
+// estimateAudioStreams builds the audio streams an unprobed release will
+// expose on a detail page: one per declared language, with the title's
+// original language included when the release is DUAL or MULTI. A DUAL or
+// MULTI tag says there is more than one track without naming the dub, so
+// that track is listed unlabelled — unless the indexer the release came
+// from declares a source language (sourceLang), in which case that
+// language fills the slot rather than being guessed from the viewer. Ether
+// never claims a language the release name does not state. Probing at play
+// replaces the estimate. The stream the viewer would actually hear (their
+// wanted language when the name states it, otherwise the original) is
+// flagged Default. One stream (the original) is kept when nothing is known.
+func estimateAudioStreams(info core.ReleaseInfo, original, sourceLang string, wanted []string) []core.StreamInfo {
+	langs := estimateAudioLanguages(info, original, sourceLang)
+	if len(langs) == 0 {
+		// Nothing is known about the language; keep one unlabelled stream so
+		// the detail page still shows the audio codec, as before.
+		return []core.StreamInfo{{Index: 1, Type: "audio", Default: true}}
+	}
+	def := 0
+	if pick := estimatedDefaultAudio(langs, wanted, original); pick >= 0 {
+		def = pick
+	}
+	out := make([]core.StreamInfo, 0, len(langs))
+	for i, lang := range langs {
+		out = append(out, core.StreamInfo{
+			Index: i + 1, Type: "audio", Language: lang, Default: i == def,
+		})
+	}
+	return out
+}
+
+// estimateAudioLanguages lists the audio languages a release declares, in
+// display order: concrete declared languages first, then the original when
+// the release is DUAL or MULTI, plus a dub entry when such a release names
+// none. That dub is the indexer's source language (sourceLang) when it is
+// set and differs from the title's original language, otherwise unlabelled:
+// a bare DUAL from a pt-BR tracker, on an English film, shows the dub as
+// pt-BR rather than guessed from the viewer. The original is the sole entry
+// when the release says nothing.
+func estimateAudioLanguages(info core.ReleaseInfo, original, sourceLang string) []string {
+	var out []string
+	seen := map[string]bool{}
+	add := func(v string) bool {
+		name := releaseparse.LanguageName(v)
+		if name == "" || name == releaseparse.LanguageMulti || name == releaseparse.LanguageDual {
+			return false
+		}
+		// Display value: the canonical BCP 47 tag ("pt-BR", "en"), which
+		// frontends render, falling back to the parser's name when the tag
+		// is unknown to the tag vocabulary.
+		code := langtag.CanonicalBCP47(name)
+		if code == "" {
+			code = name
+		}
+		key := strings.ToLower(name)
+		if seen[key] {
+			return false
+		}
+		seen[key] = true
+		out = append(out, code)
+		return true
+	}
+	wide := false
+	hasNonOriginal := false
+	for _, l := range info.Languages {
+		if l == releaseparse.LanguageMulti || l == releaseparse.LanguageDual {
+			wide = true
+			continue
+		}
+		if add(l) {
+			if original == "" || releaseparse.LanguageMatch(l, original) == releaseparse.LanguageNoMatch {
+				hasNonOriginal = true
+			}
+		}
+	}
+	if wide {
+		add(original)
+		if !hasNonOriginal {
+			// DUAL/MULTI with no named dub beyond the title's original language:
+			// the source language is the evidence we have for the other track,
+			// but only when it says something new — a source matching the
+			// original adds nothing, and an unset source stays unlabelled rather
+			// than collapsing a multi-track release to only the original language.
+			src := langtag.CanonicalBCP47(sourceLang)
+			if src == "" {
+				src = strings.TrimSpace(sourceLang)
+			}
+			if src != "" && releaseparse.LanguageMatch(src, original) == releaseparse.LanguageNoMatch {
+				add(src)
+			} else {
+				out = append(out, "")
+			}
+		}
+	}
+	if len(out) == 0 {
+		add(original)
+	}
+	return out
+}
+
+// estimatedDefaultAudio is the position in langs that playback would pick:
+// the first wanted language that matches a stream, otherwise the original
+// language, otherwise the first. -1 when langs is empty.
+func estimatedDefaultAudio(langs, wanted []string, original string) int {
+	for _, w := range wanted {
+		for i, l := range langs {
+			if releaseparse.LanguageMatch(l, w) != releaseparse.LanguageNoMatch {
+				return i
+			}
+		}
+	}
+	for i, l := range langs {
+		if releaseparse.LanguageMatch(l, original) != releaseparse.LanguageNoMatch {
+			return i
+		}
+	}
+	if len(langs) > 0 {
+		return 0
+	}
+	return -1
 }
 
 func variantWidth(h int) int {

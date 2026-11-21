@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"strings"
 )
 
 // RAR 5.0 header types and flags.
@@ -135,6 +136,9 @@ func readRAR5(r io.ReaderAt, size int64, o RAROptions) (*RARVolume, error) {
 		if blockKey != nil {
 			var iv [16]byte
 			if err := readAt(r, iv[:], pos, size); err != nil {
+				if o.SizeEstimated && mainSeen && atEstimatedVolumeEnd(r, pos) {
+					break
+				}
 				return nil, err
 			}
 			var padded int64
@@ -150,6 +154,9 @@ func readRAR5(r io.ReaderAt, size int64, o RAROptions) (*RARVolume, error) {
 			}
 			pre := prefix[:min(int64(rar5Prefix), size-pos)]
 			if err := readAt(r, pre, pos, size); err != nil {
+				if o.SizeEstimated && mainSeen && atEstimatedVolumeEnd(r, pos) {
+					break
+				}
 				return nil, err
 			}
 			hs, n := uvarint(pre[4:])
@@ -157,7 +164,7 @@ func readRAR5(r io.ReaderAt, size int64, o RAROptions) (*RARVolume, error) {
 				return nil, fmt.Errorf("archive: invalid RAR5 header size: %w", ErrCorrupt)
 			}
 			total := 4 + n + int(hs)
-			if int64(total) > size-pos {
+			if int64(total) > size-pos || (o.MaxHeaderBytes > 0 && int64(total) > o.MaxHeaderBytes) {
 				return nil, fmt.Errorf("archive: truncated RAR5 header: %w", ErrCorrupt)
 			}
 			h = make([]byte, total)
@@ -269,7 +276,7 @@ func parseRAR5File(p *rar5Buf, extra []byte, hflags uint64, crypto ...*rarCrypto
 	var f RARFile
 	ff := p.vint()
 	unp := p.size()
-	p.vint() // attributes
+	attr := p.vint()
 	if ff&rar5FileMtime != 0 {
 		p.u32()
 	}
@@ -278,13 +285,16 @@ func parseRAR5File(p *rar5Buf, extra []byte, hflags uint64, crypto ...*rarCrypto
 		f.HasCRC = true
 	}
 	ci := p.vint()
-	p.vint() // host OS
+	hostOS := p.vint()
 	nameLen := p.vint()
 	name := p.bytes(nameLen)
 	if p.err != nil {
 		return f, p.err
 	}
-	f.Name = string(name)
+	f.StoredName = string(name)
+	f.Name = strings.ReplaceAll(f.StoredName, `\`, "/")
+	f.UnsafeName = strings.Contains(f.StoredName, `\`)
+	f.NonRegular = (hostOS == 1 && attr&0xf000 != 0 && attr&0xf000 != 0x8000 && attr&0xf000 != 0x4000) || (hostOS == 0 && attr&0x400 != 0)
 	f.UnpackedSize = unp
 	if ff&rar5FileUnknownSize != 0 {
 		f.UnpackedSize = -1
@@ -303,7 +313,11 @@ func parseRAR5File(p *rar5Buf, extra []byte, hflags uint64, crypto ...*rarCrypto
 			return f, fmt.Errorf("extra area: %w", x.err)
 		}
 		rb := rar5Buf{b: rec}
-		if t := rb.vint(); rb.err == nil && t == rar5ExtraEncryption {
+		t := rb.vint()
+		if t == 5 {
+			f.NonRegular = true
+		}
+		if rb.err == nil && t == rar5ExtraEncryption {
 			if f.Encrypted {
 				return f, fmt.Errorf("archive: duplicate RAR5 encryption record: %w", ErrCorrupt)
 			}

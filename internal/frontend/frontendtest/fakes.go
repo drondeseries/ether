@@ -37,6 +37,7 @@ type Experience struct {
 	SetRatingFunc            func(context.Context, *core.Viewer, core.RatingKey, float64) error
 	RemoveFromContinueFunc   func(context.Context, *core.Viewer, core.RatingKey) error
 	ReportRowInteractionFunc func(context.Context, frontend.RowInteraction) error
+	PublishedViewsFunc       func(context.Context) ([]frontend.View, error)
 	ViewsFunc                func(context.Context, *core.Viewer) ([]frontend.View, error)
 	RowsFunc                 func(context.Context, frontend.RowRequest) ([]frontend.Row, error)
 	ItemFunc                 func(context.Context, frontend.ItemRequest) (frontend.ItemDetail, error)
@@ -69,6 +70,12 @@ func (f Experience) NotInterestedItem(c context.Context, v *core.Viewer, d core.
 		return f.NotInterestedItemFunc(c, v, d, k)
 	}
 	return frontend.NotInterestedEntry{}, core.ErrNotFound
+}
+func (f Experience) PublishedViews(c context.Context) ([]frontend.View, error) {
+	if f.PublishedViewsFunc != nil {
+		return f.PublishedViewsFunc(c)
+	}
+	return nil, nil
 }
 func (f Experience) Views(c context.Context, v *core.Viewer) ([]frontend.View, error) {
 	if f.ViewsFunc != nil {
@@ -241,6 +248,7 @@ type Sessions struct {
 	MarkersFunc            func(context.Context, frontend.SessionAccess, string) (frontend.SessionMarkers, error)
 	ServeMediaFunc         func(http.ResponseWriter, *http.Request)
 	ReportSampleFunc       func(context.Context, frontend.SessionAccess, string, frontend.ProgressSample) (frontend.ReportOutcome, error)
+	KeepAliveFunc          func(context.Context, frontend.SessionAccess, string) error
 	ReportFunc             func(context.Context, frontend.SessionAccess, string, frontend.Timeline) error
 	ReportItemFunc         func(context.Context, frontend.SessionAccess, core.RatingKey, frontend.Timeline) error
 	StopFunc               func(context.Context, frontend.SessionAccess, string) error
@@ -289,6 +297,12 @@ func (f Sessions) ServeMedia(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.NotFound(w, r)
+}
+func (f Sessions) KeepAlive(ctx context.Context, a frontend.SessionAccess, id string) error {
+	if f.KeepAliveFunc != nil {
+		return f.KeepAliveFunc(ctx, a, id)
+	}
+	return nil
 }
 func (f Sessions) Report(c context.Context, a frontend.SessionAccess, id string, t frontend.Timeline) error {
 	if f.ReportFunc != nil {
@@ -353,25 +367,123 @@ func (f Sessions) Events(c context.Context, s frontend.EventScope) (<-chan front
 	return ch, nil
 }
 
+func (f Experience) NewRecent(frontend.RecentOptions) frontend.Recent { return nil }
+func (f Experience) NewDetailRelated(frontend.DetailRelatedOptions) frontend.DetailRelated {
+	return nil
+}
+func (f Experience) NewEpisodeBatch(frontend.EpisodeBatchOptions) frontend.EpisodeBatch { return nil }
+func (f Experience) NewContinueDeck(frontend.ContinueDeckOptions) frontend.ContinueDeck { return nil }
+func (f Experience) NewContinue(frontend.ContinueOptions) frontend.Continue             { return nil }
+func (f Experience) NewRowSelection(frontend.RowSelectionOptions) frontend.RowSelection { return nil }
+func (f Experience) NewHomeSelection(frontend.HomeSelectionOptions) frontend.HomeSelection {
+	return nil
+}
+func (f Experience) NewScopedCollection(frontend.ScopedCollectionOptions) frontend.ScopedCollection {
+	return nil
+}
+func (f Experience) NewPlaylistSelection(frontend.PlaylistSelectionOptions) frontend.PlaylistSelection {
+	return nil
+}
+func (f Experience) NewPostPlaySelection(frontend.PostPlaySelectionOptions) frontend.PostPlaySelection {
+	return nil
+}
+func (f Experience) NewDiscoverySelection(frontend.DiscoverySelectionOptions) frontend.DiscoverySelection {
+	return nil
+}
+func (f Experience) NewTrackPreferenceSelector(frontend.TrackPreferenceSelectorOptions) frontend.TrackPreferenceSelector {
+	return nil
+}
+func (f Experience) SearchFor(frontend.SearchSources, frontend.Visibility, func(*core.User) bool) frontend.Search {
+	return nil
+}
+func (f Experience) StatisticsDefaults(d frontend.Dashboard, r frontend.ResourceStatistics, _ func() time.Time) (frontend.Dashboard, frontend.ResourceStatistics) {
+	return d, r
+}
+func (f Experience) MergeShareFilter(filter, _ core.Filter) (core.Filter, bool) {
+	return filter, false
+}
+func (f Experience) ArrangeHome(_ context.Context, _ core.Recommender, _ *core.User, _ core.HubContext, _ string, rows []core.Hub, _ []core.NeutralHomeRow) ([]int, error) {
+	idx := make([]int, len(rows))
+	for i := range rows {
+		idx[i] = i
+	}
+	return idx, nil
+}
+func (f Experience) DetailExtras(context.Context, frontend.ExtrasSource, *core.Title, string, map[int]bool) ([]frontend.ExtraClip, error) {
+	return nil, nil
+}
+func (f Experience) DiscoverySearch(*frontend.DiscoveryFeatures) func(context.Context, *core.User, string, int) ([]core.Title, bool) {
+	return nil
+}
+func (f Experience) FamiliarFrom(any) func(context.Context, *core.User, []core.RatingKey) map[core.RatingKey]int {
+	return nil
+}
+func (f Experience) ContinueFilter(_ core.State, personal func(context.Context, *core.User, []core.Title) []core.Title) func(context.Context, *core.User, []core.Title) []core.Title {
+	return personal
+}
+func (f Experience) SameDayUnavailable(context.Context, *core.Title, time.Time, func(context.Context, []core.Title) []core.Title, frontend.AvailabilitySource) bool {
+	return false
+}
+func (f Experience) SeasonNextEpisode([]core.Title, map[core.RatingKey]core.WatchStatus, time.Time, func(*core.Title) bool) *core.Title {
+	return nil
+}
+func (f Experience) ShowOnDeck([]core.Title, map[core.RatingKey]core.WatchStatus, func(*core.Title) bool) *core.Title {
+	return nil
+}
+func (f Experience) RequestDatabaseObservation(context.Context) (int64, time.Duration) {
+	return 0, 0
+}
+func (f Experience) PlaybackMarkerRanges(context.Context, frontend.MarkerRanges, core.RatingKey, core.MediaInfo) ([]frontend.MarkerRange, error) {
+	return nil, nil
+}
+func (f Experience) CatalogSource() core.Catalog             { return nil }
+func (f Experience) CollectionsSource() core.Collections     { return nil }
+func (f Experience) StateSource() core.State                 { return nil }
+func (f Experience) PlaylistsSource() core.Playlists         { return nil }
+func (f Experience) RecommenderSource() core.Recommender     { return nil }
+func (f Experience) VibeSearchSource() frontend.VibeSearcher { return nil }
+func (f Experience) SearchSources() frontend.SearchSources   { return frontend.SearchSources{} }
+func (f Experience) FavoriteShowsFunc() func(context.Context, *core.User) (map[core.RatingKey]bool, error) {
+	return nil
+}
+func (f Experience) FilterAvailableFunc() func(context.Context, []core.Title) []core.Title {
+	return nil
+}
+func (f Experience) JudgedOnFactsFunc() func(context.Context) func(core.Title) bool { return nil }
+func (f Experience) PrioritizeAvailableFunc() func(context.Context, []core.Title) []core.Title {
+	return nil
+}
+func (f Experience) EpisodeOrderSource() frontend.EpisodeOrder      { return nil }
+func (f Experience) DiscoveryFeatures() *frontend.DiscoveryFeatures { return nil }
+func (f Experience) DashboardSource() frontend.Dashboard            { return nil }
+func (f Experience) ResourcesSource() frontend.ResourceStatistics   { return nil }
+func (f Experience) LibraryTitles() (string, string)                { return "", "" }
+func (f Experience) HomeRevision(context.Context, *core.User) (frontend.HomeRevision, bool, error) {
+	return frontend.HomeRevision{}, false, nil
+}
+func (f Experience) NoProviderWait(ctx context.Context) context.Context { return ctx }
+
 var _ frontend.Experience = Experience{}
 var _ frontend.Sessions = Sessions{}
 
 // Identity implements a configurable surface-bound identity for protocol tests.
 type Identity struct {
-	IssueRefreshFunc  func(context.Context, string, core.Device) (string, error)
-	RefreshFunc       func(context.Context, string, core.Device) (string, string, error)
-	ResolveFunc       func(context.Context, string) (*core.Viewer, error)
-	ResolveDeviceFunc func(context.Context, string, core.Device) (*core.Viewer, time.Time, error)
-	ViewerTimesFunc   func(context.Context, string, int64) (frontend.ViewerTimes, error)
-	PublicViewersFunc func(context.Context) ([]frontend.PublicViewer, error)
-	SignInFunc        func(context.Context, string, string, core.Device) (string, error)
-	InitiateFunc      func(context.Context, core.Device) (string, string, error)
-	StatusFunc        func(context.Context, string) (bool, error)
-	DetailsFunc       func(context.Context, string) (frontend.QuickConnectDetails, error)
-	PollFunc          func(context.Context, string) (string, error)
-	ApproveFunc       func(context.Context, *core.Viewer, string) error
-	RevokeFunc        func(context.Context, string) error
-	SetupCompleteFunc func() bool
+	IssueRefreshFunc           func(context.Context, string, core.Device) (string, error)
+	RefreshFunc                func(context.Context, string, core.Device) (string, string, error)
+	ResolveFunc                func(context.Context, string) (*core.Viewer, error)
+	ResolveDeviceFunc          func(context.Context, string, core.Device) (*core.Viewer, time.Time, error)
+	ViewerTimesFunc            func(context.Context, string, int64) (frontend.ViewerTimes, error)
+	PublicViewersFunc          func(context.Context) ([]frontend.PublicViewer, error)
+	SignInFunc                 func(context.Context, string, string, core.Device) (string, error)
+	SignInWithPlexFunc         func(context.Context, string, core.Device) (string, error)
+	AuthenticationFeaturesFunc func() frontend.AuthenticationFeatures
+	InitiateFunc               func(context.Context, core.Device) (string, string, error)
+	StatusFunc                 func(context.Context, string) (bool, error)
+	DetailsFunc                func(context.Context, string) (frontend.QuickConnectDetails, error)
+	PollFunc                   func(context.Context, string) (string, error)
+	ApproveFunc                func(context.Context, *core.Viewer, string) error
+	RevokeFunc                 func(context.Context, string) error
+	SetupCompleteFunc          func() bool
 }
 
 func (f Identity) Resolve(ctx context.Context, credential string) (*core.Viewer, error) {
@@ -417,6 +529,18 @@ func (f Identity) SignIn(ctx context.Context, user, password string, d core.Devi
 	}
 	return "", frontend.ErrIdentityUnavailable
 }
+func (f Identity) SignInWithPlex(ctx context.Context, token string, d core.Device) (string, error) {
+	if f.SignInWithPlexFunc != nil {
+		return f.SignInWithPlexFunc(ctx, token, d)
+	}
+	return "", frontend.ErrIdentityUnavailable
+}
+func (f Identity) AuthenticationFeatures() frontend.AuthenticationFeatures {
+	if f.AuthenticationFeaturesFunc != nil {
+		return f.AuthenticationFeaturesFunc()
+	}
+	return frontend.AuthenticationFeatures{}
+}
 func (f Identity) QuickConnectInitiate(ctx context.Context, d core.Device) (string, string, error) {
 	if f.InitiateFunc != nil {
 		return f.InitiateFunc(ctx, d)
@@ -454,12 +578,66 @@ func (f Identity) Revoke(ctx context.Context, grant string) error {
 	return frontend.ErrIdentityUnavailable
 }
 func (f Identity) SetupComplete() bool { return f.SetupCompleteFunc != nil && f.SetupCompleteFunc() }
+func (f Identity) Accept(ctx context.Context, token string) (*core.Viewer, frontend.CredentialAcceptance, error) {
+	u, err := f.Resolve(ctx, token)
+	return u, frontend.CredentialAcceptance{}, err
+}
+func (f Identity) ReceiptCurrent(context.Context, frontend.CredentialAcceptance) error {
+	return core.ErrUnauthorized
+}
+func (f Identity) IssueDelegation(context.Context, int64) (string, error) {
+	return "", core.ErrUnauthorized
+}
+func (f Identity) ActiveUser(context.Context, int64) (*core.User, error) {
+	return nil, frontend.ErrIdentityUnavailable
+}
+func (f Identity) Users(context.Context) ([]core.User, error) {
+	return nil, nil
+}
 
 var _ frontend.SurfaceIdentity = Identity{}
 
+// PlexHomeIdentity opts a fake identity into the optional Plex Home
+// profile selection API.
+type PlexHomeIdentity struct {
+	Identity
+	HouseholdProfilesFunc          func(context.Context, string) ([]frontend.HouseholdProfile, error)
+	HouseholdProfilesForViewerFunc func(context.Context, *core.Viewer) ([]frontend.HouseholdProfile, error)
+	SignInWithHouseholdProfileFunc func(context.Context, frontend.HouseholdProfileSignIn) (string, error)
+	FetchHouseholdAvatarFunc       func(context.Context, frontend.HouseholdAvatarRequest) ([]byte, string, error)
+}
+
+func (f PlexHomeIdentity) HouseholdProfiles(ctx context.Context, token string) ([]frontend.HouseholdProfile, error) {
+	if f.HouseholdProfilesFunc != nil {
+		return f.HouseholdProfilesFunc(ctx, token)
+	}
+	return nil, frontend.ErrIdentityUnavailable
+}
+func (f PlexHomeIdentity) HouseholdProfilesForViewer(ctx context.Context, v *core.Viewer) ([]frontend.HouseholdProfile, error) {
+	if f.HouseholdProfilesForViewerFunc != nil {
+		return f.HouseholdProfilesForViewerFunc(ctx, v)
+	}
+	return nil, frontend.ErrIdentityUnavailable
+}
+func (f PlexHomeIdentity) SignInWithHouseholdProfile(ctx context.Context, req frontend.HouseholdProfileSignIn) (string, error) {
+	if f.SignInWithHouseholdProfileFunc != nil {
+		return f.SignInWithHouseholdProfileFunc(ctx, req)
+	}
+	return "", frontend.ErrIdentityUnavailable
+}
+func (f PlexHomeIdentity) FetchHouseholdAvatar(ctx context.Context, req frontend.HouseholdAvatarRequest) ([]byte, string, error) {
+	if f.FetchHouseholdAvatarFunc != nil {
+		return f.FetchHouseholdAvatarFunc(ctx, req)
+	}
+	return nil, "", frontend.ErrIdentityUnavailable
+}
+
+var _ frontend.HouseholdProfileAuth = PlexHomeIdentity{}
+
 // Capabilities is a configurable fake for the host capability provider.
 type Capabilities struct {
-	BuildFunc func(context.Context, frontend.CapabilityRequest) (frontend.CapabilityResult, error)
+	BuildFunc            func(context.Context, frontend.CapabilityRequest) (frontend.CapabilityResult, error)
+	ApplyClientRulesFunc func(frontend.HostQualityConfig, core.ClientCaps, *core.Viewer, string) core.ClientCaps
 }
 
 func (f Capabilities) Build(ctx context.Context, req frontend.CapabilityRequest) (frontend.CapabilityResult, error) {
@@ -467,6 +645,13 @@ func (f Capabilities) Build(ctx context.Context, req frontend.CapabilityRequest)
 		return f.BuildFunc(ctx, req)
 	}
 	return frontend.CapabilityResult{}, nil
+}
+
+func (f Capabilities) ApplyClientRules(q frontend.HostQualityConfig, c core.ClientCaps, v *core.Viewer, media string) core.ClientCaps {
+	if f.ApplyClientRulesFunc != nil {
+		return f.ApplyClientRulesFunc(q, c, v, media)
+	}
+	return c
 }
 
 var _ frontend.Capabilities = Capabilities{}
@@ -527,12 +712,34 @@ var _ frontend.Preferences = Preferences{}
 
 // LiveTV is a configurable fake for viewer-scoped live television.
 type LiveTV struct {
+	EnabledFunc          func() bool
 	ChannelsFunc         func(context.Context, *core.Viewer) ([]frontend.LiveChannel, error)
+	GroupsFunc           func(context.Context, *core.Viewer) ([]frontend.LiveGroup, error)
+	GroupChannelsFunc    func(context.Context, *core.Viewer, string) ([]frontend.LiveChannel, error)
 	GuideFunc            func(context.Context, *core.Viewer, frontend.LiveGuideQuery) ([]frontend.LiveProgramme, error)
 	ResolveChannelFunc   func(context.Context, *core.Viewer, string) (frontend.LiveChannel, error)
 	ResolveProgrammeFunc func(context.Context, *core.Viewer, string, frontend.LiveGuideQuery) (frontend.LiveProgramme, error)
 }
 
+func (f LiveTV) Groups(ctx context.Context, v *core.Viewer) ([]frontend.LiveGroup, error) {
+	if f.GroupsFunc != nil {
+		return f.GroupsFunc(ctx, v)
+	}
+	return nil, nil
+}
+func (f LiveTV) GroupChannels(ctx context.Context, v *core.Viewer, id string) ([]frontend.LiveChannel, error) {
+	if f.GroupChannelsFunc != nil {
+		return f.GroupChannelsFunc(ctx, v, id)
+	}
+	return nil, core.ErrNotFound
+}
+
+func (f LiveTV) Enabled() bool {
+	if f.EnabledFunc != nil {
+		return f.EnabledFunc()
+	}
+	return true
+}
 func (f LiveTV) Channels(ctx context.Context, v *core.Viewer) ([]frontend.LiveChannel, error) {
 	if f.ChannelsFunc != nil {
 		return f.ChannelsFunc(ctx, v)
@@ -557,8 +764,84 @@ func (f LiveTV) ResolveProgrammeGUID(ctx context.Context, v *core.Viewer, id str
 	}
 	return frontend.LiveProgramme{}, core.ErrNotFound
 }
+func (f LiveTV) VisibleTo(context.Context, *frontend.User) bool { return false }
+func (f LiveTV) ServeXMLTV(w http.ResponseWriter, r *http.Request, _ *frontend.User) {
+	http.NotFound(w, r)
+}
+func (f LiveTV) Stop(context.Context, string, *frontend.User) error { return core.ErrNotFound }
+func (f LiveTV) ServeDASHPart(w http.ResponseWriter, r *http.Request, _ string, _ *frontend.User, _, _ int, _ bool) {
+	http.NotFound(w, r)
+}
+func (f LiveTV) ServePlaylist(w http.ResponseWriter, r *http.Request, _ string, _ *frontend.User) {
+	http.NotFound(w, r)
+}
+func (f LiveTV) ServeRelaySegment(w http.ResponseWriter, r *http.Request, _ string, _ int, _ *frontend.User) {
+	http.NotFound(w, r)
+}
+func (f LiveTV) ServeResource(w http.ResponseWriter, r *http.Request, _, _ string, _ *frontend.User) {
+	http.NotFound(w, r)
+}
+func (f LiveTV) AllowedChannels(context.Context, *frontend.User) ([]frontend.LiveTVChannel, error) {
+	return nil, nil
+}
+func (f LiveTV) AllowedChannel(context.Context, *frontend.User, string) (frontend.LiveTVChannel, error) {
+	return frontend.LiveTVChannel{}, core.ErrNotFound
+}
+func (f LiveTV) Channel(context.Context, string) (frontend.LiveTVChannel, error) {
+	return frontend.LiveTVChannel{}, core.ErrNotFound
+}
+func (f LiveTV) ChannelForViewer(context.Context, *frontend.User, string) (frontend.LiveTVChannel, error) {
+	return frontend.LiveTVChannel{}, core.ErrNotFound
+}
+func (f LiveTV) AllChannels(context.Context) ([]frontend.LiveTVChannel, error) { return nil, nil }
+func (f LiveTV) ChannelPermitted(context.Context, *frontend.User, string) (bool, error) {
+	return false, nil
+}
+func (f LiveTV) LineupChangedFor(*frontend.User) time.Time { return time.Time{} }
+func (f LiveTV) GuideForChannels(context.Context, *frontend.User, time.Time, time.Time, []string) ([]frontend.LiveTVProgramme, error) {
+	return nil, nil
+}
+func (f LiveTV) GuideWindow(context.Context, *frontend.User, time.Time, time.Time) ([]frontend.LiveTVProgramme, error) {
+	return nil, nil
+}
+func (f LiveTV) GuideChannelLogo(context.Context, frontend.LiveTVChannel) string { return "" }
+func (f LiveTV) TuneWithSession(context.Context, *frontend.User, string, frontend.ClientCaps, string) (frontend.LiveTVSessionInfo, error) {
+	return frontend.LiveTVSessionInfo{}, core.ErrNotFound
+}
+func (f LiveTV) Sessions(context.Context, *frontend.User) []frontend.LiveTVSessionInfo { return nil }
+func (f LiveTV) Session(context.Context, string, *frontend.User) (frontend.LiveTVSessionInfo, error) {
+	return frontend.LiveTVSessionInfo{}, core.ErrNotFound
+}
+func (f LiveTV) ServeDASH(http.ResponseWriter, *http.Request, string, *frontend.User) error {
+	return core.ErrNotFound
+}
+func (f LiveTV) ServeHTTP(http.ResponseWriter, *http.Request, string, *frontend.User) error {
+	return core.ErrNotFound
+}
+func (f LiveTV) ViewingSessions() []*frontend.PlaySession { return nil }
+func (f LiveTV) NoteClientActivity()                      {}
+func (f LiveTV) AuthenticateMediaGrant(*http.Request, func(context.Context, int64) *frontend.User) (*frontend.User, bool) {
+	return nil, false
+}
+func (f LiveTV) LogoKey() []byte { return nil }
 
 var _ frontend.LiveTV = LiveTV{}
+
+// Artwork is a default fake for frontend.Artwork.
+type Artwork struct{}
+
+func (Artwork) List(context.Context, frontend.ArtworkRequest) ([]frontend.Image, bool, error) {
+	return nil, false, nil
+}
+func (Artwork) Read(context.Context, frontend.ArtworkRequest, frontend.Image, frontend.ArtworkTransform) ([]byte, string, error) {
+	return nil, "", core.ErrNotFound
+}
+func (Artwork) RemoteCache() frontend.ArtworkImageCache      { return nil }
+func (Artwork) PaletteCache() frontend.ArtworkPaletteCache   { return nil }
+func (Artwork) PosterRenderer() frontend.TitlePosterRenderer { return nil }
+func (Artwork) ImageURLFunc() frontend.ImageURLFunc          { return nil }
+
+var _ frontend.Artwork = Artwork{}
 
 func (f Identity) IssueRefresh(ctx context.Context, token string, d core.Device) (string, error) {
 	if f.IssueRefreshFunc != nil {
@@ -599,6 +882,32 @@ func (f TrackPreferences) SetSubtitle(ctx context.Context, v *core.Viewer, langu
 	return frontend.ErrPreferencesNotFound
 }
 
+func (Experience) LibraryGUIDs() frontend.LibraryGUIDs       { return nil }
+func (Experience) LibraryMetadata() frontend.LibraryMetadata { return nil }
+func (Experience) Markers(context.Context, core.RatingKey, core.MediaInfo) ([]frontend.MarkerRange, error) {
+	return nil, nil
+}
+
+func (Sessions) TrickplayAvailable(string) bool                      { return false }
+func (Sessions) TrickplayBIF(string) ([]byte, bool)                  { return nil, false }
+func (Sessions) TrickplayFrame(string, time.Duration) ([]byte, bool) { return nil, false }
+func (Sessions) CancelTrickplay(string)                              {}
+
+func (TrackPreferences) Select(context.Context, int64, core.RatingKey, core.MediaInfo, string) (frontend.PlaybackPreferenceSelection, error) {
+	return frontend.PlaybackPreferenceSelection{}, nil
+}
+func (TrackPreferences) Remember(context.Context, int64, core.RatingKey, string, *core.StreamInfo) error {
+	return nil
+}
+func (TrackPreferences) GetRules(context.Context, int64) (frontend.PlaybackPreferenceRules, error) {
+	return frontend.PlaybackPreferenceRules{}, nil
+}
+func (TrackPreferences) HasViewerRules(context.Context, int64) (bool, error) { return false, nil }
+func (TrackPreferences) ForgetChoice(context.Context, int64, core.RatingKey, string) error {
+	return nil
+}
+func (TrackPreferences) PreloadChoices(context.Context, int64, []core.RatingKey) error { return nil }
+
 func (f Sessions) ReportSample(ctx context.Context, a frontend.SessionAccess, id string, sample frontend.ProgressSample) (frontend.ReportOutcome, error) {
 	if f.ReportSampleFunc != nil {
 		return f.ReportSampleFunc(ctx, a, id, sample)
@@ -615,4 +924,9 @@ func (f Sessions) ReportSample(ctx context.Context, a frontend.SessionAccess, id
 		err = f.Stop(ctx, a, id)
 	}
 	return frontend.ReportApplied, err
+}
+
+// CachedPaths models a host with already resolved, authorized paths.
+func (f VirtualPaths) CachedPaths(ctx context.Context, v *core.Viewer, d core.Device, keys []core.RatingKey) (map[core.RatingKey]string, error) {
+	return f.Paths(ctx, v, d, keys)
 }

@@ -53,7 +53,16 @@ func drainValidations(ctx context.Context, cands []candidate, results <-chan val
 	for {
 		select {
 		case v := <-results:
-			noteValidation(ctx, cands[v.index].rel, v)
+			for _, fv := range v.fallbacks {
+				noteValidation(ctx, fv.rel, fv.val)
+			}
+			if v.promoted == nil {
+				rel := cands[v.index].rel
+				if v.rel.ID != "" {
+					rel = v.rel
+				}
+				noteValidation(ctx, rel, v)
+			}
 		default:
 			return
 		}
@@ -107,14 +116,27 @@ func (s *Service) lastResort(ctx context.Context, p *unverifiedPool, key core.Ra
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	var expanded []candidate
 	for _, c := range ranked {
+		base := c
+		base.fallbacks = nil
+		expanded = append(expanded, base)
+		for _, fb := range c.fallbacks {
+			if _, ok := p.nzbs[fb.rel.ID]; ok {
+				fbCopy := fb
+				fbCopy.fallbacks = nil
+				expanded = append(expanded, fbCopy)
+			}
+		}
+	}
+	for _, c := range expanded {
 		nzb, ok := p.nzbs[c.rel.ID]
 		// Another Resolve may have confirmed this release dead meanwhile.
-		if !ok || s.recentlyFailedHealth(c.rel.ID) || s.isBad(c.rel.ID) {
+		if !ok || s.recentlyFailedRelease(c.rel) || s.isBadRelease(c.rel) {
 			continue
 		}
 		var keep []candidate
-		for _, o := range ranked {
+		for _, o := range expanded {
 			if !slices.ContainsFunc(keep, func(k candidate) bool { return k.rel.ID == o.rel.ID }) {
 				keep = append(keep, o)
 			}
@@ -132,7 +154,7 @@ func (s *Service) lastResort(ctx context.Context, p *unverifiedPool, key core.Ra
 			_, inconclusive := p.nzbs[o.rel.ID]
 			return tr.Candidates[o.trace].Rejected && !inconclusive
 		})
-		if c.fallback {
+		if c.fallback || c.belowScore {
 			res.QualityFallback = qualityFallbackReason(c.rel, tr)
 			tr.Downgrade = res.QualityFallback
 		}

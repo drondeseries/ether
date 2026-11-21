@@ -90,6 +90,15 @@ func (s *Service) RevokeViewerSessions(ctx context.Context, viewerID int64) (int
 		}
 		total += n
 	}
+	if total > 0 {
+		s.emitViewerEvent(ViewerEvent{
+			Kind:      "grant_revoked",
+			ViewerID:  viewerID,
+			GrantKind: "sessions",
+			Reason:    "sign_out",
+			Actor:     "owner",
+		})
+	}
 	return int(total), nil
 }
 
@@ -126,6 +135,17 @@ func (s *Service) RemoveViewer(ctx context.Context, viewerID int64) error {
 	}
 	s.gen.Add(1)
 	s.notify("")
+	name := r.Username
+	if name == "" {
+		name = r.Title
+	}
+	s.emitViewerEvent(ViewerEvent{
+		Kind:     "deactivated",
+		ViewerID: viewerID,
+		Username: name,
+		Reason:   "removed_by_owner",
+		Actor:    "owner",
+	})
 	return nil
 }
 
@@ -178,6 +198,13 @@ func (s *Service) MergeViewers(ctx context.Context, fromID, intoID int64) error 
 	}
 	s.gen.Add(1)
 	s.notify("")
+	s.emitViewerEvent(ViewerEvent{
+		Kind:         "merged",
+		ViewerID:     intoID,
+		FromViewerID: fromID,
+		IntoViewerID: intoID,
+		Actor:        "owner",
+	})
 	return nil
 }
 

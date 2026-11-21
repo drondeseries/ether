@@ -16,17 +16,12 @@ var dockerBridge = netip.MustParsePrefix("172.16.0.0/12")
 
 // sharedPrefix is the path a protocol also serves on Ether's own port.
 func sharedPrefix(id string) string {
-	switch id {
-	case "jellyfin", "emby", "silo", "stremio", "webdav", "m3u", "dlna":
-		return "/" + id
-	default:
-		return ""
-	}
+	return consoleFrontendPolicy(id).SharedPrefix
 }
 
 // consoleConnectURLs is what the owner console shows for an app. It prefers
-// the address the owner is already using (or a configured custom URL) and
-// never offers a container bridge address.
+// the protocol's own dedicated listener port over Ether's shared-port path
+// ("also reachable at"), and never offers a container bridge address.
 func consoleConnectURLs(r *http.Request, id string, urls []string, cfg config.Config, trusted []netip.Prefix) []string {
 	scheme, host, ok := requestOrigin(r, trusted)
 	seen := map[string]bool{}
@@ -40,16 +35,20 @@ func consoleConnectURLs(r *http.Request, id string, urls []string, cfg config.Co
 		out = append(out, raw)
 	}
 	prefix := sharedPrefix(id)
-	if advScheme, advHost, advOK := advertisedOrigin(cfg); advOK && prefix != "" {
+	// An app with its own public address is reached at that address as-is;
+	// the Plex custom URL must not be presented as this app's address.
+	publicURL, hasPublicURL := frontendPublicURL(cfg, id)
+	if hasPublicURL {
+		add(publicURL)
+	} else if advScheme, advHost, advOK := advertisedOrigin(cfg); advOK && prefix != "" {
 		add(originURL(advScheme, advHost, prefix))
 	}
 	// Plex is the process the owner already opened. A bridge container's
-	// own address is not "this computer only".
-	if id == "plex" && ok {
+	// own address is not "this computer only". Plex apps at home connect
+	// straight to the server, so a reverse proxy or the public host name is
+	// never the at-home address, nor is the http:// guess for it (#381).
+	if consoleFrontendPolicy(id).MainListener && ok && !viaProxy(r) && !publicRouteHost(cfg, hostOnly(host)) {
 		add(originURL(scheme, host, ""))
-	}
-	if ok && prefix != "" {
-		add(originURL(scheme, host, prefix))
 	}
 	for _, raw := range urls {
 		u, err := url.Parse(raw)
@@ -65,14 +64,46 @@ func consoleConnectURLs(r *http.Request, id string, urls []string, cfg config.Co
 		}
 		add(raw)
 	}
-	return rankConnectURLs(out, host)
+	if ok && prefix != "" {
+		add(originURL(scheme, host, prefix))
+	}
+	ranked := rankConnectURLs(out, host, prefix)
+	if hasPublicURL {
+		// The owner set this address for the app; it is the one to hand out.
+		rest := ranked[:0]
+		for _, candidate := range ranked {
+			if candidate != publicURL {
+				rest = append(rest, candidate)
+			}
+		}
+		ranked = append([]string{publicURL}, rest...)
+	}
+	return ranked
+}
+
+// frontendPublicURL returns the app's own public address when the owner set
+// a valid one. Plex never uses it: Plex apps use Plex.CustomURLs.
+func frontendPublicURL(cfg config.Config, id string) (string, bool) {
+	if !consoleFrontendPolicy(id).PublicURL {
+		return "", false
+	}
+	raw := strings.TrimSpace(cfg.Frontends[id].PublicURL)
+	if raw == "" {
+		return "", false
+	}
+	c, err := remote.ParseCustomURL(raw)
+	if err != nil || containerHost(c.Address) {
+		return "", false
+	}
+	return strings.TrimRight(c.URI, "/"), true
 }
 
 // rankConnectURLs puts the address the owner can hand to a device first.
-// A hostname or the LAN the console is already using wins. Home LAN
-// (192.168.0.0/16) beats other private ranges, which are often VPNs.
-// Loopback stays available but is not the default when a better address exists.
-func rankConnectURLs(urls []string, originHost string) []string {
+// For protocols with a dedicated listener port, that listener beats the
+// shared-port fallback path on Ether's main port. Home LAN (192.168.0.0/16)
+// beats other private ranges, which are often VPNs. Loopback stays available
+// but is not the default when a better address exists.
+func rankConnectURLs(urls []string, originHost, prefix string) []string {
 	type scored struct {
 		url   string
 		score int
@@ -80,7 +111,7 @@ func rankConnectURLs(urls []string, originHost string) []string {
 	}
 	rows := make([]scored, len(urls))
 	for i, raw := range urls {
-		rows[i] = scored{url: raw, score: connectScore(raw, originHost), index: i}
+		rows[i] = scored{url: raw, score: connectScore(raw, originHost, prefix), index: i}
 	}
 	for i := 1; i < len(rows); i++ {
 		row := rows[i]
@@ -100,7 +131,7 @@ func rankConnectURLs(urls []string, originHost string) []string {
 
 var tailscaleNet = netip.MustParsePrefix("100.64.0.0/10")
 
-func connectScore(raw, originHost string) int {
+func connectScore(raw, originHost, prefix string) int {
 	u, err := url.Parse(raw)
 	if err != nil || u.Host == "" {
 		return -1
@@ -132,9 +163,12 @@ func connectScore(raw, originHost string) int {
 	if originHost != "" && sameHost(host, originHost) && score >= 40 {
 		score += 25
 	}
-	// Prefer the port the console is already open on, so the default matches
-	// the address the owner is looking at.
-	if originPort(originHost) != "" && originPort(originHost) == u.Port() && score >= 40 {
+	// A dedicated listener (root path on its own port) always beats the
+	// shared-port fallback path (/jellyfin, /emby, /silo) on the same tier.
+	if prefix != "" && (u.Path == "" || u.Path == "/") && score > 0 {
+		score += 15
+	} else if originPort(originHost) != "" && originPort(originHost) == u.Port() && score >= 40 {
+		// For main-listener and shared-only apps, prefer the port the console is open on.
 		score += 5
 	}
 	return score
@@ -165,6 +199,44 @@ func advertisedOrigin(cfg config.Config) (scheme, host string, ok bool) {
 		return u.Scheme, u.Host, true
 	}
 	return "", "", false
+}
+
+// viaProxy reports whether the request carries reverse-proxy headers, so
+// the browser did not reach Ether's own listener directly.
+func viaProxy(r *http.Request) bool {
+	for _, h := range []string{"Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "X-Real-Ip"} {
+		if r.Header.Get(h) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// publicRouteHost reports whether host is the owner's public host name or
+// the host of an outside custom URL: addresses for away from home.
+func publicRouteHost(cfg config.Config, host string) bool {
+	if host == "" {
+		return false
+	}
+	public := strings.TrimSpace(cfg.Plex.PublicHost)
+	if _, rest, ok := strings.Cut(public, "://"); ok {
+		public = rest
+	}
+	public = strings.TrimSuffix(public, "/")
+	if public != "" && sameHost(public, host) {
+		return true
+	}
+	for _, raw := range cfg.Plex.CustomURLs {
+		if c, err := remote.ParseCustomURL(raw); err == nil && !c.Local && strings.EqualFold(c.Address, host) {
+			return true
+		}
+	}
+	for _, fe := range cfg.Frontends {
+		if c, err := remote.ParseCustomURL(strings.TrimSpace(fe.PublicURL)); err == nil && !c.Local && strings.EqualFold(c.Address, host) {
+			return true
+		}
+	}
+	return false
 }
 
 func requestOrigin(r *http.Request, trusted []netip.Prefix) (scheme, host string, ok bool) {
@@ -230,16 +302,16 @@ func hostOnly(hostport string) string {
 	return strings.Trim(hostport, "[]")
 }
 
-func sameHost(a, b string) bool {
-	return strings.EqualFold(hostOnly(a), hostOnly(b))
-}
-
 func containerHost(host string) bool {
 	ip, err := netip.ParseAddr(strings.Trim(host, "[]"))
 	if err != nil {
 		return false
 	}
 	return dockerBridge.Contains(ip.Unmap())
+}
+
+func sameHost(a, b string) bool {
+	return strings.EqualFold(hostOnly(a), hostOnly(b))
 }
 
 func originURL(scheme, host, path string) string {

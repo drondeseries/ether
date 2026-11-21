@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -37,6 +38,14 @@ func (c *Context) T(key string, params map[string]any) string {
 	return c.I18n.T(key, params, c.Locale)
 }
 
+// PublishEvent emits a manifest-declared plugin event onto Ether's event bus.
+func (c *Context) PublishEvent(key string, payload any, corr *EventCorrelation) error {
+	if eh, ok := c.Ether.(EventsHost); ok {
+		return eh.PublishEvent(c.Context, key, payload, corr)
+	}
+	return fmt.Errorf("events.publish is not supported by this host")
+}
+
 // Routes holds the capability handlers for a Plugin.
 type Routes struct {
 	Catalog          func(ctx *Context, req CatalogRequest) (CatalogResponse, error)
@@ -54,6 +63,7 @@ type Routes struct {
 	Health           func(ctx *Context) (HealthResponse, error)
 	Notify           func(ctx *Context, req NotifyRequest) (NotifyResponse, error)
 	Event            func(ctx *Context, events []EtherEvent) (EventResponse, error)
+	FlowAction       func(ctx *Context, req FlowActionRequest) (FlowActionResponse, error)
 	View             func(ctx *Context, req ViewRequest) (ViewResponse, error)
 	Action           func(ctx *Context, req ActionRequest) (ActionResponse, error)
 	Tool             func(ctx *Context, req ToolRequest) (ToolResponse, error)
@@ -84,6 +94,8 @@ type Plugin struct {
 	host            Host
 	remoteOpts      RemoteHostOptions
 	pageRoutes      map[string]string
+	flowRoutes      map[string]string
+	kindHandlers    *kindHandlers
 
 	mu              sync.RWMutex
 	settings        map[string]any
@@ -142,6 +154,14 @@ func New(def Definition) *Plugin {
 			}
 		}
 	}
+	flowRoutes := map[string]string{}
+	if def.Manifest.Ether != nil && def.Manifest.Ether.Contributes != nil {
+		for _, fa := range def.Manifest.Ether.Contributes.FlowActions {
+			if fa.Route != "" && fa.Key != "" {
+				flowRoutes[fa.Route] = fa.Key
+			}
+		}
+	}
 	initialSettings, _ := DecodeSettings(schema, nil, def.DefaultSettings)
 
 	return &Plugin{
@@ -153,6 +173,7 @@ func New(def Definition) *Plugin {
 		host:            def.Host,
 		remoteOpts:      def.RemoteHostOptions,
 		pageRoutes:      pageRoutes,
+		flowRoutes:      flowRoutes,
 		settings:        initialSettings,
 	}
 }
@@ -276,6 +297,9 @@ func (p *Plugin) buildContext(ctx context.Context, req RawRequest) *Context {
 	hdrs := map[string]string{}
 	for k, v := range req.Headers {
 		hdrs[k] = v
+	}
+	if tok := headerValue(req.Headers, HeaderViewerToken); tok != "" {
+		ctx = WithViewerToken(ctx, tok)
 	}
 
 	return &Context{
@@ -659,6 +683,45 @@ func (p *Plugin) Dispatch(ctx context.Context, req RawRequest) RawResponse {
 		}
 	}
 
+	if method == http.MethodPost {
+		flowKey, matchedFlow := p.flowRoutes[path]
+		if !matchedFlow && strings.HasPrefix(path, "/ether/v1/flow-actions/") {
+			flowKey, _ = url.PathUnescape(strings.TrimPrefix(path, "/ether/v1/flow-actions/"))
+			matchedFlow = flowKey != ""
+		}
+		if matchedFlow {
+			if p.routes.FlowAction == nil {
+				return errorJSON(http.StatusNotFound, "not_found", "Flow action handler is not registered.")
+			}
+			var faReq FlowActionRequest
+			if len(req.Body) > 0 {
+				if err := json.Unmarshal(req.Body, &faReq); err != nil {
+					return errorJSON(http.StatusBadRequest, "invalid_json", "Flow action request body must be valid JSON.")
+				}
+			}
+			faReq.Key = flowKey
+			if faReq.IdempotencyKey == "" {
+				for hk, hv := range pctx.Headers {
+					if strings.EqualFold(hk, HeaderIdempotencyKey) && strings.TrimSpace(hv) != "" {
+						faReq.IdempotencyKey = strings.TrimSpace(hv)
+						break
+					}
+				}
+			}
+			if faReq.Params == nil {
+				faReq.Params = map[string]any{}
+			}
+			res, err := p.routes.FlowAction(pctx, faReq)
+			if err != nil {
+				return toRouteErrorResponse(err)
+			}
+			if res.Output == nil {
+				res.Output = map[string]any{}
+			}
+			return okJSON(res, http.StatusOK)
+		}
+	}
+
 	if method == http.MethodPost && strings.HasPrefix(path, "/ether/action/") {
 		if p.routes.Action == nil {
 			return errorJSON(http.StatusNotFound, "not_found", "Action handler is not registered.")
@@ -696,7 +759,14 @@ func (p *Plugin) Dispatch(ctx context.Context, req RawRequest) RawResponse {
 			return errorJSON(http.StatusNotFound, "not_found", "Job handler is not registered.")
 		}
 		jobName, _ := url.PathUnescape(strings.TrimPrefix(path, "/ether/job/"))
-		res, err := p.routes.Job(pctx, JobRequest{Name: jobName})
+		jobReq := JobRequest{Name: jobName}
+		if len(req.Body) > 0 {
+			if err := json.Unmarshal(req.Body, &jobReq); err != nil {
+				return errorJSON(http.StatusBadRequest, "invalid_json", "Job body must be valid JSON.")
+			}
+		}
+		jobReq.Name = jobName
+		res, err := p.routes.Job(pctx, jobReq)
 		if err != nil {
 			return toRouteErrorResponse(err)
 		}
@@ -861,6 +931,10 @@ func (p *Plugin) Dispatch(ctx context.Context, req RawRequest) RawResponse {
 		}
 	}
 
+	if resp, handled := p.dispatchKinds(pctx, method, path, req); handled {
+		return resp
+	}
+
 	return errorJSON(http.StatusNotFound, "not_found", "No route matched "+method+" "+path+".")
 }
 
@@ -922,6 +996,12 @@ type ServeOptions struct {
 	Port       int
 	TunnelURL  string
 	Credential string
+	// URL is the server's http(s) base (ETHER_URL). When set, the tunnel URL
+	// and pair URL are derived from it and the SDK pairs with a code.
+	URL string
+	// StateDir overrides where the pairing credential is saved
+	// (ETHER_PLUGIN_STATE_DIR).
+	StateDir string
 }
 
 // ServeHandle represents a running HTTP or tunnel sidecar session.
@@ -942,6 +1022,14 @@ func (p *Plugin) Start(ctx context.Context, opts ServeOptions) (*ServeHandle, er
 	if tunnelURL == "" {
 		tunnelURL = os.Getenv("ETHER_TUNNEL_URL")
 	}
+	inputs := pairingInputsFromEnv(opts)
+	if tunnelURL == "" && inputs.URL != "" {
+		derived, err := TunnelURL(inputs.URL)
+		if err != nil {
+			return nil, err
+		}
+		tunnelURL = derived
+	}
 	mode := opts.Mode
 	if mode == "" {
 		if tunnelURL != "" {
@@ -951,11 +1039,14 @@ func (p *Plugin) Start(ctx context.Context, opts ServeOptions) (*ServeHandle, er
 		}
 	}
 	if mode == "tunnel" {
-		cred := opts.Credential
-		if cred == "" {
-			cred = os.Getenv("ETHER_PLUGIN_CREDENTIAL")
+		if tunnelURL == "" {
+			return nil, fmt.Errorf("tunnel mode requires TunnelURL, ETHER_TUNNEL_URL or ETHER_URL")
 		}
-		return p.startTunnel(ctx, tunnelURL, cred)
+		credential, fromFile, err := resolveCredential(ctx, inputs, p.manifest.ID)
+		if err != nil {
+			return nil, err
+		}
+		return p.startTunnel(ctx, tunnelURL, credential, fromFile, inputs.StateDir)
 	}
 
 	host := opts.Host

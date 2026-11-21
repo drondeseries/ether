@@ -22,6 +22,7 @@ import (
 
 	"github.com/braedonsaunders/ether/internal/config"
 	"github.com/braedonsaunders/ether/internal/core"
+	"github.com/braedonsaunders/ether/internal/events"
 	"github.com/braedonsaunders/ether/internal/playback"
 	"github.com/braedonsaunders/ether/internal/schedule"
 )
@@ -66,6 +67,8 @@ type Deps struct {
 	Markers MarkerSource
 	// PostPlayEnabled reports the owner's switch (nil = on).
 	PostPlayEnabled func() bool
+	// Events receives non-blocking cache.prefetch.* events when set.
+	Events *events.Bus
 }
 
 // Options tune the prefetcher. Zero values take the defaults noted.
@@ -76,11 +79,12 @@ type Options struct {
 	QueueSize int
 	// WarmInterval is how often in-progress resume points are warmed (default 15m).
 	WarmInterval time.Duration
-	// WarmBehind is pulled before the resume point, for the client's
-	// rewind-on-resume (default 4 MiB). The window after it is
-	// Cache.PrefetchBytes.
+	// Without a keyframe index, WarmBehind is pulled before the estimated
+	// resume point for rewind-on-resume (default and maximum 4 MiB). Indexed
+	// resumes start exactly at their preceding cue. The following 25 seconds
+	// of media are capped at 256 MiB and 10% of the cache budget.
 	WarmBehind int64
-	// InProgressLimit is how many in-progress titles per user are warmed (default 20).
+	// InProgressLimit is how many in-progress titles per user are warmed (default 5).
 	InProgressLimit int
 	// DoneTTL suppresses repeating a finished next-episode job (default 6h).
 	DoneTTL time.Duration
@@ -129,7 +133,7 @@ func (o *Options) defaults() {
 		o.WarmBehind = 4 << 20
 	}
 	if o.InProgressLimit <= 0 {
-		o.InProgressLimit = 20
+		o.InProgressLimit = 5
 	}
 	if o.DoneTTL <= 0 {
 		o.DoneTTL = 6 * time.Hour
@@ -179,10 +183,27 @@ type entry struct {
 	ttl   time.Duration // how long a done entry suppresses repeats
 }
 
+type jobOutcome struct {
+	titleKey    string
+	titleName   string
+	bytesWarmed int64
+}
+
+type jobOutcomeKey struct{}
+
+func outcomeFromContext(ctx context.Context) *jobOutcome {
+	if out, ok := ctx.Value(jobOutcomeKey{}).(*jobOutcome); ok {
+		return out
+	}
+	return nil
+}
+
 type job struct {
-	id  string // dedupe key
-	ttl time.Duration
-	run func(ctx context.Context) error
+	id       string // dedupe key
+	kind     string // next_episode | resume | keep_warm | postplay
+	titleKey core.RatingKey
+	ttl      time.Duration
+	run      func(ctx context.Context) error
 }
 
 // Prefetcher is the background prefetch worker pool.
@@ -298,9 +319,22 @@ func (p *Prefetcher) OnTimeline(user *core.User, key core.RatingKey, offset, dur
 	if cfg := p.config(); cfg.DisableSpeculation || cfg.Mode == "off" {
 		return
 	}
+	// Resume warming reuses the played source; permanent failure may replace it.
+	if user != nil && offset > 0 && p.deps.Hints != nil && p.config().KeepInProgressWarm && state != "playing" && state != "buffering" && (key.Kind() == core.KindMovie || key.Kind() == core.KindEpisode) {
+		u := *user
+		p.enqueue(job{
+			id:       fmt.Sprintf("resume:%d:%d:%d:%s", u.ID, key, offset/(25*time.Second), state),
+			kind:     "resume",
+			titleKey: key,
+			ttl:      25 * time.Second,
+			run:      func(ctx context.Context) error { return p.warmResume(ctx, u.ID, key, offset, duration) },
+		})
+	}
 	// Post-play hook queue (#30): movies and finales pre-buffer their
 	// #1 pick near the end. Runs before the episode-only path below.
-	p.onTimelinePostPlay(user, key, offset, duration, state)
+	if p.config().SpeculativeWarming != "off" {
+		p.onTimelinePostPlay(user, key, offset, duration, state)
+	}
 	if user == nil || key.Kind() != core.KindEpisode || duration <= 0 || offset <= 0 {
 		return
 	}
@@ -317,9 +351,11 @@ func (p *Prefetcher) OnTimeline(user *core.User, key core.RatingKey, offset, dur
 	}
 	u := *user
 	p.enqueue(job{
-		id:  fmt.Sprintf("next:%d:%d", u.ID, key),
-		ttl: p.opts.DoneTTL,
-		run: func(ctx context.Context) error { return p.nextEpisode(ctx, &u, key) },
+		id:       fmt.Sprintf("next:%d:%d", u.ID, key),
+		kind:     "next_episode",
+		titleKey: key,
+		ttl:      p.opts.DoneTTL,
+		run:      func(ctx context.Context) error { return p.nextEpisode(ctx, &u, key) },
 	})
 }
 
@@ -392,12 +428,20 @@ func (p *Prefetcher) runJob(j job) {
 		p.mu.Unlock()
 	}()
 
+	started := p.now()
+	outcome := &jobOutcome{}
+	if j.titleKey != 0 {
+		outcome.titleKey = j.titleKey.String()
+	}
 	ctx, cancel := context.WithTimeout(p.ctx, p.opts.JobTimeout)
 	var err error
+	ran := false
 	if cfg := p.config(); !cfg.DisableSpeculation && cfg.Mode != "off" {
-		err = j.run(ctx)
+		ran = true
+		err = j.run(context.WithValue(core.WithUnattendedSearch(ctx), jobOutcomeKey{}, outcome))
 	}
 	cancel()
+	durMS := p.now().Sub(started).Milliseconds()
 
 	p.mu.Lock()
 	p.running--
@@ -419,8 +463,25 @@ func (p *Prefetcher) runJob(j job) {
 	p.mu.Unlock()
 	if err != nil && p.ctx.Err() == nil {
 		p.log.Warn("prefetch job failed", "job", j.id, "err", err)
+		if p.deps.Events != nil && ran && j.kind != "postplay_probe" {
+			_ = p.deps.Events.PublishTyped(events.EventCachePrefetchFailed, events.CachePrefetchFailedPayload{
+				TitleKey:  outcome.titleKey,
+				TitleName: outcome.titleName,
+				Kind:      j.kind,
+				Error:     err.Error(),
+			}, events.WithCorrelation(events.Correlation{TitleID: outcome.titleKey}))
+		}
 	} else if err == nil {
 		p.log.Debug("prefetch job done", "job", j.id)
+		if p.deps.Events != nil && ran && j.kind != "postplay_probe" && (outcome.bytesWarmed > 0 || outcome.titleName != "") {
+			_ = p.deps.Events.PublishTyped(events.EventCachePrefetchCompleted, events.CachePrefetchCompletedPayload{
+				TitleKey:    outcome.titleKey,
+				TitleName:   outcome.titleName,
+				Kind:        j.kind,
+				BytesWarmed: outcome.bytesWarmed,
+				DurationMS:  durMS,
+			}, events.WithCorrelation(events.Correlation{TitleID: outcome.titleKey}))
+		}
 	}
 }
 
@@ -438,10 +499,9 @@ func (p *Prefetcher) nextEpisode(ctx context.Context, user *core.User, key core.
 		return nil // not aired yet; don't spend indexer budget
 	}
 	p.setCurrent(episodeLabel(next), core.CacheCauseNextEpisode)
-	if p.postplayEnabled() && next.Key.Season() != key.Season() {
-		// Season finale: the post-play hook queue owns the pre-buffer
-		// (its #1 pick may not be next season's opener) — don't warm both.
-		return nil
+	if out := outcomeFromContext(ctx); out != nil {
+		out.titleKey = next.Key.String()
+		out.titleName = episodeLabel(next)
 	}
 	var caps core.ClientCaps
 	if p.deps.Hints != nil {
@@ -456,6 +516,9 @@ func (p *Prefetcher) nextEpisode(ctx context.Context, user *core.User, key core.
 		if p.deps.Prewarmer.Prewarm(ctx, user, next.Key, caps, core.PrewarmOptions{
 			Reason: core.PrewarmNextEpisode, PrefetchBytes: length, DuringPlayback: true,
 		}) {
+			if out := outcomeFromContext(ctx); out != nil {
+				out.bytesWarmed = length
+			}
 			log.Info("preparing next episode for playback")
 		} else {
 			log.Debug("next episode preparation already present or budget unavailable")
@@ -471,7 +534,15 @@ func (p *Prefetcher) nextEpisode(ctx context.Context, user *core.User, key core.
 		if rp != nil {
 			log.Debug("warming stored release of next episode", "release", rp.Release.Name)
 			p.noteCause(rp.ReleaseID(), core.CacheCauseNextEpisode, episodeLabel(next))
-			return p.deps.Engine.Prefetch(ctx, rp.ReleaseID(), rp.NZB, 0, clampLen(0, length, rp.Size))
+			warmed := clampLen(0, length, rp.Size)
+			err := p.deps.Engine.Prefetch(ctx, rp.ReleaseID(), rp.NZB, 0, warmed)
+			if err != nil {
+				return p.replaceWarmSource(ctx, user.ID, next.Key, rp.Release, 0, next.Runtime, err)
+			}
+			if out := outcomeFromContext(ctx); out != nil {
+				out.bytesWarmed = warmed
+			}
+			return nil
 		}
 	}
 
@@ -491,7 +562,15 @@ func (p *Prefetcher) nextEpisode(ctx context.Context, user *core.User, key core.
 	}
 	log.Info("prefetching next episode", "release", res.Release.Name, "bytes", length)
 	p.noteCause(res.Release.ID, core.CacheCauseNextEpisode, episodeLabel(next))
-	return p.deps.Engine.Prefetch(ctx, res.Release.ID, res.NZB, 0, clampLen(0, length, res.Release.Size))
+	warmed := clampLen(0, length, res.Release.Size)
+	err = p.deps.Engine.Prefetch(ctx, res.Release.ID, res.NZB, 0, warmed)
+	if err != nil {
+		return p.replaceWarmSource(ctx, user.ID, next.Key, res.Release, 0, next.Runtime, err)
+	}
+	if out := outcomeFromContext(ctx); out != nil {
+		out.bytesWarmed = warmed
+	}
+	return nil
 }
 
 // clampLen keeps [off, off+length) inside a file of size bytes (when known).
@@ -548,10 +627,6 @@ func (p *Prefetcher) warmPass(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("users: %w", err)
 	}
-	ahead := cfg.PrefetchBytes
-	if ahead <= 0 {
-		ahead = 32 << 20
-	}
 	for _, u := range users {
 		list, err := p.deps.State.InProgress(ctx, u.ID, p.opts.InProgressLimit)
 		if err != nil {
@@ -561,8 +636,12 @@ func (p *Prefetcher) warmPass(ctx context.Context) error {
 			p.log.Warn("in-progress lookup failed", "user", u.ID, "err", err)
 			continue
 		}
+		// State returns most recent first. Old accounts cost no source IO.
+		if len(list) == 0 || p.now().Sub(maxTime(list[0].LastViewedAt, list[0].UpdatedAt)) > 7*24*time.Hour {
+			continue
+		}
 		for _, st := range list {
-			if st.ViewOffset <= 0 {
+			if st.ViewOffset <= 0 || p.now().Sub(maxTime(st.LastViewedAt, st.UpdatedAt)) > 7*24*time.Hour {
 				continue
 			}
 			if k := st.Key.Kind(); k != core.KindMovie && k != core.KindEpisode {
@@ -571,36 +650,76 @@ func (p *Prefetcher) warmPass(ctx context.Context) error {
 			if _, live, _ := p.deps.Hints.ClientCaps(u.ID, st.Key); live {
 				continue // the stream engine's read-ahead has it
 			}
-			rp, err := p.deps.Hints.ResumePoint(ctx, u.ID, st.Key)
-			if err != nil || rp == nil {
-				continue
-			}
-			dur := rp.Duration
-			if dur <= 0 {
-				dur = st.Duration
-			}
-			if rp.Size <= 0 || dur <= 0 {
-				continue
-			}
-			tm := playback.TimeMap{Size: rp.Size, Duration: dur, Points: resumeIndexPoints(rp.Keyframes)}
-			start, length := WarmWindowFor(st.ViewOffset, tm, p.opts.WarmBehind, ahead)
-			if length <= 0 {
-				continue
-			}
-			bucket := start / (16 << 20)
-			releaseID, nzb := rp.ReleaseID(), rp.NZB
+			st := st
+			userID := u.ID
 			p.enqueue(job{
-				id:  fmt.Sprintf("warm:%s:%d", releaseID, bucket),
-				ttl: p.opts.WarmInterval / 2,
-				run: func(ctx context.Context) error {
-					p.setCurrent(rp.Release.Name, core.CacheCauseResumeWarm)
-					p.noteCause(releaseID, core.CacheCauseResumeWarm, rp.Release.Name)
-					return p.deps.Engine.Prefetch(ctx, releaseID, nzb, start, length)
-				},
+				id:       fmt.Sprintf("warm:%d:%d:%d", userID, st.Key, st.ViewOffset/(25*time.Second)),
+				kind:     "keep_warm",
+				titleKey: st.Key,
+				ttl:      p.opts.WarmInterval / 2,
+				run:      func(ctx context.Context) error { return p.warmResume(ctx, userID, st.Key, st.ViewOffset, st.Duration) },
 			})
 		}
 	}
 	return nil
+}
+
+func maxTime(a, b time.Time) time.Time {
+	if a.After(b) {
+		return a
+	}
+	return b
+}
+
+// warmResume only resolves after a stored source proves permanently broken.
+// An unstarted title or missing source never spends an indexer request.
+func (p *Prefetcher) warmResume(ctx context.Context, userID int64, key core.RatingKey, offset, duration time.Duration) error {
+	// A queued job may outlive its timeline state. Playback already owns
+	// read-ahead for this title; resume warming must not fetch beside it.
+	if _, live, _ := p.deps.Hints.ClientCaps(userID, key); live {
+		return nil
+	}
+	rp, err := p.deps.Hints.ResumePoint(ctx, userID, key)
+	if err != nil || rp == nil || rp.Size <= 0 || len(rp.NZB) == 0 {
+		return err
+	}
+	if rp.Duration > 0 {
+		duration = rp.Duration
+	}
+	if duration <= 0 {
+		return nil
+	}
+	tm := playback.TimeMap{Size: rp.Size, Duration: duration, Points: resumeIndexPoints(rp.Keyframes)}
+	// An indexed resume starts at its actual preceding cue, with no extra
+	// slack. Without an index, WarmBehind already supplies bounded slack;
+	// applying the startup warm estimate too would pad the same range twice.
+	start := tm.KeyframeOffsetAt(offset)
+	if len(tm.Points) == 0 {
+		start = max(int64(0), start-min(p.opts.WarmBehind, int64(4<<20)))
+	}
+	end := tm.OffsetAt(min(duration, offset+25*time.Second))
+	capBytes := int64(256 << 20)
+	if budget := p.config().BudgetBytes; budget > 0 {
+		capBytes = min(capBytes, budget/10)
+	}
+	length := clampLen(start, min(max(int64(0), end-start), capBytes), rp.Size)
+	if length <= 0 {
+		return nil
+	}
+	p.setCurrent(rp.Release.Name, core.CacheCauseResumeWarm)
+	if out := outcomeFromContext(ctx); out != nil {
+		out.titleKey = key.String()
+		out.titleName = rp.Release.Name
+	}
+	p.noteCause(rp.ReleaseID(), core.CacheCauseResumeWarm, rp.Release.Name)
+	err = p.deps.Engine.Prefetch(core.WithReadOrigin(ctx, "prefetch.resume", "in-progress title"), rp.ReleaseID(), rp.NZB, start, length)
+	if err == nil {
+		if out := outcomeFromContext(ctx); out != nil {
+			out.bytesWarmed = length
+		}
+		return nil
+	}
+	return p.replaceWarmSource(ctx, userID, key, rp.Release, offset, duration, err)
 }
 
 func WarmWindowFor(viewOffset time.Duration, tm playback.TimeMap, behind, ahead int64) (start, length int64) {
@@ -640,3 +759,26 @@ func (p *Prefetcher) prune() {
 }
 
 var _ Hints = (*playback.Manager)(nil)
+
+func (p *Prefetcher) replaceWarmSource(ctx context.Context, userID int64, key core.RatingKey, old core.Release, offset, duration time.Duration, failure error) error {
+	if !(errors.Is(failure, core.ErrArticleMissing) || errors.Is(failure, core.ErrArticleCorrupt) || errors.Is(failure, core.ErrReleaseRejected)) || ctx.Err() != nil {
+		return failure
+	}
+	replacer, ok := p.deps.Hints.(interface {
+		ReplaceWarmSource(context.Context, *core.User, core.RatingKey, core.ClientCaps, core.Release, time.Duration, time.Duration, error) error
+	})
+	if !ok || p.deps.Auth == nil {
+		return failure
+	}
+	users, err := p.deps.Auth.Users(ctx)
+	if err != nil {
+		return err
+	}
+	for _, user := range users {
+		if user.ID == userID {
+			caps, _, _ := p.deps.Hints.ClientCaps(userID, key)
+			return replacer.ReplaceWarmSource(ctx, &user, key, caps, old, offset, duration, failure)
+		}
+	}
+	return failure
+}

@@ -6,8 +6,10 @@ import { renderAppWith } from "./routes";
 const WAIT = { timeout: 4000 };
 
 /** `/discovery/settings` and one viewer's watchlist, layered over the fake backend. */
-function discoveryRoutes(opts: { enabled?: boolean; items?: unknown[] } = {}) {
-  let settings = {
+function discoveryRoutes(
+  opts: { enabled?: boolean; items?: unknown[]; extra?: Record<string, unknown> } = {},
+) {
+  let settings: Record<string, unknown> = {
     enabled: opts.enabled ?? false,
     plex: true,
     trakt: true,
@@ -19,11 +21,55 @@ function discoveryRoutes(opts: { enabled?: boolean; items?: unknown[] } = {}) {
     subtitleTranslate: false,
     speechToText: false,
     overviewTranslate: false,
+    ...opts.extra,
   };
   let items = opts.items ?? [];
   return (method: string, path: string, body: unknown) => {
     if (path === "/discovery/settings") {
-      if (method === "PUT") settings = body as typeof settings;
+      if (method === "PUT") {
+        const next: Record<string, unknown> = { ...settings, ...(body as Record<string, unknown>) };
+        if (typeof next.plexFriendsRssUrl === "string" && next.plexFriendsRssUrl.trim() !== "") {
+          next.plexFriendsRssUrl = "••••";
+          next.plexFriendsRssStatus = {
+            configured: true,
+            lastRead: 1_760_000_000,
+            imported: 3,
+            unmatchedTitles: 1,
+          };
+        } else {
+          delete next.plexFriendsRssUrl;
+          delete next.plexFriendsRssStatus;
+        }
+        if (typeof next.plexOwnerRssUrl === "string" && next.plexOwnerRssUrl.trim() !== "") {
+          next.plexOwnerRssUrl = "••••";
+          next.plexOwnerRssStatus = {
+            configured: true,
+            lastRead: 1_760_000_000,
+            imported: 1,
+            unmatchedTitles: 0,
+          };
+        } else {
+          delete next.plexOwnerRssUrl;
+          delete next.plexOwnerRssStatus;
+        }
+        settings = next;
+      }
+      return settings;
+    }
+    if (method === "POST" && path === "/discovery/rss/sync") {
+      settings = {
+        ...settings,
+        plexFriendsRssStatus: {
+          configured: true,
+          lastRead: 1_760_000_600,
+          imported: 4,
+          unmatchedTitles: 0,
+          problem: "rate_limited",
+        },
+      };
+      return settings;
+    }
+    if (method === "POST" && path === "/discovery/friends/sync") {
       return settings;
     }
     const m = /^\/discovery\/users\/\d+\/(.*)$/.exec(path);
@@ -34,6 +80,18 @@ function discoveryRoutes(opts: { enabled?: boolean; items?: unknown[] } = {}) {
         (i) => String((i as { title: { key: unknown } }).title.key) !== rest.slice(6),
       );
       return {};
+    }
+    if (method === "POST" && rest === "sync/jobs") {
+      return { id: 1, state: "completed", plex: "synced", count: items.length };
+    }
+    if (rest === "check") {
+      return {
+        state: "completed",
+        done: items.length,
+        total: items.length,
+        enabled: settings.enabled,
+        nextCheck: new Date(Date.now() + 30 * 60_000).toISOString(),
+      };
     }
     return items;
   };
@@ -85,9 +143,9 @@ function metadataRoutes() {
   };
 }
 
-describe("Watchlists (Catalog settings)", () => {
+describe("Watchlists (Viewers)", () => {
   it("starts monitoring and notifications off and saves opt-in settings in place", async () => {
-    const { fake } = renderAppWith("/catalog/settings", discoveryRoutes());
+    const { fake } = renderAppWith("/viewers", discoveryRoutes());
     const enabled = await screen.findByLabelText("Watchlist monitoring", {}, WAIT);
     expect(enabled).not.toBeChecked();
     expect(screen.getByLabelText("Tell me too")).not.toBeChecked();
@@ -109,6 +167,93 @@ describe("Watchlists (Catalog settings)", () => {
     await waitFor(() =>
       expect(screen.queryByRole("region", { name: "Unsaved changes" })).toBeNull(),
     );
+  });
+
+  it("saves Plex Friends' Watchlist RSS URLs, redacts them on reload, and shows shared-row status", async () => {
+    const { fake } = renderAppWith("/viewers", discoveryRoutes({ enabled: true }));
+    const friendsRss = await screen.findByLabelText("Friends' Watchlist RSS", {}, WAIT);
+    expect(
+      screen.getByText(
+        /Plex doesn't say which friend added what, so it shows as a shared “Your friends want to watch” row\./,
+      ),
+    ).toBeInTheDocument();
+    fireEvent.change(friendsRss, {
+      target: { value: "https://rss.plex.tv/11111111-2222-3333-4444-555555555555" },
+    });
+    fireEvent.click(await screen.findByRole("button", { name: "Save changes" }));
+    await waitFor(() =>
+      expect(puts(fake, "/discovery/settings")).toContainEqual(
+        expect.objectContaining({
+          enabled: true,
+          plexFriendsRssUrl: "https://rss.plex.tv/11111111-2222-3333-4444-555555555555",
+        }),
+      ),
+    );
+    await waitFor(() =>
+      expect(screen.queryByRole("region", { name: "Unsaved changes" })).toBeNull(),
+    );
+    expect(screen.getByLabelText("Friends' Watchlist RSS")).toHaveValue("••••");
+    expect(
+      screen.getByText("Saved. Leave as is to keep it, or type a new value to replace it."),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/3 titles in set/)).toBeInTheDocument();
+    expect(screen.getByText(/1 unmatched title/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /Read RSS feeds now/ }));
+    await waitFor(() => expect(calls(fake, "POST", "/discovery/rss/sync")).toHaveLength(1));
+    expect(await screen.findByText(/4 titles in set/)).toBeInTheDocument();
+    expect(screen.getByText(/0 unmatched titles/)).toBeInTheDocument();
+    expect(
+      screen.getByText("Plex asked Ether to slow down. Ether will try again."),
+    ).toBeInTheDocument();
+  });
+
+  it("summarizes Plex friends' watchlists in a collapsible panel and filters rate-limited friends", async () => {
+    const { fake } = renderAppWith(
+      "/viewers",
+      discoveryRoutes({
+        enabled: true,
+        extra: {
+          plexFriendsStatus: [
+            {
+              id: "1",
+              username: "deharryson1",
+              configured: true,
+              lastRead: 1_700_000_000,
+              imported: 47,
+              unmatchedTitles: 0,
+            },
+            {
+              id: "2",
+              username: "ehr.jm",
+              configured: true,
+              lastRead: 1_700_000_000,
+              imported: 38,
+              unmatchedTitles: 0,
+              problem: "upstream",
+              error: "Plex community: HTTP 429",
+            },
+          ],
+        },
+      }),
+    );
+
+    expect(
+      await screen.findByText(/2 friends · 1 synced · 85 titles/, {}, WAIT),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/1 rate-limited \(HTTP 429\)/)).toBeInTheDocument();
+    expect(screen.queryByText("deharryson1")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: /Sync friends now/ }));
+    await waitFor(() => expect(calls(fake, "POST", "/discovery/friends/sync")).toHaveLength(1));
+
+    fireEvent.click(screen.getByRole("button", { name: /Show friends \(2\)/ }));
+    expect(screen.getByText("deharryson1")).toBeInTheDocument();
+    expect(screen.getByText("ehr.jm")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /Issues \(1\)/ }));
+    expect(screen.queryByText("deharryson1")).toBeNull();
+    expect(screen.getByText("ehr.jm")).toBeInTheDocument();
   });
 });
 
@@ -139,7 +284,9 @@ describe("A viewer's watchlist (viewer profile › Watchlist)", () => {
     expect(await screen.findByText("Adventure", { selector: "p" }, WAIT)).toBeInTheDocument();
     expect(screen.queryByText(/Add a reminder/)).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: /Sync viewer/ }));
-    await waitFor(() => expect(calls(fake, "POST", "/discovery/users/2/sync")).toHaveLength(1));
+    await waitFor(() =>
+      expect(calls(fake, "POST", "/discovery/users/2/sync/jobs")).toHaveLength(1),
+    );
     fireEvent.click(await screen.findByRole("button", { name: /Check availability/ }));
     await waitFor(() => expect(calls(fake, "POST", "/discovery/users/2/check")).toHaveLength(1));
     fireEvent.click(await screen.findByRole("button", { name: "Remove Adventure" }));
@@ -186,7 +333,11 @@ describe("Metadata › Ratings", () => {
     const toggle = await screen.findByLabelText("External ratings", {}, WAIT);
     expect(screen.queryByRole("button", { name: /Edit rating sources/ })).toBeNull();
     expect(screen.queryByLabelText("Viewer")).toBeNull();
+    expect(screen.queryByRole("region", { name: "Plex rating fields" })).toBeNull();
+    expect(screen.getByText("Off: apps show the catalogue rating.")).toBeInTheDocument();
     fireEvent.click(toggle);
+    expect(screen.getByText("On: apps show the scores chosen below.")).toBeInTheDocument();
+    expect(screen.queryByText("Off: apps show the catalogue rating.")).toBeNull();
     expect(screen.queryByLabelText("Provider")).not.toBeInTheDocument();
     expect(screen.queryByLabelText("API key")).not.toBeInTheDocument();
     expect(
@@ -194,10 +345,13 @@ describe("Metadata › Ratings", () => {
         .getAllByRole("link", { name: "Integrations" })
         .map((link) => link.getAttribute("href")),
     ).toContain("/services/ratings");
+    fireEvent.click(screen.getByRole("button", { name: "Plex rating" }));
+    fireEvent.click(await screen.findByRole("option", { name: "IMDb" }, WAIT));
     fireEvent.click(await screen.findByRole("button", { name: "Save changes" }));
     await waitFor(() =>
       expect(calls(fake, "PUT", "/discovery/ratings/settings").at(-1)?.body).toMatchObject({
         enabled: true,
+        critic: "imdb",
         apiKey: "",
       }),
     );
@@ -253,7 +407,8 @@ describe("Metadata › Artwork", () => {
     );
     const drawer = await screen.findByRole("dialog", { name: title.title });
     fireEvent.click(await within(drawer).findByRole("button", { name: "Pin poster (en)" }));
-    fireEvent.change(within(drawer).getByLabelText("Backdrop"), { target: { value: "/bd.jpg" } });
+    fireEvent.click(within(drawer).getByRole("button", { name: "Backdrop" }));
+    fireEvent.click(await screen.findByRole("option", { name: /Backdrop 1/ }, WAIT));
     fireEvent.click(within(drawer).getByRole("button", { name: "Save title artwork" }));
     await waitFor(() =>
       expect(

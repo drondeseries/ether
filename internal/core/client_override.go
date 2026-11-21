@@ -2,8 +2,9 @@ package core
 
 // ClientCapabilityOverride is an owner edit of one registry client.
 // Nil slices and zero numbers leave the registry value in place.
-// A client that declares the same fact at runtime still wins.
+// Runtime declarations win unless Force is set for the edited facts.
 type ClientCapabilityOverride struct {
+	Force   bool   `json:"force,omitempty"`
 	ID      string `json:"id,omitempty"`
 	Product string `json:"product,omitempty"`
 	// ProductExact marks a product-only override already scoped by the app editor

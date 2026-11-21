@@ -450,6 +450,12 @@ describe("cluster helpers", () => {
     expect(transcodeLabel({ ...base.self, caps: { transcode: true, hwAccel: "vaapi" } })).toBe(
       "vaapi",
     );
+    expect(
+      transcodeLabel({
+        ...base.self,
+        caps: { transcode: true, hwAccel: "vaapi", videoTranscoding: "off" },
+      }),
+    ).toBe("Off");
   });
 });
 
@@ -490,6 +496,7 @@ describe("Cluster details elsewhere", () => {
       intervalHours: 24,
       retain: 7,
       sharedDir: "/mnt/backups/ether",
+      skipOnAirMedia: false,
     });
   });
 

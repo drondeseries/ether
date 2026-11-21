@@ -117,6 +117,7 @@ func (f *flexInt) UnmarshalJSON(b []byte) error {
 }
 
 type pmsMetadata struct {
+	Year             flexInt `json:"year"`
 	RatingKey        flexInt `json:"ratingKey"`
 	Type             string  `json:"type"`
 	Title            string  `json:"title"`
@@ -134,6 +135,13 @@ type pmsMetadata struct {
 	LastViewedAt         flexInt `json:"lastViewedAt"`
 	ViewedAt             flexInt `json:"viewedAt"`
 	AccountID            flexInt `json:"accountID"`
+	// Media carries the item's files: a multi-episode file (S05E22-23) is one
+	// PMS episode item that also holds the episodes its name spans.
+	Media []struct {
+		Part []struct {
+			File string `json:"file"`
+		} `json:"Part"`
+	} `json:"Media"`
 }
 
 func (m pmsMetadata) showKey() int64 {
@@ -297,8 +305,8 @@ func (c *pmsClient) accounts(ctx context.Context, token string) ([]pmsAccount, e
 }
 
 // history reads one page of an account's views after the cursor second,
-// oldest first.
-func (c *pmsClient) history(ctx context.Context, token string, accountID, after int64, start, size int) ([]pmsMetadata, error) {
+// oldest first, and the server's matching row count when reported.
+func (c *pmsClient) history(ctx context.Context, token string, accountID, after int64, start, size int) ([]pmsMetadata, int, error) {
 	q := url.Values{}
 	q.Set("accountID", strconv.FormatInt(accountID, 10))
 	q.Set("sort", "viewedAt:asc")
@@ -307,13 +315,13 @@ func (c *pmsClient) history(ctx context.Context, token string, accountID, after 
 	q.Set("X-Plex-Container-Size", strconv.Itoa(size))
 	var out pmsContainer
 	if err := c.get(ctx, "/status/sessions/history/all", q, token, &out); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	items := out.MediaContainer.Metadata
 	if len(items) > size {
 		items = items[:size]
 	}
-	return items, nil
+	return items, max(int(out.MediaContainer.TotalSize), 0), nil
 }
 
 func (c *pmsClient) metadata(ctx context.Context, token string, key int64) (pmsMetadata, error) {
@@ -343,6 +351,25 @@ func (c *pmsClient) sections(ctx context.Context, token string) ([]pmsSection, e
 		}
 	}
 	return list, nil
+}
+
+// sectionPage reads one page of a section's items with external GUIDs. libType
+// is 1 for movies, 2 for shows and 4 for episodes.
+func (c *pmsClient) sectionPage(ctx context.Context, token, section string, libType, start, size int) ([]pmsMetadata, error) {
+	q := url.Values{}
+	q.Set("type", strconv.Itoa(libType))
+	q.Set("includeGuids", "1")
+	q.Set("X-Plex-Container-Start", strconv.Itoa(start))
+	q.Set("X-Plex-Container-Size", strconv.Itoa(size))
+	var out pmsContainer
+	if err := c.get(ctx, "/library/sections/"+url.PathEscape(section)+"/all", q, token, &out); err != nil {
+		return nil, err
+	}
+	items := out.MediaContainer.Metadata
+	if len(items) > size {
+		items = items[:size]
+	}
+	return items, nil
 }
 
 // byGUID asks one section for the item whose primary GUID is guid. libType is
@@ -378,5 +405,7 @@ func (c *pmsClient) progress(ctx context.Context, token string, key int64, offse
 	q.Set("identifier", pmsIdentifier)
 	q.Set("time", strconv.FormatInt(offset.Milliseconds(), 10))
 	q.Set("state", "stopped")
-	return c.get(ctx, "/:/progress", q, token, nil)
+	return c.get(ctx, pathProgress, q, token, nil)
 }
+
+const pathProgress = "/:/progress"

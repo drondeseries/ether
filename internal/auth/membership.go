@@ -30,5 +30,37 @@ func (s *Service) SetOwnerEnabled(ctx context.Context, viewerID int64, enabled b
 		return err
 	}
 	s.notify("")
+	var name string
+	var streamLimit int
+	var maxRating string
+	var libs []core.LibraryID
+	if u, e := s.User(ctx, viewerID); e == nil && u != nil {
+		name = u.Username
+		if name == "" {
+			name = u.Title
+		}
+		streamLimit = u.StreamLimit
+		maxRating = u.MaxContentRating
+		libs = u.AllowedLibraries
+	}
+	if !enabled {
+		s.emitViewerEvent(ViewerEvent{
+			Kind:     "deactivated",
+			ViewerID: viewerID,
+			Username: name,
+			Reason:   "paused_by_owner",
+			Actor:    "owner",
+		})
+	} else {
+		s.emitViewerEvent(ViewerEvent{
+			Kind:             "access_changed",
+			ViewerID:         viewerID,
+			Username:         name,
+			StreamLimit:      streamLimit,
+			MaxContentRating: maxRating,
+			AllowedLibraries: libs,
+			Actor:            "owner",
+		})
+	}
 	return nil
 }

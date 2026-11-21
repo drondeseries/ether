@@ -2,6 +2,7 @@ package transcode
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"time"
@@ -12,7 +13,7 @@ import (
 // RawFormat is the switcher's working format. It is fixed for a channel output's life.
 type RawFormat struct {
 	Width, Height  int    // even; the channel's largest rendition size
-	FPSNum, FPSDen int    // 30/1 by default; 30000/1001 and 25/1 also allowed
+	FPSNum, FPSDen int    // a broadcast rate: 24, 25, 30, 50 or 60 (and the /1001 NTSC forms)
 	SampleRate     int    // 48000
 	Channels       int    // 2
 	PixelFormat    string // "yuv420p" (I420, planar, tightly packed: Y then U then V, no row padding)
@@ -24,7 +25,9 @@ type RawFormat struct {
 // floor((n+1)*SR*FPSDen/FPSNum) - floor(n*SR*FPSDen/FPSNum) samples per channel,
 // so audio never drifts (1600 every tick at 48 kHz / 30 fps).
 type RawFrame struct {
-	OutputTime time.Time // scheduled output-clock time, independent of delivery/burst time
+	// GraphicsTransition marks the first animated frame replacing a title plate.
+	GraphicsTransition bool
+	OutputTime         time.Time // scheduled output-clock time, independent of delivery/burst time
 	// PolicyTags are immutable comparable identities supplied by the planner.
 	// Every identity represented in a segment survives encoder publication.
 	PolicyTags []any
@@ -51,8 +54,24 @@ type DecoderRequest struct {
 	// PrimeLive reads four provider segments on the first open only. Callers
 	// with an aired source timestamp must leave it false on reconnect.
 	PrimeLive bool
-	Loop      bool // repeat a local cached master seamlessly; incompatible with Live and URLs
+	// ReserveStart starts an HLS live input at the first segment the relay
+	// lists, which is the stability reserve, instead of near the live edge.
+	ReserveStart bool
+	// InputFormat is the probed live container ("hls" or "mpegts"; empty when
+	// unknown). Demuxer-private options are only valid for their own demuxer.
+	InputFormat string
+	Loop        bool // repeat a local cached master seamlessly; incompatible with Live and URLs
+	// AudioIndex is the input's audio track to decode, counted among its
+	// audio streams (0 = first). Callers pick it by language.
+	AudioIndex int
 }
+
+// ErrInputChanged reports that a live input changed its codec or stream set
+// mid-stream affecting the selected audio/video (such as a new codec on a PID): one
+// elementary stream keeps flowing while the other can no longer be decoded.
+// The caller splices a replacement decoder into its existing output timeline.
+// PMT version bumps and unrelated elementary streams alone are not changes.
+var ErrInputChanged = errors.New("transcode: live input changed its streams")
 
 // Decoder yields frames already in Format, one per call, paced by the caller.
 // Next blocks until a frame is ready; it returns io.EOF at end of input, and
@@ -68,10 +87,15 @@ type Decoder interface {
 
 type EncoderRequest struct {
 	SessionID       string
-	Source          RawFormat     // what Write receives
-	Decision        core.Decision // output codec, size, bitrate, audio; fixed for life; HW from HWAccel
-	SegmentDuration time.Duration // 4 s; keyframe exactly at every segment start
-	DVRWindow       time.Duration // segments kept on node-local disk for timeshift (30 min default; 0 = live window only)
+	Source          RawFormat       // what Write receives
+	Decision        core.Decision   // output codec, size, bitrate, audio; fixed for life; HW from HWAccel
+	ClientCaps      core.ClientCaps // viewer limits used for optional RTX VSR upscale headroom
+	SegmentDuration time.Duration   // 4 s; keyframe exactly at every segment start
+	DVRWindow       time.Duration   // segments kept on node-local disk for timeshift (30 min default; 0 = live window only)
+	// LiveSource marks a provider (IPTV) channel: rate control may use one
+	// segment of VBV buffer under the ceiling, so keyframes of moving
+	// pictures are not starved. Scheduled channels keep a one-second bound.
+	LiveSource bool
 }
 
 // ContinuousEncoder never restarts and never changes output parameters.

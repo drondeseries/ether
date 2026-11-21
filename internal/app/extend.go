@@ -35,6 +35,7 @@ func (a *App) buildExtensibility(ctx context.Context, cfg config.Config) error {
 	if a.streamRT, err = a.buildConsoleStream(ctx, cfg); err != nil {
 		return fmt.Errorf("console stream: %w", err)
 	}
+	a.buildFlows()
 	if a.pluginsRT, err = a.buildPlugins(ctx, cfg); err != nil {
 		return fmt.Errorf("plugins: %w", err)
 	}

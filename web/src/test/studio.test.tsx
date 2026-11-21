@@ -156,6 +156,42 @@ describe("Collection Studio editor", () => {
     ).toBeInTheDocument();
   });
 
+  it("adds TV air-date rules and previews matching returning shows", async () => {
+    const { fake } = renderApp("/collections/new?draft=air-rules");
+    await screen.findByLabelText("Collection name", {}, WAIT);
+    fireEvent.click(screen.getByRole("radio", { name: "TV shows" }));
+    fireEvent.click(screen.getByRole("button", { name: /Add rule/ }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Latest season premiere" }));
+    await waitFor(
+      () =>
+        expect(
+          previewBodies(fake).some((s) =>
+            hasRule(
+              s,
+              (r) => r.field === "latestSeasonPremiere" && r.op === "within" && r.value === "30d",
+            ),
+          ),
+        ).toBe(true),
+      WAIT,
+    );
+    expect(screen.getByText("Latest season premiere in the last 30 days")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /Add rule/ }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Latest aired episode" }));
+    await waitFor(
+      () =>
+        expect(
+          previewBodies(fake).some((s) =>
+            hasRule(
+              s,
+              (r) => r.field === "latestEpisode" && r.op === "within" && r.value === "30d",
+            ),
+          ),
+        ).toBe(true),
+      WAIT,
+    );
+  });
+
   it("sends each air-date sort and direction to the live preview", async () => {
     const { fake } = renderApp("/collections/new?draft=air-sort");
     await screen.findByLabelText("Collection name", {}, WAIT);
@@ -206,6 +242,27 @@ describe("Collection Studio editor", () => {
     expect(await screen.findByDisplayValue("Saturday matinee", {}, WAIT)).toBeInTheDocument();
     expect(screen.getByText(/Restored unsaved changes/)).toBeInTheDocument();
   });
+
+  it("never saves an untouched new draft or previews blankSpec() when opening an existing collection's Artwork", async () => {
+    const fresh = renderApp("/collections/new?draft=new-untouched-b2");
+    await screen.findByLabelText("Collection name", {}, WAIT);
+    await new Promise((r) => setTimeout(r, 700));
+    expect(localStorage.getItem("ether.draft.collection.new-untouched-b2")).toBeNull();
+    fresh.unmount();
+
+    const { fake } = renderApp("/collections/c1?section=artwork");
+    const drawer = await screen.findByRole("dialog", { name: "Edit collection" }, WAIT);
+    expect(
+      await within(drawer).findByDisplayValue("Edge of Your Seat", {}, WAIT),
+    ).toBeInTheDocument();
+    await waitFor(() => expect(previewBodies(fake).length).toBeGreaterThan(0), WAIT);
+    await new Promise((r) => setTimeout(r, 700));
+    // Every preview call from the editor must use c1's own spec, never blankSpec() (50 whole-catalogue items).
+    expect(previewBodies(fake).every((s) => s.name === "Edge of Your Seat" && s.limit !== 50)).toBe(
+      true,
+    );
+    expect(localStorage.getItem("ether.draft.collection.c1")).toBeNull();
+  });
 });
 
 describe("Collection Studio gallery", () => {
@@ -229,7 +286,7 @@ describe("Collection Studio gallery", () => {
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull(), WAIT);
     expect(screen.getByRole("region", { name: "Collection posters" })).toBe(gallery);
     expect(screen.getByRole("complementary", { name: "Collection library" })).toBe(library);
-    expect(screen.getByRole("button", { name: "Preview Family movie night" })).toHaveAttribute(
+    expect(screen.getByRole("button", { name: "Preview Family Movie Night" })).toHaveAttribute(
       "aria-current",
       "true",
     );
@@ -238,33 +295,35 @@ describe("Collection Studio gallery", () => {
   it("previews a selected collection in place and publishes it", async () => {
     const { fake } = renderApp("/collections?collection=c3");
     expect(
-      await screen.findByRole("heading", { name: "Family movie night" }, WAIT),
+      await screen.findByRole("heading", { name: "Family Movie Night" }, WAIT),
     ).toBeInTheDocument();
     expect(screen.queryByRole("dialog")).toBeNull();
-    const row = screen.getByRole("button", { name: "Preview Family movie night" });
+    const row = screen.getByRole("button", { name: "Preview Family Movie Night" });
     expect(row).toHaveAttribute("aria-current", "true");
     await waitFor(
-      () => expect(previewBodies(fake).some((s) => s.name === "Family movie night")).toBe(true),
+      () => expect(previewBodies(fake).some((s) => s.name === "Family Movie Night")).toBe(true),
       WAIT,
     );
     fireEvent.click(screen.getByRole("button", { name: "Publish" }));
     await waitFor(() => expect(calls(fake, "PUT", "/collections/c3")).toHaveLength(1), WAIT);
     expect(await screen.findByRole("button", { name: "Unpublish" }, WAIT)).toBeInTheDocument();
     expect(within(row).getByText("Published")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Preview New to Ether" }));
-    expect(await screen.findByRole("heading", { name: "New to Ether" }, WAIT)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Preview Recently Added" }));
+    expect(
+      await screen.findByRole("heading", { name: "Recently Added" }, WAIT),
+    ).toBeInTheDocument();
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 
   it("filters the library and recovers from an empty search", async () => {
     renderApp("/collections");
-    await screen.findByRole("heading", { name: "Edge of your seat" }, WAIT);
+    await screen.findByRole("heading", { name: "Edge of Your Seat" }, WAIT);
     fireEvent.click(screen.getByRole("button", { name: "Collection status" }));
     fireEvent.click(await screen.findByRole("menuitemradio", { name: "Drafts" }));
     expect(
-      await screen.findByRole("heading", { name: "Family movie night" }, WAIT),
+      await screen.findByRole("heading", { name: "Family Movie Night" }, WAIT),
     ).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Preview Edge of your seat" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Preview Edge of Your Seat" })).toBeNull();
     fireEvent.change(screen.getByRole("searchbox", { name: "Search collections" }), {
       target: { value: "no such collection" },
     });
@@ -273,7 +332,7 @@ describe("Collection Studio gallery", () => {
       target: { value: "" },
     });
     expect(
-      await screen.findByRole("heading", { name: "Family movie night" }, WAIT),
+      await screen.findByRole("heading", { name: "Family Movie Night" }, WAIT),
     ).toBeInTheDocument();
   });
 
@@ -306,10 +365,10 @@ describe("Collection Studio gallery", () => {
     const gallery = await screen.findByRole("region", { name: "Collection posters" }, WAIT);
     expect(within(gallery).getAllByRole("button", { name: /Open .+ preview/ })).toHaveLength(4);
     fireEvent.click(
-      within(gallery).getByRole("button", { name: "Open Family movie night preview" }),
+      within(gallery).getByRole("button", { name: "Open Family Movie Night preview" }),
     );
     expect(
-      await screen.findByRole("heading", { name: "Family movie night" }, WAIT),
+      await screen.findByRole("heading", { name: "Family Movie Night" }, WAIT),
     ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Show collection preview" })).toHaveAttribute(
       "aria-pressed",
@@ -350,19 +409,19 @@ describe("Collection Studio gallery", () => {
   it("lists collections and starts a new one from a template", async () => {
     renderApp("/collections");
     expect(
-      await screen.findByRole("heading", { name: "Edge of your seat" }, WAIT),
+      await screen.findByRole("heading", { name: "Edge of Your Seat" }, WAIT),
     ).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Collection views" }));
     fireEvent.click(screen.getByRole("menuitemradio", { name: /Templates/ }));
     fireEvent.click(
-      await screen.findByRole("button", { name: "Preview template Hidden gems" }, WAIT),
+      await screen.findByRole("button", { name: "Preview template Hidden Gems" }, WAIT),
     );
-    const card = await screen.findByRole("button", { name: "Use template Hidden gems" }, WAIT);
+    const card = await screen.findByRole("button", { name: "Use template Hidden Gems" }, WAIT);
     fireEvent.click(card);
-    expect(await screen.findByDisplayValue("Hidden gems", {}, WAIT)).toBeInTheDocument();
+    expect(await screen.findByDisplayValue("Hidden Gems", {}, WAIT)).toBeInTheDocument();
     expect(
       within(await screen.findByRole("dialog", { name: "New collection" }, WAIT)).getByText(
-        "Rating is at least 7.5",
+        "Rating is at least 7.3",
       ),
     ).toBeInTheDocument();
   });
@@ -370,7 +429,7 @@ describe("Collection Studio gallery", () => {
   it("builds a collection live from a description and saves it in one click", async () => {
     const user = userEvent.setup();
     const { fake } = renderApp("/collections");
-    await screen.findByRole("heading", { name: "Edge of your seat" }, WAIT);
+    await screen.findByRole("heading", { name: "Edge of Your Seat" }, WAIT);
     fireEvent.click(screen.getByRole("button", { name: /Describe it/ }));
     const dialog = await screen.findByRole("dialog");
     const composer = await within(dialog).findByPlaceholderText(
@@ -427,7 +486,7 @@ describe("Collection Studio gallery", () => {
     setMockAgentEnabled(false);
     try {
       renderApp("/collections");
-      await screen.findByRole("heading", { name: "Edge of your seat" }, WAIT);
+      await screen.findByRole("heading", { name: "Edge of Your Seat" }, WAIT);
       fireEvent.click(screen.getByRole("button", { name: /Describe it/ }));
       const dialog = await screen.findByRole("dialog");
       expect(

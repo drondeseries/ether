@@ -64,6 +64,12 @@ func newDebridLink(key string, opts ProviderOptions) *debridLink {
 
 func (p *debridLink) Kind() string { return "debridlink" }
 
+// supportsAtomicHashCache reports whether Debrid-Link can query its cache
+// with a bare 40-character hex info hash without adding an uncached torrent.
+func (p *debridLink) supportsAtomicHashCache(infoHash string) bool {
+	return reInfoHash.MatchString(infoHash)
+}
+
 type dlEnvelope struct {
 	Success bool            `json:"success"`
 	Error   string          `json:"error"`
@@ -251,6 +257,13 @@ func dlFileByID(t *dlTorrent, id string) *dlFile {
 }
 
 func (p *debridLink) Acquire(ctx context.Context, req AcquireRequest) (*Acquired, error) {
+	if req.Private && !req.privateChecked {
+		var perr error
+		req, perr = prepareAcquire(ctx, p, req, false)
+		if perr != nil {
+			return nil, perr
+		}
+	}
 	id, added := req.TorrentID, false
 	var t *dlTorrent
 	if id == "" {

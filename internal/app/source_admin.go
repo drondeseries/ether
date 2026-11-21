@@ -159,7 +159,7 @@ func (a *App) sourceAdminServices() sourceadmin.Services {
 			for _, ix := range remaining {
 				for slot, v := range cfg.Indexers {
 					if (ix.Indexer == v.ID || v.ID == "" && ix.Indexer == v.Name) && len(d.Indexers) < limit {
-						d.Indexers = append(d.Indexers, sourceadmin.Indexer{Slot: slot, HitsUsed: ix.HitsUsed, HitsRemaining: ix.HitsRemaining, GrabsUsed: ix.GrabsUsed, GrabsRemaining: ix.GrabsRemaining, RetryAt: ix.RetryAt, Enabled: ix.Enabled, Torrent: ix.Torrent})
+						d.Indexers = append(d.Indexers, sourceadmin.Indexer{Slot: slot, HitsUsed: ix.HitsUsed, HitsRemaining: ix.HitsRemaining, GrabsUsed: ix.GrabsUsed, GrabsRemaining: ix.GrabsRemaining, RetryAt: ix.RetryAt, PausedUntil: ix.PausedUntil, MissingDefinition: ix.MissingDefinition, Enabled: ix.Enabled, Torrent: ix.Torrent})
 						break
 					}
 				}

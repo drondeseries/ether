@@ -122,6 +122,7 @@ func TestRouterAllCapabilities(t *testing.T) {
 					CapTools,
 					CapRankingStep,
 					CapRuleCondition,
+					CapPosterBadges,
 				},
 				Summary: "Test plugin covering all capabilities.",
 				Runtime: RuntimeDecl{Kind: "remote"},
@@ -135,6 +136,11 @@ func TestRouterAllCapabilities(t *testing.T) {
 					}},
 				},
 				Contributes: &Contributes{
+					PosterBadges: []PosterBadgeSetMeta{{
+						Key:         "dub_languages",
+						Label:       "Dub languages",
+						Description: "Audio dub availability on series posters",
+					}},
 					Pages: []PageMeta{{
 						Key:   "home",
 						Label: "Overview",
@@ -503,6 +509,7 @@ func TestStartHTTPAndTunnelSidecar(t *testing.T) {
 
 func TestRemoteHostClient(t *testing.T) {
 	var seenCred string
+	var seenBadgePut, seenBadgeDelete bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seenCred = r.Header.Get("X-Ether-Plugin-Credential")
 		w.Header().Set("Content-Type", "application/json")
@@ -511,6 +518,14 @@ func TestRemoteHostClient(t *testing.T) {
 			_, _ = w.Write([]byte(`{"key":"greeting","value":"hello"}`))
 		case r.Method == http.MethodGet && r.URL.Path == "/ether/plugin-host/kv":
 			_, _ = w.Write([]byte(`{"keys":["greeting"]}`))
+		case r.Method == http.MethodPut && r.URL.Path == "/ether/plugin-host/badges/dub_languages":
+			seenBadgePut = true
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		case r.Method == http.MethodDelete && r.URL.Path == "/ether/plugin-host/badges/dub_languages":
+			seenBadgeDelete = true
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/ether/plugin-host/badges-usage":
+			_, _ = w.Write([]byte(`{"titles":3,"quotaTitles":200000}`))
 		default:
 			_, _ = w.Write([]byte(`{"ok":true}`))
 		}
@@ -521,6 +536,7 @@ func TestRemoteHostClient(t *testing.T) {
 		BaseURL:    srv.URL,
 		Credential: "cred-go-123",
 	})
+	var _ BadgesHost = client
 	ctx := context.Background()
 	val, found, err := client.KVGet(ctx, "greeting")
 	if err != nil || !found || val != "hello" {
@@ -533,11 +549,89 @@ func TestRemoteHostClient(t *testing.T) {
 	if err != nil || len(keys) != 1 || keys[0] != "greeting" {
 		t.Fatalf("unexpected KVList: %+v %v", keys, err)
 	}
+	if err := client.BadgesSet(ctx, "dub_languages", []BadgeEntry{{
+		Title:  BadgeTitleRef{Type: "show", TMDB: 95479},
+		Labels: []string{"EN DUB"},
+	}}); err != nil {
+		t.Fatalf("BadgesSet failed: %v", err)
+	}
+	usage, err := client.BadgesUsage(ctx)
+	if err != nil || usage.Titles != 3 || usage.QuotaTitles != PosterBadgeQuotaTitles {
+		t.Fatalf("unexpected BadgesUsage: %+v %v", usage, err)
+	}
+	if err := client.BadgesClear(ctx, "dub_languages"); err != nil {
+		t.Fatalf("BadgesClear failed: %v", err)
+	}
+	if !seenBadgePut || !seenBadgeDelete {
+		t.Fatalf("expected badge PUT and DELETE calls, got put=%v delete=%v", seenBadgePut, seenBadgeDelete)
+	}
 	if err := client.NotifyOwner(ctx, "Sync complete."); err != nil {
 		t.Fatalf("NotifyOwner failed: %v", err)
 	}
 	if seenCred != "cred-go-123" {
 		t.Fatalf("expected credential header cred-go-123, got %q", seenCred)
+	}
+}
+
+func TestMockHostBadgesBounds(t *testing.T) {
+	ctx := context.Background()
+	host := NewMockHost()
+	var _ BadgesHost = host
+	host.BadgeQuotaTitles = 2
+
+	if err := host.BadgesSet(ctx, "dub_languages", []BadgeEntry{
+		{Title: BadgeTitleRef{Type: "show", TMDB: 95479}, Labels: []string{"en dub", "es dub"}},
+		{Title: BadgeTitleRef{Type: "movie", IMDB: "tt0245429"}, Labels: []string{"director's cut"}},
+	}); err != nil {
+		t.Fatalf("unexpected BadgesSet error: %v", err)
+	}
+	usage, err := host.BadgesUsage(ctx)
+	if err != nil || usage.Titles != 2 || usage.QuotaTitles != 2 {
+		t.Fatalf("unexpected usage: %+v %v", usage, err)
+	}
+	if got := host.Badges["dub_languages"]["tmdb:show:95479"]; len(got) != 2 || got[0] != "EN DUB" {
+		t.Fatalf("unexpected stored labels: %+v", got)
+	}
+
+	//Exceeding quota rejects without mutating stored sets.
+	if err := host.BadgesSet(ctx, "dub_languages", []BadgeEntry{
+		{Title: BadgeTitleRef{Type: "show", TMDB: 1429}, Labels: []string{"EN DUB"}},
+	}); err == nil {
+		t.Fatal("expected quota error")
+	}
+
+	// Empty labels removes the title's badges.
+	if err := host.BadgesSet(ctx, "dub_languages", []BadgeEntry{
+		{Title: BadgeTitleRef{Type: "show", TMDB: 95479}, Labels: nil},
+	}); err != nil {
+		t.Fatalf("delete via empty labels failed: %v", err)
+	}
+	usage, _ = host.BadgesUsage(ctx)
+	if usage.Titles != 1 {
+		t.Fatalf("expected 1 badged title after delete, got %d", usage.Titles)
+	}
+
+	// Invalid inputs are rejected.
+	if err := host.BadgesSet(ctx, "BadKey", nil); err == nil {
+		t.Fatal("expected invalid setKey error")
+	}
+	if err := host.BadgesSet(ctx, "dub_languages", []BadgeEntry{
+		{Title: BadgeTitleRef{Type: "show", TMDB: 95479}, Labels: []string{"A", "B", "C", "D"}},
+	}); err == nil {
+		t.Fatal("expected >3 labels error")
+	}
+	if err := host.BadgesSet(ctx, "dub_languages", []BadgeEntry{
+		{Title: BadgeTitleRef{Type: "show", TMDB: 95479}, Labels: []string{"BAD_CHAR"}},
+	}); err == nil {
+		t.Fatal("expected invalid label char error")
+	}
+
+	if err := host.BadgesClear(ctx, "dub_languages"); err != nil {
+		t.Fatalf("BadgesClear failed: %v", err)
+	}
+	usage, _ = host.BadgesUsage(ctx)
+	if usage.Titles != 0 {
+		t.Fatalf("expected 0 titles after clear, got %d", usage.Titles)
 	}
 }
 

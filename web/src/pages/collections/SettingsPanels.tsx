@@ -531,7 +531,8 @@ export function ArtworkPreview({
         <Artwork
           src={artworkPreviewURL(spec.artwork.url)}
           alt=""
-          title={t("Add an image URL")}
+          title={size === "sm" ? "" : t("Add an image URL")}
+          icon={<Link2 size={size === "sm" ? 16 : 22} aria-hidden />}
           className="size-full"
           eager
         />
@@ -632,6 +633,24 @@ export function AudiencePanel({ spec, update }: { spec: CollectionSpec; update: 
             </Button>
           ))}
         </div>
+        <ToggleRow
+          title={t("Play trailer preview on focus")}
+          description={
+            tg.homeRow || tg.sectionRow
+              ? t(
+                  "Vela and Moonfin can play the focused title's trailer. Other apps show wide artwork.",
+                )
+              : t("Turn on a Home or Library row to use trailer previews.")
+          }
+          disabled={!tg.homeRow && !tg.sectionRow}
+          checked={Boolean(spec.previewOnFocus)}
+          onChange={(previewOnFocus) => update({ previewOnFocus })}
+        />
+        <ToggleRow
+          title={t("Ranked (Top 10)")}
+          checked={Boolean(spec.rankedTop10)}
+          onChange={(rankedTop10) => update({ rankedTop10 })}
+        />
         <ToggleRow
           title={t("Collections tab")}
           description={t("Listed in the matching libraries.")}

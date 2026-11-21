@@ -44,6 +44,10 @@ type Options struct {
 	Sites     config.IndexerSites
 	// Sealer protects stored login cookies; nil stores them as given.
 	Sealer config.FieldSealer
+	// MaxPerHost bounds concurrent requests per host:port; 0 = newznab.DefaultMaxPerHost.
+	MaxPerHost int
+	// HostLimiter shares a per-host limiter across indexer subsystems when set.
+	HostLimiter *newznab.HostLimiter
 }
 
 // Service manages installed definitions and the runners of configured
@@ -61,6 +65,7 @@ type Service struct {
 	log      *slog.Logger
 	now      func() time.Time
 	lock     LoginLock
+	hosts    *newznab.HostLimiter
 
 	mu      sync.Mutex
 	sites   config.IndexerSites
@@ -98,6 +103,10 @@ func New(o Options) *Service {
 		km := &keyedMutex{}
 		o.LoginLock = km.lock
 	}
+	hosts := o.HostLimiter
+	if hosts == nil {
+		hosts = newznab.NewHostLimiter(o.MaxPerHost)
+	}
 	return &Service{
 		defs:     &defStore{db: o.DB},
 		sessions: &sessionStore{db: o.DB, sealer: o.Sealer, now: o.Now},
@@ -107,6 +116,7 @@ func New(o Options) *Service {
 		log:      o.Logger,
 		now:      o.Now,
 		lock:     o.LoginLock,
+		hosts:    hosts,
 		sites:    o.Sites,
 		parsed:   map[string]*parsedDef{},
 		runners:  map[string]*runnerEntry{},
@@ -221,15 +231,17 @@ func credentialFingerprint(cfg config.Indexer) string {
 
 func (s *Service) newRunner(cfg config.Indexer, p *parsedDef) (*Runner, error) {
 	return newRunner(p.def, runnerOptions{
-		IndexerID:  cfg.ID,
-		SiteLink:   cfg.URL,
-		Settings:   mergedSettings(cfg),
-		HTTPClient: s.hc,
-		FlareURL:   s.flareURL,
-		Sessions:   s.sessions,
-		Lock:       s.lock,
-		Logger:     s.log.With("indexer", cfg.Name),
-		Now:        s.now,
+		IndexerID:   cfg.ID,
+		SiteLink:    cfg.URL,
+		Settings:    mergedSettings(cfg),
+		HTTPClient:  s.hc,
+		FlareURL:    s.flareURL,
+		Sessions:    s.sessions,
+		Lock:        s.lock,
+		Logger:      s.log.With("indexer", cfg.Name),
+		Now:         s.now,
+		HostLimiter: s.hosts,
+		Language:    cfg.Language,
 	})
 }
 
@@ -298,6 +310,9 @@ func (s *Service) Backend(cfg config.Indexer) (newznab.Backend, error) {
 	defer cancel()
 	r, err := s.runner(ctx, cfg)
 	if err != nil {
+		if errors.Is(err, ErrUnknownDefinition) {
+			return nil, fmt.Errorf("indexer %q: %w: %w", cfg.Name, err, newznab.ErrMissingDefinition)
+		}
 		return nil, fmt.Errorf("indexer %q: %w", cfg.Name, err)
 	}
 	return backend{r: r, movieCats: cfg.MovieCategories, tvCats: cfg.TVCategories}, nil

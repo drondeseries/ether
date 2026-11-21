@@ -31,7 +31,11 @@ type programmeOverlays struct {
 // background prepare. The clock only blends the compact non-transparent bounds.
 func (p *scheduleBroadcastPlanner) prepareProgrammeOverlays(ctx context.Context, programme Programme, chapters []core.Chapter) *programmeOverlays {
 	c := p.channel
-	if c.Look == nil || programme.Item.Key == 0 {
+	// Overlays is the owner's explicit on/off switch for the corner logo and
+	// lower-third ("" is Off, the default); nothing below ever checks it, so
+	// a Look with a Bug/lower-third configured renders them unconditionally
+	// even when the owner has turned this off.
+	if c.Look == nil || c.Look.Overlays == "" || programme.Item.Key == 0 {
 		return nil
 	}
 	source, ok := p.s.o.Graphics.(overlaySource)
@@ -58,8 +62,8 @@ func (p *scheduleBroadcastPlanner) prepareProgrammeOverlays(ctx context.Context,
 		}
 		request := p.s.clipRequest(c, Programme{ChannelID: c.ID, Start: programme.Start, End: programme.End, Item: Item{Slate: moment}})
 		request.Bind["now.title"] = programme.Item.Title
-		request.Bind["now.meta"] = programme.Item.EpisodeTitle
-		request.Bind["now.logline"] = programme.Item.Summary
+		request.Bind["now.meta"] = ProgrammeMeta(programme.Item)
+		request.Bind["now.logline"] = Logline(programme.Item.Summary)
 		doc, bindings, ok := source.Overlay(ctx, request)
 		if !ok {
 			continue

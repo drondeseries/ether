@@ -9,6 +9,9 @@ import (
 // ErrPrepareSlow indicates that preparation continues after the caller's wait.
 var ErrPrepareSlow = errors.New("playback preparation is still running")
 
+// PlaybackPrepareWithin joins a shared source preparation. A positive wait
+// permits ErrPrepareSlow while preparation continues; a non-positive wait
+// waits for completion or context cancellation under the service deadline.
 type PlaybackPrepareWithin interface {
 	PrepareWithin(context.Context, time.Duration, *User, RatingKey, ClientCaps, string, bool) (*PlaySession, error)
 }
@@ -37,6 +40,11 @@ type PrewarmOptions struct {
 	// DuringPlayback allows the warm-up while the viewer already has an
 	// active session (a trailer, or the end of a film, is playing).
 	DuringPlayback bool `json:"duringPlayback,omitempty"`
+	// PlayIntent marks a detail warm-up from a device whose real caps are
+	// known. Held for a moment, it may open the one top-ranked add-on
+	// stream that its add-on reports debrid-cached (core.WithOnDemandWarm).
+	// Up Next and next-episode warm-ups imply it. Never set for browsing.
+	PlayIntent bool `json:"-"`
 }
 
 // Prewarmer is implemented by playback managers that can resolve, open,

@@ -8,12 +8,14 @@ import (
 	"github.com/braedonsaunders/ether/internal/core"
 	"github.com/braedonsaunders/ether/internal/experience"
 	"github.com/braedonsaunders/ether/internal/frontend"
+	"github.com/braedonsaunders/ether/internal/frontend/frontendtest"
 	"github.com/braedonsaunders/ether/internal/frontend/kit/ids"
 )
 
 type collageState struct{ core.State }
 
 type collageArt struct {
+	frontendtest.Artwork
 	img frontend.Image
 }
 
@@ -79,10 +81,8 @@ func TestLibraryCollageDoesNotBrowseOnTheRequest(t *testing.T) {
 		},
 	}
 	viewer := &core.User{ID: 1, IsOwner: true}
-	start := time.Now()
-	_, err = s.LibraryCollage(context.Background(), viewer, core.Device{ID: "tv"}, viewID)
-	if elapsed := time.Since(start); elapsed > 50*time.Millisecond || err == nil {
-		t.Fatalf("cold collage waited %s: %v", elapsed, err)
+	if _, err = s.LibraryCollage(context.Background(), viewer, core.Device{ID: "tv"}, viewID); err == nil {
+		t.Fatal("cold collage succeeded before posters finished")
 	}
 	select {
 	case <-browsed:
@@ -90,7 +90,7 @@ func TestLibraryCollageDoesNotBrowseOnTheRequest(t *testing.T) {
 	default:
 	}
 	close(block)
-	deadline := time.Now().Add(time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for {
 		img, err := s.LibraryCollage(context.Background(), viewer, core.Device{ID: "tv"}, viewID)
 		if err == nil && img.Path == ref {

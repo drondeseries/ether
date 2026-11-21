@@ -2,7 +2,7 @@ package app
 
 import (
 	"github.com/braedonsaunders/ether/internal/catalog"
-	"github.com/braedonsaunders/ether/internal/plexmeta"
+	plexmeta "github.com/braedonsaunders/ether/internal/plexmeta"
 )
 
 // Leader-only schedules in a cluster restart on every leadership handoff.
@@ -20,5 +20,15 @@ func (a *App) catalogOptions() []catalog.Option {
 		opts = append(opts, catalog.WithResumeSchedule())
 	}
 	opts = append(opts, catalog.WithSaferRatingSQL(plexmeta.RatingSQL{}))
+	opts = append(opts, catalog.WithOnStatusChange(func(progressOnly bool) {
+		if !progressOnly || (a.streamRT != nil && a.streamRT.Subscribers() > 0) {
+			a.publishDashboard()
+		}
+	}))
+	opts = append(opts,
+		catalog.WithOnSyncEvent(a.onCatalogSyncEvent),
+		catalog.WithOnTitlesAdded(a.onCatalogTitlesAdded),
+		catalog.WithOnMetadataError(a.onCatalogMetadataError),
+	)
 	return opts
 }

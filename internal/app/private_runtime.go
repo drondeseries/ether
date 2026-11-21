@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/braedonsaunders/ether/internal/cluster"
 	"github.com/braedonsaunders/ether/internal/clusterconfig"
+	"github.com/braedonsaunders/ether/internal/clusterplayback"
 	"github.com/braedonsaunders/ether/internal/config"
 	"github.com/braedonsaunders/ether/internal/hoststat"
 	"github.com/braedonsaunders/ether/internal/nodewire"
@@ -36,6 +38,7 @@ type privatePlayback interface {
 }
 
 type deploymentRuntime struct {
+	vaultHandler  http.Handler
 	sourceAdmin   http.Handler
 	publicReady   atomic.Bool
 	quotaOpen     atomic.Bool
@@ -192,6 +195,10 @@ func (a *App) startPrivate(ctx context.Context) (func(), error) {
 			http.Error(w, "denied", 403)
 			return
 		}
+		if p.vaultHandler != nil && strings.HasPrefix(r.URL.Path, "/private/vault/") {
+			p.vaultHandler.ServeHTTP(w, r)
+			return
+		}
 		if p.sourceAdmin != nil && r.URL.Path == "/cluster/runtime/source-admin" {
 			p.sourceAdmin.ServeHTTP(w, r)
 			return
@@ -253,6 +260,36 @@ func (a *App) startPrivate(ctx context.Context) (func(), error) {
 			}
 		}
 	})
+	// Cluster retention runs on the leader only, off every request path:
+	// bounded batches of index-driven deletes, each its own short transaction.
+	// A leadership overlap is harmless; every batch re-selects under the
+	// placement ledger lock.
+	if pruner, ok := p.playback.(interface {
+		PruneRetained(context.Context, clusterplayback.RetentionOptions) (clusterplayback.RetentionReport, error)
+	}); ok {
+		launch(func() {
+			ticker := time.NewTicker(time.Minute)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-runCtx.Done():
+					return
+				case <-ticker.C:
+					if !a.cluster.IsLeader() {
+						continue
+					}
+					op, cancel := context.WithTimeout(runCtx, 10*time.Second)
+					report, err := pruner.PruneRetained(op, clusterplayback.RetentionOptions{})
+					cancel()
+					if err != nil && runCtx.Err() == nil {
+						a.log.Warn("cluster playback retention failed", "err", err)
+					} else if report.Sessions+report.Routes+report.Receipts > 0 {
+						a.log.Info("cluster playback retention", "sessions", report.Sessions, "routes", report.Routes, "receipts", report.Receipts, "more", report.More)
+					}
+				}
+			}
+		})
+	}
 	launch(func() {
 		tick := time.NewTicker(time.Second)
 		defer tick.Stop()
@@ -389,9 +426,6 @@ func (a *App) runSpecialist(ctx context.Context) error {
 	if a.load != nil {
 		background.start(func() { a.load.Run(ctx) })
 	}
-	if a.cache != nil {
-		background.start(func() { a.cache.Run(ctx) })
-	}
 	if err := a.startCluster(ctx); err != nil {
 		return err
 	}
@@ -406,6 +440,10 @@ func (a *App) runSpecialist(ctx context.Context) error {
 		return err
 	}
 	defer stop()
+	if a.cache != nil {
+		background.start(func() { a.cache.Run(ctx) })
+	}
+
 	select {
 	case <-ctx.Done():
 		return a.runResult()

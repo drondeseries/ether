@@ -1,6 +1,8 @@
 package mediabrowser
 
 import (
+	"context"
+	"errors"
 	"github.com/braedonsaunders/ether/internal/frontend"
 	"github.com/braedonsaunders/ether/internal/frontend/kit/ids"
 	"github.com/braedonsaunders/ether/internal/frontend/kit/paging"
@@ -31,22 +33,41 @@ func (i *instance) facets(kind string) http.HandlerFunc {
 			http.Error(w, "Unavailable", 503)
 			return
 		}
-		if terms := route.Query(r.URL.Query(), "SearchTerm"); kind == "person" && len(terms) == 1 && strings.TrimSpace(terms[0]) != "" {
-			i.searchPersons(w, r, v, terms[0])
-			return
-		}
-		facets, err := i.host.Experience.Facets(r.Context(), v, device(r), facetView(r), kind)
-		if err != nil {
-			http.Error(w, "Unavailable", 503)
-			return
+		if kind == "person" {
+			// Without a term this is the most credited visible people: the
+			// person facet walked every credited title in the library.
+			term := ""
+			if terms := route.Query(r.URL.Query(), "SearchTerm"); len(terms) == 1 {
+				term = strings.TrimSpace(terms[0])
+			}
+			if _, ok := i.host.Experience.(frontend.PeopleReader); ok {
+				i.searchPersons(w, r, v, term)
+				return
+			}
 		}
 		offset, limit := queryInt(r, "StartIndex", 0), queryInt(r, "Limit", 50)
-		items := make([]any, 0)
+		var page []frontend.FacetValue
+		total := 0
+		if pager, ok := i.host.Experience.(frontend.FacetPager); ok {
+			// A page of names and their count, not every studio listed
+			// to slice fifty.
+			page, total, err = pager.FacetPage(r.Context(), v, device(r), facetView(r), kind, offset, limit)
+		} else {
+			var facets []frontend.FacetValue
+			facets, err = i.host.Experience.Facets(r.Context(), v, device(r), facetView(r), kind)
+			page, total = paging.Slice(facets, offset, limit), len(facets)
+		}
+		if err != nil {
+			i.logFacetFailure(kind, err)
+			jsonReply(w, i.queryResult([]any{}, 0, offset))
+			return
+		}
+		items := make([]any, 0, len(page))
 		typeName := map[string]string{"genre": "Genre", "studio": "Studio", "person": "Person"}[kind]
-		for _, facet := range paging.Slice(facets, offset, limit) {
+		for _, facet := range page {
 			items = append(items, map[string]any{"Id": facet.ID, "Name": facet.Title, "Type": typeName, "ServerId": i.info.ID})
 		}
-		jsonReply(w, i.queryResult(items, len(facets), offset))
+		jsonReply(w, i.queryResult(items, total, offset))
 	}
 }
 
@@ -65,14 +86,26 @@ func (i *instance) searchPersons(w http.ResponseWriter, r *http.Request, v *fron
 	}
 	people, err := reader.People(r.Context(), v, device(r), frontend.PeopleQuery{Query: term, Limit: min(offset+limit, 100)})
 	if err != nil {
-		http.Error(w, "Unavailable", 503)
+		// A browse list answers empty, never an error the app shows (#421).
+		i.logFacetFailure("person", err)
+		jsonReply(w, i.queryResult([]any{}, 0, offset))
 		return
 	}
-	items := make([]any, 0, len(people))
-	for _, person := range paging.Slice(people, offset, limit) {
-		items = append(items, map[string]any{"Id": person.ID, "Name": person.Name, "Type": "Person", "ServerId": i.info.ID})
+	page := paging.Slice(people, offset, limit)
+	grants, imgs := i.issuePersonGrants(r, page)
+	items := make([]any, 0, len(page))
+	for n, person := range page {
+		items = append(items, i.personItemDTO(person, grants[n], imgs[n], false))
 	}
 	jsonReply(w, i.queryResult(items, len(people), offset))
+}
+
+// logFacetFailure records a genre/studio/person list that could not be
+// built; the app is answered an empty list instead of an error.
+func (i *instance) logFacetFailure(kind string, err error) {
+	if i.host.Log != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, frontend.ErrNotFound) {
+		i.host.Log.Warn("mediabrowser facet list unavailable", "frontend", i.protocol, "kind", kind, "err", err)
+	}
 }
 
 func (i *instance) resolveFilters(r *http.Request, v *frontend.Viewer, q *frontend.ItemQuery) error {

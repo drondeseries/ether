@@ -18,6 +18,7 @@ type ReelSnapshot struct {
 type ReelClip struct {
 	ID, Name, Path string
 	Duration       time.Duration
+	Link           bool
 }
 type momentHistory struct {
 	last      map[string]time.Time
@@ -25,11 +26,49 @@ type momentHistory struct {
 	lastBreak time.Time
 }
 
+func (s *Service) ensureChannelReels(ctx context.Context, c Channel) {
+	if s.o.Reels == nil {
+		return
+	}
+	looks := []*ChannelLook{c.Look}
+	for _, b := range c.Blocks {
+		looks = append(looks, b.Breaks)
+	}
+	for _, p := range c.Pins {
+		looks = append(looks, p.Breaks)
+	}
+	for _, look := range looks {
+		if look == nil || look.ReelID == "" {
+			continue
+		}
+		id := look.ReelID
+		s.mu.Lock()
+		_, loaded := s.reelSnapshots[id]
+		s.mu.Unlock()
+		if loaded {
+			continue
+		}
+		snapshot, err := s.o.Reels(ctx, id)
+		if err != nil {
+			continue
+		}
+		snapshot.Clips = append([]ReelClip(nil), snapshot.Clips...)
+		s.mu.Lock()
+		if s.reelSnapshots == nil {
+			s.reelSnapshots = map[string]*ReelSnapshot{}
+		}
+		if _, exists := s.reelSnapshots[id]; !exists {
+			s.reelSnapshots[id] = &snapshot
+		}
+		s.mu.Unlock()
+	}
+}
+
 func (s *Service) refreshReels() {
 	if s.o.Reels == nil {
 		return
 	}
-	cs, err := s.virtualChannels(s.ctx)
+	cs, err := s.virtualChannels(s.serviceContext())
 	if err != nil {
 		return
 	}
@@ -48,7 +87,7 @@ func (s *Service) refreshReels() {
 			}
 			id := look.ReelID
 			seen[id] = true
-			snapshot, err := s.o.Reels(s.ctx, id)
+			snapshot, err := s.o.Reels(s.serviceContext(), id)
 			if err != nil {
 				continue
 			}

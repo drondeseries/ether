@@ -415,6 +415,7 @@ func (p *pool) hedgeBody(ctx context.Context, id string, groups []string) (*yenc
 	c.uses++
 	before := c.wireBytes()
 	start := time.Now()
+	c.bodyStarted = false
 	if p.o.UseGroup && len(groups) > 0 && c.CurrentGroup() != groups[0] {
 		if err = c.Group(ctx, groups[0]); errors.Is(err, ErrNoSuchGroup) {
 			err = nil
@@ -424,8 +425,13 @@ func (p *pool) hedgeBody(ctx context.Context, id string, groups []string) (*yenc
 	if err == nil {
 		part, err = c.BodyDecode(ctx, id, &yenc.DecodeOptions{MaxSize: p.o.MaxArticleSize})
 	}
+	bodyStarted := c.bodyStarted
 	wire := c.wireBytes() - before
 	rtt := c.lastRTT
+	took := time.Since(start)
+	if err == nil && reused {
+		p.noteBodyTransfer(c, wire, took)
+	}
 	p.put(c, core.PriorityLive)
 	if err != nil {
 		if errors.Is(err, ErrNoSuchArticle) {
@@ -435,11 +441,13 @@ func (p *pool) hedgeBody(ctx context.Context, id string, groups []string) (*yenc
 				p.bodyTakedowns.Add(1)
 			}
 		}
-		return nil, wire, p.failed(err, reused, ctx)
+		ferr := p.failed(err, reused && !bodyStarted, ctx)
+		p.statTrust.noteBodyResult(id, ferr, bodyStarted, ctx)
+		return nil, wire, ferr
 	}
+	p.statTrust.noteBodyResult(id, nil, bodyStarted, ctx)
 	p.brk.success()
 	p.articles.Add(1)
-	took := time.Since(start)
 	p.latMu.Lock()
 	p.latency.add(rtt)
 	p.fetching.add(took)

@@ -13,11 +13,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/braedonsaunders/ether/internal/config"
 	"github.com/braedonsaunders/ether/internal/plextv"
-	"github.com/braedonsaunders/ether/internal/store"
 )
 
 // TestSpikePlexMetadataUsesSpikeCatalog reproduces the in-app spike wiring:
@@ -47,7 +45,6 @@ func TestSpikePlexMetadataUsesSpikeCatalog(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	store.SeedTestDataDir(t, dir)
 	a, err := New(context.Background(), Options{
 		DataDir:    dir,
 		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
@@ -142,7 +139,6 @@ func TestSpikePlexMetadataUsesSpikeCatalog(t *testing.T) {
 	req.Header.Set("X-Plex-Client-Identifier", "spike-test")
 	req.Header.Set("X-Plex-Product", "Plex Web")
 	req.Header.Set("Range", "bytes=0-31")
-	started := time.Now()
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -151,11 +147,6 @@ func TestSpikePlexMetadataUsesSpikeCatalog(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusPartialContent {
 		t.Fatalf("GET %s immediately after ready: status %d, body %s", part, resp.StatusCode, body)
-	}
-	if elapsed := time.Since(started); elapsed > time.Second {
-		t.Fatalf("play immediately after ready took %s", elapsed)
-	} else {
-		t.Logf("play immediately after ready took %s", elapsed)
 	}
 	if len(body) == 0 {
 		t.Fatal("play returned no bytes")

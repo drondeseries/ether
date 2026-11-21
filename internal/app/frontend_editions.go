@@ -9,8 +9,7 @@ import (
 	"github.com/braedonsaunders/ether/internal/frontend"
 )
 
-// surfaceEditions exposes probed local copies only. A miss is an empty list,
-// not a resolver search.
+// surfaceEditions exposes probed local copies and release variants.
 type surfaceEditions struct{ app *App }
 
 func (s surfaceEditions) Editions(ctx context.Context, _ *core.Viewer, _ core.Device, key core.RatingKey) ([]frontend.Version, error) {
@@ -83,4 +82,69 @@ func (s surfaceEditions) EditionsMany(ctx context.Context, _ *core.Viewer, _ cor
 		out[key] = versions
 	}
 	return out, nil
+}
+
+func (s surfaceEditions) Variants(ctx context.Context, req core.ResolveRequest, max int) ([]core.ReleaseVariant, error) {
+	if s.app == nil || s.app.resolver == nil {
+		return nil, nil
+	}
+	req.User = s.app.withEffectiveAudioLanguages(ctx, req.User)
+	variants, err := s.app.resolver.Variants(ctx, req, max)
+	if err == nil && s.app.playback != nil {
+		variants = s.app.playback.WithCachedVariantInfo(ctx, req.User, req.Title, variants)
+	}
+	return variants, err
+}
+
+func (s surfaceEditions) RefillSearchCache(t *core.Title) <-chan struct{} {
+	if s.app == nil || s.app.resolver == nil {
+		return nil
+	}
+	return s.app.resolver.RefillSearchCache(t)
+}
+
+func (s surfaceEditions) Available(ctx context.Context, key core.RatingKey) (bool, bool) {
+	if s.app == nil || s.app.resolver == nil {
+		return false, false
+	}
+	return s.app.resolver.Available(ctx, key)
+}
+
+func (s surfaceEditions) VersionSlots(ctx context.Context, req core.ResolveRequest, max int, labels bool) ([]core.ReleaseVariant, error) {
+	if s.app == nil {
+		return nil, nil
+	}
+	if req.Title != nil {
+		if vs, ok := labMediaVariants(s.app.opts.DataDir, req.Title); ok {
+			for i := range vs {
+				vs[i].Availability = core.VersionInstant
+			}
+			return vs, nil
+		}
+	}
+	if s.app.resolver == nil {
+		return nil, nil
+	}
+	if labels {
+		req.User = s.app.withEffectiveAudioLanguages(ctx, req.User)
+	}
+	versions, err := s.app.resolver.VersionSlots(ctx, req, max, labels)
+	if err == nil && labels && s.app.playback != nil {
+		versions = s.app.playback.WithCachedVariantInfo(ctx, req.User, req.Title, versions)
+	}
+	return versions, err
+}
+
+func (s surfaceEditions) ViewerChoiceFor(ctx context.Context, viewer *core.Viewer, title *core.Title) (*core.ViewerChoiceSummary, error) {
+	if s.app == nil || s.app.resolver == nil {
+		return nil, nil
+	}
+	return s.app.resolver.ViewerChoiceSummary(ctx, viewer, title)
+}
+
+func (s surfaceEditions) ClearViewerChoice(ctx context.Context, viewer *core.Viewer, title *core.Title, scope string) (bool, error) {
+	if s.app == nil || s.app.resolver == nil || viewer == nil {
+		return false, nil
+	}
+	return s.app.resolver.ClearViewerChoice(ctx, viewer.ID, title, scope)
 }

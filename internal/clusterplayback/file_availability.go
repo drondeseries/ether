@@ -2,7 +2,6 @@ package clusterplayback
 
 import (
 	"context"
-	"errors"
 	"time"
 
 	"github.com/braedonsaunders/ether/internal/config"
@@ -13,6 +12,11 @@ import (
 func (p *RemotePlayback) CheckFileAvailability(ctx context.Context, u *core.User, k core.RatingKey, caps core.ClientCaps, release string) (bool, error) {
 	if u == nil {
 		return false, core.ErrUnauthorized
+	}
+	if core.LocalResponse(ctx) {
+		// A local-only check (a batched checkFiles lookup) must not make the
+		// source node search; the local-only request does not cross the wire.
+		return false, core.ErrForegroundOnly
 	}
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
@@ -46,8 +50,10 @@ func (r *Runtime) checkSourceFile(ctx context.Context, peer nodewire.Identity, q
 	if r.o.SourcePolicy(ctx, viewer, ps) != nil {
 		return sourceResponse{}, ErrDenied
 	}
+	// Only a verdict travels back; an error is no verdict and the front
+	// keeps the offered (available) state.
 	live, err := checker.CheckFileAvailability(ctx, viewer, q.Key, q.Caps, q.ReleaseID)
-	if err != nil && !errors.Is(err, core.ErrNotAvailable) && !errors.Is(err, core.ErrNotFound) {
+	if err != nil {
 		return sourceResponse{}, nil
 	}
 	return sourceResponse{FileAvailable: &live}, nil

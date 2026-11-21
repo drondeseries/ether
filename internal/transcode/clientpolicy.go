@@ -1,6 +1,7 @@
 package transcode
 
 import (
+	"reflect"
 	"slices"
 
 	"github.com/braedonsaunders/ether/internal/clientreg"
@@ -70,8 +71,9 @@ func ClientPolicyFor(c core.ClientCaps) ClientPolicy {
 }
 
 // ResolvePolicy layers owner overrides on the registry, then lets a runtime
-// declaration replace Dolby Vision profiles and subtitle codecs.
+// declaration replace Dolby Vision profiles and subtitle codecs unless forced.
 func ResolvePolicy(c core.ClientCaps, overrides []core.ClientCapabilityOverride) ClientPolicy {
+	c = ApplyForcedOverrides(c, "", overrides)
 	got := clientreg.Policy(identityOf(c), overrides)
 	policy := ClientPolicy{
 		Family:              got.Family,
@@ -79,7 +81,7 @@ func ResolvePolicy(c core.ClientCaps, overrides []core.ClientCapabilityOverride)
 		SubtitleCodecs:      slices.Clone(got.Subtitles),
 		Notes:               got.Notes,
 	}
-	if len(c.DVProfiles) > 0 {
+	if len(c.DVProfiles) > 0 || c.DVProfilesExplicit {
 		policy.DolbyVisionProfiles = slices.Clone(c.DVProfiles)
 	}
 	if c.SubtitleCodecs != nil {
@@ -103,4 +105,59 @@ func SupportsDVProfile(c core.ClientCaps, profile int) bool {
 
 func supportsSubtitle(c core.ClientCaps, codec string) bool {
 	return slices.Contains(ClientPolicyFor(c).SubtitleCodecs, codec)
+}
+
+// ApplyForcedOverrides replaces only explicitly edited facts after runtime
+// declarations. Matching is identical to the registry baseline's selectors.
+func ApplyForcedOverrides(c core.ClientCaps, model string, overrides []core.ClientCapabilityOverride) core.ClientCaps {
+	if !slices.ContainsFunc(overrides, func(o core.ClientCapabilityOverride) bool { return o.Force }) {
+		return c
+	}
+	id := identityOf(c)
+	id.Model = model
+	playback, policy := clientreg.Playback(id, nil), clientreg.Policy(id, nil)
+	for _, o := range overrides {
+		if !o.Force || !clientreg.OverrideApplies(o, []string{playback.ID, policy.ID}, id) {
+			continue
+		}
+		before := c
+		if o.VideoCodecs != nil {
+			c.VideoCodecs = slices.Clone(o.VideoCodecs)
+		}
+		if o.AudioCodecs != nil {
+			c.AudioCodecs = slices.Clone(o.AudioCodecs)
+		}
+		if o.Containers != nil {
+			c.Containers = slices.Clone(o.Containers)
+		}
+		if o.SubtitleCodecs != nil {
+			c.SubtitleCodecs = slices.Clone(o.SubtitleCodecs)
+		}
+		if o.DolbyVisionProfiles != nil {
+			c.DVProfiles = slices.Clone(o.DolbyVisionProfiles)
+			c.DVProfilesExplicit = len(o.DolbyVisionProfiles) == 0
+			c.DVProfilesForced = len(o.DolbyVisionProfiles) > 0
+		}
+		if o.MaxHeight > 0 {
+			c.MaxHeight = o.MaxHeight
+			c.ExplicitMaxHeight = true
+			c.MaxHeightSource = "App compatibility forced override"
+		}
+		if o.MaxBitrateKbps > 0 {
+			c.MaxBitrateKbps = o.MaxBitrateKbps
+			c.DefaultRemoteBitrate = false
+		}
+		if o.HDR10 != nil {
+			c.HDR10 = *o.HDR10
+			c.ExplicitNoHDR = !*o.HDR10
+		}
+		if o.DolbyVision != nil {
+			c.DolbyVision = *o.DolbyVision
+			c.DolbyVisionBaseOnly = !*o.DolbyVision
+		}
+		if !reflect.DeepEqual(before, c) {
+			c.ForcedOverrideApplied = true
+		}
+	}
+	return c
 }

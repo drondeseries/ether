@@ -3,6 +3,8 @@ package resolver
 import (
 	"context"
 	"time"
+
+	"github.com/braedonsaunders/ether/internal/store"
 )
 
 // Retention and in-memory bounds for the resolver's caches. Everything here
@@ -15,6 +17,10 @@ const (
 	// always permanent; if the release is still broken after this long it
 	// fails one more check and is marked again.
 	badRetention = 90 * 24 * time.Hour
+
+	// subtitleCheckRetention bounds burned-in subtitle probe verdicts and
+	// claim records so defunct releases age out instead of growing forever.
+	subtitleCheckRetention = 90 * 24 * time.Hour
 
 	maxSearchCache     = 2000   // indexer result sets (each holds a release list)
 	maxAvailEntries    = 50_000 // title availability, mirrored in resolver_availability
@@ -60,8 +66,9 @@ func (s *Service) unavailableRetention() time.Duration {
 
 // Prune drops expired entries from the in-memory caches and deletes
 // resolver rows that can no longer be served: expired availability, health
-// passes older than the health TTL and automatic bad marks not re-marked
-// within badRetention (owner blocks never expire).
+// passes older than the health TTL, automatic bad marks not re-marked
+// within badRetention (owner blocks and deliberate rejections never expire),
+// and burned-in subtitle probes older than subtitleCheckRetention.
 // Indexer reputation is a handful of counters and is kept. It is meant to be
 // called periodically (the app runs it daily).
 func (s *Service) Prune(ctx context.Context) (int64, error) {
@@ -92,7 +99,33 @@ func (s *Service) Prune(ctx context.Context) (int64, error) {
 			delete(s.bad, k)
 		}
 	}
+	for k, e := range s.seaDexMem {
+		if e == nil || now.Sub(e.fetchedAt) > seaDexRetention {
+			delete(s.seaDexMem, k)
+		}
+	}
+	for k, e := range s.seaDexKeys {
+		if now.Sub(e.updatedAt) > seaDexRetention {
+			delete(s.seaDexKeys, k)
+		}
+	}
+	for k, m := range s.badContent {
+		if !m.live(now) {
+			delete(s.badContent, k)
+		}
+	}
+	for k, l := range s.contentByRelease {
+		if now.Sub(l.at) >= badRetention {
+			delete(s.contentByRelease, k)
+		}
+	}
+	for k, m := range s.failedGrabs {
+		if !m.live(now) {
+			delete(s.failedGrabs, k)
+		}
+	}
 	s.mu.Unlock()
+	s.pruneReleaseTitlesMem(now)
 	if s.db == nil {
 		return 0, nil
 	}
@@ -100,6 +133,7 @@ func (s *Service) Prune(ctx context.Context) (int64, error) {
 	if s.healthTTL > 0 {
 		verifiedCutoff = now.Add(-s.healthTTL).Unix()
 	}
+	seaDexCutoff := now.Add(-seaDexRetention).Unix()
 	var total int64
 	for _, q := range []struct {
 		sql  string
@@ -108,6 +142,11 @@ func (s *Service) Prune(ctx context.Context) (int64, error) {
 		{`DELETE FROM resolver_availability WHERE expires_at<? AND (available=1 OR checked_at<?)`, []any{now.Unix(), now.Add(-s.unavailableRetention()).Unix()}},
 		{`DELETE FROM resolver_verified WHERE checked_at<?`, []any{verifiedCutoff}},
 		{`DELETE FROM resolver_bad WHERE manual=0 AND updated_at<?`, []any{now.Add(-badRetention).Unix()}},
+		{`DELETE FROM resolver_seadex WHERE fetched_at<?`, []any{seaDexCutoff}},
+		{`DELETE FROM resolver_seadex_keys WHERE updated_at<?`, []any{seaDexCutoff}},
+		{`DELETE FROM resolver_failed_grabs WHERE updated_at<?`, []any{now.Add(-failedGrabRetention).Unix()}},
+		{`DELETE FROM resolver_content_links WHERE updated_at<?`, []any{now.Add(-badRetention).Unix()}},
+		{`DELETE FROM resolver_release_titles WHERE expires_at<=?`, []any{now.Unix()}},
 	} {
 		res, err := s.db.ExecContext(ctx, q.sql, q.args...)
 		if err != nil {
@@ -115,6 +154,17 @@ func (s *Service) Prune(ctx context.Context) (int64, error) {
 		}
 		n, _ := res.RowsAffected()
 		total += n
+	}
+	subCutoff := now.Add(-subtitleCheckRetention).Unix()
+	for _, del := range []string{
+		`DELETE FROM resolver_hardsub WHERE release_id IN (SELECT release_id FROM resolver_hardsub WHERE updated_at>0 AND updated_at<? ORDER BY updated_at LIMIT ?)`,
+		`DELETE FROM resolver_subtitle_checks WHERE release_id IN (SELECT release_id FROM resolver_subtitle_checks WHERE updated_at>0 AND updated_at<? ORDER BY updated_at LIMIT ?)`,
+	} {
+		n, err := store.PruneBatched(ctx, s.db, del, subCutoff)
+		total += n
+		if err != nil {
+			return total, err
+		}
 	}
 	return total, nil
 }

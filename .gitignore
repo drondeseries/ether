@@ -4,6 +4,8 @@
 /ether-tray
 /ether.exe
 /ether-tray.exe
+/internal/admin/dist/*
+!/internal/admin/dist/.gitkeep
 node_modules/
 .pnpm-store/
 *.db
@@ -17,12 +19,15 @@ node_modules/
 *.md
 /docs/benchmarks/
 !/README.md
+!/CONTRIBUTING.md
 !/CHANGELOG.md
 !/UPGRADING.md
 !/LEGAL.md
 !/THIRD_PARTY_NOTICES.md
 !/docs/install.md
 !/docs/performance.md
+!/docs/yenc-simd-validation.md
+!/docs/yenc-backend-benchmarks.md
 !/docs/prism-scorecard.md
 !/docs/user-guide.md
 !/packaging/community/README.md

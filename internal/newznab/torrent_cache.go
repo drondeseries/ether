@@ -18,6 +18,7 @@ const (
 
 type torrentDescriptor struct {
 	hash, magnet string
+	private      bool
 	expires      time.Time
 }
 
@@ -37,21 +38,21 @@ func torrentDescriptorKey(cfg config.Indexer, r core.Release) [32]byte {
 	return sha256.Sum256(b)
 }
 
-func (c *torrentDescriptorCache) get(key [32]byte, now time.Time) (string, string, bool) {
+func (c *torrentDescriptorCache) get(key [32]byte, now time.Time) (string, string, bool, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.entries == nil {
-		return "", "", false
+		return "", "", false, false
 	}
 	e, ok := c.entries.Get(key)
 	if ok && !now.Before(e.expires) {
 		c.entries.Remove(key)
 		ok = false
 	}
-	return e.hash, e.magnet, ok
+	return e.hash, e.magnet, e.private, ok
 }
 
-func (c *torrentDescriptorCache) put(key [32]byte, hash, magnet string, now time.Time) {
+func (c *torrentDescriptorCache) put(key [32]byte, hash, magnet string, private bool, now time.Time) {
 	// Trackers and display names come from external torrent documents. Do
 	// not let one oversized magnet defeat the cache's memory bound.
 	if len(magnet) > 16<<10 {
@@ -62,5 +63,5 @@ func (c *torrentDescriptorCache) put(key [32]byte, hash, magnet string, now time
 	if c.entries == nil {
 		c.entries = lru.New(lru.Options[[32]byte, torrentDescriptor]{MaxEntries: maxTorrentDescriptors})
 	}
-	c.entries.Add(key, torrentDescriptor{hash: hash, magnet: magnet, expires: now.Add(torrentDescriptorTTL)})
+	c.entries.Add(key, torrentDescriptor{hash: hash, magnet: magnet, private: private, expires: now.Add(torrentDescriptorTTL)})
 }

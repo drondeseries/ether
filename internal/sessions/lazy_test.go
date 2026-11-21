@@ -49,7 +49,7 @@ func TestLazyStreamCapabilityReusesSessionAndRevalidatesGrant(t *testing.T) {
 	defer events.Close()
 	pb := &fakePlayback{sessions: map[string]*core.PlaySession{}, limit: 3}
 	networkLookups := 0
-	b, err := NewBroker(BrokerDeps{Events: events, Playback: pb, Transcoder: fakeBrokerTranscoder{}, Progress: &fakeProgress{}, ActiveViewer: active, CanPlay: func(_ *core.Viewer, remote bool, _ time.Time) bool { return !remote }, BitrateLimit: func(*core.Viewer) int { return 0 }, OnTimeline: func(*core.Viewer, core.RatingKey, time.Duration, time.Duration, string) {}, Now: func() time.Time { return now }, Lookup: func(_ context.Context, _ *core.Viewer, _ core.Device, k core.RatingKey) (*core.Title, error) {
+	b, err := NewBroker(BrokerDeps{SurfacePolicy: testSessionPolicy, Events: events, Playback: pb, Transcoder: fakeBrokerTranscoder{}, Progress: &fakeProgress{}, ActiveViewer: active, CanPlay: func(_ *core.Viewer, remote bool, _ time.Time) bool { return !remote }, BitrateLimit: func(*core.Viewer) int { return 0 }, OnTimeline: func(*core.Viewer, core.RatingKey, time.Duration, time.Duration, string) {}, Now: func() time.Time { return now }, Lookup: func(_ context.Context, _ *core.Viewer, _ core.Device, k core.RatingKey) (*core.Title, error) {
 		networkLookups++
 		return &core.Title{Key: k}, nil
 	}})
@@ -231,6 +231,39 @@ func TestLazyStreamCapabilityReusesSessionAndRevalidatesGrant(t *testing.T) {
 	grants.mu.Lock()
 	grants.revoked = false
 	grants.mu.Unlock()
+	unstartedReq := req
+	unstartedReq.Device.ID = "not-yet-playing"
+	unstartedPath, err := lazy.Issue(ctx, "account-credential-secret", unstartedReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalPlanLookup := b.deps.Lookup
+	originalMediaLookup := b.deps.MediaLookup
+	b.deps.CurrentMediaLookup = originalMediaLookup
+	deleted := func(context.Context, *core.Viewer, core.Device, core.RatingKey) (*core.Title, error) {
+		return nil, core.ErrNotFound
+	}
+	b.deps.Lookup, b.deps.MediaLookup = deleted, deleted
+	if _, err := lazy.Issue(ctx, "account-credential-secret", req); err == nil {
+		t.Fatal("deleted membership issued lazy capability")
+	}
+	replay := httptest.NewRecorder()
+	lazy.ServeHTTP(replay, httptest.NewRequest(http.MethodGet, unstartedPath, nil))
+	if replay.Code != http.StatusNotFound {
+		t.Fatalf("unstarted capability replay admitted: %d", replay.Code)
+	}
+	running := httptest.NewRecorder()
+	lazy.ServeHTTP(running, httptest.NewRequest(http.MethodGet, path, nil))
+	if running.Code != http.StatusOK {
+		t.Fatalf("running lazy stream interrupted: %d", running.Code)
+	}
+	runningAuth := httptest.NewRecorder()
+	lazy.(frontend.AuthenticatedLazyStreams).ServeAuthenticated(runningAuth, httptest.NewRequest(http.MethodGet, "/dav/movie.mkv", nil), "account-credential-secret", authenticated)
+	if runningAuth.Code != http.StatusOK {
+		t.Fatalf("running authenticated stream interrupted: %d", runningAuth.Code)
+	}
+	b.deps.Lookup, b.deps.MediaLookup = originalPlanLookup, originalMediaLookup
+	b.deps.CurrentMediaLookup = nil
 	mediaHidden = true
 	hiddenRange := httptest.NewRecorder()
 	lazy.(frontend.AuthenticatedLazyStreams).ServeAuthenticated(hiddenRange, httptest.NewRequest(http.MethodGet, "/dav/movie.mkv", nil), "account-credential-secret", authenticated)
@@ -294,7 +327,7 @@ func TestAuthenticatedLazyConcurrentFirstRangesReuseSession(t *testing.T) {
 	lookup := func(_ context.Context, _ *core.Viewer, _ core.Device, key core.RatingKey) (*core.Title, error) {
 		return &core.Title{Key: key}, nil
 	}
-	broker, err := NewBroker(BrokerDeps{Events: events, Playback: pb, Transcoder: fakeBrokerTranscoder{}, Progress: &fakeProgress{}, ActiveViewer: active, CanPlay: func(*core.Viewer, bool, time.Time) bool { return true }, BitrateLimit: func(*core.Viewer) int { return 0 }, OnTimeline: func(*core.Viewer, core.RatingKey, time.Duration, time.Duration, string) {}, Lookup: lookup, MediaLookup: lookup})
+	broker, err := NewBroker(BrokerDeps{SurfacePolicy: testSessionPolicy, Events: events, Playback: pb, Transcoder: fakeBrokerTranscoder{}, Progress: &fakeProgress{}, ActiveViewer: active, CanPlay: func(*core.Viewer, bool, time.Time) bool { return true }, BitrateLimit: func(*core.Viewer) int { return 0 }, OnTimeline: func(*core.Viewer, core.RatingKey, time.Duration, time.Duration, string) {}, Lookup: lookup, MediaLookup: lookup})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -355,7 +388,7 @@ func TestAuthenticatedLazyConflictAndExpiry(t *testing.T) {
 	lookup := func(_ context.Context, _ *core.Viewer, _ core.Device, key core.RatingKey) (*core.Title, error) {
 		return &core.Title{Key: key}, nil
 	}
-	broker, err := NewBroker(BrokerDeps{Events: events, Playback: pb, Transcoder: fakeBrokerTranscoder{}, Progress: &fakeProgress{}, ActiveViewer: active, CanPlay: func(*core.Viewer, bool, time.Time) bool { return true }, BitrateLimit: func(*core.Viewer) int { return 0 }, OnTimeline: func(*core.Viewer, core.RatingKey, time.Duration, time.Duration, string) {}, Lookup: lookup, MediaLookup: lookup, Now: func() time.Time { return now }})
+	broker, err := NewBroker(BrokerDeps{SurfacePolicy: testSessionPolicy, Events: events, Playback: pb, Transcoder: fakeBrokerTranscoder{}, Progress: &fakeProgress{}, ActiveViewer: active, CanPlay: func(*core.Viewer, bool, time.Time) bool { return true }, BitrateLimit: func(*core.Viewer) int { return 0 }, OnTimeline: func(*core.Viewer, core.RatingKey, time.Duration, time.Duration, string) {}, Lookup: lookup, MediaLookup: lookup, Now: func() time.Time { return now }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -418,7 +451,7 @@ func TestLazyRenewalRespectsGrantAndDatabase(t *testing.T) {
 	db := store.OpenTest(t)
 	now := time.Now().Truncate(time.Millisecond)
 	grant := &expiringLazyGrants{fakeLazyGrants: &fakeLazyGrants{}, expires: now.Add(20 * time.Minute)}
-	broker := &Broker{deps: BrokerDeps{Now: func() time.Time { return now }}, lazySessions: map[string]lazySession{lazyHash("hash"): {id: "session", expires: now.Add(time.Minute).UnixMilli()}}}
+	broker := &Broker{deps: BrokerDeps{SurfacePolicy: testSessionPolicy, Now: func() time.Time { return now }}, lazySessions: map[string]lazySession{lazyHash("hash"): {id: "session", expires: now.Add(time.Minute).UnixMilli()}}}
 	streams := &lazyStreams{db: db, broker: broker, protocol: "stremio", grants: grant, ttl: time.Hour}
 	if _, err := db.Exec(`INSERT INTO capability_headers(namespace,digest,shard,viewer_id,surface,device_id,expires) VALUES('lazy-stream',?,1,1,'stremio','',?)`, lazyHash("hash"), now.Add(time.Minute).UnixMilli()); err != nil {
 		t.Fatal(err)

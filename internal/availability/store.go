@@ -4,9 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"github.com/braedonsaunders/ether/internal/core"
-	"github.com/braedonsaunders/ether/internal/store"
 	"time"
+
+	"github.com/braedonsaunders/ether/internal/config"
+	"github.com/braedonsaunders/ether/internal/core"
+	"github.com/braedonsaunders/ether/internal/releaseparse"
+	"github.com/braedonsaunders/ether/internal/store"
 )
 
 const hiddenMigration = `
@@ -19,6 +22,104 @@ CREATE TABLE availability_hidden_current (
 );`
 
 func init() {
+	// Ephemeral derived paging sets: never exported in logical backups, and
+	// rebuilt on demand after restore.
+	store.RegisterLocalTable("availability_hidden")
+	store.RegisterLocalTable("availability_hidden_current")
+	store.RegisterLocalTable("availability_hidden_retired")
+	store.RegisterRestore("availability_hidden", func(context.Context, *sql.Tx) (func(context.Context, *sql.Tx) error, error) {
+		return func(ctx context.Context, tx *sql.Tx) error {
+			if _, err := tx.ExecContext(ctx, `DELETE FROM availability_hidden`); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, `DELETE FROM availability_hidden_retired`); err != nil {
+				return err
+			}
+			_, err := tx.ExecContext(ctx, `DELETE FROM availability_hidden_current`)
+			return err
+		}, nil
+	}, "availability_hidden", "availability_hidden_current", "availability_hidden_retired")
+
+	// Rebuild availability_hidden as WITHOUT ROWID on SQLite and drop accumulated
+	// 64-char-digest generations from 0.3.6. Own component so availability stays
+	// pinned at version 6.
+	store.RegisterAfter("availability_hidden_slim", "availability")
+	store.Register("availability_hidden_slim", 1, "SELECT 1;")
+	store.RegisterSQLiteApply("availability_hidden_slim", 1, func(ctx context.Context, tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `
+DELETE FROM availability_hidden_current;
+DROP TABLE availability_hidden;
+CREATE TABLE availability_hidden (
+ kind TEXT NOT NULL, generation TEXT NOT NULL, rating_key INTEGER NOT NULL,
+ created_at INTEGER NOT NULL, PRIMARY KEY(kind,generation,rating_key)
+) WITHOUT ROWID;`)
+		return err
+	})
+	store.RegisterDialect("availability_hidden_slim", 1, store.Postgres, `DELETE FROM availability_hidden_current; DELETE FROM availability_hidden;`)
+
+	// Interval membership: a key is hidden in snapshot N iff
+	// from_seq<=N<to_seq (to_seq=max int64 while current), so publishing
+	// writes only the delta instead of a full new generation. Converts the
+	// current generation to seq 1 and drops retired generations. Own
+	// component, like availability_hidden_slim, so availability stays at 6.
+	store.RegisterAfter("availability_hidden_intervals", "availability_hidden_slim")
+	store.Register("availability_hidden_intervals", 1, "SELECT 1;")
+	store.RegisterSQLiteApply("availability_hidden_intervals", 1, func(ctx context.Context, tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `
+CREATE TABLE availability_hidden_new (
+ kind TEXT NOT NULL, rating_key INTEGER NOT NULL, from_seq INTEGER NOT NULL,
+ to_seq INTEGER NOT NULL, PRIMARY KEY(kind,rating_key,from_seq)
+) WITHOUT ROWID;
+INSERT INTO availability_hidden_new(kind,rating_key,from_seq,to_seq)
+ SELECT h.kind,h.rating_key,1,9223372036854775807 FROM availability_hidden h
+ JOIN availability_hidden_current c ON c.kind=h.kind AND c.generation=h.generation;
+DROP TABLE availability_hidden;
+ALTER TABLE availability_hidden_new RENAME TO availability_hidden;
+CREATE INDEX availability_hidden_toseq ON availability_hidden(kind,to_seq,rating_key);
+CREATE TABLE availability_hidden_current_new (
+ kind TEXT PRIMARY KEY, seq INTEGER NOT NULL, policy TEXT NOT NULL
+);
+INSERT INTO availability_hidden_current_new(kind,seq,policy) SELECT kind,1,policy FROM availability_hidden_current;
+DROP TABLE availability_hidden_current;
+ALTER TABLE availability_hidden_current_new RENAME TO availability_hidden_current;
+CREATE TABLE availability_hidden_retired (
+ kind TEXT NOT NULL, seq INTEGER NOT NULL, retired_at INTEGER NOT NULL,
+ PRIMARY KEY(kind,seq)
+) WITHOUT ROWID;`)
+		return err
+	})
+	store.RegisterDialect("availability_hidden_intervals", 1, store.Postgres, `
+CREATE TABLE availability_hidden_new (
+ kind TEXT NOT NULL, rating_key BIGINT NOT NULL, from_seq BIGINT NOT NULL,
+ to_seq BIGINT NOT NULL, PRIMARY KEY(kind,rating_key,from_seq)
+);
+INSERT INTO availability_hidden_new(kind,rating_key,from_seq,to_seq)
+ SELECT h.kind,h.rating_key,1,9223372036854775807 FROM availability_hidden h
+ JOIN availability_hidden_current c ON c.kind=h.kind AND c.generation=h.generation;
+DROP TABLE availability_hidden;
+ALTER TABLE availability_hidden_new RENAME TO availability_hidden;
+CREATE INDEX availability_hidden_toseq ON availability_hidden(kind,to_seq,rating_key);
+CREATE TABLE availability_hidden_current_new (
+ kind TEXT PRIMARY KEY, seq BIGINT NOT NULL, policy TEXT NOT NULL
+);
+INSERT INTO availability_hidden_current_new(kind,seq,policy) SELECT kind,1,policy FROM availability_hidden_current;
+DROP TABLE availability_hidden_current;
+ALTER TABLE availability_hidden_current_new RENAME TO availability_hidden_current;
+CREATE TABLE availability_hidden_retired (
+ kind TEXT NOT NULL, seq BIGINT NOT NULL, retired_at BIGINT NOT NULL,
+ PRIMARY KEY(kind,seq)
+);`)
+
+	store.RegisterAfter("availability_checks_retention", "availability_coverage")
+	store.Register("availability_checks_retention", 1, `CREATE INDEX availability_title_checks_prune ON availability_title_checks(next_check, checked_at);`)
+
+	// Retention runs every feed cycle (once a minute). Without these, its
+	// "anything expired?" probes scanned availability_releases (2 KB rows)
+	// and an availability_feed_items index whose leading column is the
+	// title, every minute. Own component: availability is pinned to the
+	// delivered schema boundary.
+	store.RegisterAfter("availability_retention", "availability")
+	store.Register("availability_retention", 1, `CREATE INDEX availability_feed_items_seen ON availability_feed_items(seen_at); CREATE INDEX availability_releases_last_seen ON availability_releases(last_seen);`)
 	store.Register("availability", 6, hiddenMigration)
 	// covered_since: since when a feed's head polls have overlapped without a
 	// gap, so it has shown every release posted since then. full_at: a
@@ -123,6 +224,9 @@ func (s *Service) spend(ctx context.Context, kind string, n, limit int64) error 
 }
 func (s *Service) remember(ctx context.Context, f core.ReleaseFeed, t core.Title, r core.Release, policy string) error {
 	defer s.clearVisibility()
+	if r.Info.Title == "" && r.Name != "" {
+		r.Info = releaseparse.Parse(r.Name)
+	}
 	raw, err := s.encode(r)
 	if err != nil {
 		return err
@@ -137,9 +241,59 @@ func (s *Service) remember(ctx context.Context, f core.ReleaseFeed, t core.Title
  generation=excluded.generation`, r.ID, t.Key, f.ID, f.Generation, raw, t.Title, r.Name, r.Protocol, now, now, t.Popularity, policy, releasePolicyDigest(r))
 	if err == nil {
 		s.publishConsoleEvidence(ctx, t.Key, r, f.ID, policy, -1)
+		_ = s.maybeOpenGateFromRelease(ctx, f, t, r, s.now(), false)
 	}
 	return err
 }
+
+// Prune removes expired observations, retired hidden generations, and aged
+// completed title-check records during scheduled maintenance.
+func (s *Service) Prune(ctx context.Context) (int64, error) {
+	if err := s.prune(ctx); err != nil {
+		return 0, err
+	}
+	var total int64
+	now := s.now().Unix()
+	avail := s.cfg().Availability
+	if avail.ModeFor(hiddenMovies) != config.ModeDigital && avail.DisableMovieEvidenceGate {
+		if res, err := s.db.ExecContext(ctx, `DELETE FROM availability_hidden WHERE kind=?`, hiddenMovies); err == nil {
+			n, _ := res.RowsAffected()
+			total += n
+		}
+		_, _ = s.db.ExecContext(ctx, `DELETE FROM availability_hidden_retired WHERE kind=?`, hiddenMovies)
+		_, _ = s.db.ExecContext(ctx, `DELETE FROM availability_hidden_current WHERE kind=?`, hiddenMovies)
+	}
+	for _, kind := range []string{hiddenMovies, hiddenShows, hiddenEpisodes} {
+		var cur int64
+		err := s.db.QueryRowContext(ctx, `SELECT seq FROM availability_hidden_current WHERE kind=?`, kind).Scan(&cur)
+		if errors.Is(err, sql.ErrNoRows) {
+			// No reader can pin a seq without a current row.
+			res, err := s.db.ExecContext(ctx, `DELETE FROM availability_hidden WHERE kind=?`, kind)
+			if err != nil {
+				return total, err
+			}
+			n, _ := res.RowsAffected()
+			total += n
+			if _, err := s.db.ExecContext(ctx, `DELETE FROM availability_hidden_retired WHERE kind=?`, kind); err != nil {
+				return total, err
+			}
+			continue
+		}
+		if err != nil {
+			return total, err
+		}
+		n, err := pruneHiddenRetention(ctx, s.db, kind, cur, now)
+		if err != nil {
+			return total, err
+		}
+		total += n
+	}
+	checksCutoff := s.now().Add(-90 * 24 * time.Hour).Unix()
+	n, err := store.PruneBatched(ctx, s.db, `DELETE FROM availability_title_checks WHERE rating_key IN (SELECT rating_key FROM availability_title_checks WHERE next_check=0 AND checked_at>0 AND checked_at<? ORDER BY checked_at LIMIT ?)`, checksCutoff)
+	total += n
+	return total, err
+}
+
 func (s *Service) prune(ctx context.Context) error {
 	if c, ok := s.d.Catalog.(interface {
 		PruneConsoleReleaseEvidence(context.Context, int64) error

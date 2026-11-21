@@ -17,6 +17,7 @@ const (
 	kindPlain planKind = "plain"
 	kindRAR   planKind = "rar"
 	kind7z    planKind = "7z"
+	kindZIP   planKind = "zip"
 	kindSplit planKind = "split"
 )
 
@@ -82,11 +83,14 @@ func (l *layout) pieces(off, n int64) []piece {
 
 // plan is the resolved main video of a release.
 type plan struct {
-	kind planKind
-	name string
-	size int64
-	vols []*postedFile
-	rel  *release
+	report   sync.Once
+	restored bool
+	siblings []*plan
+	kind     planKind
+	name     string
+	size     int64
+	vols     []*postedFile
+	rel      *release
 
 	// RAR: the member name every continuation header must carry, and
 	// whether volumes use RAR5 headers.
@@ -106,6 +110,14 @@ type plan struct {
 	pending  map[int]chan struct{}
 	exactErr error
 	exact    chan struct{} // non-nil while an exact rebuild runs
+
+	// clips, for a Blu-ray main feature of several clips, is where each clip's
+	// bytes end and how far its timestamps are from a continuous timeline.
+	clips []clipBoundary
+	spans []clipSpan // clips as byte ranges, built with the plan
+	// sub, for a feature from an encrypted disc image, is where each stretch is
+	// read from: the image's own plan, which decrypts it.
+	sub []subRange
 
 	// PAR2 verification verdict of the first volume (see verifyPar2).
 	par2Done bool
@@ -152,13 +164,13 @@ func (p *plan) buildLocked(version int) (*layout, error) {
 		if vi.size < 0 || vi.dataSize < 0 {
 			return nil, fmt.Errorf("stream: volume %d has a negative size: %w", k, ErrCorrupt)
 		}
-		if !p.verified[k] {
+		if !p.verified[k] || !p.vols[k].SizeKnown() {
 			p.vols[k].setAssumed(vi.size)
 		}
 	}
 	l := &layout{version: version, size: p.size}
 	switch p.kind {
-	case kind7z:
+	case kind7z, kindZIP:
 		starts := make([]int64, len(p.info)+1)
 		for k, vi := range p.info {
 			if vi.size > math.MaxInt64-starts[k] {
@@ -176,7 +188,7 @@ func (p *plan) buildLocked(version int) (*layout, error) {
 			k := sort.Search(len(p.info), func(k int) bool { return starts[k+1] > off })
 			for rem > 0 {
 				if k >= len(p.info) {
-					return nil, fmt.Errorf("stream: 7z member extends past the last volume: %w", ErrCorrupt)
+					return nil, fmt.Errorf("stream: %s member extends past the last volume: %w", p.kind, ErrCorrupt)
 				}
 				take := starts[k+1] - off
 				if take > rem {
@@ -190,7 +202,7 @@ func (p *plan) buildLocked(version int) (*layout, error) {
 			}
 		}
 		if inner != p.size {
-			return nil, fmt.Errorf("stream: 7z extents cover %d of %d bytes: %w", inner, p.size, ErrCorrupt)
+			return nil, fmt.Errorf("stream: %s extents cover %d of %d bytes: %w", p.kind, inner, p.size, ErrCorrupt)
 		}
 	default:
 		var inner int64
@@ -313,7 +325,7 @@ func (p *plan) inspect(ctx context.Context, v verifier, k int) (volInfo, error) 
 	size := pf.Size()
 	switch p.kind {
 	case kindRAR:
-		vol, err := archive.ReadRARVolume(b.reader(ctx, pf), size, b.rarOptions(ctx, 1))
+		vol, err := archive.ReadRARVolume(b.reader(ctx, pf), size, b.rarOptionsFor(ctx, pf, 1))
 		if err != nil {
 			return volInfo{}, fmt.Errorf("stream: rar volume %d (%s): %w", k+1, pf.Name(), err)
 		}
@@ -327,8 +339,8 @@ func (p *plan) inspect(ctx context.Context, v verifier, k int) (volInfo, error) 
 		if m := rarMember(vol.Format, &f); m.Streamable() != nil {
 			return volInfo{}, fmt.Errorf("stream: rar volume %d (%s): %w", k+1, pf.Name(), m.Streamable())
 		}
-		return volInfo{size: size, dataOff: f.DataOffset, dataSize: f.PackedSize}, nil
-	case kind7z:
+		return volInfo{size: rarVolSize(pf, f.DataOffset, f.PackedSize), dataOff: f.DataOffset, dataSize: f.PackedSize}, nil
+	case kind7z, kindZIP:
 		return volInfo{size: size}, nil
 	default:
 		return volInfo{size: size, dataOff: 0, dataSize: size}, nil
@@ -337,58 +349,80 @@ func (p *plan) inspect(ctx context.Context, v verifier, k int) (volInfo, error) 
 
 // rebuildExact inspects every volume and rebuilds the layout from facts.
 func (p *plan) rebuildExact(ctx context.Context, v verifier) error {
-	p.mu.Lock()
-	if p.exactErr != nil {
-		err := p.exactErr
-		p.mu.Unlock()
-		return err
-	}
-	if ch := p.exact; ch != nil {
-		p.mu.Unlock()
-		select {
-		case <-ch:
+	for {
+		p.mu.Lock()
+		if p.exactErr != nil {
+			err := p.exactErr
+			p.mu.Unlock()
+			return err
+		}
+		allVerified := true
+		for _, ok := range p.verified {
+			if !ok {
+				allVerified = false
+				break
+			}
+		}
+		if allVerified {
+			p.mu.Unlock()
 			return nil
-		case <-ctx.Done():
-			return ctx.Err()
 		}
-	}
-	ch := make(chan struct{})
-	p.exact = ch
-	p.mu.Unlock()
-
-	infos := make([]volInfo, len(p.vols))
-	b := &builder{e: v.e, rel: p.rel, prio: v.prio, fo: v.fo}
-	err := b.parallel(ctx, len(p.vols), func(ctx context.Context, k int) error {
-		vi, err := p.inspect(ctx, v, k)
-		infos[k] = vi
-		return err
-	})
-
-	p.mu.Lock()
-	defer func() {
-		p.exact = nil
-		close(ch)
+		if ch := p.exact; ch != nil {
+			p.mu.Unlock()
+			select {
+			case <-ch:
+				continue
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		ch := make(chan struct{})
+		p.exact = ch
 		p.mu.Unlock()
-	}()
-	if err != nil {
-		if IsRejection(err) && ctx.Err() == nil {
-			p.exactErr = err
+
+		infos := make([]volInfo, len(p.vols))
+		b := &builder{e: v.e, rel: p.rel, prio: v.prio, fo: v.fo}
+		err := b.parallel(ctx, len(p.vols), func(ctx context.Context, k int) error {
+			vi, err := p.inspect(ctx, v, k)
+			infos[k] = vi
+			return err
+		})
+
+		p.mu.Lock()
+		finish := func() {
+			p.exact = nil
+			close(ch)
+			p.mu.Unlock()
 		}
-		return err
+		if err != nil {
+			if IsRejection(err) && ctx.Err() == nil {
+				p.exactErr = err
+			}
+			finish()
+			return err
+		}
+		p.info = infos
+		for k := range p.verified {
+			p.verified[k] = true
+		}
+		version := 1
+		if p.lay != nil {
+			version = p.lay.version + 1
+		}
+		l, err := p.buildLocked(version)
+		if err != nil {
+			p.exactErr = err
+			finish()
+			return err
+		}
+		p.lay = l
+		finish()
+		return nil
 	}
-	p.info = infos
-	for k := range p.verified {
-		p.verified[k] = true
-	}
-	version := 1
-	if p.lay != nil {
-		version = p.lay.version + 1
-	}
-	l, err := p.buildLocked(version)
-	if err != nil {
-		p.exactErr = err
-		return err
-	}
-	p.lay = l
-	return nil
+}
+
+// clipBoundary is one clip of a concatenated Blu-ray main feature.
+type clipBoundary struct {
+	byteLen  int64 // the clip's size in the played file
+	delta90k int64 // added to its PTS/DTS/PCR (90 kHz) for a continuous timeline
 }

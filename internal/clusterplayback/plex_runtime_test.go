@@ -2,14 +2,6 @@ package clusterplayback
 
 import (
 	"context"
-	"github.com/braedonsaunders/ether/internal/clusterbus"
-	"github.com/braedonsaunders/ether/internal/config"
-	"github.com/braedonsaunders/ether/internal/core"
-	"github.com/braedonsaunders/ether/internal/nodewire"
-	"github.com/braedonsaunders/ether/internal/placement"
-	"github.com/braedonsaunders/ether/internal/playback"
-	"github.com/braedonsaunders/ether/internal/plex"
-	"github.com/braedonsaunders/ether/internal/sessions"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -18,6 +10,17 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/braedonsaunders/ether/internal/clusterbus"
+	"github.com/braedonsaunders/ether/internal/config"
+	"github.com/braedonsaunders/ether/internal/core"
+	"github.com/braedonsaunders/ether/internal/experience"
+	"github.com/braedonsaunders/ether/internal/frontend"
+	"github.com/braedonsaunders/ether/internal/frontends/plex"
+	"github.com/braedonsaunders/ether/internal/nodewire"
+	"github.com/braedonsaunders/ether/internal/placement"
+	"github.com/braedonsaunders/ether/internal/playback"
+	"github.com/braedonsaunders/ether/internal/sessions"
 )
 
 type composedAuth struct {
@@ -72,19 +75,22 @@ func (p *composedPolicy) Allowed(*core.User, *core.Title) bool { return !p.hidde
 func (p *composedPolicy) CanPlay(_ *core.User, remote bool, _ time.Time) bool {
 	return !remote || !p.wan.Load()
 }
+func (*composedPolicy) SetMaxRating(context.Context, *core.User, string) error {
+	return core.ErrUnauthorized
+}
 
 type forwardOnlyEncoder struct{ r *Runtime }
 
-func (e forwardOnlyEncoder) StartPlexHLS(context.Context, *core.User, string, string, core.HLSRequest) (core.HLSSession, error) {
+func (e forwardOnlyEncoder) StartSegmentedHLS(context.Context, *core.User, string, string, core.HLSRequest) (core.HLSSession, error) {
 	return nil, ErrDenied
 }
-func (e forwardOnlyEncoder) PlexHLSSession(string) (core.HLSSession, bool) { return nil, false }
-func (e forwardOnlyEncoder) StopPlexHLS(string) bool                       { return false }
-func (e forwardOnlyEncoder) ForwardPlexMedia(w http.ResponseWriter, q *http.Request, id string) bool {
-	return e.r.ForwardPlexMedia(w, q, id)
+func (e forwardOnlyEncoder) SegmentedHLSSession(string) (core.HLSSession, bool) { return nil, false }
+func (e forwardOnlyEncoder) StopSegmentedHLS(string) bool                       { return false }
+func (e forwardOnlyEncoder) ForwardEncodedMedia(w http.ResponseWriter, q *http.Request, id string) bool {
+	return e.r.ForwardEncodedMedia(w, q, id)
 }
-func (e forwardOnlyEncoder) ForwardPlexGrantMedia(w http.ResponseWriter, q *http.Request, id string) bool {
-	return e.r.ForwardPlexGrantMedia(w, q, id)
+func (e forwardOnlyEncoder) ForwardGrantMedia(w http.ResponseWriter, q *http.Request, id string) bool {
+	return e.r.ForwardGrantMedia(w, q, id)
 }
 
 func TestRealPlexRuntimeDecisionStartSeekAcrossFrontends(t *testing.T) {
@@ -103,7 +109,12 @@ func TestRealPlexRuntimeDecisionStartSeekAcrossFrontends(t *testing.T) {
 		t.Fatal(err)
 	}
 	encoder := &fixtureEncoder{}
-	manager, err := playback.New(playback.Deps{Catalog: fixtureCatalog{}, Resolver: fixtureResolver{}, Engine: fixtureEngine{}, Transcoder: encoder, SelectProfile: func(core.ClientCaps, *core.User, string) core.QualityProfile { return core.QualityProfile{} }}, config.Defaults(t.TempDir()), playback.Options{})
+	manager, err := playback.New(playback.Deps{Catalog: fixtureCatalog{}, Resolver: fixtureResolver{}, Engine: fixtureEngine{}, Transcoder: encoder, SelectProfile: func(core.ClientCaps, *core.User, string) core.QualityProfile { return core.QualityProfile{} }}, config.Defaults(t.TempDir()), playback.Options{SessionSurface: func(surface string) string {
+		if surface == "plex" {
+			return ""
+		}
+		return surface
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,7 +134,7 @@ func TestRealPlexRuntimeDecisionStartSeekAcrossFrontends(t *testing.T) {
 	eligible := func(context.Context, nodewire.Identity, config.NodeRole) error { return nil }
 	auth := &composedAuth{}
 	policy := &composedPolicy{}
-	base := Options{DB: db, Placement: ledger, Endpoint: endpoint, Eligible: eligible, MemberRole: eligible, Capacity: 32, ClockBoundKnown: true, ClockSkew: time.Millisecond, Decide: func(core.MediaInfo, core.ClientCaps, core.DecideOptions) core.Decision {
+	base := Options{SurfacePolicy: testSessionPolicy, Delivery: testDeliveryPolicy(), DB: db, Placement: ledger, Endpoint: endpoint, Eligible: eligible, MemberRole: eligible, Capacity: 32, ClockBoundKnown: true, ClockSkew: time.Millisecond, Decide: func(core.MediaInfo, core.ClientCaps, core.DecideOptions) core.Decision {
 		return core.Decision{Kind: core.DecisionRemux, VideoCopy: true, AudioCopy: true, Container: "mpegts", AudioStream: -1, SubtitleStream: -1}
 	}}
 	base.MediaServers = func(context.Context) ([]nodewire.Identity, error) { return []nodewire.Identity{senderID}, nil }
@@ -196,7 +207,7 @@ func TestRealPlexRuntimeDecisionStartSeekAcrossFrontends(t *testing.T) {
 	defer events.Close()
 	hub := clusterbus.NewHub()
 	ownerNode, senderNode := hub.Node(ownerID.NodeID), hub.Node(senderID.NodeID)
-	broker, err := sessions.NewBroker(sessions.BrokerDeps{DB: db, Cluster: ownerNode, Playback: remote, Transcoder: decision, DistributedHLS: owner, Events: events, ActiveViewer: auth.ActiveUser, CanPlay: policy.CanPlay, BitrateLimit: func(*core.User) int { return 0 }, Progress: composedState{}, OnTimeline: func(*core.User, core.RatingKey, time.Duration, time.Duration, string) {}, Lookup: func(c context.Context, u *core.User, d core.Device, k core.RatingKey) (*core.Title, error) {
+	broker, err := sessions.NewBroker(sessions.BrokerDeps{SurfacePolicy: testSessionPolicy, DB: db, Cluster: ownerNode, Playback: remote, Transcoder: decision, DistributedHLS: owner, Events: events, ActiveViewer: auth.ActiveUser, CanPlay: policy.CanPlay, BitrateLimit: func(*core.User) int { return 0 }, Progress: composedState{}, OnTimeline: func(*core.User, core.RatingKey, time.Duration, time.Duration, string) {}, Lookup: func(c context.Context, u *core.User, d core.Device, k core.RatingKey) (*core.Title, error) {
 		return fixtureCatalog{}.Get(c, k)
 	}})
 	if err != nil {
@@ -207,10 +218,16 @@ func TestRealPlexRuntimeDecisionStartSeekAcrossFrontends(t *testing.T) {
 	cfg.Plex.Claimed = true
 	cfg.Server.MachineIdentifier = "offline-machine"
 	cfg.Server.TrustedProxyCIDRs = []string{"10.1.0.0/16"}
-	deps := plex.Deps{DB: db, Cluster: ownerNode, Catalog: fixtureCatalog{}, State: composedState{}, Auth: auth, AccessPolicy: policy, Playback: remote, Transcoder: decision, PlexEncoder: broker, DisableEnrichment: true, Config: func() config.Config { return cfg }}
+	exp := experience.NewDirectService(experience.ServiceDeps{Catalog: fixtureCatalog{}, State: composedState{}})
+	deps := plex.Deps{
+		Host:              frontend.Host{Sessions: sessions.BindSurface(broker, "plex"), Experience: exp, Identity: frontend.BindAuth(auth), ViewerPolicy: policy, HostConfig: func() config.Config { return cfg }},
+		DB:                db,
+		Playback:          remote,
+		Transcoder:        decision,
+		DisableEnrichment: true,
+	}
 	publicOwner := plex.NewServer(deps)
 	defer publicOwner.Close()
-	publicOwner.UsePlaybackBroker(broker)
 	if err = owner.BindPlexDelivery(publicOwner); err != nil {
 		t.Fatal(err)
 	}
@@ -229,17 +246,15 @@ func TestRealPlexRuntimeDecisionStartSeekAcrossFrontends(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer senderBroker.Close(ctx)
-	deps.Playback, deps.Transcoder, deps.PlexEncoder = remoteSender, senderDecision, senderBroker
-	deps.Cluster = senderNode
+	deps.Playback, deps.Transcoder, deps.Host.Sessions = remoteSender, senderDecision, sessions.BindSurface(senderBroker, "plex")
 	publicSender := plex.NewServer(deps)
 	defer publicSender.Close()
-	publicSender.UsePlaybackBroker(senderBroker)
 	if err = sender.BindPlexDelivery(publicSender); err != nil {
 		t.Fatal(err)
 	}
 	forwardDeps := deps
-	forwardDeps.DB, forwardDeps.Cluster = nil, nil
-	forwardDeps.Playback, forwardDeps.Transcoder, forwardDeps.PlexEncoder = remote, decision, forwardOnlyEncoder{r: owner}
+	forwardDeps.DB = nil
+	forwardDeps.Playback, forwardDeps.Transcoder, forwardDeps.Host.Sessions = remote, decision, sessions.NewLocalRuntime(sessions.LocalRuntimeDeps{Sessions: sessions.BindSurface(broker, "plex"), Playback: remote, Transcoder: decision, Encoder: forwardOnlyEncoder{r: owner}})
 	publicForward := plex.NewServer(forwardDeps)
 	defer publicForward.Close()
 	startURI := "/video/:/transcode/universal/start.m3u8?path=%2Flibrary%2Fmetadata%2F" + core.MovieKey(1).String() + "&session=real-composed-plex&directPlay=0&directStream=1"
@@ -313,7 +328,7 @@ func TestRealPlexRuntimeDecisionStartSeekAcrossFrontends(t *testing.T) {
 	q.RemoteAddr = start.RemoteAddr
 	q.Header = start.Header.Clone()
 	variant := httptest.NewRecorder()
-	if !owner.ForwardPlexMedia(variant, q, "real-composed-plex") {
+	if !owner.ForwardEncodedMedia(variant, q, "real-composed-plex") {
 		t.Fatal("variant was not forwarded")
 	}
 	if variant.Code != 200 {
@@ -443,7 +458,7 @@ func TestRealPlexRuntimeDecisionStartSeekAcrossFrontends(t *testing.T) {
 }
 
 func brokerTestDeps(remote *RemotePlayback, decision core.Transcoder, owner *Runtime, events *sessions.EventBus, auth *composedAuth, policy *composedPolicy) sessions.BrokerDeps {
-	return sessions.BrokerDeps{Playback: remote, Transcoder: decision, DistributedHLS: owner, Events: events, ActiveViewer: auth.ActiveUser, CanPlay: policy.CanPlay, BitrateLimit: func(*core.User) int { return 0 }, Progress: composedState{}, OnTimeline: func(*core.User, core.RatingKey, time.Duration, time.Duration, string) {}, Lookup: func(c context.Context, u *core.User, d core.Device, k core.RatingKey) (*core.Title, error) {
+	return sessions.BrokerDeps{SurfacePolicy: testSessionPolicy, Playback: remote, Transcoder: decision, DistributedHLS: owner, Events: events, ActiveViewer: auth.ActiveUser, CanPlay: policy.CanPlay, BitrateLimit: func(*core.User) int { return 0 }, Progress: composedState{}, OnTimeline: func(*core.User, core.RatingKey, time.Duration, time.Duration, string) {}, Lookup: func(c context.Context, u *core.User, d core.Device, k core.RatingKey) (*core.Title, error) {
 		return fixtureCatalog{}.Get(c, k)
 	}}
 }

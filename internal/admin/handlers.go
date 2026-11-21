@@ -18,6 +18,7 @@ import (
 	"github.com/braedonsaunders/ether/internal/config"
 	"github.com/braedonsaunders/ether/internal/contentrating"
 	"github.com/braedonsaunders/ether/internal/core"
+	"github.com/braedonsaunders/ether/internal/datafs"
 	"github.com/braedonsaunders/ether/internal/plextv"
 	"github.com/braedonsaunders/ether/internal/tmdb"
 )
@@ -71,7 +72,7 @@ func SetupStatus(cfg config.Config) (steps []SetupStep, complete bool) {
 	cacheDone := strings.TrimSpace(cfg.Cache.Dir) != "" && cfg.Cache.BudgetBytes >= 0
 	sourcesDone := enabledProviders+enabledDebrid+keylessSources > 0
 	steps = []SetupStep{
-		{ID: "plex", Title: "Sign in to plex.tv and claim", Complete: plexDone, Required: true, Detail: plexDetail},
+		{ID: accountSetupID, Title: "Sign in to plex.tv and claim", Complete: plexDone, Required: true, Detail: plexDetail},
 		{ID: "sources", Title: "Debrid accounts or Usenet providers", Complete: sourcesDone, Required: true,
 			Detail: fmt.Sprintf("%d debrid, %d Usenet, %d addon", enabledDebrid, enabledProviders, keylessSources)},
 		{ID: "indexers", Title: "Indexers", Complete: enabledIndexers > 0, Required: true,
@@ -93,12 +94,13 @@ func (h *Handler) setupStatus(r *http.Request) ([]SetupStep, bool) {
 	cfg := h.deps.Config.Get()
 	steps, complete := SetupStatus(cfg)
 	local := h.deps.LocalOwnerConfigured != nil && h.deps.LocalOwnerConfigured(r.Context())
-	plexOff := cfg.Frontends != nil && !cfg.Frontends["plex"].Enabled
+	// Account setup is wired to the main listener frontend.
+	accountOff := cfg.Frontends != nil && !cfg.Frontends[accountSetupID].Enabled
 	for i := range steps {
-		if steps[i].ID != "plex" {
+		if steps[i].ID != accountSetupID {
 			continue
 		}
-		if plexOff {
+		if accountOff {
 			steps[i].Title = "Create local owner"
 			steps[i].Complete = local
 			if local {
@@ -157,7 +159,7 @@ func (h *Handler) handleSetupComplete(w http.ResponseWriter, r *http.Request) {
 	// Never even when forced: after setup only the server's Plex owner can
 	// open the admin UI, so finishing unclaimed would lock everyone out.
 	for _, s := range steps {
-		if s.ID == "plex" && !s.Complete {
+		if s.ID == accountSetupID && !s.Complete {
 			writeError(w, http.StatusConflict, "plex_required",
 				"create a local owner or claim Plex before completing setup")
 			return
@@ -228,6 +230,32 @@ func (h *Handler) handleClaim(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
+func (h *Handler) handleSyncPlexFriends(w http.ResponseWriter, r *http.Request) {
+	cfg := h.deps.Config.Get()
+	if !cfg.Plex.Claimed || cfg.Plex.Token == "" {
+		writeError(w, http.StatusConflict, "plex_not_claimed", "Sign in and claim this server first.")
+		return
+	}
+	syncer, ok := h.deps.PlexAuth.(PlexFriendSyncer)
+	if !ok || syncer == nil {
+		writeError(w, http.StatusServiceUnavailable, "plex_unavailable", "Plex friend sync is unavailable.")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), h.deps.TestTimeout)
+	defer cancel()
+	if err := syncer.SyncFriends(ctx); err != nil {
+		writeError(w, http.StatusBadGateway, "plex_friends_sync_failed", err.Error())
+		return
+	}
+	if h.deps.RefreshViewers != nil {
+		_ = h.deps.RefreshViewers(ctx)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":     true,
+		"detail": h.safeStatus(r, func(context.Context) any { return h.deps.PlexAuth.Status() }),
+	})
+}
+
 func (h *Handler) handlePlexStatus(w http.ResponseWriter, r *http.Request) {
 	cfg := h.deps.Config.Get()
 	out := map[string]any{
@@ -249,7 +277,11 @@ type testResult struct {
 }
 
 func (h *Handler) runTest(w http.ResponseWriter, r *http.Request, fn func(ctx context.Context) error) {
-	ctx, cancel := context.WithTimeout(r.Context(), h.deps.TestTimeout)
+	h.runTestWithin(w, r, h.deps.TestTimeout, fn)
+}
+
+func (h *Handler) runTestWithin(w http.ResponseWriter, r *http.Request, timeout time.Duration, fn func(ctx context.Context) error) {
+	ctx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
 	start := time.Now()
 	err := func() (err error) {
@@ -345,6 +377,26 @@ func (h *Handler) handleTestIndexer(w http.ResponseWriter, r *http.Request) {
 	h.runTest(w, r, func(ctx context.Context) error { return h.deps.TestIndexer(ctx, ix) })
 }
 
+func (h *Handler) handleIndexerPreview(w http.ResponseWriter, r *http.Request) {
+	if h.deps.IndexerPreview == nil {
+		writeError(w, http.StatusNotImplemented, "unavailable", "request preview is unavailable")
+		return
+	}
+	var ix config.Indexer
+	if err := decodeJSONLenient(r, &ix); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_json", err.Error())
+		return
+	}
+	// The preview masks the key itself; redacted placeholders in the draft
+	// are passed through untouched.
+	out, err := h.deps.IndexerPreview(ix)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "preview_failed", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
 func (h *Handler) handleTestDebrid(w http.ResponseWriter, r *http.Request) {
 	var p config.DebridProvider
 	if err := decodeJSONLenient(r, &p); err != nil {
@@ -384,6 +436,24 @@ func (h *Handler) handleTestIntroDB(w http.ResponseWriter, r *http.Request) {
 	h.runTest(w, r, func(ctx context.Context) error { return h.deps.TestIntroDB(ctx, key) })
 }
 
+func (h *Handler) handleTestSkipDB(w http.ResponseWriter, r *http.Request) {
+	if h.deps.TestSkipDB == nil {
+		writeError(w, http.StatusNotImplemented, "not_available", "SkipDB test is not available")
+		return
+	}
+	var body struct {
+		APIKey string `json:"apiKey"`
+	}
+	if !decodeTestBody(w, r, &body) {
+		return
+	}
+	key := body.APIKey
+	if isRedacted(key) || key == "" {
+		key = h.deps.Config.Get().Markers.SkipDBAPIKey
+	}
+	h.runTest(w, r, func(ctx context.Context) error { return h.deps.TestSkipDB(ctx, key) })
+}
+
 func (h *Handler) handleTestTMDB(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Key string `json:"key"`
@@ -415,6 +485,22 @@ func (h *Handler) handleTestOpenSubtitles(w http.ResponseWriter, r *http.Request
 	h.runTest(w, r, func(ctx context.Context) error { return h.deps.TestOpenSubtitles(ctx, cfg) })
 }
 
+func (h *Handler) handleTestSubDL(w http.ResponseWriter, r *http.Request) {
+	prev := h.deps.Config.Get().SubDL
+	cfg := prev
+	cfg.APIKey = redact(prev.APIKey)
+	if !decodeTestBody(w, r, &cfg) {
+		return
+	}
+	var perrs placeholderErrors
+	cfg.APIKey = perrs.restore("subdl.apiKey", cfg.APIKey, prev.APIKey, true)
+	if len(perrs) > 0 {
+		writeSecretRequired(w, perrs)
+		return
+	}
+	h.runTest(w, r, func(ctx context.Context) error { return h.deps.TestSubDL(ctx, cfg) })
+}
+
 // llmSettings decodes posted (unsaved) language-model settings onto the
 // stored ones and restores a bound API key.
 func (h *Handler) llmSettings(w http.ResponseWriter, r *http.Request) (config.LLM, bool) {
@@ -437,8 +523,15 @@ func (h *Handler) handleTestLLM(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	h.runTest(w, r, func(ctx context.Context) error { return h.deps.TestLLM(ctx, cfg) })
+	h.runTestWithin(w, r, llmTestTimeout, func(ctx context.Context) error { return h.deps.TestLLM(ctx, cfg) })
 }
+
+// llmTestTimeout bounds the language-model test. Thinking models (Gemini,
+// o-series, DeepSeek R1) reason before answering even "reply ok", and the
+// OpenAI-compatible endpoint returns nothing until they finish, so the
+// 20-second budget other testers use failed them with "context deadline
+// exceeded". It matches the model client's own request limit.
+const llmTestTimeout = 2 * time.Minute
 
 // LLMModel is one model a language-model provider offers.
 type LLMModel struct {
@@ -588,7 +681,7 @@ func (h *Handler) handleDisk(w http.ResponseWriter, r *http.Request) {
 		}
 		probe = parent
 	}
-	usage := diskUsage
+	usage := datafs.Usage
 	if h.deps.DiskUsage != nil {
 		usage = h.deps.DiskUsage
 	}
@@ -697,10 +790,35 @@ func (h *Handler) handleClearLogs(w http.ResponseWriter, r *http.Request) {
 }
 
 // DiskFree reports available bytes on the filesystem containing path.
-func DiskFree(path string) (int64, error) { _, free, err := diskUsage(path); return free, err }
+func DiskFree(path string) (int64, error) { _, free, err := datafs.Usage(path); return free, err }
 
 // DiskUsage reports the size and free bytes of the volume holding path.
-func DiskUsage(path string) (total, free int64, err error) { return diskUsage(path) }
+func DiskUsage(path string) (total, free int64, err error) { return datafs.Usage(path) }
+
+// handleDatabaseCompact reports (GET) or starts (POST) the owner's one-time
+// database compaction. POST returns at once; the compaction runs in the
+// background and GET reports it.
+func (h *Handler) handleDatabaseCompact(w http.ResponseWriter, r *http.Request) {
+	access, _ := RequestAccess(r.Context())
+	if !access.Owner {
+		writeError(w, http.StatusForbidden, "owner_required", "sign in as the owner to compact the database")
+		return
+	}
+	fn := h.deps.DatabaseCompactStatus
+	if r.Method == http.MethodPost {
+		fn = h.deps.DatabaseCompact
+	}
+	if fn == nil {
+		writeError(w, http.StatusNotImplemented, "not_implemented", "database compaction is not available")
+		return
+	}
+	value, err := fn(r.Context())
+	if err != nil {
+		writeError(w, http.StatusConflict, "database_compact_unavailable", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"value": value})
+}
 
 func (h *Handler) handleDatabaseCheck(w http.ResponseWriter, r *http.Request) {
 	access, _ := RequestAccess(r.Context())

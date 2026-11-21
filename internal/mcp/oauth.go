@@ -1,8 +1,10 @@
 package mcp
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
@@ -25,6 +27,45 @@ CREATE TABLE mcp_oauth_clients (id TEXT PRIMARY KEY, name TEXT NOT NULL, redirec
 CREATE TABLE mcp_oauth_requests (id TEXT PRIMARY KEY, client_id TEXT NOT NULL, redirect_uri TEXT NOT NULL, state TEXT NOT NULL, challenge TEXT NOT NULL, scope TEXT NOT NULL, resource TEXT NOT NULL, expires INTEGER NOT NULL);
 CREATE TABLE mcp_oauth_codes (hash TEXT PRIMARY KEY, client_id TEXT NOT NULL, redirect_uri TEXT NOT NULL, challenge TEXT NOT NULL, scope TEXT NOT NULL, resource TEXT NOT NULL, owner_id INTEGER NOT NULL, expires INTEGER NOT NULL);
 `)
+	// Indexes for PruneOAuth and the registration-cap eviction.
+	store.Register("mcp_oauth", 2, `CREATE INDEX mcp_oauth_clients_created ON mcp_oauth_clients(created); CREATE INDEX mcp_oauth_requests_expires ON mcp_oauth_requests(expires); CREATE INDEX mcp_oauth_codes_expires ON mcp_oauth_codes(expires);`)
+}
+
+// clientUnusedAge is how long a registered client is kept without a pending
+// request, an unexpired code or any grant. Clients register immediately
+// before they authorize, so an hour only drops abandoned registrations.
+const clientUnusedAge = time.Hour
+
+// evictClients deletes the oldest clients that registered more than
+// clientUnusedAge ago and hold nothing: no unexpired authorization request
+// or code, and no grant row in any state. Tokens are grants issued to
+// device "mcp-<client_id>" (token); a revoked or expired grant still keeps
+// its client until identity's Prune removes the grant a week after it died,
+// so an app re-authorizing with its remembered client_id keeps working.
+// Last placeholder is the batch limit.
+const evictClients = `DELETE FROM mcp_oauth_clients WHERE id IN (SELECT id FROM mcp_oauth_clients WHERE created<? AND id NOT IN (SELECT client_id FROM mcp_oauth_requests WHERE expires>?) AND id NOT IN (SELECT client_id FROM mcp_oauth_codes WHERE expires>?) AND NOT EXISTS (SELECT 1 FROM identity_grants g WHERE g.device_id='mcp-'||mcp_oauth_clients.id AND g.surface=?) ORDER BY created LIMIT ?)`
+
+// PruneOAuth deletes expired authorization requests and codes and evicts
+// unused clients (see evictClients), reporting the rows removed. Requests
+// and codes are otherwise only cleared by the next authorize or approval.
+func PruneOAuth(ctx context.Context, db *sql.DB) (int64, error) {
+	now := time.Now().UnixMilli()
+	var total int64
+	for _, s := range []struct {
+		del  string
+		args []any
+	}{
+		{`DELETE FROM mcp_oauth_requests WHERE id IN (SELECT id FROM mcp_oauth_requests WHERE expires<=? ORDER BY expires LIMIT ?)`, []any{now}},
+		{`DELETE FROM mcp_oauth_codes WHERE hash IN (SELECT hash FROM mcp_oauth_codes WHERE expires<=? ORDER BY expires LIMIT ?)`, []any{now}},
+		{evictClients, []any{now - clientUnusedAge.Milliseconds(), now, now, identity.SurfaceMCP}},
+	} {
+		n, err := store.PruneBatched(ctx, db, s.del, s.args...)
+		total += n
+		if err != nil {
+			return total, err
+		}
+	}
+	return total, nil
 }
 
 func randomURL() (string, error) {
@@ -121,13 +162,26 @@ func (p *Pairing) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	data, _ := json.Marshal(b.Redirects)
-	// Bound durable registrations as well as request buckets.
-	result, err := p.opts.DB.ExecContext(r.Context(), `INSERT INTO mcp_oauth_clients(id,name,redirects,created) SELECT ?,?,?,? WHERE (SELECT COUNT(*) FROM mcp_oauth_clients)<4096`, id, name, string(data), p.now().UnixMilli())
+	// Bound durable registrations as well as request buckets. At the cap,
+	// evict a small batch of unused clients and try once more.
+	now := p.now().UnixMilli()
+	insert := func() (int64, error) {
+		result, err := p.opts.DB.ExecContext(r.Context(), `INSERT INTO mcp_oauth_clients(id,name,redirects,created) SELECT ?,?,?,? WHERE (SELECT COUNT(*) FROM mcp_oauth_clients)<4096`, id, name, string(data), now)
+		if err != nil {
+			return 0, err
+		}
+		return result.RowsAffected()
+	}
+	n, err := insert()
+	if err == nil && n != 1 {
+		if _, err = p.opts.DB.ExecContext(r.Context(), evictClients, now-clientUnusedAge.Milliseconds(), now, now, identity.SurfaceMCP, 64); err == nil {
+			n, err = insert()
+		}
+	}
 	if err != nil {
 		http.Error(w, "unavailable", 500)
 		return
 	}
-	n, _ := result.RowsAffected()
 	if n != 1 {
 		http.Error(w, "registration limit reached", 429)
 		return
@@ -135,6 +189,29 @@ func (p *Pairing) register(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 201, map[string]any{"client_id": id, "client_name": name, "redirect_uris": b.Redirects, "token_endpoint_auth_method": "none", "grant_types": []string{"authorization_code"}, "response_types": []string{"code"}})
 }
 func oauthError(w http.ResponseWriter, code string) { writeJSON(w, 400, map[string]any{"error": code}) }
+
+// canonicalScope parses an RFC 6749 §3.3 space-delimited scope list
+// (clients built from scopes_supported ask for "read full", #651).
+// "full" includes "read", so a valid list collapses to that one grant;
+// any unknown scope rejects the request rather than being dropped.
+// An absent scope keeps the historical default of "full".
+func canonicalScope(raw string) (string, bool) {
+	fields := strings.Fields(raw)
+	if len(fields) == 0 {
+		return "full", true
+	}
+	granted := "read"
+	for _, f := range fields {
+		switch f {
+		case "read":
+		case "full":
+			granted = "full"
+		default:
+			return "", false
+		}
+	}
+	return granted, true
+}
 func (p *Pairing) authorize(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.WriteHeader(405)
@@ -146,10 +223,7 @@ func (p *Pairing) authorize(w http.ResponseWriter, r *http.Request) {
 	}
 	q := r.URL.Query()
 	client, redirect, challenge := q.Get("client_id"), q.Get("redirect_uri"), q.Get("code_challenge")
-	scope := q.Get("scope")
-	if scope == "" {
-		scope = "full"
-	}
+	scope, scopeOK := canonicalScope(q.Get("scope"))
 	resource := q.Get("resource")
 	if resource == "" {
 		resource = absoluteURL(r, "/ether/mcp")
@@ -165,7 +239,7 @@ func (p *Pairing) authorize(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	decoded, e := base64.RawURLEncoding.DecodeString(challenge)
-	if err != nil || !found || q.Get("response_type") != "code" || q.Get("code_challenge_method") != "S256" || e != nil || len(decoded) != 32 || base64.RawURLEncoding.EncodeToString(decoded) != challenge || (scope != "read" && scope != "full") || resource != absoluteURL(r, "/ether/mcp") || len(q.Get("state")) > 1024 {
+	if err != nil || !found || q.Get("response_type") != "code" || q.Get("code_challenge_method") != "S256" || e != nil || len(decoded) != 32 || base64.RawURLEncoding.EncodeToString(decoded) != challenge || !scopeOK || resource != absoluteURL(r, "/ether/mcp") || len(q.Get("state")) > 1024 {
 		oauthError(w, "invalid_request")
 		return
 	}

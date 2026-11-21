@@ -18,6 +18,14 @@ export function installMockBackend(): void {
   setMockAgentPace(Number(params.get("agentPace") ?? 70));
   const fake = createFakeServer({
     latencyMs: 120,
+    // `?vela` previews an owner-installed Vela client.
+    velaInstalled: params.has("vela"),
+    velaDistribution:
+      params.get("velaDist") === "installing"
+        ? "installing"
+        : params.get("velaDist") === "rollback"
+          ? "rollback"
+          : undefined,
     liveTVEmpty: params.get("livetv") === "empty",
     onAirLayout: params.get("onair") ?? undefined,
     householdAudio: true,
@@ -29,26 +37,42 @@ export function installMockBackend(): void {
     cacheRestart: params.has("cacheRestart"),
     restore: params.get("restore") ?? undefined,
     prerolls: params.has("prerolls"),
+    portConflict: params.get("portConflict") || (params.has("portConflict") ? true : undefined),
   });
+  // Configured through the API, but the owner has not closed setup yet.
+  if (params.get("setup") === "resume") {
+    fake.state.config.setupComplete = false;
+    fake.state.boot.setupComplete = false;
+    fake.state.boot.ownerConfigured = true;
+  }
   if (params.get("backups") === "empty") fake.state.backups = [];
+  const offApps = new Set(
+    (params.get("off") ?? "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean),
+  );
   fake.state.config.frontends = Object.fromEntries(
     ["plex", "jellyfin", "emby", "silo", "stremio", "webdav", "m3u", "xtream", "dlna"].map((id) => [
       id,
-      { enabled: true },
+      { enabled: !offApps.has(id) },
     ]),
   );
+  if (params.get("catalogKey") === "missing") fake.state.config.catalog.tmdbKey = "";
   // Deterministic account workspaces for owner-console visual review.
   if (params.get("integrations") === "all") {
     const c = fake.state.config;
     c.catalog.tmdbKey = "[configured]";
     c.trakt = { enabled: true, clientId: "ether-trakt", clientSecret: "[configured]" };
     c.simkl = { enabled: true, clientId: "ether-simkl", clientSecret: "[configured]" };
+    c.mdblist = { enabled: true };
     c.openSubtitles = {
       enabled: true,
       apiKey: "[configured]",
       username: "ether",
       password: "[configured]",
     };
+    c.subdl = { enabled: true, apiKey: "[configured]" };
     c.markers = { ...c.markers, theIntroDb: true, apiKey: "[configured]" };
     c.posters = {
       version: 1,
@@ -112,12 +136,155 @@ export function installMockBackend(): void {
       });
     };
   }
+  // Owner screenshot fixtures: opt in with ?review. Switch availability/sync
+  // scenarios through sessionStorage["ether.review.state"] (done/running/empty/failed/pin).
+  if (params.has("review")) {
+    const original = fake.fetch;
+    fake.fetch = async (input, init) => {
+      const path = new URL(String(input), window.location.origin).pathname;
+      const state = sessionStorage.getItem("ether.review.state") || "done";
+      const json = (value: unknown) =>
+        new Response(JSON.stringify(value), { headers: { "Content-Type": "application/json" } });
+      if (path.endsWith("/discovery/settings"))
+        return json({
+          enabled: true,
+          plex: true,
+          trakt: true,
+          plexFriendsStatus: [
+            {
+              id: "friend-1",
+              username: "Sam",
+              configured: true,
+              lastRead: Math.floor(Date.now() / 1000),
+              imported: 12,
+              unmatchedTitles: 0,
+            },
+            {
+              id: "friend-2",
+              username: "Jordan",
+              configured: true,
+              lastRead: Math.floor(Date.now() / 1000),
+              imported: 0,
+              unmatchedTitles: 0,
+              problem: "upstream",
+              error: "Plex could not read this watchlist. Try again later.",
+            },
+          ],
+        });
+      if (path.includes("/discovery/users/")) {
+        if (path.includes("/sync/jobs"))
+          return json({
+            id: 1,
+            state: state === "running" ? "running" : "completed",
+            plex: state === "pin" ? "pin" : "synced",
+            count: 3,
+          });
+        if (path.endsWith("/check"))
+          return json({
+            state,
+            done: 2,
+            total: 3,
+            enabled: true,
+            nextCheck: new Date(Date.now() + 1800000).toISOString(),
+          });
+        return json(
+          state === "empty"
+            ? []
+            : [
+                {
+                  title: {
+                    key: "movie:1",
+                    title: "The Grand Budapest Hotel",
+                    released: "2014-03-28",
+                  },
+                  sources: ["Plex Home"],
+                  availableAt: new Date().toISOString(),
+                  checkedAt: new Date().toISOString(),
+                },
+                {
+                  title: { key: "movie:2", title: "Arrival", released: "2016-11-11" },
+                  sources: ["Friends' Watchlist"],
+                  checkedAt: new Date().toISOString(),
+                },
+                {
+                  title: { key: "movie:3", title: "Spirited Away", released: "2001-07-20" },
+                  sources: ["Trakt"],
+                },
+              ],
+        );
+      }
+      if (path.endsWith("/logs/stream"))
+        return new Response(
+          "event: snapshot\ndata: " +
+            JSON.stringify({ entries: fake.state.logs, total: fake.state.logs.length }) +
+            "\n\n",
+          { headers: { "Content-Type": "text/event-stream" } },
+        );
+      if (path.endsWith("/poster-folders"))
+        return json({
+          breadcrumbs: [{ name: "Posters", path: "/media/posters" }],
+          path: "/media/posters",
+          parent: "/media",
+          directories: ["Movies", "Shows", "Family"],
+          posters: 128,
+          limited: false,
+        });
+      const response = await original(input, init);
+      if (path.includes("/libraries/3/item/")) {
+        const body = await response.json();
+        body.item.unavailable = {
+          code: "file_missing",
+          detail:
+            "The file was moved or removed from the library folder. Choose another file or sync this library.",
+        };
+        return json(body);
+      }
+      if (path.endsWith("/plex-servers/step-aside/explain"))
+        return json({
+          title: "The Iron Echo",
+          key: 2,
+          kind: "movie",
+          cause: "held",
+          servers: ["Living room PMS"],
+          missing: [],
+          missingMore: 0,
+        });
+      if (path.endsWith("/plex-servers")) {
+        const body = await response.json();
+        if (Array.isArray(body))
+          for (const server of body) {
+            server.stepAside = true;
+            server.stepAsideStatus = {
+              state: "complete",
+              movies: 124,
+              showsFull: 18,
+              showsPartial: 3,
+              episodes: 420,
+              unmatched: 2,
+              lastScan: Math.floor(Date.now() / 1000) - 120,
+            };
+          }
+        return json(body);
+      }
+      return response;
+    };
+  }
   const real = window.fetch.bind(window);
   window.fetch = (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(
       input instanceof Request ? input.url : String(input),
       window.location.origin,
     );
+    if (url.origin === window.location.origin && url.pathname === "/vela/skins/catalog.json")
+      return Promise.resolve(
+        new Response(JSON.stringify({ documents: [] }), {
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+    if (url.origin === window.location.origin && url.pathname.startsWith("/vela/v0/branding/"))
+      return Promise.resolve(
+        fake.velaBranding.serveAsset(url.pathname.slice("/vela/v0/branding/".length)),
+      );
     if (url.origin === window.location.origin && url.pathname.startsWith("/ether/api/"))
       return fake.fetch(url.toString(), init);
     return real(input, init);

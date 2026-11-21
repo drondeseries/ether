@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"slices"
 
 	"github.com/braedonsaunders/ether/internal/core"
 )
@@ -20,7 +21,7 @@ const feedRejectedReason = "not accepted by the current quality policy"
 // searching. Broad capabilities mean the default owner's profile determines
 // eligibility; this is source evidence, never a claim about every device.
 func (s *Service) FeedCandidate(ctx context.Context, t *core.Title, r core.Release) (core.Release, string, error) {
-	e, err := s.feedEvaluationForMedia(ctx, titleMedia(t))
+	e, err := s.feedEvaluationForProfile(ctx, titleMedia(t), s.ProfileForTitle(ctx, feedClient, nil, t))
 	if err != nil {
 		return r, "", err
 	}
@@ -37,6 +38,10 @@ func (s *Service) FeedEvaluation(ctx context.Context) (core.FeedEvaluation, erro
 
 func (s *Service) feedEvaluationForMedia(ctx context.Context, media string) (*feedEvaluation, error) {
 	p := SelectProfileForMedia(s.qualityCfg(), feedClient, nil, media)
+	return s.feedEvaluationForProfile(ctx, media, p)
+}
+
+func (s *Service) feedEvaluationForProfile(ctx context.Context, media string, p core.QualityProfile) (*feedEvaluation, error) {
 	policy, err := s.compileRules(p.ReleaseRules)
 	if err != nil {
 		return nil, err
@@ -77,7 +82,17 @@ func (e *feedEvaluationSet) forTitle(t *core.Title) *feedEvaluation {
 func (e *feedEvaluationSet) Key() string { return e.movie.Key() + "|" + e.tv.Key() }
 
 func (e *feedEvaluationSet) Evaluate(ctx context.Context, t *core.Title, rs []core.Release) ([]core.FeedVerdict, error) {
-	return e.forTitle(t).Evaluate(ctx, t, rs)
+	base := e.forTitle(t)
+	p := base.s.ProfileForTitle(ctx, feedClient, nil, t)
+	if p.SelectionKey == base.profile.SelectionKey {
+		return base.Evaluate(ctx, t, rs)
+	}
+	selected, err := base.s.feedEvaluationForProfile(ctx, titleMedia(t), p)
+	if err != nil {
+		return nil, err
+	}
+	defer selected.Close()
+	return selected.Evaluate(ctx, t, rs)
 }
 
 func (e *feedEvaluationSet) Transient(id string) string { return e.movie.Transient(id) }
@@ -109,7 +124,16 @@ func (e *feedEvaluation) Key() string {
 	}
 	profile := e.profile
 	profile.Import = nil // provenance is not policy; SyncedAt must not invalidate verdicts
-	b, _ := json.Marshal([]any{"feed-verdict-v3", e.media, profile.SelectionKey, profile, e.env.rcfg, e.env.lang, e.s.profileAllowsCam(), registry})
+	var libraries string
+	if policy, ok := e.s.libProfiles.(interface{ PolicyKey(context.Context) string }); ok {
+		libraries = policy.PolicyKey(context.Background())
+	}
+	quality := e.s.qualityCfg()
+	quality.Profiles = slices.Clone(quality.Profiles)
+	for i := range quality.Profiles {
+		quality.Profiles[i].Import = nil
+	}
+	b, _ := json.Marshal([]any{"feed-verdict-v5", libraries, quality, e.media, profile.SelectionKey, profile, e.env.rcfg, e.env.lang, e.s.profileAllowsCam(), registry})
 	sum := sha256.Sum256(b)
 	e.key = hex.EncodeToString(sum[:])
 	return e.key
@@ -134,8 +158,13 @@ func (e *feedEvaluation) Transient(id string) string {
 	if e.s.isBad(id) {
 		return "marked bad"
 	}
-	if e.s.recentlyFailedHealth(id) {
+	if e.s.recentlyFailedHealth(id) || e.s.recentlyFailedGrabKey(id) {
 		return "source recently failed health check; retrying later"
+	}
+	for _, k := range e.s.idContentKeys(id) {
+		if e.s.recentlyFailedHealth(k) || e.s.recentlyFailedGrabKey(k) {
+			return "source recently failed health check; retrying later"
+		}
 	}
 	return ""
 }
@@ -168,6 +197,9 @@ func (e *feedEvaluation) judge(ctx context.Context, t *core.Title, r core.Releas
 
 // judgeWith ranks the release on its own, exactly as a one-result search.
 func (e *feedEvaluation) judgeWith(ctx context.Context, req core.ResolveRequest, sreq core.SearchRequest, env rankEnv, r core.Release) (core.Release, string, error) {
+	if reason := packEvidenceReason(r, sreq); reason != "" {
+		return r, reason, nil
+	}
 	trace := Trace{}
 	candidates, _, err := e.s.rankWith(ctx, env, req, sreq, e.profile, []core.Release{r}, &trace, "")
 	if err != nil {
@@ -181,6 +213,22 @@ func (e *feedEvaluation) judgeWith(ctx context.Context, req core.ResolveRequest,
 		return r, reason, nil
 	}
 	return candidates[0].rel, "", nil
+}
+
+// packEvidenceReason keeps a feed item from standing in for an episode it is
+// not shown to hold. A Usenet season pack is narrowed to one episode only when
+// its NZB is fetched, so from its name alone it proves just the episodes it
+// lists ("S01E03-E10"): a bare "S01" says nothing about a premiere that may
+// not be in it. Torrent packs are unchanged. "" accepts.
+func packEvidenceReason(r core.Release, sreq core.SearchRequest) string {
+	if sreq.Type != core.TypeEpisode || !r.Info.FullSeason || r.Protocol != core.ProtocolUsenet {
+		return ""
+	}
+	_, episode := releaseNumbers(r.Info, sreq)
+	if !slices.Contains(r.Info.Episodes, episode) {
+		return "season pack does not list the episode"
+	}
+	return ""
 }
 
 // VerifyFeedCandidate validates exactly the discovered release. It never invokes
@@ -198,16 +246,30 @@ func (s *Service) VerifyFeedCandidate(ctx context.Context, t *core.Title, r core
 	}
 	payload, err := s.indexer.FetchNZB(ctx, r)
 	if err != nil {
+		if permanentGrabFailure(err) {
+			keys := append(s.releaseContentKeys(r), r.ID)
+			s.noteFailedGrab(ctx, keys, err.Error())
+		}
 		return err
 	}
+	var extraKeys []string
+	r, extraKeys = s.learnReleaseContent(ctx, r, payload)
 	ok, err := core.CheckReleaseHealth(ctx, s.health, r.ID, payload)
 	if err != nil {
+		if permanentFailure(err) {
+			if ckeys := s.releaseContentKeys(r, extraKeys...); len(ckeys) > 0 {
+				s.noteFailedGrab(ctx, ckeys, err.Error())
+			}
+		}
 		return err
 	}
 	if !ok {
+		if ckeys := s.releaseContentKeys(r, extraKeys...); len(ckeys) > 0 {
+			s.noteFailedGrab(ctx, ckeys, "health: unhealthy")
+		}
 		return core.ErrSourceUnavailable
 	}
-	s.markVerified(ctx, r.ID)
+	s.markVerifiedKeys(ctx, s.allVerificationKeys(r, extraKeys...))
 	s.rememberReleases(t, []core.Release{r})
 	s.setAvailability(ctx, int64(t.Key), true, s.searchTTL())
 	return nil

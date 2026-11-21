@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -22,11 +23,16 @@ import (
 
 	"github.com/braedonsaunders/ether/internal/config"
 	"github.com/braedonsaunders/ether/internal/core"
+	"github.com/braedonsaunders/ether/internal/events"
 )
 
 // ErrTooManyTranscodes is returned by StartHLS when config MaxTranscodes
 // video transcodes are already running. Remuxes are not counted.
 var ErrTooManyTranscodes = errors.New("transcode: too many concurrent transcodes")
+
+// ErrVideoTranscodingDisabled is returned when a non-live movie or show
+// requires video re-encoding while transcode.videoTranscoding is "off".
+var ErrVideoTranscodingDisabled = core.ErrVideoTranscodingDisabled
 
 // ErrImageSubtitle is returned when a bitmap subtitle is asked for as text.
 var ErrImageSubtitle = errors.New("transcode: bitmap subtitles cannot be converted to text")
@@ -35,48 +41,68 @@ var ErrImageSubtitle = errors.New("transcode: bitmap subtitles cannot be convert
 type Option func(*options)
 
 type options struct {
+	decodeDB       *sql.DB
 	runtimeDir     string
 	runner         Runner
 	finder         *finder
 	detectHW       bool
 	idleTimeout    time.Duration
 	segmentTimeout time.Duration
-	stallTimeout   time.Duration
-	restartAhead   time.Duration
-	maxAhead       time.Duration
-	keepBehind     time.Duration
-	pollInterval   time.Duration
-	segmentURI     func(n int, container string) string
-	dashURLs       DASHURLs
-	manifestWait   time.Duration
-	onFailure      func(sessionID string, at time.Duration, err error)
-	onInputFailure func(sessionID, inputURL string, at time.Duration, err error)
-	onRunStart     func(inputURL string, from, to time.Duration)
-	onEncoder      func(sessionID string, started bool, excerpt string)
-	tracePlayback  bool
+	// segmentPadLimit bounds padding a slow segment (segment_padding.go).
+	segmentPadLimit time.Duration
+	stallTimeout    time.Duration
+	// httpWriteTimeout bounds one blocked progressive (protocol=http)
+	// socket write. A progressive client that has buffered ahead, or is
+	// paused with a full buffer, legitimately stops reading for far
+	// longer than the segment stall budget; killing its stream then
+	// reads as a clean EOF and the player enters post-play (#650). The
+	// bound therefore matches the paused-session retention Ether
+	// already promises, and only retires truly dead sockets.
+	httpWriteTimeout time.Duration
+	restartAhead     time.Duration
+	maxAhead         time.Duration
+	keepBehind       time.Duration
+	pollInterval     time.Duration
+	segmentURI       func(n int, container string) string
+	dashURLs         DASHURLs
+	manifestWait     time.Duration
+	onFailure        func(sessionID string, at time.Duration, err error)
+	onInputFailure   func(sessionID, inputURL string, at time.Duration, err error)
+	onRunStart       func(inputURL string, from, to time.Duration)
+	onEncoder        func(sessionID string, started bool, excerpt string)
+	onChange         func()
+	events           *events.Bus
+	openSubtitle     func(id, format, source string) (io.ReadCloser, string, error)
+	tracePlayback    bool
 	// rungDwell is how long a run keeps producing its rung before a
 	// request on another rung may replace it (see Session.rungDwellLocked).
 	rungDwell time.Duration
 	// audioMatchBudget bounds the best-effort loudness analysis before a
 	// source swap (see Session.prepareAudioMatch).
 	audioMatchBudget time.Duration
+	// copySamplePackets is the packet budget of the pre-publication copy
+	// sample (seek_ramp_index.go): a title it covers whole is indexed.
+	copySamplePackets int
 }
 
 func defaultOptions() options {
 	return options{
-		runner:         ExecRunner{},
-		detectHW:       true,
-		idleTimeout:    2 * time.Minute,
-		segmentTimeout: 45 * time.Second,
-		stallTimeout:   30 * time.Second,
-		restartAhead:   24 * time.Second,
-		maxAhead:       2 * time.Minute,
-		keepBehind:     3 * time.Minute,
-		pollInterval:   150 * time.Millisecond,
-		segmentURI:     SegmentName,
-		dashURLs:       PlexDASHURLs,
-		manifestWait:   15 * time.Second,
-		rungDwell:      8 * time.Second,
+		runner:            ExecRunner{},
+		detectHW:          true,
+		idleTimeout:       2 * time.Minute,
+		segmentTimeout:    45 * time.Second,
+		segmentPadLimit:   segmentPadMax,
+		copySamplePackets: copySamplePackets,
+		stallTimeout:      30 * time.Second,
+		httpWriteTimeout:  core.PausedSessionRetention,
+		restartAhead:      24 * time.Second,
+		maxAhead:          2 * time.Minute,
+		keepBehind:        3 * time.Minute,
+		pollInterval:      150 * time.Millisecond,
+		segmentURI:        SegmentName,
+		dashURLs:          PlexDASHURLs,
+		manifestWait:      15 * time.Second,
+		rungDwell:         8 * time.Second,
 
 		audioMatchBudget: defaultAudioMatchBudget,
 	}
@@ -86,6 +112,9 @@ func defaultOptions() options {
 // directory. No downloads occur while RTX Video is off. Embedded/test managers
 // that omit this option never install software.
 func WithRuntimeDir(dir string) Option { return func(o *options) { o.runtimeDir = dir } }
+
+// WithDecodeStore persists device decode capability results across restarts.
+func WithDecodeStore(db *sql.DB) Option { return func(o *options) { o.decodeDB = db } }
 
 // WithRunner replaces the process runner (tests).
 func WithRunner(r Runner) Option { return func(o *options) { o.runner = r } }
@@ -99,6 +128,10 @@ func WithIdleTimeout(d time.Duration) Option { return func(o *options) { o.idleT
 // WithSegmentTimeout bounds how long ServeSegment waits for ffmpeg
 // (default 45s).
 func WithSegmentTimeout(d time.Duration) Option { return func(o *options) { o.segmentTimeout = d } }
+
+// WithSegmentPadLimit bounds how long a slow segment's response is padded
+// before the request aborts (default segmentPadMax).
+func WithSegmentPadLimit(d time.Duration) Option { return func(o *options) { o.segmentPadLimit = d } }
 
 // WithStallTimeout sets the no-progress timeout for an actively requested
 // on-demand segment. Zero disables the watchdog.
@@ -127,8 +160,62 @@ func WithEncoderObserver(f func(sessionID string, started bool, excerpt string))
 // start/stop reasons. It does not change encoding or delivery.
 func WithTracePlayback(on bool) Option { return func(o *options) { o.tracePlayback = on } }
 
+// WithOnChange is notified when owner-visible transcoder capability state changes.
+func WithOnChange(f func()) Option { return func(o *options) { o.onChange = f } }
+
+// WithSubtitleOpener resolves ether-subtitle:<id> sidecars into session-local
+// files so burn-in and Matroska soft-subtitle muxing use aligned timing.
+func WithSubtitleOpener(f func(id, format, source string) (io.ReadCloser, string, error)) Option {
+	return func(o *options) { o.openSubtitle = f }
+}
+
+func (m *Manager) stageExternalSubtitles(dir string, info core.MediaInfo, source string) core.MediaInfo {
+	if m == nil || m.opts.openSubtitle == nil || dir == "" || len(info.Streams) == 0 {
+		return info
+	}
+	cloned := false
+	const maxStagedSubtitle = 32 << 20
+	for i := range info.Streams {
+		st := info.Streams[i]
+		if st.Type != "subtitle" || !st.External || !strings.HasPrefix(st.ExternalURL, "ether-subtitle:") {
+			continue
+		}
+		rc, actual, err := m.opts.openSubtitle(st.ExternalURL, "srt", source)
+		if err != nil || rc == nil {
+			if rc != nil {
+				_ = rc.Close()
+			}
+			continue
+		}
+		data, readErr := io.ReadAll(io.LimitReader(rc, maxStagedSubtitle+1))
+		_ = rc.Close()
+		if readErr != nil || len(data) == 0 || len(data) > maxStagedSubtitle {
+			continue
+		}
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			continue
+		}
+		ext := "srt"
+		if actual == "vtt" {
+			ext = "vtt"
+		}
+		target := filepath.Join(dir, fmt.Sprintf("sidecar-%d.%s", st.Index, ext))
+		if err := os.WriteFile(target, data, 0o600); err != nil {
+			continue
+		}
+		if !cloned {
+			info = core.CloneMediaInfo(info)
+			cloned = true
+		}
+		info.Streams[i].ExternalURL = target
+		info.Streams[i].Codec = ext
+	}
+	return info
+}
+
 // Manager runs ffmpeg for Ether. It implements core.Transcoder.
 type Manager struct {
+	textCueMu    sync.Mutex
 	slotChanged  chan struct{}
 	slotViewers  int
 	slotHolders  []*transcodeSlot
@@ -159,6 +246,7 @@ type Manager struct {
 	// Avoid immediately reusing a failed progressive hardware encoder on a
 	// client retry, including a retry that creates a new session.
 	httpHWFailedUntil atomic.Int64
+	activeTranscodes  atomic.Int32
 	feat              features
 	tempDir           string
 	// graphErr is the latest owner-visible reason a graph could not be built.
@@ -217,6 +305,7 @@ func New(cfg config.Transcode, logger *slog.Logger, opts ...Option) (*Manager, e
 	if m.feat, err = probeFeatures(ctx, m.runner, m.ffmpeg); err != nil {
 		return nil, err
 	}
+	// FFmpeg build identity: detects the patched segment-clock encoder, independent of client frontend.
 	m.feat.jellyfinSegmentClock = strings.Contains(strings.ToLower(m.version), "jellyfin")
 	if !m.feat.hasEncoder("libx264") {
 		m.log.Warn("ffmpeg has no libx264; CPU transcoding unavailable", "ffmpeg", m.ffmpeg)
@@ -242,6 +331,12 @@ func New(cfg config.Transcode, logger *slog.Logger, opts ...Option) (*Manager, e
 	if err := os.MkdirAll(m.tempDir, 0o755); err != nil {
 		return nil, fmt.Errorf("transcode: temp dir: %w", err)
 	}
+	decode := newDecodeProbeCache(m.runner, m.ffmpeg, m.ffprobe, m.tempDir, m.feat.encoders)
+	decode.db, decode.log = o.decodeDB, m.log
+	m.feat.decode = decode
+	qsvTM := newQSVToneMapCache(m.runner, m.ffmpeg, m.ffprobe, m.tempDir, m.feat.encoders)
+	qsvTM.db, qsvTM.log, qsvTM.onChange = o.decodeDB, m.log, o.onChange
+	m.feat.qsvToneMap = qsvTM
 	m.cleanStale()
 	m.log.Info("ffmpeg features", "ffmpeg", m.ffmpeg, "version", m.version,
 		"filters", featureLine(m.feat), "encoders", encoderLine(m.feat),
@@ -364,11 +459,12 @@ func (m *Manager) FFprobePath() string { return m.ffprobe }
 // Capability is the owner-visible transcoder health card: which colour and
 // tone-map paths were probed, plus the latest graph failure.
 type Capability struct {
-	Notice        string   `json:"notice,omitempty"`
-	PlaybackError string   `json:"playbackError,omitempty"`
-	FiltersProbed bool     `json:"filtersProbed"`
-	ToneMap       []string `json:"toneMap,omitempty"`
-	Colour        []string `json:"colour,omitempty"`
+	Notice          string   `json:"notice,omitempty"`
+	PlaybackError   string   `json:"playbackError,omitempty"`
+	FiltersProbed   bool     `json:"filtersProbed"`
+	HardwareToneMap *bool    `json:"hardwareToneMap,omitempty"`
+	ToneMap         []string `json:"toneMap,omitempty"`
+	Colour          []string `json:"colour,omitempty"`
 }
 
 // Capability reports probed filters and any owner-visible limitation.
@@ -379,12 +475,30 @@ func (m *Manager) Capability() Capability {
 	m.mu.Lock()
 	playback := m.graphErr
 	m.mu.Unlock()
+	var hwToneMap *bool
+	if m.hw.Name != "" && m.hw.Name != AccelNone {
+		avail := false
+		switch m.hw.Name {
+		case AccelVAAPI:
+			avail = !m.hw.NoGPUTonemap && m.feat.hasFilter("tonemap_vaapi")
+		case AccelVideoToolbox:
+			avail = m.feat.hasFilter("tonemap_videotoolbox") || m.feat.hasFilter("scale_vt")
+		case AccelNVENC:
+			avail = m.feat.hasFilter("tonemap_cuda")
+		case AccelQSV:
+			if !m.hw.NoGPUTonemap && m.feat.qsvToneMap != nil {
+				avail = m.feat.qsvToneMap.method(m.hw, m.feat, true) != qsvToneMapNone
+			}
+		}
+		hwToneMap = &avail
+	}
 	return Capability{
-		Notice:        m.limitation(),
-		PlaybackError: playback,
-		FiltersProbed: m.feat.filtersProbed,
-		ToneMap:       toneMapPaths(m.feat, m.hw),
-		Colour:        colourPaths(m.feat),
+		Notice:          m.limitation(),
+		PlaybackError:   playback,
+		FiltersProbed:   m.feat.filtersProbed,
+		HardwareToneMap: hwToneMap,
+		ToneMap:         toneMapPaths(m.feat, m.hw),
+		Colour:          colourPaths(m.feat),
 	}
 }
 
@@ -393,9 +507,13 @@ func (m *Manager) noteGraphError(err error) {
 		return
 	}
 	m.mu.Lock()
+	changed := m.graphErr != err.Error()
 	m.graphErr = err.Error()
 	m.mu.Unlock()
 	m.log.Warn("transcode graph unavailable", "err", err)
+	if changed && m.opts.onChange != nil {
+		m.opts.onChange()
+	}
 }
 
 func (m *Manager) limitation() string {
@@ -410,7 +528,7 @@ func (m *Manager) limitation() string {
 		}
 		parts = append(parts, detail)
 	}
-	if len(toneMapPaths(m.feat, m.hw)) == 0 {
+	if len(toneMapPaths(m.feat, m.hw)) == 0 && !qsvToneMapPendingCandidate(m.feat, m.hw) {
 		parts = append(parts, toneMapUnavailableMessage())
 	}
 	if !m.feat.hasFilter("zscale") && !m.feat.hasFilter("colorspace") {
@@ -454,6 +572,14 @@ func probeState(f features) string {
 		return f.probeDetail
 	}
 	return "filters unread"
+}
+
+// ToneMapsDolbyVisionProfile5 reports whether this ffmpeg can reshape a
+// Dolby Vision profile 5 (IPTPQc2) picture through its RPU and tone-map it
+// to SDR. Profile 5 has no HDR10 base, so without it a video conversion of
+// such a source is refused.
+func (m *Manager) ToneMapsDolbyVisionProfile5() bool {
+	return m != nil && m.feat.hasFilter("tonemapx")
 }
 
 // HWAccel implements core.Transcoder.
@@ -507,6 +633,17 @@ func (m *Manager) Policy() Policy {
 		HEVCEncoder:          hevcHW,
 		HEVCHardware:         hevcHW,
 	}
+}
+
+// VideoTranscodingOff reports whether video re-encoding is disabled for movies
+// and shows in the current configuration.
+func (m *Manager) VideoTranscodingOff() bool {
+	if m == nil {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.cfg.VideoTranscodingOff()
 }
 
 // Probe implements core.Transcoder.
@@ -566,7 +703,7 @@ func (m *Manager) StartHLS(ctx context.Context, req core.HLSRequest) (core.HLSSe
 	return m.startHLS(ctx, req, life)
 }
 
-func (m *Manager) startHLS(ctx context.Context, req core.HLSRequest, life *encoderLifetime) (result core.HLSSession, resultErr error) {
+func (m *Manager) startHLS(ctx context.Context, req core.HLSRequest, life *encoderLifetime, warmAt ...int) (result core.HLSSession, resultErr error) {
 	defer life.finishWork()
 	defer func() {
 		if result == nil {
@@ -632,11 +769,14 @@ func (m *Manager) startHLS(ctx context.Context, req core.HLSRequest, life *encod
 	v := req.Info.Video()
 	// Profile 5 has no HDR10 fallback. Refuse when this ffmpeg cannot reshape
 	// IPTPQc2 through the RPU, rather than delivering a green/purple encode.
-	if v != nil && v.DolbyVision && v.DolbyVisionProfile == 5 && !d.VideoCopy && !m.feat.hasFilter("tonemapx") {
+	if v != nil && v.DolbyVision && v.DolbyVisionProfile == 5 && !d.VideoCopy && !m.ToneMapsDolbyVisionProfile5() {
 		return nil, errors.New("transcode: DoVi (Profile 5) color space is not supported")
 	}
 	if v == nil {
 		d.VideoCopy = true // audio-only: nothing to encode
+	}
+	if !req.LiveInput && !d.VideoCopy && m.VideoTranscodingOff() {
+		return nil, ErrVideoTranscodingDisabled
 	}
 	if d.VideoCopy && v != nil && d.VideoCodec == "" {
 		d.VideoCodec = v.Codec
@@ -666,11 +806,17 @@ func (m *Manager) startHLS(ctx context.Context, req core.HLSRequest, life *encod
 		d.Container = segmentContainer(d.VideoCodec, d.AudioCodec)
 	}
 	m.mu.Lock()
+	videoOff := !req.LiveInput && m.cfg.VideoTranscodingOff()
 	rtxConfig, _ := normalizedRTX(m.cfg.RTXVideo)
 	adapt := adaptiveFromConfig(m.cfg)
 	if req.Ramp.Version != 0 {
 		adapt.FastStart = req.Ramp.Segments > 0
 		adapt.RampSegs, adapt.RampDur = req.Ramp.Segments, req.Ramp.Duration
+	}
+	if videoOff {
+		// Video transcoding is off for movies and shows: never start encoded
+		// fast-start ramps, governor clamps or lower-bitrate encode rungs.
+		adapt.FastStart, adapt.Governor, adapt.Ladder, adapt.LadderUnderCopy = false, false, false, false
 	}
 	if enhancementSelected(d) {
 		// Native VSR keeps a steady clock. Lower rungs use ordinary FFmpeg
@@ -679,6 +825,32 @@ func (m *Manager) startHLS(ctx context.Context, req core.HLSRequest, life *encod
 	}
 	atCap := m.cfg.MaxTranscodes > 0 && m.encodingLocked(req.SessionID) >= m.cfg.MaxTranscodes
 	m.mu.Unlock()
+	id := req.SessionID
+	if id == "" {
+		id = randomHex(12)
+	}
+
+	if req.InputLease != nil {
+		if err := life.installInput(req.InputLease); err != nil {
+			return nil, err
+		}
+	}
+	if err := m.claimEncoderID(ctx, id, life); err != nil {
+		return nil, err
+	}
+	healTimestamps := false
+	if !videoOff && !(req.LazyStart && req.QualityRungs) && !atCap && proto == core.ProtocolHLS && (d.Container == ContainerMPEGTS || d.Container == ContainerFMP4) {
+		if damaged, heal := m.copyDamage(ctx, req, d, life); damaged {
+			healTimestamps = heal
+			d.Kind, d.VideoCopy, d.VideoCodec = core.DecisionTranscode, false, "h264"
+			if heal {
+				d.Reason += "; sampled timestamp discontinuity; healing video clock"
+			} else {
+				d.Reason += "; sampled video corruption; encoding video"
+			}
+			m.log.Info("sampled video damage; encoding video", "session", req.SessionID, "healTimestamps", heal)
+		}
+	}
 	if atCap && d.VideoCopy {
 		// The encoder cap is reached. A copy session still plays, but
 		// plainly: no encoded fast-start ramp, no governor clamps and no
@@ -689,7 +861,40 @@ func (m *Manager) startHLS(ctx context.Context, req core.HLSRequest, life *encod
 	if ValidCopyTimeline(req) {
 		adapt.FastStart, adapt.Governor, adapt.Ladder = false, false, false
 	}
+	if req.QualityRungs && !videoOff {
+		adapt.Ladder, adapt.LadderUnderCopy = true, true
+	}
 	rungs := buildRungs(req.Info, d, adapt)
+	if req.QualityRungs && !videoOff {
+		rungs = rungs[:1]
+		for _, variant := range req.QualityVariants {
+			rungs = append(rungs, qualityRung(req.Info, variant))
+		}
+	}
+	if req.QualityRungs && !videoOff {
+		allowed := rungs[:1]
+		for _, rung := range rungs[1:] {
+			for _, id := range req.QualityRungIDs {
+				if rung.id == id {
+					allowed = append(allowed, rung)
+					break
+				}
+			}
+		}
+		rungs = allowed
+	}
+	if req.LadderVideoCodecs != nil {
+		allowed := rungs[:1]
+		for _, rung := range rungs[1:] {
+			for _, codec := range req.LadderVideoCodecs {
+				if rung.decision.VideoCodec == codec {
+					allowed = append(allowed, rung)
+					break
+				}
+			}
+		}
+		rungs = allowed
+	}
 	if proto == core.ProtocolHLS && d.Container == ContainerMatroska && len(rungs) > 1 {
 		// Plex's native player probes every rendition's initialization and
 		// early segments concurrently. These rungs share one encoder, so
@@ -704,6 +909,21 @@ func (m *Manager) startHLS(ctx context.Context, req core.HLSRequest, life *encod
 		rungs = rungs[:1]
 	}
 
+	if proto == core.ProtocolDASH {
+		// TV apps expect PMS's single video track. All other DASH clients may
+		// switch only within one codec family; copy HEVC + AVC is invalid.
+		if req.PMSDASH {
+			rungs = rungs[:1]
+		} else {
+			for _, rung := range rungs[1:] {
+				if dashCodecFamily(rung.codecs) != dashCodecFamily(rungs[0].codecs) {
+					rungs = rungs[:1]
+					break
+				}
+			}
+		}
+	}
+
 	segDur := req.SegmentDuration
 	if segDur <= 0 {
 		segDur = DefaultSegmentDuration
@@ -716,6 +936,9 @@ func (m *Manager) startHLS(ctx context.Context, req core.HLSRequest, life *encod
 				segDur = encodedDASHSegmentDuration
 			}
 		}
+	}
+	if proto == core.ProtocolDASH && req.PMSDASH {
+		segDur = DefaultDASHSegmentDuration
 	}
 	if req.Resume != nil {
 		n := req.Resume.FirstSegment
@@ -734,14 +957,44 @@ func (m *Manager) startHLS(ctx context.Context, req core.HLSRequest, life *encod
 		}
 	}
 
+	// Continuous clients rebase their first video presentation packet to zero.
+	// Resolve the true copy origin before authoring the playlist and audio cut.
+	copyOrigin := req.Continuous && req.Info.Duration > 0 && proto == core.ProtocolHLS && d.VideoCopy && v != nil && !req.LiveInput && len(slateData) == 0 && req.Resume == nil && !enhancementSelected(d)
+	copyOpeningEnd := time.Duration(0)
+	if copyOrigin {
+		scope, err := encoderScopeHeaders(req.InputLease, req.InputURL)
+		if err != nil {
+			return nil, err
+		}
+		measured, next, err := m.continuousCopyOrigin(ctx, runSpec{Input: req.InputURL, InputHeaders: inputHeaders, InputScopeHeaders: scope, Info: req.Info, Start: offset})
+		if err != nil {
+			// An inconclusive bounded probe must not prevent playback. Keep the
+			// requested clock and the ordinary demuxer/keyframe seek behavior;
+			// only a proven origin may enable the exact copy-origin seek path.
+			m.log.Debug("copy presentation origin unavailable; using requested start", "session", req.SessionID, "err", err)
+			copyOrigin = false
+		} else {
+			offset = measured
+			copyOpeningEnd = next
+		}
+	}
+
 	// HLS playlists start at the offset; a DASH MPD always spans the whole
 	// title and the first run starts at the offset's segment.
 	base, startSeg, total := offset, 0, 0
+	var opening []time.Duration
+	if req.Continuous && proto == core.ProtocolHLS && req.Resume == nil && req.Info.Duration > 0 && !req.LiveInput && v != nil && !enhancementSelected(d) {
+		if !d.VideoCopy {
+			opening = []time.Duration{500 * time.Millisecond, 500 * time.Millisecond, time.Second}
+		} else if copyOpeningEnd > base {
+			opening = []time.Duration{copyOpeningEnd - base}
+		}
+	}
 	if req.Resume != nil {
 		base = 0
 		startSeg = req.Resume.FirstSegment
 	}
-	tracks := 1
+	var tracks int
 	var reps []dashRep
 	var plan *Timeline
 	if proto == core.ProtocolDASH {
@@ -777,22 +1030,37 @@ func (m *Manager) startHLS(ctx context.Context, req core.HLSRequest, life *encod
 		// an explained Plex-visible difference vs a 4s remux. Pure copy
 		// remux (audio copies too) stays on 4s so long-GOP MKV does not
 		// restart ffmpeg and replay frames.
-		if req.SegmentDuration <= 0 {
+		if req.SegmentDuration <= 0 && !req.Continuous {
 			if short := remuxOpenSegment(adapt, d, v); short > 0 {
 				segDur = short
 			}
 		}
 		// Recovery reconstructs the original plan; segment numbers are not
 		// steady-grid offsets while FastStart is enabled.
-		fastStart := !req.LiveInput && adapt.FastStart && v != nil && (!d.VideoCopy || d.Container == ContainerMPEGTS)
+		//
+		// A TS copy's ramp is encoded, and the copy can only take over at a
+		// source keyframe: the ramp runs to the first indexed one at or
+		// after its nominal end. Without a keyframe index that handover
+		// is a guess. Copy cannot start mid-GOP, the keyframe before it is
+		// already inside the encoded ramp, so the copy resumed at the next
+		// keyframe: the media between was skipped (and A/V shifted against
+		// the playlist clock), or with no later keyframe the copy published
+		// nothing and the playlist's tail failed. An unindexed copy keeps one
+		// copy plan from its first segment instead, like fMP4 and Matroska.
+		if req.Continuous {
+			adapt.FastStart, adapt.Governor = false, false
+		}
+		fastStart := !req.LiveInput && adapt.FastStart && v != nil && (!d.VideoCopy || (d.Container == ContainerMPEGTS && len(req.Info.Keyframes) > 0))
 		plan = buildTimeline(span, segDur, timelineOptions{
-			steadyMode: steadyMode,
-			fastStart:  fastStart,
-			rampSegs:   adapt.RampSegs,
-			rampDur:    adapt.RampDur,
-			keyframes:  req.Info.Keyframes,
-			base:       base,
-			snap:       d.VideoCopy && len(req.Info.Keyframes) > 0,
+			steadyMode:      steadyMode,
+			opening:         opening,
+			fastStart:       fastStart,
+			rampSegs:        adapt.RampSegs,
+			rampDur:         adapt.RampDur,
+			keyframes:       req.Info.Keyframes,
+			base:            base,
+			snap:            d.VideoCopy && len(req.Info.Keyframes) > 0,
+			strictKeyframes: d.AndroidMatroskaHLS && d.Container == ContainerMatroska,
 		})
 		total = plan.Total()
 		tracks = len(rungs) // one segment track per rung
@@ -801,23 +1069,52 @@ func (m *Manager) startHLS(ctx context.Context, req core.HLSRequest, life *encod
 		return nil, errors.New("transcode: resume segment outside authored timeline")
 	}
 
-	id := req.SessionID
-	if id == "" {
-		id = randomHex(12)
-	}
-
-	if req.InputLease != nil {
-		if err := life.installInput(req.InputLease); err != nil {
+	// One bounded packet sample provides representative copy bandwidth
+	// and, for a seek, a proven encoded-ramp handover. It cannot establish
+	// the bitrate of future unseen scenes or change a published timeline.
+	if proto == core.ProtocolHLS && req.Resume == nil && req.Ramp.Version == 0 && !ValidCopyTimeline(req) && !req.LiveInput &&
+		d.VideoCopy && len(req.Info.Keyframes) == 0 && plan != nil {
+		sample := m.sampleCopyIndex(ctx, req, offset, life)
+		points := sample.points
+		nominal := time.Duration(adapt.RampSegs) * adapt.RampDur
+		// A TS copy's encoded ramp needs a sampled keyframe to hand over at
+		// (c6add9e4f): a complete sample of a title whose only keyframe
+		// opens it keeps one copy plan, exactly as when it went unsampled.
+		rampBoundary := d.Container == ContainerMPEGTS && adapt.FastStart && hasSampledRampBoundary(points, offset, nominal)
+		sampledRamp := offset > 0 && rampBoundary
+		if sample.complete || sampledRamp {
+			req.Info.Keyframes = points
+			plan = buildTimeline(plan.span, segDur, timelineOptions{steadyMode: ModeCopy, opening: opening,
+				fastStart: rampBoundary, rampSegs: adapt.RampSegs, rampDur: adapt.RampDur,
+				keyframes: points, base: base, snap: true, strictKeyframes: d.AndroidMatroskaHLS && d.Container == ContainerMatroska && sample.complete})
+			total = plan.Total()
+		}
+		if len(rungs) > 0 {
+			slot := segDur
+			for _, duration := range plan.durs {
+				if duration > 0 && duration < slot {
+					slot = duration
+				}
+			}
+			slot = max(slot, plan.TargetDuration()/2)
+			peak := sampledCopyPeakKbps(sample.peakPoints, slot)
+			if a := findStream(req.Info, d.AudioStream, "audio"); a != nil && !d.AudioCopy {
+				peak += max(0, decisionAudioKbps(req.Info, d)-copiedAudioKbps(a))
+			}
+			rungs[0].peakKbps = max(rungs[0].peakKbps, peak)
+		}
+		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-	}
-	if err := m.claimEncoderID(ctx, id, life); err != nil {
-		return nil, err
 	}
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
 		return nil, errors.New("transcode: manager closed")
+	}
+	if !req.LiveInput && !d.VideoCopy && m.cfg.VideoTranscodingOff() {
+		m.mu.Unlock()
+		return nil, ErrVideoTranscodingDisabled
 	}
 	if !d.VideoCopy && m.cfg.MaxTranscodes > 0 {
 		if m.encodingLocked("") >= m.cfg.MaxTranscodes {
@@ -844,7 +1141,19 @@ func (m *Manager) startHLS(ctx context.Context, req core.HLSRequest, life *encod
 		index := *req.SoftSubtitleStream
 		softSubtitleStream = &index
 	}
+	mediaGeneration := req.MediaGeneration
+	if mediaGeneration == "" {
+		mediaGeneration = randomHex(16)
+	}
+	if _, _, ok := splitMediaGeneration("g-" + mediaGeneration + "-segment"); !ok {
+		return nil, errors.New("transcode: invalid media generation")
+	}
 	s := &Session{
+		mediaGeneration:         mediaGeneration,
+		serialRungs:             req.QualityRungs,
+		copyOrigin:              copyOrigin,
+		androidMatroskaHLS:      d.AndroidMatroskaHLS,
+		healTimestamps:          healTimestamps,
 		encoder:                 life,
 		id:                      id,
 		m:                       m,
@@ -854,6 +1163,10 @@ func (m *Manager) startHLS(ctx context.Context, req core.HLSRequest, life *encod
 		total:                   total,
 		container:               d.Container,
 		proto:                   proto,
+		diagnosticsEnabled:      req.Diagnostics,
+		outputCodecs:            map[int]string{},
+		outputInit:              map[int]string{},
+		outputAudioChannels:     map[int]int{},
 		requireIndependentProof: req.RequireIndependentProof,
 		log:                     m.log.With("session", id, "initialRelease", req.ReleaseID),
 		created:                 time.Now(),
@@ -862,6 +1175,7 @@ func (m *Manager) startHLS(ctx context.Context, req core.HLSRequest, life *encod
 			rtxTimeline:        enhancementSelected(d),
 			rtxConfig:          rtxConfig,
 			liveInput:          req.LiveInput,
+			liveFromBacklog:    req.LiveInput && req.LiveFromBacklog,
 			loopInput:          len(slateData) > 0,
 			input:              req.InputURL,
 			inputHeaders:       inputHeaders,
@@ -890,6 +1204,11 @@ func (m *Manager) startHLS(ctx context.Context, req core.HLSRequest, life *encod
 			governorOn:  adapt.Governor && proto == core.ProtocolHLS && d.VideoCopy && v != nil,
 		},
 	}
+	s.textSubtitleStreams = append([]int(nil), req.TextSubtitleStreams...)
+	s.textSubtitleSource = req.TextSubtitleSource
+	if s.textSubtitleSource == "" {
+		s.textSubtitleSource = req.ReleaseID
+	}
 	if softSubtitleStream != nil {
 		s.softSubtitleInputIndex = *softSubtitleStream
 	}
@@ -899,6 +1218,8 @@ func (m *Manager) startHLS(ctx context.Context, req core.HLSRequest, life *encod
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("transcode: session dir: %w", err)
 	}
+	req.Info = m.stageExternalSubtitles(dir, req.Info, req.ReleaseID)
+	s.info = req.Info
 	if len(slateData) > 0 {
 		if err := os.WriteFile(req.InputURL, slateData, 0o600); err != nil {
 			os.RemoveAll(dir)
@@ -921,13 +1242,31 @@ func (m *Manager) startHLS(ctx context.Context, req core.HLSRequest, life *encod
 			manifestID = req.ManifestSessionID
 		}
 		s.dash = newDASHState(reps, m.opts.dashURLs, manifestID)
+		s.dash.pms = req.PMSDASH
+		if !req.LiveInput && req.ResumeHint > 0 && req.StartOffset == 0 && segDur > 0 && req.ResumeHint < s.info.Duration {
+			at := int(req.ResumeHint / segDur)
+			if at > startSeg && at < s.total {
+				startSeg = at
+				s.lastReq = startSeg
+			}
+		}
 	}
 	s.Touch()
 	s.log.Info("transcode session starting", "protocol", proto, "kind", d.Kind, "container", d.Container,
 		"offset", offset, "segment", startSeg, "segments", s.total, "reason", d.Reason)
 
+	if len(warmAt) > 0 {
+		startSeg = warmAt[0]
+		s.lastReq = startSeg
+		s.speculative = true
+	}
 	s.mu.Lock()
-	err := s.startRunForLocked(startSeg, false, "session start")
+	var err error
+	// A ladder has no selected rendition until the first media/init GET.
+	// Avoid encoding an expensive base only to discard it at that GET.
+	if !req.LazyStart && (len(rungs) <= 1 || len(warmAt) > 0) {
+		err = s.startRunForLocked(startSeg, false, "session start")
+	}
 	s.mu.Unlock()
 	if err != nil {
 		return nil, err
@@ -940,9 +1279,16 @@ func (m *Manager) startHLS(ctx context.Context, req core.HLSRequest, life *encod
 		life.mu.Unlock()
 		return nil, errors.New("transcode: manager closed or start canceled")
 	}
+	if prev := m.sessions[id]; prev != nil && !prev.decision.VideoCopy {
+		m.activeTranscodes.Add(-1)
+	}
 	m.sessions[id] = s
+	if !s.decision.VideoCopy {
+		m.activeTranscodes.Add(1)
+	}
 	m.mu.Unlock()
 	life.mu.Unlock()
+	s.startResumeWarm(ctx, req)
 	return s, nil
 }
 
@@ -990,6 +1336,9 @@ func (m *Manager) forget(s *Session) {
 	m.mu.Lock()
 	if m.sessions[s.id] == s {
 		delete(m.sessions, s.id)
+		if !s.decision.VideoCopy {
+			m.activeTranscodes.Add(-1)
+		}
 	}
 	m.mu.Unlock()
 }
@@ -1021,6 +1370,16 @@ func (m *Manager) reapIdle(now time.Time) {
 		return
 	}
 	for _, s := range m.Sessions() {
+		// An authenticated stop is terminal even if the dead player keeps
+		// fetching segments: those fetches touch LastAccess, so without
+		// this a stopped session (and its suspended ffmpeg) never reaps
+		// (#410). Close kills the process through its guardian, stopped
+		// or not.
+		if s.stoppedAt.Load() != 0 {
+			s.log.Info("closing stopped session")
+			_ = s.Close()
+			continue
+		}
 		if idle := now.Sub(s.LastAccess()); idle > m.opts.idleTimeout && now.UnixNano() >= s.pauseUntil.Load() {
 			s.log.Info("closing idle session", "idle", idle.Round(time.Second))
 			_ = s.Close()
@@ -1072,6 +1431,12 @@ func (m *Manager) Close() error {
 		setupDone = m.rtxSetup.done
 	}
 	m.mu.Unlock()
+	if cache, ok := m.feat.decode.(*decodeProbeCache); ok {
+		cache.close()
+	}
+	if cache, ok := m.feat.qsvToneMap.(*qsvToneMapCache); ok {
+		cache.close()
+	}
 	for _, h := range https {
 		_ = h.Close()
 	}
@@ -1232,4 +1597,10 @@ func (t *tailWriter) String() string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return string(t.buf)
+}
+
+// AudioFallbackAvailable requires the actual AAC encoder and fragmented MP4
+// segment muxers discovered at startup. Unknown inventory fails closed.
+func (m *Manager) AudioFallbackAvailable() bool {
+	return m.ffmpeg != "" && m.feat.encoders["aac"] && m.feat.muxers["hls"] && m.feat.muxers["mp4"]
 }

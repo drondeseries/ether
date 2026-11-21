@@ -24,6 +24,39 @@ Installers and the Docker image bundle `ffmpeg` and `ffprobe` from the
   and compatible. If you build Ether yourself you may equally point it
   at your system's ffmpeg (`transcode.ffmpegPath` in the config).
 
+## RapidYenc
+
+`internal/usenet` imports [mnightingale/rapidyenc](https://github.com/mnightingale/rapidyenc),
+pinned in `go.mod`/`go.sum` to commit `6657b7ca854e05728fa4a67f29ebc90ecd304428`
+(2026-10-08). Supported pure-Go SIMD builds use its public `NewDecoder` API
+behind Ether's bounded NNTP input adapter. Ether does not select upstream's C
+backend. CGO-enabled builds, Windows ARM64, unsupported targets/CPUs and
+explicit caller buffers use Ether's SWAR decoder. The RapidYenc response path
+requires `CGO_ENABLED=0 GOEXPERIMENT=simd` and has no C/C++ toolchain dependency.
+The dependency is MIT-licensed:
+
+MIT License
+
+Copyright (c) 2023 Michael Nightingale
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
 ## Go modules (direct dependencies)
 
 | Module | Used for | Licence |
@@ -35,6 +68,7 @@ Installers and the Docker image bundle `ffmpeg` and `ffprobe` from the
 | `github.com/jackc/pgx/v5` (+ `github.com/jackc/pgpassfile`, `github.com/jackc/pgservicefile`, `github.com/jackc/puddle/v2`) | Pure-Go PostgreSQL driver (database/sql adapter) for clustered mode, `internal/store` | MIT (© Jack Christensen) |
 | `github.com/kardianos/service` | OS service (systemd/launchd/Windows SCM), `internal/service` | Zlib-style (“as-is”, © Daniel Theophanes) |
 | `github.com/ulikunitz/xz` | 7z header LZMA decoding, `internal/archive` | BSD-3-Clause |
+| `github.com/mnightingale/rapidyenc` | Pure-Go SIMD Usenet yEnc article decoding, `internal/usenet` | MIT (© Michael Nightingale) |
 | `golang.org/x/crypto` (`argon2`) | Local password hashing, `internal/identity` | BSD-3-Clause |
 | `golang.org/x/text` | Legacy subtitle code pages, `internal/subtitles`; language names, `internal/collections` | BSD-3-Clause |
 | `golang.org/x/image` | Collection poster rendering (scaling, WebP decoding, OpenType text), `internal/artwork` | BSD-3-Clause |
@@ -125,16 +159,29 @@ including the obligation to offer source to users interacting with them
 over a network. Ether's complete source, including `web/`, is public at
 the repository above, which satisfies that offer.
 
-## AltMount (reference only)
+## AltMount
 
 Ether was designed with [AltMount](https://github.com/javi11/altmount)
 as a reference for Usenet-streaming concepts (provider pooling, NZB
-segment indexing). Ether's code is its own.
+segment indexing).
 
 > MIT License — Copyright (c) 2025 Javier Blanco
 
-No AltMount code is vendored; the stream engine's tests use AltMount's
-MIT-licensed WinRAR RAR5 fixture files (see below).
+Disc-image playback adapts AltMount code (contributed by its author); each
+adapted file keeps the copyright line above in a header comment:
+
+- `internal/iso/fs.go`, `bluray.go`, `mpls.go`, `volume.go` (and their
+  tests): ISO 9660/UDF reading and Blu-ray main-feature playlist selection,
+  from AltMount `internal/importer/archive/iso/`. Ether bounds the
+  filesystem walk and playlist reads against damaged or hostile images.
+- `internal/iso/disc.go`: multi-disc grouping by volume label, from AltMount
+  `internal/importer/archive/iso_expansion.go`.
+- `internal/stream/tsremux.go`: MPEG-TS timestamp rewriting for a
+  continuous Blu-ray main-feature timeline, from AltMount
+  `internal/nzbfilesystem/tsremux.go`.
+
+The stream engine's tests also use AltMount's MIT-licensed WinRAR RAR5
+fixture files (see below). The MIT License text follows those fixtures.
 
 ## Stream engine components
 
@@ -177,6 +224,21 @@ MIT License text:
 > SOFTWARE.
 
 ## Data and API attributions
+
+### Jellyfin Web
+
+Ether serves the official, **unmodified** Jellyfin Web client at `/web` on the
+Jellyfin port. Nothing is bundled: when Jellyfin is turned on, Ether downloads the pinned
+release artifact from `repo.jellyfin.org`
+(`jellyfin-web_12.4+deb13_all.deb`, version 12.4, verified by SHA-256) and
+extracts it under the data directory. Source:
+https://github.com/jellyfin/jellyfin-web/tree/v12.4. The package's own
+`COPYRIGHT` notice is served at `/web/COPYRIGHT`.
+
+Jellyfin Web is licensed under the GNU General Public License, version 2
+(GPL-2.0). Ether distributes it unmodified and dynamically; it is a separate
+program from Ether and its complete licence text travels with the downloaded
+package.
 
 - Metadata and artwork come from **TMDB**. This product uses the TMDB
   API but is not endorsed or certified by TMDB.
@@ -315,3 +377,42 @@ Archivo Black is also bundled under SIL Open Font License 1.1 for the Grunge 90
 family, with its complete licence in `internal/onair/fonts/data/archivoblack-OFL.txt`.
 It is subset with the same script and renamed EtherAir12, retaining its
 original licence metadata. Monoton is not bundled.
+
+## Research prototype font: Anton
+
+The standalone Top 10 raster experiment in `docs/research/top10-prototype`
+includes Anton, Copyright 2020 The Anton Project Authors, under the SIL Open
+Font License 1.1. Source: https://github.com/google/fonts/tree/main/ofl/anton.
+The full licence is [OFL.txt](docs/research/top10-prototype/OFL.txt).
+The ranked artwork compositor also bundles this font under `internal/overlays`,
+with the complete licence in `internal/overlays/anton-OFL.txt`.
+
+## RAR member decoder
+
+`third_party/rardecode` contains github.com/nwaples/rardecode/v2 v2.4.5,
+Copyright (c) 2015, Nicholas Waples, BSD-2-Clause. Ether adds PPMd and
+filter allocation bounds; see `third_party/rardecode/ETHER.md`.
+
+Copyright (c) 2015, Nicholas Waples
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+* Redistributions of source code must retain the above copyright notice, this
+  list of conditions and the following disclaimer.
+
+* Redistributions in binary form must reproduce the above copyright notice,
+  this list of conditions and the following disclaimer in the documentation
+  and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.

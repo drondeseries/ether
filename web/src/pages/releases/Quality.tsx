@@ -8,35 +8,23 @@ import {
   SearchSelect,
   SettingsSection,
   Switch,
-  Textarea,
   confirmDialog,
   toast,
 } from "@braedonsaunders/appkit-ui";
-import {
-  Check,
-  ChevronDown,
-  Download,
-  Film,
-  Plus,
-  RefreshCw,
-  SlidersHorizontal,
-  Trash2,
-  Tv,
-} from "lucide-react";
+import { Check, Download, Film, Plus, RefreshCw, SlidersHorizontal, Tv } from "lucide-react";
 import { useState } from "react";
-import { Link } from "react-router-dom";
-import { MoreOptions } from "../../components/ConfigSection";
+import { useAsync } from "../../lib/hooks";
+import { librariesApi } from "../libraries/api";
 import { ErrorPanel, LoadingRows } from "../../components/feedback";
-import { ChipGroup, ListInput, NumberInput, Segmented } from "../../components/fields";
-import { Section } from "../../components/layout";
+import { ChipGroup, NumberInput, Segmented } from "../../components/fields";
+import { Section, SubtabNav } from "../../components/layout";
 import { SaveBar, useDraft } from "../../components/SaveBar";
 import { SettingsRow } from "../../components/SettingsRow";
-import { DragHandle, SortableList, type DragHandleProps } from "../../components/Sortable";
-import { localized, t, tn, tx } from "../../i18n";
+import { localized, t, tn } from "../../i18n";
 import { searchSelectLabels } from "../../i18n/appkit-labels";
-import { api } from "../../lib/api";
-import { isPluginDescriptor, textOf } from "../../lib/extend";
+import { ApiError, api } from "../../lib/api";
 import { relativeTime } from "../../lib/format";
+import { itemName, resolutionGroups, withMediaFormats } from "../../lib/qualityRanking";
 import {
   MEDIA_MOVIE,
   MEDIA_TV,
@@ -46,79 +34,65 @@ import {
   mediaLabel,
   mediaTypeForApp,
   profileMediaType,
-  qualityGateLabel,
   releaseConsole,
   type ProfileMedia,
   type QualitySyncReport,
 } from "../../lib/releases";
-import type { CustomFormatDefinition, QualityProfile, ReleaseRule } from "../../lib/types";
+import type { CustomFormatDefinition, QualityProfile } from "../../lib/types";
 import { parseDuration } from "../settings/duration";
-import { QUALITY_AUDIO, QUALITY_CODECS, QUALITY_SOURCES } from "../settings/schema";
 import { SourceOrderSection } from "../sources/EqualQuality";
 import { RemoteBitrateSection } from "./RemoteBitrateSection";
 import { ConfigSection } from "../../components/ConfigSection";
 import { PLAY_VERSIONS } from "../settings/schema";
 import {
   BoolRow,
-  OrderButtons,
   RecordDrawer,
   RecordItem,
   TextRow,
   recordErrors,
-  swap,
   type Errors,
 } from "../sources/form";
+import { FilterRulesEditor, releaseRuleConflict, useRankingRegistry } from "./ReleasePreferences";
+import { CustomFormatsSection, LanguageSection, QualityOrderSection } from "./QualityRanking";
 import {
-  useRankingRegistry,
-  descriptorLabel,
-  descriptorOwnerName,
-  insertStepAtDefaultPosition,
-  PluginBadge,
-  FilterRulesEditor,
-  RuleEditorCard,
-  RulePreview,
-  insertPreferRuleInRanking,
-  normalizeRanking,
-  releaseRuleConflict,
-  syncRulesWithRanking,
-} from "./ReleasePreferences";
-import {
+  formatsJSON,
   mergeCustomFormats,
-  parseScoring,
+  parseFormats,
   sameFormats,
-  scoringText,
-  type ParsedScoring,
   type ResolverPolicy,
 } from "./resolverDraft";
 import { TrashImport } from "./TrashImport";
-import { useQuality, type Quality } from "./useQuality";
-
+import { settleQualityRules, useQuality, type Quality } from "./useQuality";
+/**
+ * A new profile starts as a copy of the media's first profile (its quality
+ * order and format scores), so it ranks like the owner's own until changed.
+ */
 function blankProfile(profiles: QualityProfile[], media: ProfileMedia): QualityProfile {
   const taken = (name: string) => profiles.some((p) => p.name === name && p.mediaType === media);
   let n = profiles.filter((p) => p.mediaType === media).length + 1;
   while (taken(t("Profile {n}", { n }))) n++;
+  const base = profiles.find((p) => p.mediaType === media && !p.import);
   return {
     name: t("Profile {n}", { n }),
     mediaType: media,
-    ranking: [],
     maxHeight: 1080,
     minHeight: 720,
     allowHdr: false,
     allowDolbyVision: false,
-    preferredSources: ["webdl", "bluray"],
-    preferredCodecs: ["h264", "hevc"],
-    preferredAudio: ["eac3", "ac3", "aac"],
+    qualityOrder: resolutionGroups(1080, 720),
+    customFormatScores: Object.fromEntries(
+      Object.entries(base?.customFormatScores ?? {}).filter(([id]) => !id.startsWith("rule:")),
+    ),
     minSizeMbPerMin: 5,
     maxSizeMbPerMin: 150,
     episodeMinSizeMbPerMin: 0,
     episodeMaxSizeMbPerMin: 0,
-    preferLargest: false,
     preferredLanguages: null,
     allowCam: false,
   };
 }
 
-const HEIGHTS = localized(() => [
+const RESOLUTIONS = localized(() => [
   { value: "0", label: t("Any") },
   { value: "480", label: "480p" },
   { value: "720", label: "720p" },
@@ -126,19 +100,24 @@ const HEIGHTS = localized(() => [
   { value: "2160", label: t("4K (2160p)") },
 ]);
 
-const heightLabel = (h: number) => HEIGHTS.find((x) => x.value === String(h))?.label ?? `${h}p`;
+const resolutionLabel = (h: number) =>
+  RESOLUTIONS.find((x) => x.value === String(h))?.label ?? `${h}p`;
 
 function profileSummary(p: QualityProfile) {
   const range =
     p.minHeight === p.maxHeight
-      ? heightLabel(p.maxHeight)
-      : t("{min} to {max}", { min: heightLabel(p.minHeight), max: heightLabel(p.maxHeight) });
+      ? resolutionLabel(p.maxHeight)
+      : t("{min} to {max}", {
+          min: resolutionLabel(p.minHeight),
+          max: resolutionLabel(p.maxHeight),
+        });
+  const first = p.qualityOrder?.[0];
+  const formats = Object.values(p.customFormatScores ?? {}).filter((v) => v !== 0).length;
   return [
     range,
     p.allowDolbyVision ? t("HDR and Dolby Vision") : p.allowHdr ? t("HDR allowed") : t("SDR only"),
-    p.preferredSources?.length
-      ? t("prefers {sources}", { sources: p.preferredSources.join(", ") })
-      : "",
+    first ? t("{quality} first", { quality: itemName(first) }) : "",
+    formats ? tn(formats, "{count} custom format", "{count} custom formats") : "",
   ]
     .filter(Boolean)
     .join(" · ");
@@ -147,7 +126,6 @@ function profileSummary(p: QualityProfile) {
 const MEDIA_OPTIONS = localized(() =>
   PROFILE_MEDIA.map((value) => ({ value, label: mediaLabel(value) })),
 );
-
 /** Movies / Shows badge for a profile (Movies & shows for a rule for every media). */
 export function MediaBadge({ media }: { media?: string }) {
   return <Badge variant={media ? "info" : "secondary"}>{mediaLabel(media)}</Badge>;
@@ -285,6 +263,22 @@ function withRenamedProfile(
 }
 
 /**
+ * The server names a refused profile by its position in the list sent. Name
+ * the profile instead, so a change blocked by another profile (removing one
+ * while two others clash) says which one to fix.
+ */
+function withProfileNames(e: unknown, sent: QualityProfile[]): unknown {
+  if (!(e instanceof ApiError) || !e.fields?.length) return e;
+  const fields = e.fields.map((f) => {
+    const at = /^quality\.profiles\[(\d+)\]/.exec(f.field);
+    const p = at ? sent[Number(at[1])] : undefined;
+    if (!p) return f;
+    return { ...f, field: t("{name} ({media})", { name: p.name, media: mediaLabel(p.mediaType) }) };
+  });
+  return new ApiError(e.status, e.code, e.message, fields);
+}
+
+/**
  * Keep every stored default pointing at a profile that serves its media. An
  * At home default that outlives its profile falls back to the media's first
  * profile; an Away default falls back to the At home one.
@@ -303,597 +297,12 @@ function settleDefaults(next: Quality): Quality {
       next[home] = mediaFallback(profiles, media);
     }
   }
+  if (profiles.length > 0) {
+    if (next.default && !profiles.some((p) => p.name === next.default)) next.default = "";
+    if (next.remote && !profiles.some((p) => p.name === next.remote)) next.remote = "";
+    if (next.rules) next.rules = settleQualityRules(next).rules;
+  }
   return next;
-}
-
-/** Ordered multi-pick: chips toggle membership; the order picked is the preference order. */
-function PreferenceList({
-  label,
-  all,
-  value,
-  onChange,
-}: {
-  label: string;
-  all: string[];
-  value: string[] | null;
-  onChange: (v: string[]) => void;
-}) {
-  const v = value ?? [];
-  return (
-    <div className="space-y-1.5">
-      <ChipGroup
-        ariaLabel={label}
-        size="sm"
-        value={v}
-        onChange={(next) =>
-          onChange(next.filter((x) => v.includes(x)).concat(next.filter((x) => !v.includes(x))))
-        }
-        options={[...all, ...v.filter((x) => !all.includes(x))].map((x) => ({
-          value: x,
-          label: x,
-        }))}
-      />
-      <p className="text-xs text-fg-muted">
-        {v.length ? t("Preference: {order}", { order: v.join(" › ") }) : t("No preference")}
-      </p>
-    </div>
-  );
-}
-
-/** Anchor of the profile drawer's custom scoring section. */
-const CUSTOM_SCORES_ID = "profile-custom-scores";
-
-function hasImportedRules(draft: QualityProfile, resolver: ResolverPolicy | null): boolean {
-  const gates = draft.allowedQualities ?? [];
-  const ownScores = Object.keys(draft.customFormatScores ?? {}).length;
-  const sharedFormats = (resolver?.customFormats ?? []).length;
-  const sharedScores = Object.keys(resolver?.customFormatScores ?? {}).length;
-  return (
-    gates.length > 0 ||
-    draft.minCustomFormatScore != null ||
-    ownScores > 0 ||
-    sharedFormats > 0 ||
-    sharedScores > 0
-  );
-}
-
-/** Section 4: shown only when the profile carries imported TRaSH / Radarr / Sonarr rules or custom formats. */
-function ImportedSection({
-  draft,
-  resolver,
-  scoring,
-  setScoring,
-  patch,
-  revealed,
-}: {
-  draft: QualityProfile;
-  resolver: ResolverPolicy | null;
-  scoring: { formats: string; scores: string } | null;
-  setScoring: React.Dispatch<React.SetStateAction<{ formats: string; scores: string } | null>>;
-  patch: (p: Partial<QualityProfile>) => void;
-  /** The Custom score step's "Edit scores" asked for the scoring editor. */
-  revealed: boolean;
-}) {
-  const imported = hasImportedRules(draft, resolver);
-  if (!imported && !revealed) return null;
-  const gates = draft.allowedQualities ?? [];
-  const scored = Object.keys(draft.customFormatScores ?? {}).length;
-  return (
-    <SettingsSection
-      title={imported ? t("Imported profile") : t("Custom scores")}
-      description={
-        imported
-          ? t("Carried over from a guide or Starr profile.")
-          : t("Give custom formats points. Higher totals rank first at the Custom score step.")
-      }
-    >
-      {gates.length ? (
-        <SettingsRow
-          stacked
-          title={t("Allowed qualities")}
-          description={t(
-            "Other release type and resolution pairs are never played with this profile.",
-          )}
-        >
-          <span className="flex flex-wrap items-center gap-1.5">
-            {gates.map((q) => (
-              <Badge key={q} variant="outline">
-                {qualityGateLabel(q)}
-              </Badge>
-            ))}
-            <Button variant="ghost" size="sm" onClick={() => patch({ allowedQualities: null })}>
-              {t("Allow all")}
-            </Button>
-          </span>
-        </SettingsRow>
-      ) : null}
-      <SettingsRow
-        title={t("Minimum format score")}
-        description={
-          scored
-            ? tn(
-                scored,
-                "Releases whose custom formats score lower aren't played. This profile sets its own scores for {count} format.",
-                "Releases whose custom formats score lower aren't played. This profile sets its own scores for {count} formats.",
-              )
-            : t("Releases whose custom formats score lower aren't played.")
-        }
-        control={
-          <NumberInput
-            aria-label={t("Minimum format score")}
-            value={draft.minCustomFormatScore ?? 0}
-            className="w-24"
-            onChange={(n) => patch({ minCustomFormatScore: n })}
-          />
-        }
-      />
-      <MoreOptions label={t("More options: Custom scoring")} reveal={revealed}>
-        <div className="space-y-4 py-3">
-          <p className="px-4 text-sm text-fg-muted">
-            {tx("Scores are whole numbers, for example {example}.", {
-              example: <code>{'{ "x265-hd": -500 }'}</code>,
-            })}
-          </p>
-          <label className="block space-y-2 px-4 text-sm font-medium text-fg">
-            {t("Custom format definitions")}
-            <Textarea
-              className="min-h-40 w-full font-mono text-xs"
-              spellCheck={false}
-              value={scoring?.formats ?? "[]"}
-              onChange={(e) =>
-                setScoring((s) =>
-                  s ? { ...s, formats: e.target.value } : { formats: e.target.value, scores: "{}" },
-                )
-              }
-            />
-          </label>
-          <label className="block space-y-2 px-4 pb-2 text-sm font-medium text-fg">
-            {t("Score overrides for this profile")}
-            <Textarea
-              className="min-h-28 w-full font-mono text-xs"
-              spellCheck={false}
-              value={scoring?.scores ?? "{}"}
-              onChange={(e) =>
-                setScoring((s) =>
-                  s ? { ...s, scores: e.target.value } : { formats: "[]", scores: e.target.value },
-                )
-              }
-            />
-          </label>
-          <p className="px-4 pb-2 text-sm">
-            <Link to="/quality/history" className="text-primary underline">
-              {t("Inspect release scores and rejection reasons")}
-            </Link>
-          </p>
-        </div>
-      </MoreOptions>
-    </SettingsSection>
-  );
-}
-
-/** Section 2: ONE numbered, draggable list representing the profile's ranking ladder. */
-function WhatMattersMostSection({
-  draft,
-  patch,
-  rankingError,
-  hasScores,
-  onEditScores,
-}: {
-  draft: QualityProfile;
-  patch: (p: Partial<QualityProfile>) => void;
-  rankingError?: string;
-  /** The profile or the shared custom formats carry scores. */
-  hasScores: boolean;
-  /** Shows and scrolls to the profile's custom scoring editor. */
-  onEditScores: () => void;
-}) {
-  const { steps, fields } = useRankingRegistry();
-  const [expanded, setExpanded] = useState<string | null>(null);
-  const ladder = normalizeRanking(draft, steps);
-  const rules = draft.releaseRules ?? [];
-
-  function updateRanking(nextRanking: string[]) {
-    patch({
-      ranking: nextRanking,
-      releaseRules: syncRulesWithRanking(rules, nextRanking),
-    });
-  }
-
-  function updatePreferRule(id: string, rulePatch: Partial<ReleaseRule>) {
-    const nextRules = rules.map((r) => (r.id === id ? { ...r, ...rulePatch } : r));
-    let nextRanking = ladder;
-    if (rulePatch.action === "require" || rulePatch.action === "avoid") {
-      nextRanking = ladder.filter((s) => s !== `rule:${id}`);
-    } else if (rulePatch.action === "prefer" && !ladder.includes(`rule:${id}`)) {
-      nextRanking = insertPreferRuleInRanking(ladder, id);
-    }
-    patch({
-      ranking: nextRanking,
-      releaseRules: syncRulesWithRanking(nextRules, nextRanking),
-    });
-  }
-
-  function removePreferRule(id: string) {
-    const nextRules = rules.filter((r) => r.id !== id);
-    const nextRanking = ladder.filter((s) => s !== `rule:${id}`);
-    patch({
-      ranking: nextRanking,
-      releaseRules: nextRules,
-    });
-  }
-
-  const [stepToAdd, setStepToAdd] = useState("");
-  const isPluginStep = (step: string) => {
-    const desc = steps.find((d) => d.id === step);
-    return desc ? isPluginDescriptor(desc) : step.startsWith("plugin:");
-  };
-  const addable = steps.filter((d) => isPluginDescriptor(d) && !ladder.includes(d.id));
-  const chosen = addable.some((d) => d.id === stepToAdd) ? stepToAdd : (addable[0]?.id ?? "");
-
-  /** A ranking step a plugin contributes: its badge, its own editor, removal. */
-  function renderPluginStep(step: string, handle: DragHandleProps, index: number) {
-    const desc = steps.find((d) => d.id === step);
-    const meta = desc?.meta;
-    const title = desc ? textOf(desc.label) || step : step;
-    const editor = typeof meta?.editor === "object" ? meta.editor : null;
-    const editorKind =
-      editor?.kind ?? editor?.editor ?? (typeof meta?.editor === "string" ? meta.editor : "none");
-    const choices = (
-      editor?.options ??
-      editor?.choices ??
-      meta?.options ??
-      meta?.choices ??
-      []
-    ).map((o) =>
-      typeof o === "string"
-        ? { value: o, label: o }
-        : { value: o.value, label: textOf(o.label) || o.value },
-    );
-    const config = draft.rankingConfig?.[step] ?? {};
-    const setConfig = (next: Record<string, unknown>) =>
-      patch({ rankingConfig: { ...draft.rankingConfig, [step]: next } });
-    const expandable = ["ordered_list", "choice", "range", "toggle"].includes(editorKind);
-    const isExpanded = expanded === step;
-    const num = (v: unknown) => (typeof v === "number" ? v : 0);
-    return (
-      <div data-ranking-step={step} className="space-y-3 px-3 py-3">
-        <div className="flex items-center gap-2">
-          <DragHandle handle={handle} label={t("Move {name}", { name: title })} />
-          <span className="w-5 text-xs tabular-nums text-fg-muted">{index + 1}</span>
-          <div className="min-w-0 flex-1">
-            <p className="flex flex-wrap items-center gap-2 text-sm font-medium text-fg">
-              {title}
-              {desc ? <PluginBadge owner={descriptorOwnerName(desc)} /> : null}
-            </p>
-            {desc ? null : (
-              <p className="truncate text-xs text-fg-muted">
-                {t("This plugin is off or removed. The step is skipped.")}
-              </p>
-            )}
-          </div>
-          {expandable && desc ? (
-            <Button
-              variant="ghost"
-              size="sm"
-              aria-expanded={isExpanded}
-              aria-label={t("Configure {name}", { name: title })}
-              onClick={() => setExpanded(isExpanded ? null : step)}
-            >
-              {t("Values")}
-              <ChevronDown size={13} />
-            </Button>
-          ) : null}
-          <OrderButtons
-            label={title}
-            i={index}
-            n={ladder.length}
-            onMove={(d) => updateRanking(swap(ladder, index, index + d))}
-          />
-          <Button
-            variant="ghost"
-            size="icon"
-            aria-label={t("Remove step")}
-            onClick={() => updateRanking(ladder.filter((s) => s !== step))}
-          >
-            <Trash2 size={14} />
-          </Button>
-        </div>
-        {isExpanded && desc ? (
-          <div className="space-y-3 border-t border-border pt-3">
-            {editorKind === "toggle" ? (
-              <label className="flex items-center gap-2 text-sm">
-                <Switch
-                  aria-label={title}
-                  checked={config.value === true}
-                  onChange={(e) => setConfig({ value: e.currentTarget.checked })}
-                />
-                {t("Enabled")}
-              </label>
-            ) : null}
-            {editorKind === "choice" ? (
-              <SearchSelect
-                {...searchSelectLabels()}
-                ariaLabel={title}
-                value={typeof config.value === "string" ? config.value : ""}
-                options={choices}
-                onChange={(value) => setConfig({ value })}
-              />
-            ) : null}
-            {editorKind === "ordered_list" ? (
-              <PreferenceList
-                label={title}
-                all={choices.map((c) => c.value)}
-                value={
-                  Array.isArray(config.value)
-                    ? config.value.filter((v): v is string => typeof v === "string")
-                    : []
-                }
-                onChange={(value) => setConfig({ value })}
-              />
-            ) : null}
-            {editorKind === "range" ? (
-              <div className="grid grid-cols-2 gap-3">
-                <label className="space-y-1 text-sm">
-                  {t("Minimum")}
-                  <NumberInput
-                    aria-label={t("Minimum")}
-                    value={num(config.min)}
-                    onChange={(min) => setConfig({ min, max: Math.max(min, num(config.max)) })}
-                  />
-                </label>
-                <label className="space-y-1 text-sm">
-                  {t("Maximum")}
-                  <NumberInput
-                    aria-label={t("Maximum")}
-                    value={num(config.max)}
-                    onChange={(max) => setConfig({ min: Math.min(max, num(config.min)), max })}
-                  />
-                </label>
-              </div>
-            ) : null}
-          </div>
-        ) : null}
-      </div>
-    );
-  }
-
-  function renderBuiltinStep(step: string, handle: DragHandleProps, index: number) {
-    const fixed = step === "connection" || step === "verified";
-    const stepMeta: Record<string, { title: string; summary: string; expandable?: boolean }> = {
-      language: {
-        title: t("Audio language"),
-        summary: draft.preferredLanguages?.length
-          ? draft.preferredLanguages.join(" › ")
-          : t("Any language"),
-        expandable: true,
-      },
-      connection: {
-        title: t("Connection fit"),
-        summary: t("Fits the viewer's bandwidth"),
-      },
-      resolution: {
-        title: t("Resolution"),
-        summary:
-          draft.minHeight === draft.maxHeight
-            ? heightLabel(draft.maxHeight)
-            : t("{min} to {max}, highest first", {
-                min: heightLabel(draft.minHeight),
-                max: heightLabel(draft.maxHeight),
-              }),
-      },
-      releaseType: {
-        title: t("Release type"),
-        summary: draft.preferredSources?.length
-          ? draft.preferredSources.join(" › ")
-          : t("No preference"),
-        expandable: true,
-      },
-      hdr: {
-        title: t("HDR"),
-        summary: draft.allowDolbyVision
-          ? t("Dolby Vision › HDR10 › SDR")
-          : draft.allowHdr
-            ? t("HDR10 › SDR")
-            : t("SDR only"),
-      },
-      customScore: {
-        title: t("Custom score"),
-        summary: hasScores
-          ? t("Higher total score first, including your custom format scores")
-          : t("Higher total score first. No custom format scores yet."),
-      },
-      verified: {
-        title: t("Played fine recently"),
-        summary: t("Verified streams rank ahead of untested ones"),
-      },
-      videoCodec: {
-        title: t("Video codec"),
-        summary: draft.preferredCodecs?.length
-          ? draft.preferredCodecs.join(" › ")
-          : t("No preference"),
-        expandable: true,
-      },
-      audioFormat: {
-        title: t("Audio format"),
-        summary: draft.preferredAudio?.length
-          ? draft.preferredAudio.join(" › ")
-          : t("No preference"),
-        expandable: true,
-      },
-      size: {
-        title: t("Larger file"),
-        summary: draft.preferLargest
-          ? t("Ranks larger files higher within the allowed size range")
-          : t("Off"),
-      },
-    };
-    const meta = stepMeta[step] ?? { title: step, summary: "" };
-    const isExpanded = expanded === step;
-
-    return (
-      <div
-        data-ranking-step={step}
-        className={`space-y-3 px-3 py-3 ${fixed ? "bg-bg-subtle/40 opacity-70" : ""}`}
-      >
-        <div className="flex items-center gap-2">
-          {fixed ? (
-            <span className="size-8 shrink-0" aria-hidden />
-          ) : (
-            <DragHandle handle={handle} label={t("Move {name}", { name: meta.title })} />
-          )}
-          <span className="w-5 text-xs tabular-nums text-fg-muted">{index + 1}</span>
-          <div className="min-w-0 flex-1">
-            <p className="text-sm font-medium text-fg">{meta.title}</p>
-            <p className="truncate text-xs text-fg-muted">{meta.summary}</p>
-          </div>
-          {fixed ? <Badge variant="secondary">{t("Automatic")}</Badge> : null}
-          {step === "customScore" ? (
-            <Button variant="ghost" size="sm" onClick={onEditScores}>
-              {t("Edit scores")}
-            </Button>
-          ) : null}
-          {step === "size" ? (
-            <Switch
-              aria-label={t("Larger file")}
-              checked={draft.preferLargest ?? false}
-              onChange={(e) => patch({ preferLargest: e.currentTarget.checked })}
-            />
-          ) : null}
-          {meta.expandable ? (
-            <Button
-              variant="ghost"
-              size="sm"
-              aria-expanded={isExpanded}
-              aria-label={t("Configure {name}", { name: meta.title })}
-              onClick={() => setExpanded(isExpanded ? null : step)}
-            >
-              {t("Values")}
-              <ChevronDown size={13} />
-            </Button>
-          ) : null}
-          {!fixed ? (
-            <OrderButtons
-              label={meta.title}
-              i={index}
-              n={ladder.length}
-              onMove={(d) => updateRanking(swap(ladder, index, index + d))}
-            />
-          ) : null}
-        </div>
-        {isExpanded && step === "language" ? (
-          <div className="space-y-1.5 border-t border-border pt-3">
-            <ListInput
-              ariaLabel={t("Languages")}
-              value={draft.preferredLanguages}
-              onChange={(v) => patch({ preferredLanguages: v.length ? v.map(String) : null })}
-              placeholder="en, fr"
-            />
-            <p className="text-xs text-fg-muted">
-              {t("ISO codes in preference order. Empty accepts any.")}
-            </p>
-          </div>
-        ) : null}
-        {isExpanded && step === "releaseType" ? (
-          <div className="border-t border-border pt-3">
-            <PreferenceList
-              label={t("Release type")}
-              all={QUALITY_SOURCES}
-              value={draft.preferredSources}
-              onChange={(v) => patch({ preferredSources: v })}
-            />
-          </div>
-        ) : null}
-        {isExpanded && step === "videoCodec" ? (
-          <div className="border-t border-border pt-3">
-            <PreferenceList
-              label={t("Video codec")}
-              all={QUALITY_CODECS}
-              value={draft.preferredCodecs}
-              onChange={(v) => patch({ preferredCodecs: v })}
-            />
-          </div>
-        ) : null}
-        {isExpanded && step === "audioFormat" ? (
-          <div className="border-t border-border pt-3">
-            <PreferenceList
-              label={t("Audio format")}
-              all={QUALITY_AUDIO}
-              value={draft.preferredAudio}
-              onChange={(v) => patch({ preferredAudio: v })}
-            />
-          </div>
-        ) : null}
-      </div>
-    );
-  }
-
-  return (
-    <SettingsSection
-      title={t("What matters most")}
-      description={t("Checked from top to bottom. Drag or use the arrows to change the order.")}
-    >
-      <div className="space-y-3 px-5 py-4">
-        {rankingError ? (
-          <p role="alert" className="text-sm text-danger">
-            {rankingError}
-          </p>
-        ) : null}
-        <SortableList
-          items={ladder}
-          getId={(step) => step}
-          onReorder={(next) => updateRanking(next)}
-          className="divide-y divide-border overflow-hidden rounded-lg border border-border"
-          renderItem={(step, handle, index) => {
-            if (step.startsWith("rule:")) {
-              const id = step.slice(5);
-              const r = rules.find((x) => x.id === id);
-              if (!r) return null;
-              return (
-                <div data-ranking-step={step}>
-                  <RuleEditorCard
-                    rule={r}
-                    fields={fields}
-                    handle={handle}
-                    stepNumber={index + 1}
-                    canMoveUp={index > 0}
-                    canMoveDown={index < ladder.length - 1}
-                    onMove={(d) => updateRanking(swap(ladder, index, index + d))}
-                    onChange={(rulePatch) => updatePreferRule(r.id, rulePatch)}
-                    onRemove={() => removePreferRule(r.id)}
-                  />
-                </div>
-              );
-            }
-            return isPluginStep(step)
-              ? renderPluginStep(step, handle, index)
-              : renderBuiltinStep(step, handle, index);
-          }}
-        />
-        {addable.length > 0 ? (
-          <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-            <div className="min-w-0 sm:flex-1">
-              <SearchSelect
-                {...searchSelectLabels()}
-                ariaLabel={t("Step to add")}
-                value={chosen}
-                options={addable.map((d) => ({ value: d.id, label: descriptorLabel(d) }))}
-                onChange={setStepToAdd}
-              />
-            </div>
-            <Button
-              size="sm"
-              disabled={!chosen}
-              onClick={() => updateRanking(insertStepAtDefaultPosition(ladder, steps, chosen))}
-            >
-              <Plus size={14} />
-              {t("Add a step")}
-            </Button>
-          </div>
-        ) : null}
-      </div>
-      <RulePreview profile={draft} />
-    </SettingsSection>
-  );
 }
 
 const SYNC_INTERVALS = localized(() => [
@@ -910,7 +319,7 @@ function syncHours(raw: string | undefined): string {
   const { amount, unit } = parseDuration(raw);
   const n = Number(amount);
   if (!Number.isFinite(n)) return "24";
-  const hours = unit === "d" ? n * 24 : unit === "h" ? n : n / 60;
+  const hours = unit === "d" ? n * 24 : unit === "h" ? n : unit === "m" ? n / 60 : n / 3600;
   return hours > 0 ? String(hours) : "24";
 }
 
@@ -1069,7 +478,7 @@ export function QualityTab() {
   if (!quality) return <LoadingRows rows={4} />;
   return (
     <>
-      <div className="space-y-5 rounded-xl border border-primary/30 bg-primary/5 p-5">
+      <div className="space-y-5 rounded-xl border border-border p-5">
         <ProfileList
           quality={quality}
           resolver={config.data?.resolver ?? null}
@@ -1102,6 +511,7 @@ export function QualityTab() {
 }
 
 type Commit = (next: Quality, message: string) => Promise<void>;
+type ProfileDrawerTab = "tiers" | "limits" | "scoring";
 
 function ProfileList({
   quality,
@@ -1118,7 +528,8 @@ function ProfileList({
   media: ProfileMedia;
   onMediaChange: (media: ProfileMedia) => void;
 }) {
-  const { steps, fields } = useRankingRegistry();
+  const { fields } = useRankingRegistry();
+  const libraries = useAsync((signal) => librariesApi.list(signal), []);
   const profiles = quality.profiles ?? [];
   const visible = profiles
     .map((profile, index) => ({ profile, index }))
@@ -1132,8 +543,8 @@ function ProfileList({
     home: false,
     away: false,
   });
-  const [scoring, setScoring] = useState<{ formats: string; scores: string } | null>(null);
-  const [scoringShown, setScoringShown] = useState(false);
+  /** The shared custom format definitions editor (JSON). */
+  const [formatsText, setFormatsText] = useState("[]");
   /** The definitions editor text when the drawer opened; unchanged means no PUT. */
   const [formatBaseline, setFormatBaseline] = useState("");
   /** The shared definitions as they were when the drawer opened (for merging). */
@@ -1141,12 +552,13 @@ function ProfileList({
   const [errors, setErrors] = useState<Errors>({});
   const [error, setError] = useState<unknown>(null);
   const [saving, setSaving] = useState(false);
+  const [drawerTab, setDrawerTab] = useState<ProfileDrawerTab>("tiers");
 
   const open = (index: number, draft: QualityProfile) => {
     setErrors({});
     setError(null);
+    setDrawerTab("tiers");
     const cloned = structuredClone(draft);
-    cloned.ranking = normalizeRanking(cloned, steps);
     setEditing({ index, draft: cloned });
     const isExisting = index < profiles.length;
     const scope = (profileMediaType(cloned) || media) as ProfileMedia;
@@ -1157,43 +569,29 @@ function ProfileList({
         : !profiles.some((p) => p.mediaType === scope),
       away: isExisting && mediaDefault(quality, scope, true) === cloned.name,
     });
-    const text = scoringText(resolver, draft);
-    setScoring(text);
-    setFormatBaseline(text.formats);
-    setScoringShown(false);
+    const text = formatsJSON(resolver);
+    setFormatsText(text);
+    setFormatBaseline(text);
     setFormatSnapshot(structuredClone(resolver?.customFormats ?? []));
   };
-
-  function editScores() {
-    setScoringShown(true);
-    // The section renders on this state change; scroll once it exists.
-    requestAnimationFrame(() =>
-      document
-        .getElementById(CUSTOM_SCORES_ID)
-        ?.scrollIntoView({ behavior: "smooth", block: "start" }),
-    );
-  }
 
   async function save() {
     if (!editing) return;
     const { index, draft: profileDraft } = editing;
-    let draft: QualityProfile = {
-      ...profileDraft,
-      ranking: normalizeRanking(profileDraft, steps),
-    };
-    let parsed: ParsedScoring | null = null;
-    if (scoring && (scoringShown || hasImportedRules(profileDraft, resolver))) {
+    let draft: QualityProfile = { ...profileDraft };
+    let parsed: CustomFormatDefinition[] | null = null;
+    if (formatsText !== formatBaseline) {
       try {
-        parsed = parseScoring(scoring.formats, scoring.scores);
+        parsed = parseFormats(formatsText);
       } catch (e) {
         setError(e);
+        setDrawerTab("scoring");
         return;
       }
-      draft = { ...draft, customFormatScores: parsed.customFormatScores };
     }
     const old = profiles[index];
     const scope = (profileMediaType(draft) || media) as ProfileMedia;
-    draft = { ...draft, mediaType: scope };
+    draft = withMediaFormats({ ...draft, mediaType: scope });
     const list =
       index < profiles.length
         ? profiles.map((p, j) => (j === index ? draft : p))
@@ -1243,6 +641,7 @@ function ProfileList({
     const conflict = releaseRuleConflict(draft.releaseRules ?? [], fields);
     if (conflict) {
       setErrors({ releaseRules: conflict });
+      setDrawerTab("limits");
       return;
     }
     setSaving(true);
@@ -1252,13 +651,12 @@ function ProfileList({
       await commit(next, index < profiles.length ? t("Profile saved") : t("Profile added"));
       // Only touch the shared definitions when this drawer actually edited
       // them; otherwise a stale snapshot must not be sent back.
-      const formatsChanged = scoring !== null && scoring.formats !== formatBaseline;
-      if (parsed && formatsChanged) {
+      if (parsed) {
         const latestConfig = await api.getConfig();
         const latest = latestConfig.resolver.customFormats ?? [];
         const merged = mergeCustomFormats({
           original: formatSnapshot,
-          edited: parsed.customFormats,
+          edited: parsed,
           latest,
           app: appForMedia(scope),
         });
@@ -1268,10 +666,23 @@ function ProfileList({
         }
       }
       setEditing(null);
-      setScoring(null);
     } catch (e) {
-      setError(e);
-      setErrors(recordErrors(e, `quality.profiles[${index}].`));
+      const nextErrors = recordErrors(e, `quality.profiles[${index}].`);
+      setError(withProfileNames(e, list));
+      setErrors(nextErrors);
+      if (nextErrors.name) {
+        setDrawerTab("tiers");
+      } else if (
+        nextErrors.minHeight ||
+        nextErrors.maxHeight ||
+        nextErrors.minSizeMbPerMin ||
+        nextErrors.maxSizeMbPerMin ||
+        nextErrors.episodeMinSizeMbPerMin ||
+        nextErrors.episodeMaxSizeMbPerMin ||
+        nextErrors.releaseRules
+      ) {
+        setDrawerTab("limits");
+      }
     } finally {
       setSaving(false);
     }
@@ -1337,7 +748,7 @@ function ProfileList({
       await commit(next, t("Profile removed"));
       setEditing(null);
     } catch (e) {
-      setError(e);
+      setError(withProfileNames(e, rest));
     } finally {
       setSaving(false);
     }
@@ -1422,7 +833,9 @@ function ProfileList({
         ) : (
           <ul className="divide-y divide-border">
             {visible.map(({ profile: p, index: i }) => {
-              const usedBy = rules.filter((r) => r.profile === p.name).length;
+              const usedBy = rules.filter(
+                (r) => r.profile === p.name && (!r.mediaType || r.mediaType === p.mediaType),
+              ).length;
               return (
                 <RecordItem
                   key={`${p.name}-${i}`}
@@ -1431,6 +844,18 @@ function ProfileList({
                   meta={
                     <>
                       <MediaBadge media={profileMediaType(p)} />
+                      {(libraries.data ?? [])
+                        .filter(
+                          (lib) =>
+                            lib.source !== "plugin" &&
+                            lib.qualityProfile === p.name &&
+                            (lib.mediaType === "show" ? "tv" : "movie") === p.mediaType,
+                        )
+                        .map((lib) => (
+                          <Badge key={lib.id} variant="secondary">
+                            {t("Libraries")}: {lib.name}
+                          </Badge>
+                        ))}
                       {homeDefault === p.name ? (
                         <Badge variant="info">{t("Default at home")}</Badge>
                       ) : null}
@@ -1465,6 +890,22 @@ function ProfileList({
         onClose={() => !saving && setEditing(null)}
         title={isNew ? t("New profile") : draft?.name || t("Profile")}
         description={t("How releases are filtered and ranked for apps using this profile.")}
+        subtabs={
+          draft ? (
+            <div className="[&>div]:mb-0">
+              <SubtabNav
+                ariaLabel={t("Profile sections")}
+                active={drawerTab}
+                onSelect={(k) => setDrawerTab(k as ProfileDrawerTab)}
+                tabs={[
+                  { key: "tiers", label: t("Tiers") },
+                  { key: "limits", label: t("Limits") },
+                  { key: "scoring", label: t("Scoring") },
+                ]}
+              />
+            </div>
+          ) : undefined
+        }
         onSave={() => void save()}
         saving={saving}
         saveLabel={t("Save profile")}
@@ -1474,113 +915,120 @@ function ProfileList({
         error={error}
       >
         {draft ? (
-          <>
-            {isNew ? (
-              <Button
-                variant="outline"
-                onClick={() => {
-                  setEditing(null);
-                  setImporting(true);
-                }}
-              >
-                <Download size={16} />
-                {t("Import a preset quality profile")}
-              </Button>
-            ) : null}
-            <SettingsSection title={t("Profile")}>
-              <TextRow
-                label={t("Name")}
-                value={draft.name}
-                error={errors.name}
-                onChange={(v) => patch({ name: v })}
-              />
-              <SettingsRow
-                title={t("Applies to")}
-                description={
-                  draft.import
-                    ? t("Set by the {app} profile it was imported from.", {
-                        app: draft.import.app === "sonarr" ? "Sonarr" : "Radarr",
-                      })
-                    : t("Movies or shows: a profile ranks releases for one of them.")
-                }
-                control={
-                  draft.import || isNew ? (
-                    <span className="flex flex-wrap items-center gap-1.5">
-                      <Badge variant="secondary">
-                        {mediaLabel(
-                          draft.mediaType ||
-                            mediaTypeForApp(draft.import?.app === "sonarr" ? "sonarr" : "radarr"),
-                        )}
-                      </Badge>
-                      {draft.import ? (
-                        <Badge variant="outline">
-                          {draft.import.source === "dictionarry"
-                            ? "Profilarr (Dictionarry)"
-                            : "TRaSH Guides"}
-                        </Badge>
-                      ) : null}
-                    </span>
-                  ) : (
-                    <Segmented
-                      ariaLabel={t("Applies to")}
-                      size="sm"
-                      value={profileMediaType(draft) as ProfileMedia}
-                      options={MEDIA_OPTIONS}
-                      onChange={changeApplies}
-                    />
-                  )
-                }
-              />
-              <SettingsRow
-                title={t("Default for")}
-                description={t(
-                  "Used when no device rule matches for {media}. With no profile for Away, people away from home get the At home profile.",
-                  { media: mediaLabel(draftScope || media) },
-                )}
-                control={
-                  <ChipGroup
-                    ariaLabel={t("Default for")}
-                    size="sm"
-                    options={[
-                      { value: "home", label: t("At home") },
-                      { value: "away", label: t("Away") },
-                    ]}
-                    value={[
-                      ...(defaultFor.home ? ["home" as const] : []),
-                      ...(defaultFor.away ? ["away" as const] : []),
-                    ]}
-                    onChange={(next) =>
-                      setDefaultFor({
-                        home: next.includes("home"),
-                        away: next.includes("away"),
-                      })
+          drawerTab === "tiers" ? (
+            <>
+              <SettingsSection title={t("Profile")}>
+                {isNew ? (
+                  <SettingsRow
+                    title={t("Start from a preset")}
+                    description={t(
+                      "Copy quality order and format scores from TRaSH Guides or Profilarr.",
+                    )}
+                    control={
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() => {
+                          setEditing(null);
+                          setImporting(true);
+                        }}
+                      >
+                        <Download size={14} />
+                        {t("Import a preset quality profile")}
+                      </Button>
                     }
                   />
-                }
-              />
-            </SettingsSection>
+                ) : null}
+                <TextRow
+                  label={t("Name")}
+                  value={draft.name}
+                  error={errors.name}
+                  onChange={(v) => patch({ name: v })}
+                />
+                <SettingsRow
+                  title={t("Applies to")}
+                  description={
+                    draft.import
+                      ? t("Set by the {app} profile it was imported from.", {
+                          app: draft.import.app === "sonarr" ? "Sonarr" : "Radarr",
+                        })
+                      : t("Movies or shows: a profile ranks releases for one of them.")
+                  }
+                  control={
+                    draft.import || isNew ? (
+                      <span className="flex flex-wrap items-center gap-1.5">
+                        <Badge variant="secondary">
+                          {mediaLabel(
+                            draft.mediaType ||
+                              mediaTypeForApp(draft.import?.app === "sonarr" ? "sonarr" : "radarr"),
+                          )}
+                        </Badge>
+                        {draft.import ? (
+                          <Badge variant="outline">
+                            {draft.import.source === "dictionarry"
+                              ? "Profilarr (Dictionarry)"
+                              : "TRaSH Guides"}
+                          </Badge>
+                        ) : null}
+                      </span>
+                    ) : (
+                      <Segmented
+                        ariaLabel={t("Applies to")}
+                        size="sm"
+                        value={profileMediaType(draft) as ProfileMedia}
+                        options={MEDIA_OPTIONS}
+                        onChange={changeApplies}
+                      />
+                    )
+                  }
+                />
+                <SettingsRow
+                  title={t("Default for")}
+                  description={t(
+                    "Used when no device rule matches for {media}. With no profile for Away, people away from home get the At home profile.",
+                    { media: mediaLabel(draftScope || media) },
+                  )}
+                  control={
+                    <ChipGroup
+                      ariaLabel={t("Default for")}
+                      size="sm"
+                      options={[
+                        { value: "home", label: t("At home") },
+                        { value: "away", label: t("Away") },
+                      ]}
+                      value={[
+                        ...(defaultFor.home ? ["home" as const] : []),
+                        ...(defaultFor.away ? ["away" as const] : []),
+                      ]}
+                      onChange={(next) =>
+                        setDefaultFor({
+                          home: next.includes("home"),
+                          away: next.includes("away"),
+                        })
+                      }
+                    />
+                  }
+                />
+              </SettingsSection>
 
+              <QualityOrderSection draft={draft} patch={patch} />
+
+              <LanguageSection draft={draft} patch={patch} />
+            </>
+          ) : drawerTab === "limits" ? (
             <SettingsSection
               title={t("Never play")}
-              description={
-                draft.fallbackBelowMin
-                  ? t(
-                      "When no release meets this profile, allow lower resolutions, including qualities excluded by an imported profile. Other limits still apply.",
-                    )
-                  : t("Releases outside these limits are skipped.")
-              }
+              description={t(
+                "Maximum limits and blocked releases always apply. Minimum resolution is a preference.",
+              )}
             >
               <SettingsRow
                 title={t("Resolution")}
                 description={
                   errors.minHeight || errors.maxHeight ? (
                     <span className="text-danger">{errors.minHeight || errors.maxHeight}</span>
-                  ) : draft.fallbackBelowMin ? (
-                    t(
-                      "When no release meets this profile, allow lower resolutions, including qualities excluded by an imported profile. Other limits still apply.",
-                    )
                   ) : (
-                    t("Lowest and highest acceptable.")
+                    t("Lowest preferred and highest allowed resolution.")
                   )
                 }
                 control={
@@ -1590,7 +1038,7 @@ function ProfileList({
                         {...searchSelectLabels()}
                         value={String(draft.minHeight)}
                         onChange={(v) => patch({ minHeight: Number(v) })}
-                        options={HEIGHTS}
+                        options={RESOLUTIONS}
                         ariaLabel={t("Minimum resolution")}
                         searchable={false}
                       />
@@ -1601,7 +1049,7 @@ function ProfileList({
                         {...searchSelectLabels()}
                         value={String(draft.maxHeight)}
                         onChange={(v) => patch({ maxHeight: Number(v) })}
-                        options={HEIGHTS}
+                        options={RESOLUTIONS}
                         ariaLabel={t("Maximum resolution")}
                         searchable={false}
                       />
@@ -1609,20 +1057,13 @@ function ProfileList({
                   </span>
                 }
               />
-              <SettingsRow
-                title={t("Fall back below minimum resolution")}
-                description={t(
-                  "When no release meets this profile, allow lower resolutions, including qualities excluded by an imported profile. Other limits still apply.",
-                )}
-                control={
-                  <Switch
-                    aria-label={t("Fall back below minimum resolution")}
-                    checked={draft.fallbackBelowMin ?? false}
-                    onChange={(e) => patch({ fallbackBelowMin: e.currentTarget.checked })}
-                  />
+              <div
+                className={
+                  (draftScope || media) === MEDIA_TV
+                    ? "grid gap-6 px-5 py-4 sm:grid-cols-2"
+                    : "px-5 py-4"
                 }
-              />
-              <div className="grid gap-6 border-t border-border px-4 py-3 sm:grid-cols-2">
+              >
                 <fieldset className="min-w-0 space-y-2">
                   <legend className="text-sm font-medium text-fg">{t("Movies")}</legend>
                   {errors.minSizeMbPerMin || errors.maxSizeMbPerMin ? (
@@ -1653,36 +1094,38 @@ function ProfileList({
                     <span className="text-sm text-fg-muted">MB</span>
                   </span>
                 </fieldset>
-                <fieldset className="min-w-0 space-y-2">
-                  <legend className="text-sm font-medium text-fg">{t("TV episodes")}</legend>
-                  {errors.episodeMinSizeMbPerMin || errors.episodeMaxSizeMbPerMin ? (
-                    <p className="text-xs text-danger">
-                      {errors.episodeMinSizeMbPerMin || errors.episodeMaxSizeMbPerMin}
-                    </p>
-                  ) : (
-                    <p className="text-xs text-fg-muted">
-                      {t("Optional override for TV episodes. 0 uses the movie limits.")}
-                    </p>
-                  )}
-                  <span className="flex flex-wrap items-center gap-2">
-                    <NumberInput
-                      aria-label={t("Episode minimum MB per minute")}
-                      value={draft.episodeMinSizeMbPerMin ?? 0}
-                      min={0}
-                      className="w-20"
-                      onChange={(n) => patch({ episodeMinSizeMbPerMin: n })}
-                    />
-                    <span className="text-sm text-fg-muted">{t("to")}</span>
-                    <NumberInput
-                      aria-label={t("Episode maximum MB per minute")}
-                      value={draft.episodeMaxSizeMbPerMin ?? 0}
-                      min={0}
-                      className="w-20"
-                      onChange={(n) => patch({ episodeMaxSizeMbPerMin: n })}
-                    />
-                    <span className="text-sm text-fg-muted">MB</span>
-                  </span>
-                </fieldset>
+                {(draftScope || media) === MEDIA_TV ? (
+                  <fieldset className="min-w-0 space-y-2">
+                    <legend className="text-sm font-medium text-fg">{t("TV episodes")}</legend>
+                    {errors.episodeMinSizeMbPerMin || errors.episodeMaxSizeMbPerMin ? (
+                      <p className="text-xs text-danger">
+                        {errors.episodeMinSizeMbPerMin || errors.episodeMaxSizeMbPerMin}
+                      </p>
+                    ) : (
+                      <p className="text-xs text-fg-muted">
+                        {t("Optional override for TV episodes. 0 uses the movie limits.")}
+                      </p>
+                    )}
+                    <span className="flex flex-wrap items-center gap-2">
+                      <NumberInput
+                        aria-label={t("Episode minimum MB per minute")}
+                        value={draft.episodeMinSizeMbPerMin ?? 0}
+                        min={0}
+                        className="w-20"
+                        onChange={(n) => patch({ episodeMinSizeMbPerMin: n })}
+                      />
+                      <span className="text-sm text-fg-muted">{t("to")}</span>
+                      <NumberInput
+                        aria-label={t("Episode maximum MB per minute")}
+                        value={draft.episodeMaxSizeMbPerMin ?? 0}
+                        min={0}
+                        className="w-20"
+                        onChange={(n) => patch({ episodeMaxSizeMbPerMin: n })}
+                      />
+                      <span className="text-sm text-fg-muted">MB</span>
+                    </span>
+                  </fieldset>
+                ) : null}
               </div>
               <BoolRow
                 label={t("Allow HDR")}
@@ -1706,29 +1149,16 @@ function ProfileList({
                 error={errors.releaseRules}
               />
             </SettingsSection>
-
-            <WhatMattersMostSection
+          ) : (
+            <CustomFormatsSection
               draft={draft}
               patch={patch}
-              rankingError={errors.ranking}
-              hasScores={
-                Object.keys(draft.customFormatScores ?? {}).length > 0 ||
-                (resolver?.customFormats ?? []).length > 0
-              }
-              onEditScores={editScores}
+              resolver={resolver}
+              formatsText={formatsText}
+              onFormatsText={setFormatsText}
+              revealed={false}
             />
-
-            <div id={CUSTOM_SCORES_ID} className="scroll-mt-4">
-              <ImportedSection
-                draft={draft}
-                resolver={resolver}
-                scoring={scoring}
-                setScoring={setScoring}
-                patch={patch}
-                revealed={scoringShown}
-              />
-            </div>
-          </>
+          )
         ) : null}
       </RecordDrawer>
     </>

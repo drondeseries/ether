@@ -9,6 +9,7 @@ import (
 	"github.com/braedonsaunders/ether/internal/nodewire"
 	"github.com/braedonsaunders/ether/internal/remotetranscode"
 	"sync"
+	"time"
 )
 
 // PrepareRequest contains authenticated frontend choices, never provider paths.
@@ -26,6 +27,9 @@ type PreparedSource struct {
 	Owner                       nodewire.Identity
 	PlayID, Revision, ReleaseID string
 	Info                        core.MediaInfo
+	HealthVerified              bool
+	ReleaseProtocol             string
+	RequiresRemux               bool
 }
 type preparation struct {
 	operations       int
@@ -45,6 +49,7 @@ type preparation struct {
 	life             core.SourceRetirement
 	finished         bool
 	running          bool
+	forgetAt         time.Time // forgetTerminal grace deadline
 }
 
 func (r *Runtime) PrepareSource(ctx context.Context, owner nodewire.Identity, q PrepareRequest) (PreparedSource, error) {
@@ -69,6 +74,15 @@ func (r *Runtime) prepare(ctx context.Context, peer nodewire.Identity, q *Prepar
 	}
 	r.mu.Lock()
 	previous := r.preparations[key]
+	if previous == nil {
+		// A forgotten preparation stays sealed through its durable receipt.
+		r.mu.Unlock()
+		if r.preparationSealed(ctx, peer, q.Operation) {
+			return sourceResponse{}, ErrDenied
+		}
+		r.mu.Lock()
+		previous = r.preparations[key]
+	}
 	if previous != nil {
 		if previous.peer != peer || previous.hash != hash || previous.retiring {
 			r.mu.Unlock()
@@ -115,13 +129,13 @@ func (r *Runtime) prepare(ctx context.Context, peer nodewire.Identity, q *Prepar
 	// The native Manager can deduplicate this source identity across controllers.
 	// Operations alias that lifetime; retirement waits for every alias to seal.
 	for _, other := range r.preparations {
-		if !other.receipt && !other.retiring && samePreparationIdentity(other.request, *q) {
+		if !other.receipt && !other.retiring && r.samePreparationIdentity(other.request, *q) {
 			r.mu.Unlock()
 			return r.sharePreparation(ctx, peer, *q, key, hash, other)
 		}
 	}
 	for _, other := range r.preparations {
-		if !other.receipt && samePreparationIdentity(other.request, *q) {
+		if !other.receipt && r.samePreparationIdentity(other.request, *q) {
 			r.mu.Unlock()
 			return sourceResponse{}, ErrPending
 		}
@@ -147,6 +161,7 @@ func (r *Runtime) prepare(ctx context.Context, peer nodewire.Identity, q *Prepar
 	var capturedSize int64
 	if ps != nil {
 		captured = PreparedSource{Owner: r.o.Self, PlayID: ps.ID, Revision: core.SourceRevision(ps), ReleaseID: ps.SourceReleaseID(), Info: core.CloneMediaInfo(ps.Info)}
+		captured.captureDecisionInputs(ps)
 		if ps.Source != nil {
 			capturedSize = ps.Source.Size()
 		}
@@ -188,6 +203,7 @@ func (r *Runtime) prepare(ctx context.Context, peer nodewire.Identity, q *Prepar
 		return sourceResponse{}, e
 	}
 	result := PreparedSource{Owner: r.o.Self, PlayID: ps.ID, Revision: revision, ReleaseID: ps.SourceReleaseID(), Info: core.CloneMediaInfo(ps.Info)}
+	result.captureDecisionInputs(ps)
 	encoded, e := json.Marshal(sourceResponse{Prepared: result})
 	if e != nil || len(encoded) > remotetranscode.MaxMessage {
 		return sourceResponse{}, ErrDenied
@@ -203,9 +219,9 @@ func (r *Runtime) prepare(ctx context.Context, peer nodewire.Identity, q *Prepar
 	return sourceResponse{Prepared: result}, nil
 }
 
-func samePreparationIdentity(a, b PrepareRequest) bool {
+func (r *Runtime) samePreparationIdentity(a, b PrepareRequest) bool {
 	surface := func(value string) string {
-		if value == "plex" {
+		if r.policy(core.Protocol(value)).ExternalAdmission {
 			return ""
 		}
 		return value
@@ -230,6 +246,14 @@ func (r *Runtime) retirePreparation(ctx context.Context, peer nodewire.Identity,
 	key := peer.NodeID + "/" + peer.Boot + "/" + q.Operation
 	r.mu.Lock()
 	entry := r.preparations[key]
+	if entry == nil {
+		r.mu.Unlock()
+		if r.preparationSealed(ctx, peer, q.Operation) {
+			return sourceResponse{Retired: true, Phase: "retired"}, nil // forgotten after its durable receipt
+		}
+		r.mu.Lock()
+		entry = r.preparations[key]
+	}
 	if entry == nil {
 		// An authenticated retirement seals the operation before a delayed Prepare
 		// can start. Absence alone is never returned as proof without this barrier.
@@ -313,6 +337,9 @@ func (r *Runtime) preparationStatus(ctx context.Context, peer nodewire.Identity,
 	entry := r.preparations[key]
 	if entry == nil || entry.peer != peer {
 		r.mu.Unlock()
+		if entry == nil && r.preparationSealed(ctx, peer, operation) {
+			return sourceResponse{Retired: true, Phase: "retired"}, nil // forgotten after its durable receipt
+		}
 		return sourceResponse{Phase: "unknown"}, nil
 	}
 	running, life, retiring, finished, result := entry.running || entry.operations != 0, entry.life, entry.retiring, entry.finished, entry.result
@@ -338,4 +365,13 @@ func (r *Runtime) preparationStatus(ctx context.Context, peer nodewire.Identity,
 		return sourceResponse{Phase: "owned-error"}, nil
 	}
 	return sourceResponse{Phase: "ready", Prepared: result}, nil
+}
+
+// Preserve the source facts used by the shared playback decision policy.
+func (p *PreparedSource) captureDecisionInputs(ps *core.PlaySession) {
+	p.RequiresRemux = ps.RequiresRemux
+	if ps.Resolution != nil {
+		p.HealthVerified = ps.Resolution.HealthVerified
+		p.ReleaseProtocol = ps.Resolution.Release.Protocol
+	}
 }

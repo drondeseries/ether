@@ -30,6 +30,7 @@ import (
 const (
 	// skipWarnInterval throttles the skipped-streams warning per add-on.
 	skipWarnInterval = time.Hour
+	maxAddonResults  = 250
 )
 
 // Backend returns the search backend of an add-on indexer row
@@ -119,44 +120,94 @@ func (b *addonBackend) Search(ctx context.Context, req core.SearchRequest, reser
 	}
 	b.s.mu.RLock()
 	anime := b.s.anime
+	specials := b.s.specials
 	b.s.mu.RUnlock()
-	look, ok := stremio.LookupStreams(ctx, streamManifest(rec.Manifest), req, anime)
-	if !ok {
+	looks := stremio.LookupStreamList(ctx, streamManifest(rec.Manifest), req, anime, specials)
+	if len(looks) == 0 {
 		return nil, nil
 	}
-	if err := reserve(ctx, "hit"); err != nil {
-		return nil, err
-	}
-	if err := b.s.spendSearch(ctx, rec); err != nil {
-		return nil, err
-	}
-	call := plugins.Request{Method: http.MethodGet, Path: look.Route()}
-	if rec.Manifest.Ether != nil {
-		// Ether source plugins may read search hints; third-party add-ons
-		// get exactly the Stremio request.
-		call.Query = searchHints(req)
-	}
-	resp, err := mgr.Call(ctx, rec.ID, call)
-	if err != nil {
-		b.s.noteFailure(rec.ID)
-		return nil, err
-	}
-	if resp.Status < 200 || resp.Status > 299 {
-		b.s.noteFailure(rec.ID)
-		he := &stremio.HTTPError{Status: resp.Status, RetryAfter: header(resp.Headers, "Retry-After")}
-		if he.RateLimited() {
-			return nil, &newznab.RateLimitError{RetryAfter: he.RetryAfter, Err: he}
+	var merged []core.Release
+	seen := map[string]bool{}
+	var totalNoHash, totalAmbiguous int
+	var firstErr error
+	succeeded := 0
+	for _, look := range looks {
+		if len(merged) >= maxAddonResults {
+			break
 		}
-		return nil, he
+		if err := reserve(ctx, "hit"); err != nil {
+			if succeeded > 0 {
+				break
+			}
+			return nil, err
+		}
+		if err := b.s.spendSearch(ctx, rec); err != nil {
+			if succeeded > 0 {
+				break
+			}
+			return nil, err
+		}
+		call := plugins.Request{Method: http.MethodGet, Path: look.Route()}
+		if rec.Manifest.Ether != nil {
+			// Ether source plugins may read search hints; third-party add-ons
+			// get exactly the Stremio request.
+			call.Query = searchHintsForLookup(req, look)
+		}
+		resp, err := mgr.Call(ctx, rec.ID, call)
+		if err != nil {
+			if ctx.Err() != nil {
+				b.s.noteFailure(rec.ID)
+				return nil, err
+			}
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if resp.Status < 200 || resp.Status > 299 {
+			he := &stremio.HTTPError{Status: resp.Status, RetryAfter: header(resp.Headers, "Retry-After")}
+			if he.RateLimited() {
+				if succeeded > 0 {
+					break
+				}
+				b.s.noteFailure(rec.ID)
+				return nil, &newznab.RateLimitError{RetryAfter: he.RetryAfter, Err: he}
+			}
+			if firstErr == nil {
+				firstErr = he
+			}
+			continue
+		}
+		var answer struct {
+			Streams []stremio.Stream `json:"streams"`
+		}
+		if err := json.Unmarshal(resp.Body, &answer); err != nil {
+			if firstErr == nil {
+				firstErr = errors.New("the add-on answered with invalid stream JSON")
+			}
+			continue
+		}
+		succeeded++
+		rels, noHash, ambiguous := b.convert(ctx, rec, req, look, answer.Streams)
+		totalNoHash += noHash
+		totalAmbiguous += ambiguous
+		for _, rel := range rels {
+			if seen[rel.GUID] {
+				continue
+			}
+			seen[rel.GUID] = true
+			merged = append(merged, rel)
+			if len(merged) >= maxAddonResults {
+				break
+			}
+		}
 	}
-	var answer struct {
-		Streams []stremio.Stream `json:"streams"`
-	}
-	if err := json.Unmarshal(resp.Body, &answer); err != nil {
+	if succeeded == 0 && firstErr != nil {
 		b.s.noteFailure(rec.ID)
-		return nil, errors.New("the add-on answered with invalid stream JSON")
+		return nil, firstErr
 	}
-	return b.convert(ctx, rec, req, look, answer.Streams), nil
+	b.logSkipped(totalNoHash, totalAmbiguous)
+	return merged, nil
 }
 
 // etherStream is the optional `ether` block of a stream an Ether source
@@ -173,7 +224,7 @@ type etherStream struct {
 // convert turns an answer into releases in the add-on's order. Ordinary
 // streams go through stremio.Convert; an Ether plugin's lazy and local-file
 // streams become direct releases opened at play time.
-func (b *addonBackend) convert(ctx context.Context, rec plugins.Record, req core.SearchRequest, look stremio.Lookup, streams []stremio.Stream) []core.Release {
+func (b *addonBackend) convert(ctx context.Context, rec plugins.Record, req core.SearchRequest, look stremio.Lookup, streams []stremio.Stream) ([]core.Release, int, int) {
 	origin := ""
 	if u, err := stremio.NormalizeURL(rec.SourceURL); err == nil {
 		origin = stremio.Origin(u)
@@ -213,7 +264,6 @@ func (b *addonBackend) convert(ctx context.Context, rec plugins.Record, req core
 		ordinaryAt = append(ordinaryAt, i)
 	}
 	conv := stremio.Convert(ordinary, req, look, stremio.ConvertOptions{Origin: origin, Instance: b.instance})
-	b.logSkipped(conv.SkippedNoHash, conv.SkippedAmbiguous)
 	byStream := map[int]core.Release{}
 	for j, rel := range conv.Releases {
 		src := conv.Source[j]
@@ -221,6 +271,7 @@ func (b *addonBackend) convert(ctx context.Context, rec plugins.Record, req core
 			rel.Info.Languages = mergeLanguages(rel.Info.Languages, ex.langs)
 		}
 		rel.TitleIDs = req.IDs
+		rel.TitleIDsEchoed = true
 		byStream[ordinaryAt[src]] = rel
 	}
 	for i, rel := range direct {
@@ -232,7 +283,7 @@ func (b *addonBackend) convert(ctx context.Context, rec plugins.Record, req core
 			out = append(out, rel)
 		}
 	}
-	return out
+	return out, conv.SkippedNoHash, conv.SkippedAmbiguous
 }
 
 func (b *addonBackend) logSkipped(noHash, ambiguous int) {
@@ -305,7 +356,7 @@ func searchHints(req core.SearchRequest) map[string]string {
 	if req.Year > 0 {
 		q["year"] = strconv.Itoa(req.Year)
 	}
-	if req.Season > 0 {
+	if req.Season > 0 || (req.Type == core.TypeEpisode && req.Episode > 0) {
 		q["season"] = strconv.Itoa(req.Season)
 	}
 	if req.Episode > 0 {
@@ -316,6 +367,15 @@ func searchHints(req core.SearchRequest) map[string]string {
 	}
 	if req.IDs.TMDB > 0 {
 		q["tmdbId"] = strconv.FormatInt(req.IDs.TMDB, 10)
+	}
+	return q
+}
+
+func searchHintsForLookup(req core.SearchRequest, look stremio.Lookup) map[string]string {
+	q := searchHints(req)
+	if req.Type == core.TypeEpisode && look.Season > 0 && look.Episode > 0 && !look.Packs {
+		q["season"] = strconv.Itoa(look.Season)
+		q["episode"] = strconv.Itoa(look.Episode)
 	}
 	return q
 }
@@ -344,7 +404,7 @@ func (s *StreamSources) directRelease(ctx context.Context, rec plugins.Record, r
 	if req.Type != core.TypeMovie {
 		cat = 5000
 	}
-	rel := core.Release{Name: name, Size: eb.Size, Category: cat, Info: releaseparse.Parse(name), TitleIDs: req.IDs, Protocol: "direct"}
+	rel := core.Release{Name: name, Size: eb.Size, Category: cat, Info: releaseparse.Parse(name), TitleIDs: req.IDs, TitleIDsEchoed: true, Protocol: "direct"}
 	if len(eb.Languages) > 0 {
 		rel.Info.Languages = mergeLanguages(rel.Info.Languages, eb.Languages)
 	}

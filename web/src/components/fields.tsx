@@ -36,7 +36,7 @@ export function Field({
   );
 }
 
-/** Numeric input that never emits NaN. */
+/** Numeric input that never emits NaN, and can be cleared with backspace while editing. */
 export function NumberInput({
   value,
   onChange,
@@ -56,19 +56,34 @@ export function NumberInput({
   React.InputHTMLAttributes<HTMLInputElement>,
   "value" | "onChange" | "type" | "min" | "max" | "step"
 >) {
+  const committed = Number.isFinite(value) ? value : 0;
+  const [text, setText] = useState(String(committed));
+
+  useEffect(() => {
+    setText(String(committed));
+    // Only resync from the outside value - an in-progress edit (including an
+    // emptied field) is tracked by `text` alone until it commits or blurs.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [committed]);
+
   return (
     <Input
       {...rest}
       type="number"
       inputMode="decimal"
       className={cn("tabular-nums", className)}
-      value={Number.isFinite(value) ? value : 0}
+      value={text}
       min={min}
       max={max}
       step={step}
       onChange={(e) => {
+        setText(e.currentTarget.value);
         const n = e.currentTarget.valueAsNumber;
-        onChange(Number.isFinite(n) ? n : 0);
+        if (Number.isFinite(n)) onChange(n);
+      }}
+      onBlur={(e) => {
+        const n = e.currentTarget.valueAsNumber;
+        if (!Number.isFinite(n)) setText(String(committed));
       }}
     />
   );
@@ -116,6 +131,7 @@ export function SecretInput({
   id,
   ariaLabel,
   invalid,
+  disabled,
 }: {
   value: string;
   onChange: (v: string) => void;
@@ -123,6 +139,7 @@ export function SecretInput({
   id?: string;
   ariaLabel?: string;
   invalid?: boolean;
+  disabled?: boolean;
 }) {
   const isStored =
     value === REDACTED || value === "Saved" || /^https?:\/\/[^\s]+ \(saved\)$/.test(value);
@@ -133,6 +150,7 @@ export function SecretInput({
           id={id}
           aria-label={ariaLabel}
           aria-invalid={invalid || undefined}
+          disabled={disabled}
           type="text"
           value={value}
           placeholder={placeholder}
@@ -146,6 +164,7 @@ export function SecretInput({
           id={id}
           aria-label={ariaLabel}
           aria-invalid={invalid || undefined}
+          disabled={disabled}
           value={value}
           placeholder={placeholder}
           autoComplete="new-password"
@@ -180,7 +199,7 @@ export function TestButton({
   disabled?: boolean;
 }) {
   return (
-    <span className="inline-flex flex-wrap items-center gap-2">
+    <span className="inline-flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
       <Button
         type="button"
         variant="outline"
@@ -191,7 +210,7 @@ export function TestButton({
         <PlugZap size={14} /> {state.status === "running" ? t("Testing…") : label}
       </Button>
       {state.status === "ok" ? (
-        <Badge variant="success">
+        <Badge variant="success" title={state.message}>
           <CheckCircle2 size={12} />{" "}
           {state.durationMs != null ? t("OK · {ms} ms", { ms: state.durationMs }) : t("OK")}
         </Badge>
@@ -201,6 +220,11 @@ export function TestButton({
           <XCircle size={12} />{" "}
           {state.message ? t("Failed: {message}", { message: state.message }) : t("Failed")}
         </Badge>
+      ) : null}
+      {state.status === "ok" && state.message ? (
+        <span className="basis-full text-xs text-fg-muted" role="status">
+          {state.message}
+        </span>
       ) : null}
     </span>
   );

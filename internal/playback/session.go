@@ -27,6 +27,8 @@ type identity struct {
 // generation is one opened source of a session. A failover creates a new
 // generation; the old one is retired and closed once in-flight reads end.
 type generation struct {
+	warmReads            *core.WarmReadWindow
+	prewarmReads         *core.WarmReadWindow
 	backgroundReadBytes  atomic.Int64
 	backgroundReadErrors atomic.Int64
 	backgroundRequests   atomic.Int64
@@ -64,10 +66,12 @@ type generation struct {
 	retryEpoch         uint64
 	retryPending       bool
 
-	mu      sync.Mutex
-	refs    int
-	retired bool
-	closed  bool
+	mu          sync.Mutex
+	needIndex   bool
+	needTrailer bool
+	refs        int
+	retired     bool
+	closed      bool
 }
 
 // acquire takes a read reference; false once the generation is retired.
@@ -191,12 +195,28 @@ func (g *generation) releaseID() string {
 
 // session is the internal, mutable form of a core.PlaySession.
 type session struct {
+	// alias is the identity a promoted preparation also answers for in
+	// byIdent (guarded by Manager.mu); ident itself never changes.
+	alias                 identity
+	hasAlias              bool
 	sources               *sourceLifetime
 	reserve               reserveState
 	viewerPosition        time.Duration // guarded by mu, from authenticated Plex timeline
 	viewerAt              time.Time
 	viewerState           string
+	choiceStartSet        bool            // guarded by mu; tracks real-play duration on an explicit version
+	choiceLastPos         time.Duration   // guarded by mu
+	choicePlayed          time.Duration   // guarded by mu
+	choiceRecorded        bool            // guarded by mu
 	exp                   experienceState // guarded by mu
+	stallObserved         int             // guarded by mu; timeline stalls evaluated against delivery
+	timelineEnabled       bool
+	timelineStalls        int
+	timelineDecided       bool
+	timelineDecision      core.DecisionKind
+	timelineReason        string
+	timelineBitrate       int
+	timelineHeight        int
 	encoderRecoveryReason string
 	encoderRunway         *time.Duration
 	warm                  warmState // the encoder input range being prefetched
@@ -210,6 +230,12 @@ type session struct {
 	profileKey            string // profileKey of the resolving profile
 	originalLanguage      string // catalogue language when this session was selected
 	startedAt             time.Time
+	// kindOpen opens a non-catalogue plugin item's bytes (spec §15.1). When
+	// set, the session bypasses resolution/failover and opens this source
+	// directly, then runs the normal probe/decision pipeline.
+	kindOpen          func(ctx context.Context) (core.MediaSource, error)
+	kindOpenCandidate func(ctx context.Context, exclude []string) (core.MediaSource, core.Release, error)
+	kindSourceID      string
 
 	// virtual is the byte/time layout of the first generation: the file the
 	// client was told about. Direct-play byte offsets are always in these
@@ -250,12 +276,23 @@ type session struct {
 	// downMisses counts speed-driven down-failovers that found no
 	// lower-bitrate release. They count toward MaxDownFailovers so a
 	// source that stays too slow cannot retry forever.
-	downMisses       int
+	downMisses int
+	// stallContinues counts times a stall-triggered failover continued
+	// this release because every alternate failed fast — the shape of a
+	// stalled CDN edge rather than an unhealthy release (bounded by
+	// maxStallContinues). The grace is never replenished: one continue
+	// total per playback session, even after a fully recovered read or a
+	// later generation swap, so a long session's second independent edge
+	// glitch escalates as before. A per-outage reset would need sustained
+	// healthy progress plus a cumulative starvation cap (issue #169), not
+	// merely a new request. Guarded by mu; see takeStallContinue.
+	stallContinues   int
 	requiresRemux    bool
 	prefer           string // release ID the viewer picked (PrepareVariant); read-only after creation
 	exact            bool   // exact selection must never switch releases
 	lastActive       time.Time
 	lastRead         time.Time
+	pausedAt         time.Time // set when viewerState enters "paused"
 	stopAt           time.Time // set by a "stopped" timeline; expiry after a grace
 	decision         core.DecisionKind
 	decisionReason   string
@@ -268,17 +305,28 @@ type session struct {
 	closed            bool
 	registered        bool
 
+	// Marker enter/exit tracking for playback.marker.* events (guarded by mu).
+	lastProgressAt    time.Time
+	markersLoaded     bool
+	markersCache      []MarkerSpan
+	activeMarkerKind  string
+	activeMarkerStart int64
+	activeMarkerEnd   int64
+
 	// Speed-coupled down-failover state (guarded by speedMu).
 	speedMu           sync.Mutex
 	speed             speedTracker
-	genSince          time.Time // when the current generation started serving
-	graceUntil        time.Time // slow-source checks are ignored before this
-	slowChecks        int       // consecutive slow evaluations
+	delivery          deliveryTracker
+	genSince          time.Time     // when the current generation started serving
+	graceUntil        time.Time     // slow-source checks are ignored before this
+	gracePeakBuffer   time.Duration // highest known buffer observed in current grace window
+	slowChecks        int           // consecutive slow evaluations
 	encoderSampleAt   time.Time
 	encoderRunAt      time.Time
 	encoderSeekAt     time.Time
 	encoderSlowChecks int
 	encoderRetryAt    time.Time
+	encoderMisses     int
 	lastSrcPos        int64 // latest source read position on the current generation
 	expectPos         int64 // next sequential read offset (-1 = unknown)
 }
@@ -306,6 +354,10 @@ func newSession(id string, ident identity, user *core.User, caps core.ClientCaps
 		graceUntil:       now,
 		expectPos:        -1,
 	}
+}
+
+func (s *session) isKind() bool {
+	return s != nil && (s.kindOpen != nil || s.kindOpenCandidate != nil)
 }
 
 // adopt makes g the session's first generation and fixes the virtual file.
@@ -356,6 +408,29 @@ func (s *session) isClosed() bool {
 	return s.closed
 }
 
+// invalidateDirectRetryLocked disarms a stalled range's watchdog when the
+// viewer leaves playback. A pause is not evidence of a broken source.
+// The caller holds s.mu (session locks precede generation locks).
+func (s *session) invalidateDirectRetryLocked() {
+	if s.cur != nil {
+		s.cur.mu.Lock()
+		s.cur.retryEpoch++
+		s.cur.retryPending = false
+		s.cur.mu.Unlock()
+	}
+}
+
+func (s *session) setViewerStateLocked(state string, now time.Time) {
+	if state == "paused" {
+		if s.viewerState != "paused" || s.pausedAt.IsZero() {
+			s.pausedAt = now
+		}
+	} else {
+		s.pausedAt = time.Time{}
+	}
+	s.viewerState = state
+}
+
 func (s *session) touch(now time.Time) {
 	s.mu.Lock()
 	s.lastActive = now
@@ -363,8 +438,20 @@ func (s *session) touch(now time.Time) {
 	s.stopAt = time.Time{}
 	s.stoppedBySurface = false
 	if s.viewerState == "stopped" {
-		s.viewerState = ""
+		s.setViewerStateLocked("", now)
 	}
+	s.mu.Unlock()
+}
+
+// touchMedia records media delivery. Unlike touch it must not clear a
+// client stop: a player that already reported "stopped" can keep draining
+// segments or an open range, and those reads are not the viewer coming
+// back (#410). Only a new play (touch) or a playing/paused timeline
+// (touchTimeline) cancels a stop.
+func (s *session) touchMedia(now time.Time) {
+	s.mu.Lock()
+	s.lastActive = now
+	s.lastRead = now
 	s.mu.Unlock()
 }
 
@@ -373,18 +460,25 @@ func (s *session) touchTimeline(now time.Time) {
 	s.lastActive = now
 	s.stopAt = time.Time{}
 	if s.viewerState == "stopped" {
-		s.viewerState = ""
+		s.setViewerStateLocked("", now)
 	}
 	s.mu.Unlock()
 }
 
-func (s *session) markDirectPlay() {
+func (s *session) markDirectPlay() bool {
 	s.mu.Lock()
+	first := false
 	if !s.explicit {
 		s.decision = core.DecisionDirectPlay
 		s.decisionVideoCopy, s.decisionAudioCopy = true, true
+		if !s.timelineDecided {
+			s.timelineDecided = true
+			s.timelineDecision = core.DecisionDirectPlay
+			first = true
+		}
 	}
 	s.mu.Unlock()
+	return first
 }
 
 func (s *session) addBytes(n int, now time.Time) {
@@ -437,7 +531,7 @@ func (s *session) snapshot(now time.Time) *core.PlaySession {
 		offset := s.viewerPosition.Milliseconds()
 		ps.ViewOffset = &offset
 	}
-	if measuredProtocol(s.caps.Protocol) {
+	if !s.caps.NoPlaybackTelemetry {
 		ps.Experience = s.exp.snapshot(now)
 	}
 	if s.user.Username == "" {
@@ -449,6 +543,7 @@ func (s *session) snapshot(now time.Time) *core.PlaySession {
 		ps.QualityFallback = res.QualityFallback
 		ps.Source = g.src
 		ps.Info = g.infoSnapshot()
+		ps.SegmentStart = segmentStart(s.title, res.Release, ps.Info.Duration)
 		ps.Origin = sourceOrigin(g.src, res.Release.Protocol)
 	}
 	return ps

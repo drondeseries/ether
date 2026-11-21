@@ -3,6 +3,7 @@ package mediabrowser
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"net/http"
 	"strconv"
 	"strings"
 
@@ -73,6 +74,23 @@ func (i *instance) embyItemDetailDTO(m map[string]any, d frontend.ItemDetail) {
 			m[key] = []any{}
 		}
 	}
+	switch d.Title.Type {
+	case "show":
+		// Emby answers an empty AirDays array and the default Aired display
+		// order for a series. ChildCount is the number of seasons this viewer
+		// can list. None of these walk the library.
+		if _, ok := m["AirDays"]; !ok {
+			m["AirDays"] = []any{}
+		}
+		if _, ok := m["DisplayOrder"]; !ok {
+			m["DisplayOrder"] = "Aired"
+		}
+		if d.Title.ChildCount > 0 {
+			if _, ok := m["ChildCount"]; !ok {
+				m["ChildCount"] = d.Title.ChildCount
+			}
+		}
+	}
 	if id, ok := m["Id"].(string); ok && id != "" {
 		m["PresentationUniqueKey"] = id
 		m["Etag"] = embyETag(id)
@@ -131,6 +149,7 @@ func (i *instance) embyItemDetailDTO(m map[string]any, d frontend.ItemDetail) {
 	}
 	if len(v.Media.Streams) > 0 {
 		m["MediaStreams"] = i.mediaStreams(v.Media.Streams)
+		m["HasSubtitles"] = mediaHasSubtitles(v.Media)
 	}
 }
 
@@ -185,4 +204,68 @@ func embyRicherVersion(a, b frontend.Version) bool {
 		return ah > bh
 	}
 	return a.Media.Size > b.Media.Size
+}
+
+// embyListGated maps the item keys an Emby list row carries only when the
+// request's Fields names them to the field that asks for them (the Emby
+// API's "additional fields of information"). An Emby library listing
+// without Fields answers names, ids, artwork, runtime and user data; Ether
+// builds rows with the detail DTO, so a list row drops the rest here.
+var embyListGated = map[string]string{
+	"Overview":             "overview",
+	"Genres":               "genres",
+	"GenreItems":           "genres",
+	"ProviderIds":          "providerids",
+	"DateCreated":          "datecreated",
+	"SortName":             "sortname",
+	"ForcedSortName":       "sortname",
+	"Taglines":             "taglines",
+	"Studios":              "studios",
+	"ProductionLocations":  "productionlocations",
+	"ExternalUrls":         "externalurls",
+	"OriginalTitle":        "originaltitle",
+	"ParentId":             "parentid",
+	"DisplayPreferencesId": "displaypreferencesid",
+	"CanDelete":            "candelete",
+	"CanDownload":          "candownload",
+	"LockData":             "settings",
+	"LockedFields":         "settings",
+}
+
+// embyListEmptyFields names the collection keys an Emby list row always
+// carries as an array when the request's Fields asks for them, even when the
+// item has none. Ether builds rows with the detail DTO, which drops an absent
+// collection; Emby answers an empty array instead, and clients iterate it.
+var embyListEmptyFields = map[string]string{
+	"People":         "people",
+	"Studios":        "studios",
+	"GenreItems":     "genres",
+	"Genres":         "genres",
+	"Chapters":       "chapters",
+	"RemoteTrailers": "remotetrailers",
+	"Taglines":       "taglines",
+	"MediaSources":   "mediasources",
+}
+
+// embyListFields trims an Emby list row to what the request's Fields asked
+// for. Detail responses keep the full DTO.
+func (i *instance) embyListFields(r *http.Request, item map[string]any) {
+	if i == nil || i.protocol != "emby" || item == nil {
+		return
+	}
+	fields := fieldSet(r)
+	for key, field := range embyListGated {
+		if !fields[field] {
+			delete(item, key)
+		}
+	}
+	for key, field := range embyListEmptyFields {
+		if fields[field] {
+			if _, ok := item[key]; !ok {
+				item[key] = []any{}
+			}
+			continue
+		}
+		delete(item, key)
+	}
 }

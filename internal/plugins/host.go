@@ -3,10 +3,15 @@ package plugins
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
+	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -14,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/braedonsaunders/ether/internal/events"
 	"github.com/braedonsaunders/ether/internal/safefetch"
 )
 
@@ -83,10 +89,22 @@ func (h *host) KVGet(ctx context.Context, key string) ([]byte, bool, error) {
 }
 
 func (h *host) KVPut(ctx context.Context, key string, value []byte) error {
-	if _, _, err := h.record(ctx); err != nil {
+	r, _, err := h.record(ctx)
+	if err != nil {
 		return err
 	}
-	return h.m.store.kvPut(ctx, h.plugin, key, value)
+	err = h.m.store.kvPut(ctx, h.plugin, key, value)
+	if errors.Is(err, ErrQuotaExceeded) {
+		usage, _ := h.m.store.kvUsage(ctx, h.plugin)
+		h.m.emitBusEvent(events.EventPluginQuotaExceeded, h.plugin, events.PluginQuotaExceededPayload{
+			PluginID:  h.plugin,
+			Name:      r.Name,
+			QuotaKind: "kv",
+			Used:      usage.Bytes,
+			Limit:     KVQuotaBytes,
+		}, false)
+	}
+	return err
 }
 
 func (h *host) KVDelete(ctx context.Context, key string) error {
@@ -101,6 +119,13 @@ func (h *host) KVList(ctx context.Context, prefix string) ([]string, error) {
 		return nil, err
 	}
 	return h.m.store.kvList(ctx, h.plugin, prefix)
+}
+
+func (h *host) KVUsage(ctx context.Context) (KVUsage, error) {
+	if _, _, err := h.record(ctx); err != nil {
+		return KVUsage{}, err
+	}
+	return h.m.store.kvUsage(ctx, h.plugin)
 }
 
 // Settings returns the plugin's stored non-secret settings.
@@ -141,11 +166,43 @@ func (h *host) SecretGet(ctx context.Context, name string) (string, error) {
 	return h.m.store.openSecret(h.plugin, name, stored)
 }
 
+// AllowNetworkHost reports whether pluginID is enabled, still holds its
+// network grant, and declared hostName in permissions.network.
+func (m *Manager) AllowNetworkHost(ctx context.Context, pluginID, hostName string) bool {
+	h := &host{m: m, plugin: pluginID}
+	r, g, err := h.record(ctx)
+	if err != nil || r.Manifest.Ether == nil {
+		return false
+	}
+	if g.revoked("network") {
+		h.noteDenied("network")
+		return false
+	}
+	if hostAllowed(r.Manifest.Ether.Permissions.Network, hostName) ||
+		g.allowsLocalHostName(hostName) ||
+		(DeclaresOperatorHosts(r.Manifest) && g.allowsOperatorHostName(hostName)) {
+		return true
+	}
+	if DeclaresOperatorHosts(r.Manifest) {
+		m.noteBlockedOperatorHost(ctx, pluginID, hostName)
+		return false
+	}
+	if IsLocalNetworkHost(hostName) {
+		m.noteBlockedLocalHost(ctx, pluginID, hostName)
+		return false
+	}
+	h.noteDenied("network")
+	return false
+}
+
 // hostAllowed matches a host against the manifest network list.
 func hostAllowed(patterns []string, host string) bool {
 	host = strings.ToLower(host)
 	for _, p := range patterns {
-		p = strings.ToLower(p)
+		p = strings.ToLower(strings.TrimSpace(p))
+		if p == OperatorNetworkEntry {
+			continue
+		}
 		if strings.HasPrefix(p, "*.") {
 			if strings.HasSuffix(host, p[1:]) && host != p[2:] {
 				return true
@@ -166,9 +223,18 @@ func hostAllowed(patterns []string, host string) bool {
 var ErrFetchFailed = errors.New("plugins: request failed")
 
 func fetchError(host string, err error) error {
+	var blocked *BlockedLocalHostError
+	if errors.As(err, &blocked) {
+		return blocked
+	}
+	var blockedOp *BlockedOperatorHostError
+	if errors.As(err, &blockedOp) {
+		return blockedOp
+	}
 	reason := "network error"
+	var netErr net.Error
 	switch {
-	case errors.Is(err, context.DeadlineExceeded):
+	case errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout()):
 		reason = "timed out"
 	case errors.Is(err, context.Canceled):
 		reason = "canceled"
@@ -176,24 +242,48 @@ func fetchError(host string, err error) error {
 		// A redirect left the plugin's network grant.
 		return fmt.Errorf("%w: a redirect from %s left the granted hosts", ErrPermissionDenied, host)
 	case errors.Is(err, safefetch.ErrBlocked):
+		if isNonPublicBlockError(err) {
+			return &BlockedLocalHostError{Host: host}
+		}
 		return fmt.Errorf("%w: %s is not allowed (%w)", ErrFetchFailed, host, safefetch.ErrBlocked)
+	}
+	if reason == "timed out" {
+		return fmt.Errorf("%w: %s: %w", ErrFetchFailed, host, context.DeadlineExceeded)
 	}
 	return fmt.Errorf("%w: %s: %s", ErrFetchFailed, host, reason)
 }
 
-func (h *host) HTTPFetch(ctx context.Context, req FetchRequest) (FetchResponse, error) {
+func (h *host) openFetch(ctx context.Context, req FetchRequest) (*http.Response, error) {
 	r, g, err := h.record(ctx)
 	if err != nil {
-		return FetchResponse{}, err
+		return nil, err
 	}
 	u, err := url.Parse(req.URL)
-	if err != nil || (u.Scheme != "https" && u.Scheme != "http") {
-		return FetchResponse{}, fmt.Errorf("%w: bad url", ErrPermissionDenied)
+	if err != nil || u.Hostname() == "" || (u.Scheme != "https" && u.Scheme != "http") {
+		return nil, fmt.Errorf("%w: bad url", ErrPermissionDenied)
 	}
-	if err := h.deny(r, g, "network", "", func(string) bool {
-		return hostAllowed(r.Manifest.Ether.Permissions.Network, u.Hostname())
-	}); err != nil {
-		return FetchResponse{}, err
+	if g.revoked("network") {
+		h.noteDenied("network")
+		return nil, fmt.Errorf("%w: network", ErrPermissionDenied)
+	}
+	if !networkAllowedURL(r.Manifest.Ether.Permissions.Network, u) &&
+		!g.allowsLocalURL(u) &&
+		!(DeclaresOperatorHosts(r.Manifest) && g.allowsOperatorURL(u)) {
+		if DeclaresOperatorHosts(r.Manifest) {
+			blocked := urlHostPortDisplay(u)
+			h.m.noteBlockedOperatorHost(ctx, h.plugin, blocked)
+			return nil, &BlockedOperatorHostError{Host: blocked}
+		}
+		if IsLocalNetworkHost(u.Hostname()) {
+			blocked := urlHostPortDisplay(u)
+			h.m.noteBlockedLocalHost(ctx, h.plugin, blocked)
+			return nil, &BlockedLocalHostError{Host: blocked}
+		}
+		h.noteDenied("network")
+		return nil, fmt.Errorf("%w: network", ErrPermissionDenied)
+	}
+	if trusted := trustedFetchHosts(r.Manifest, g); len(trusted) > 0 {
+		ctx = safefetch.WithTrustedHosts(ctx, trusted)
 	}
 	method := req.Method
 	if method == "" {
@@ -201,25 +291,49 @@ func (h *host) HTTPFetch(ctx context.Context, req FetchRequest) (FetchResponse, 
 	}
 	hr, err := http.NewRequestWithContext(ctx, method, req.URL, bytes.NewReader(req.Body))
 	if err != nil {
-		return FetchResponse{}, err
+		return nil, err
 	}
 	for k, v := range req.Headers {
 		hr.Header.Set(k, v)
 	}
 	// Recheck the current grant before every redirect, as well as the SSRF
 	// guard's own redirect policy. A redirect is another network request.
+	// When ctx already has a deadline, let Request.Context govern both headers
+	// and body reads so timeouts always surface context.DeadlineExceeded rather
+	// than net/http's non-unwrapping Client.Timeout error.
 	client := *h.m.client
+	if _, ok := ctx.Deadline(); ok {
+		client.Timeout = 0
+	}
+	lastURL := u
 	previousRedirect := client.CheckRedirect
 	client.CheckRedirect = func(next *http.Request, via []*http.Request) error {
+		lastURL = next.URL
 		current, grants, err := h.record(next.Context())
 		if err != nil {
 			return err
 		}
-		if err := h.deny(current, grants, "network", "", func(string) bool {
-			return hostAllowed(current.Manifest.Ether.Permissions.Network, next.URL.Hostname())
-		}); err != nil {
-			return err
+		if grants.revoked("network") {
+			h.noteDenied("network")
+			return fmt.Errorf("%w: network", ErrPermissionDenied)
 		}
+		if !networkAllowedURL(current.Manifest.Ether.Permissions.Network, next.URL) &&
+			!grants.allowsLocalURL(next.URL) &&
+			!(DeclaresOperatorHosts(current.Manifest) && grants.allowsOperatorURL(next.URL)) {
+			if DeclaresOperatorHosts(current.Manifest) {
+				blocked := urlHostPortDisplay(next.URL)
+				h.m.noteBlockedOperatorHost(next.Context(), h.plugin, blocked)
+				return &BlockedOperatorHostError{Host: blocked}
+			}
+			if IsLocalNetworkHost(next.URL.Hostname()) {
+				blocked := urlHostPortDisplay(next.URL)
+				h.m.noteBlockedLocalHost(next.Context(), h.plugin, blocked)
+				return &BlockedLocalHostError{Host: blocked}
+			}
+			h.noteDenied("network")
+			return fmt.Errorf("%w: network", ErrPermissionDenied)
+		}
+		*next = *next.WithContext(safefetch.WithTrustedHosts(next.Context(), trustedFetchHosts(current.Manifest, grants)))
 		if previousRedirect != nil {
 			return previousRedirect(next, via)
 		}
@@ -230,8 +344,27 @@ func (h *host) HTTPFetch(ctx context.Context, req FetchRequest) (FetchResponse, 
 	}
 	resp, err := client.Do(hr)
 	if err != nil {
-		return FetchResponse{}, fetchError(u.Hostname(), err)
+		if isNonPublicBlockError(err) {
+			blocked := urlHostPortDisplay(lastURL)
+			h.m.noteBlockedLocalHost(ctx, h.plugin, blocked)
+			return nil, fetchError(blocked, err)
+		}
+		return nil, fetchError(u.Hostname(), err)
 	}
+	return resp, nil
+}
+
+func (h *host) HTTPFetch(ctx context.Context, req FetchRequest) (FetchResponse, error) {
+	if req.TimeoutMS > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(min(req.TimeoutMS, int64(86400000)))*time.Millisecond)
+		defer cancel()
+	}
+	resp, err := h.openFetch(ctx, req)
+	if err != nil {
+		return FetchResponse{}, err
+	}
+	u, _ := url.Parse(req.URL)
 	defer resp.Body.Close() //nolint:errcheck
 	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxFetchBytes+1))
 	if err != nil {
@@ -240,14 +373,7 @@ func (h *host) HTTPFetch(ctx context.Context, req FetchRequest) (FetchResponse, 
 	if len(body) > MaxFetchBytes {
 		return FetchResponse{}, fmt.Errorf("plugins: response larger than %d bytes", MaxFetchBytes)
 	}
-	// Privacy label: record the observed host and bytes.
-	h.m.healthMu.Lock()
-	if hh, err := h.m.store.health(ctx, h.plugin); err == nil {
-		hh.Observed[u.Hostname()]++
-		hh.EgressBytes += int64(len(body) + len(req.Body))
-		_ = h.m.store.putHealth(ctx, h.plugin, hh)
-	}
-	h.m.healthMu.Unlock()
+	h.noteFetchTraffic(ctx, req, int64(len(body)))
 	out := FetchResponse{Status: resp.StatusCode, Headers: map[string]string{}, Body: body}
 	for k := range resp.Header {
 		out.Headers[k] = resp.Header.Get(k)
@@ -452,6 +578,45 @@ func (m *Manager) applyInverse(ctx context.Context, e JournalEntry) error {
 			return ErrUnavailable
 		}
 		return m.deps.Backends.CollectionsDelete(collectionContext(ctx, e.Plugin), inv.Doc)
+	case "kinds.upsert":
+		var inv kindInverse
+		if err := json.Unmarshal(e.Inverse, &inv); err != nil {
+			return err
+		}
+		b := m.kindBackends()
+		if len(inv.Previous) > 0 {
+			if b.KindUpsert == nil {
+				return ErrUnavailable
+			}
+			if _, err := b.KindUpsert(ctx, e.Plugin, inv.Kind, inv.Previous); err != nil {
+				return err
+			}
+		}
+		if len(inv.Items) > 0 {
+			if b.KindDelete == nil {
+				return ErrUnavailable
+			}
+			if err := b.KindDelete(ctx, e.Plugin, inv.Kind, inv.Items); err != nil {
+				return err
+			}
+		}
+		return nil
+	case "kinds.delete":
+		var inv kindInverse
+		if err := json.Unmarshal(e.Inverse, &inv); err != nil {
+			return err
+		}
+		b := m.kindBackends()
+		if b.KindUpsert == nil {
+			return ErrUnavailable
+		}
+		if len(inv.Previous) > 0 {
+			_, err := b.KindUpsert(ctx, e.Plugin, inv.Kind, inv.Previous)
+			return err
+		}
+		return nil
+	case "badges.set", "badges.clear":
+		return nil
 	default:
 		return fmt.Errorf("plugins: no inverse for journal op %q", e.Op)
 	}
@@ -607,4 +772,130 @@ func (h *host) Log(ctx context.Context, level, msg string, attrs map[string]any)
 	}
 	h.m.store.addLog(ctx, h.plugin, line)
 	return nil
+}
+
+// FoldersHash keeps small hashes synchronous; large files require an explicit job.
+func (h *host) FoldersHash(ctx context.Context, root, path string) (FolderHash, error) {
+	return h.hashFile(ctx, root, path, false, nil)
+}
+
+func (h *host) hashFile(ctx context.Context, root, path string, background bool, progress func(int64)) (FolderHash, error) {
+	const capBytes = 256 << 20
+	if _, err := h.folderCheck(ctx, root, path); err != nil {
+		return FolderHash{}, err
+	}
+	for _, seg := range strings.FieldsFunc(path, func(r rune) bool { return r == '/' || r == '\\' }) {
+		if seg == ".." {
+			return FolderHash{}, ErrPermissionDenied
+		}
+	}
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return FolderHash{}, err
+	}
+	target, err := filepath.EvalSymlinks(filepath.Join(realRoot, path))
+	if err != nil {
+		return FolderHash{}, err
+	}
+	rel, err := filepath.Rel(realRoot, target)
+	if err != nil || filepath.IsAbs(path) || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return FolderHash{}, ErrPermissionDenied
+	}
+	fs, err := os.OpenRoot(root)
+	if err != nil {
+		return FolderHash{}, err
+	}
+	defer fs.Close()
+	f, err := fs.Open(path)
+	if err != nil {
+		return FolderHash{}, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return FolderHash{}, err
+	}
+	if !info.Mode().IsRegular() {
+		return FolderHash{}, fmt.Errorf("folders.hash requires a regular file")
+	}
+	if !background && info.Size() > capBytes {
+		return FolderHash{}, fmt.Errorf("folders.hash requires a regular file of at most 256 MiB")
+	}
+	key := fmt.Sprintf("host.hash.%x", sha256.Sum256([]byte(fmt.Sprintf("%s/%s:%d:%d", realRoot, rel, info.Size(), info.ModTime().UnixNano()))))
+	if raw, ok, err := h.m.store.hashCacheGet(ctx, h.plugin, key); err != nil {
+		return FolderHash{}, err
+	} else if ok {
+		var cached FolderHash
+		if json.Unmarshal(raw, &cached) == nil {
+			if _, err := h.folderCheck(ctx, root, path); err != nil {
+				return FolderHash{}, err
+			}
+			return cached, nil
+		}
+	}
+	crc, md, sha := crc32.NewIEEE(), md5.New(), sha1.New()
+	w := io.MultiWriter(crc, md, sha)
+	buf := make([]byte, 1<<20)
+	var total int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return FolderHash{}, err
+		}
+		if _, err := h.folderCheck(ctx, root, path); err != nil {
+			return FolderHash{}, err
+		}
+		n, err := f.Read(buf)
+		total += int64(n)
+		if !background && total > capBytes {
+			return FolderHash{}, fmt.Errorf("folders.hash size limit exceeded")
+		}
+		if n > 0 {
+			_, _ = w.Write(buf[:n])
+			if progress != nil {
+				progress(total)
+			}
+			if background {
+				timer := time.NewTimer(2 * time.Millisecond)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return FolderHash{}, ctx.Err()
+				case <-timer.C:
+				}
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return FolderHash{}, err
+		}
+	}
+	after, err := f.Stat()
+	if err != nil {
+		return FolderHash{}, err
+	}
+	if total != info.Size() || after.Size() != info.Size() || !after.ModTime().Equal(info.ModTime()) {
+		return FolderHash{}, fmt.Errorf("folders.hash file changed while hashing")
+	}
+	result := FolderHash{Size: total, ModTime: info.ModTime().Unix(), CRC32: fmt.Sprintf("%08x", crc.Sum32()), MD5: fmt.Sprintf("%x", md.Sum(nil)), SHA1: fmt.Sprintf("%x", sha.Sum(nil))}
+	raw, _ := json.Marshal(result)
+	if err := h.m.store.hashCachePut(ctx, h.plugin, key, raw); err != nil {
+		return FolderHash{}, err
+	}
+	return result, nil
+}
+
+func (h *host) noteFetchTraffic(ctx context.Context, req FetchRequest, size int64) {
+	u, err := url.Parse(req.URL)
+	if err != nil {
+		return
+	}
+	h.m.healthMu.Lock()
+	defer h.m.healthMu.Unlock()
+	if hh, err := h.m.store.health(ctx, h.plugin); err == nil {
+		hh.Observed[u.Hostname()]++
+		hh.EgressBytes += size + int64(len(req.Body))
+		_ = h.m.store.putHealth(ctx, h.plugin, hh)
+	}
 }

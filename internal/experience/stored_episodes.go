@@ -90,9 +90,14 @@ func (c *episodeCursors) put(key string, after core.RatingKey) {
 // what they may see. ok is false otherwise.
 func (s *Service) storedEpisodePage(ctx context.Context, v *core.User, library *Library, q frontend.ItemQuery) (core.Page, bool, error) {
 	d := s.d.StoredEpisodes
+	// The show filter below is built from the viewer alone, so a request
+	// scoped to one library's rules, sources or collection membership must
+	// keep the indexed/walk paths that carry that scope into SQL.
+	scoped := len(q.Filter.ExtraRules) > 0 || len(q.Filter.TabRules) > 0 || len(q.Filter.PreviewRules) > 0 ||
+		len(q.Filter.CatalogueSources) > 0 || q.Filter.CollectionMembers != 0
 	if !d.complete() || library == nil || library.Type != core.TypeShow || !q.Recursive || len(q.Types) != 1 || q.Types[0] != core.TypeEpisode ||
 		q.Watched != nil || q.Favorite != nil || q.Season != nil || q.AdjacentTo != 0 || q.StartAt != 0 || q.Limit <= 0 ||
-		q.Sort != core.SortPopularity || !plainItemFilter(q.Filter) || s.d.ParentTitles == nil {
+		q.Sort != core.SortPopularity || scoped || !plainRecursiveFilter(q.Filter, library.Type) || s.d.ParentTitles == nil {
 		return core.Page{}, false, nil
 	}
 	show := core.Filter{Type: core.TypeShow, MaxContentRating: v.MaxContentRating}
@@ -147,7 +152,7 @@ func (s *Service) storedEpisodePage(ctx context.Context, v *core.User, library *
 			break
 		}
 		after = batch[len(batch)-1].Key
-		kept, err := s.visibleEpisodes(ctx, v, batch, q, show.HiddenShowGeneration != "")
+		kept, err := s.visibleEpisodes(ctx, v, batch, q, show.HiddenShowSeq != 0)
 		if err != nil {
 			return core.Page{}, false, err
 		}

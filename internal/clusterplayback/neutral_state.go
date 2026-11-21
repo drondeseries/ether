@@ -30,6 +30,11 @@ CREATE INDEX clusterplayback_neutral_scope ON clusterplayback_neutral_bindings(p
 CREATE TABLE clusterplayback_neutral_stops(session TEXT PRIMARY KEY);
 
 `)
+	// Tick and every SaveNeutralBinding delete expired bindings by expires
+	// alone; the scope index leads with protocol, so index expires directly.
+	// The table holds only live sessions' bindings (10-minute TTL), so the
+	// in-transaction build's SHARE lock lasts milliseconds.
+	store.Register("clusterplayback", 10, `CREATE INDEX clusterplayback_neutral_expiry ON clusterplayback_neutral_bindings(expires);`)
 }
 
 const neutralBindingTTL = 10 * time.Minute
@@ -45,7 +50,7 @@ func (r *Runtime) NeutralSessionCurrent(ctx context.Context, id string) bool {
 	return r.o.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM clusterplayback_neutral_stops WHERE session=?`, id).Scan(&stopped) == nil && stopped == 0
 }
 func (r *Runtime) SaveNeutralBinding(ctx context.Context, id, protocol string, viewer int64, device string, raw []byte) error {
-	if !r.clockReady() || r.o.ProtocolSealer == nil || len(raw) == 0 || len(raw) > maxAdmissionBytes || protocol != "jellyfin" && protocol != "emby" || viewer <= 0 || device == "" || len(device) > 256 || !r.ownsCoordination(ctx, id) {
+	if !r.clockReady() || r.o.ProtocolSealer == nil || len(raw) == 0 || len(raw) > maxAdmissionBytes || !r.policy(core.Protocol(protocol)).DistributedBindings || viewer <= 0 || device == "" || len(device) > 256 || !r.ownsCoordination(ctx, id) {
 		return ErrDenied
 	}
 	route, err := r.route(ctx, id)
@@ -64,8 +69,8 @@ func (r *Runtime) SaveNeutralBinding(ctx context.Context, id, protocol string, v
 	if err != nil {
 		return ErrDenied
 	}
-	// Bound ciphertext and prune expired rows; all live rows are bounded by the
-	// existing cluster-wide durable admission ceiling, never by eviction.
+	// Bound ciphertext and prune expired rows; unexpired rows belong to live
+	// placement sessions and leave with their compacted tombstone.
 	if len(sealed) > 2*maxAdmissionBytes {
 		return ErrDenied
 	}
@@ -117,7 +122,7 @@ func (r *Runtime) NeutralBindingIDs(ctx context.Context, protocol string, viewer
 	if r.o.ProtocolSealer == nil {
 		return nil, nil
 	}
-	if !r.clockReady() || viewer <= 0 || device == "" || protocol != "jellyfin" && protocol != "emby" || r.o.MemberRole(ctx, r.o.Self, config.RoleServer) != nil {
+	if !r.clockReady() || viewer <= 0 || device == "" || !r.policy(core.Protocol(protocol)).DistributedBindings || r.o.MemberRole(ctx, r.o.Self, config.RoleServer) != nil {
 		return nil, ErrDenied
 	}
 	rows, err := r.o.DB.QueryContext(ctx, `SELECT b.session FROM clusterplayback_neutral_bindings b JOIN placement_sessions p ON p.session=b.session AND p.generation>=b.generation WHERE b.protocol=? AND b.viewer=? AND b.device=? AND b.expires>? AND p.retired=0 ORDER BY b.session LIMIT 4096`, protocol, viewer, device, time.Now().UnixMilli())
@@ -146,7 +151,7 @@ func (r *Runtime) ClaimNeutralBinding(ctx context.Context, id, node string) erro
 	if err != nil {
 		return err
 	}
-	result, err := r.o.DB.ExecContext(ctx, `UPDATE plex_sessions SET node_id=?,updated_at=? WHERE id=? AND active=1 AND protocol IN ('jellyfin','emby') AND EXISTS (SELECT 1 FROM clusterplayback_coordinators c WHERE c.session=? AND c.node=? AND c.boot=? AND c.epoch=? AND c.deadline>?)`, node, time.Now().UnixMilli(), id, id, node, r.o.Self.Boot, c.Epoch, time.Now().Add(r.o.ClockSkew).UnixMilli())
+	result, err := r.o.DB.ExecContext(ctx, `UPDATE plex_sessions SET node_id=?,updated_at=? WHERE id=? AND active=1 AND broker_managed=1 AND EXISTS (SELECT 1 FROM clusterplayback_coordinators c WHERE c.session=? AND c.node=? AND c.boot=? AND c.epoch=? AND c.deadline>?)`, node, time.Now().UnixMilli(), id, id, node, r.o.Self.Boot, c.Epoch, time.Now().Add(r.o.ClockSkew).UnixMilli())
 	if err != nil {
 		return err
 	}

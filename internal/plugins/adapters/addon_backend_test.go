@@ -568,3 +568,46 @@ func TestAddonBackendFetchNZBFromAddonOriginOnly(t *testing.T) {
 		t.Fatalf("grab budget ignored: %v", err)
 	}
 }
+
+func TestAddonBackendQueriesCanonicalAndAliasRoutes(t *testing.T) {
+	env := newStreamTestEnv(t)
+	fake := &streamAddon{streams: map[string]string{
+		"/stream/series/tt0388629:1:750.json": `{"streams":[{"name":"Addon","title":"One.Piece.-.750.-.ENG.UNCUT.1080p.WEB.H.264.-NanDesuKa.(FUNi)","infoHash":"` + abHashA + `"}]}`,
+		"/stream/series/tt0388629:18:4.json":  `{"streams":[{"name":"Addon","title":"[Judas] One Piece - S18E04 [1080p]","infoHash":"` + abHashB + `"}]}`,
+	}}
+	rec := env.installAddon("https://addon.example/manifest.json", abManifest, fake)
+	b := env.addonBackend(rec, "ix-alias")
+
+	req := core.SearchRequest{
+		Type:            core.TypeEpisode,
+		IDs:             core.IDs{IMDB: "tt0388629", TMDB: 37854, TVDB: 81797},
+		Title:           "One Piece",
+		Season:          1,
+		Episode:         750,
+		AbsoluteEpisode: 750,
+		Anime:           true,
+		ReleaseAliases:  []core.EpisodeNumber{{Season: 18, Episode: 4}},
+	}
+	rels, err := b.Search(t.Context(), req, abNoReserve)
+	if err != nil {
+		t.Fatal(err)
+	}
+	asked := fake.asked()
+	if len(asked) != 2 || asked[0] != "/stream/series/tt0388629:1:750.json" || asked[1] != "/stream/series/tt0388629:18:4.json" {
+		t.Fatalf("asked paths = %v, want canonical then alias", asked)
+	}
+	if len(rels) != 2 || rels[0].InfoHash != abHashA || rels[1].InfoHash != abHashB {
+		t.Fatalf("merged releases = %+v", rels)
+	}
+
+	fake.set(func() { fake.paths = nil })
+	aliasOnly := req
+	aliasOnly.ReleaseAliasesOnly = true
+	relsOnly, err := b.Search(t.Context(), aliasOnly, abNoReserve)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fake.asked(); len(got) != 1 || got[0] != "/stream/series/tt0388629:18:4.json" || len(relsOnly) != 1 || relsOnly[0].InfoHash != abHashB {
+		t.Fatalf("alias-only paths=%v rels=%+v", got, relsOnly)
+	}
+}

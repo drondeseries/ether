@@ -27,9 +27,11 @@ interface OutboundConfig {
   password?: string;
   indexers: boolean;
   stremio: boolean;
+  liveTV: boolean;
   debrid: boolean;
   usenet: boolean;
   metadata: boolean;
+  extras: boolean;
   bypass?: string[] | null;
 }
 
@@ -51,9 +53,11 @@ function defaults(saved: EtherConfig["outbound"]): OutboundConfig {
     password: saved?.password ?? "",
     indexers: saved?.indexers ?? true,
     stremio: saved?.stremio ?? true,
+    liveTV: saved?.liveTV ?? true,
     debrid: saved?.debrid ?? true,
     usenet: saved?.usenet ?? true,
     metadata: saved?.metadata ?? false,
+    extras: saved?.extras ?? false,
     bypass: saved?.bypass ?? [],
   };
 }
@@ -147,13 +151,13 @@ export function OutboundInternet({ hidden = false }: { hidden?: boolean }) {
     >
       <SettingsRow
         setting="send-indexers-debrid-and-usenet-through-a-proxy"
-        title={t("Send indexers, debrid and Usenet through a proxy")}
+        title={t("Send sources through a proxy")}
         description={t(
           "Off until you turn it on. A proxy that is down is not replaced by a direct connection.",
         )}
         control={
           <Switch
-            aria-label={t("Send indexers, debrid and Usenet through a proxy")}
+            aria-label={t("Send sources through a proxy")}
             checked={draft.enabled}
             onChange={(e) => patch({ enabled: e.currentTarget.checked })}
           />
@@ -246,9 +250,14 @@ export function OutboundInternet({ hidden = false }: { hidden?: boolean }) {
           onChange={(indexers) => patch({ indexers })}
         />
         <RouteSwitch
-          label={t("Stremio addons")}
+          label={t("Stremio addons and plugins")}
           checked={draft.stremio}
           onChange={(stremio) => patch({ stremio })}
+        />
+        <RouteSwitch
+          label={t("Live TV and IPTV channels")}
+          checked={draft.liveTV}
+          onChange={(liveTV) => patch({ liveTV })}
         />
         <RouteSwitch
           label={t("Debrid services and streams")}
@@ -264,6 +273,11 @@ export function OutboundInternet({ hidden = false }: { hidden?: boolean }) {
           label={t("Metadata, artwork, subtitles and the language model")}
           checked={draft.metadata}
           onChange={(metadata) => patch({ metadata })}
+        />
+        <RouteSwitch
+          label={t("Trailers and extras")}
+          checked={draft.extras}
+          onChange={(extras) => patch({ extras })}
         />
         <SettingsRow
           setting="names-that-stay-on-this-network"

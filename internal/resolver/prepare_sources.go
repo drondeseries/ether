@@ -16,6 +16,9 @@ type sourcePreparer interface {
 }
 
 func (s *Service) prepareSources(ctx context.Context, cands []candidate, title *core.Title, tr *Trace, scopes ...*candidateChecks) []candidate {
+	if channelAvailabilityCheck(ctx) {
+		return cands
+	}
 	// Fallback ordering is strict by resolution and imported source preference.
 	// Source preparation routes peers and can promote a lower tier.
 	if len(cands) > 0 && cands[0].fallback {
@@ -36,10 +39,10 @@ func (s *Service) prepareSources(ctx context.Context, cands []candidate, title *
 		default:
 		}
 	}
-	if cands[0].verified && (s.resolverCfg().SourcePreference != PreferDebrid || protocolOf(cands[0].rel) == core.ProtocolTorrent) {
+	if cands[0].verified && (s.resolverCfg().SourcePreference != PreferDebrid || protocolOf(cands[0].rel) == core.ProtocolTorrent) && !(s.usenetBackingOff() && protocolOf(cands[0].rel) == core.ProtocolUsenet) {
 		return cands
 	}
-	if s.knownCached(cands[0].rel) {
+	if s.knownCached(cands[0].rel) || s.readyPeer(cands) >= 0 {
 		// Ranking already chose a cached torrent in the accepted quality
 		// tier. Validate it now instead of delaying Play to discover the
 		// availability of a dozen lower-ranked descriptors. Validation can
@@ -59,7 +62,7 @@ func (s *Service) prepareSources(ctx context.Context, cands []candidate, title *
 	var releases []core.Release
 	var torrents []int // indexes preparation could promote
 	for i, c := range cands {
-		if c.rel.Protocol == core.ProtocolTorrent && eligible(c) {
+		if c.rel.Protocol == core.ProtocolTorrent && (eligible(c) || (s.usenetBackingOff() && protocolOf(lead.rel) == core.ProtocolUsenet)) {
 			releases = append(releases, c.rel)
 			torrents = append(torrents, i)
 			if len(releases) == 12 {
@@ -89,7 +92,7 @@ func (s *Service) prepareSources(ctx context.Context, cands []candidate, title *
 	hedgeIdx := -1
 	startHedge := func(from int) {
 		hedge, hedgeIdx = nil, -1
-		if !scoped || s.resolverCfg().OptimisticStart {
+		if !scoped || s.resolverCfg().OptimisticStart || s.usenetBackingOff() {
 			return
 		}
 		// Speculative checks share ranked validation's attempt budget.
@@ -119,6 +122,7 @@ func (s *Service) prepareSources(ctx context.Context, cands []candidate, title *
 		for i := range cands {
 			if r, ok := byID[cands[i].rel.ID]; ok {
 				cands[i].rel.InfoHash, cands[i].rel.MagnetURL = r.InfoHash, r.MagnetURL
+				cands[i].rel.Private = cands[i].rel.Private || r.Private
 			}
 		}
 		s.cachePreparedSources(title, byID)
@@ -233,6 +237,11 @@ func (s *Service) cachePreparedSources(title *core.Title, byID map[string]core.R
 						updated[i].MagnetURL = p.MagnetURL
 						changed = true
 					}
+					if !updated[i].Private && p.Private {
+						updated[i].Private = true
+						updated[i].MagnetURL = p.MagnetURL
+						changed = true
+					}
 				}
 			}
 			if changed {
@@ -250,6 +259,10 @@ func (s *Service) cachePreparedSources(title *core.Title, byID map[string]core.R
 				r.rel.InfoHash = p.InfoHash
 			}
 			if r.rel.MagnetURL == "" && p.MagnetURL != "" {
+				r.rel.MagnetURL = p.MagnetURL
+			}
+			if !r.rel.Private && p.Private {
+				r.rel.Private = true
 				r.rel.MagnetURL = p.MagnetURL
 			}
 			c.recent[id] = r

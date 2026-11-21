@@ -28,8 +28,14 @@ func (s *Session) watch(r *run) {
 	t := time.NewTicker(s.m.opts.pollInterval)
 	defer t.Stop()
 	playlist := filepath.Join(r.spec.Dir, r.spec.Playlist)
+	// Failure wrappers replace proc under the session lock, but retain the
+	// original process's completion channel for this run's whole lifetime.
+	s.mu.Lock()
+	done := r.proc.Done()
+	s.mu.Unlock()
 	var watchdog runWatchdog
 	collect := func(exited bool) {
+		s.collectTextSubtitles(r)
 		switch {
 		case r.dash != nil:
 			s.collectDASH(r, exited)
@@ -41,12 +47,17 @@ func (s *Session) watch(r *run) {
 	}
 	for {
 		select {
-		case <-r.proc.Done():
+		case <-done:
 			collect(true)
 			s.finish(r)
 			s.mu.Lock()
 			obsolete := s.cur != r
 			s.mu.Unlock()
+			if obsolete {
+				for _, path := range r.spec.TextSubtitlePaths {
+					s.removals.remove(path)
+				}
+			}
 			if obsolete && r.spec.SoftSubtitlePath != "" {
 				s.removals.remove(r.spec.SoftSubtitlePath)
 			}
@@ -59,7 +70,15 @@ func (s *Session) watch(r *run) {
 			return
 		case <-t.C:
 			collect(false)
+			s.mu.Lock()
+			s.advanceHandoffLocked(r)
+			s.mu.Unlock()
 			watchdog.check(s, r)
+			if s.traceOn() {
+				s.mu.Lock()
+				s.traceBufferLocked(r)
+				s.mu.Unlock()
+			}
 			s.removals.retry()
 		}
 	}
@@ -86,7 +105,7 @@ func (s *Session) poll(r *run, playlist string, exited bool) {
 	if t < 0 || t >= len(s.done) {
 		t = 0
 	}
-	for _, n := range p.segments {
+	for i, n := range p.segments {
 		if n < r.startSeg || (n <= r.maxDone && r.produced > 0) {
 			continue
 		}
@@ -108,6 +127,17 @@ func (s *Session) poll(r *run, playlist string, exited bool) {
 			s.failRunOutputLocked(r, fmt.Errorf("transcode: segment %d is empty", n))
 			break
 		}
+		if s.liveInput && s.total == 0 && !s.isDASH() {
+			d := time.Duration(0)
+			if i < len(p.entries) {
+				d = p.entries[i].dur
+			}
+			if err := s.validateLiveDurationLocked(n, d); err != nil {
+				_ = os.Remove(path)
+				s.failRunOutputLocked(r, err)
+				break
+			}
+		}
 		if s.heldToClock(r) {
 			path := s.trackSegPath(t, n)
 			err := s.moveOntoRetainedLocked(r, t, path)
@@ -125,9 +155,13 @@ func (s *Session) poll(r *run, playlist string, exited bool) {
 		if r.produced == 0 {
 			s.log.Info("first segment ready", "run", r.seq, "segment", n, "after", time.Since(r.started))
 		}
+		s.preparationLocked("first-segment", t)
 		r.produced++
 		r.maxDone = n
 		s.done[t][n] = true
+		if s.liveInput && i < len(p.entries) {
+			s.noteLiveDurationLocked(t, n, p.entries[i].dur)
+		}
 		if t == 0 {
 			s.noteSegSizeLocked(n, s.trackSegPath(t, n))
 		}
@@ -156,17 +190,39 @@ func (s *Session) noteInitLocked(r *run, t int) error {
 	if err := s.holdInitEditsLocked(r, t); err != nil {
 		return err
 	}
-	if r.edits != nil && len(r.edits.absent) > 0 {
-		return nil // the empty video track cannot replace the retained init
+	if r.edits != nil && (len(r.edits.absent) > 0 || r.edits.keepInit) {
+		return nil // partial track init cannot replace the retained init
 	}
 	for len(s.initFiles) <= t {
 		s.initFiles = append(s.initFiles, "")
 	}
+	s.noteOutputCodecsLocked(t, filepath.Join(s.dir, rel))
+	s.preparationLocked("init-segment", t)
 	s.initFiles[t] = rel
 	if t == 0 {
 		s.initFile = rel
 		if s.clockInput == "" {
 			s.clockInput = r.spec.Input
+		}
+	}
+	if t == 0 && s.container == ContainerFMP4 && !s.fmp4TrackKnown {
+		if b, err := os.ReadFile(filepath.Join(s.dir, rel)); err == nil {
+			if tracks, err := parseInitTracks(b); err == nil {
+				v := trackInit{}
+				for _, tr := range tracks {
+					if tr.Handler == "vide" {
+						v = tr
+						break
+					}
+					if v.TrackID == 0 {
+						v = tr
+					}
+				}
+				if v.TrackID != 0 && v.Timescale != 0 {
+					s.fmp4VideoTrack = emptyFMP4Tracks{TrackID: v.TrackID, Timescale: v.Timescale}
+					s.fmp4TrackKnown = true
+				}
+			}
 		}
 	}
 	return nil
@@ -185,6 +241,11 @@ func (s *Session) noteSegSizeLocked(n int, path string) {
 // progressedLocked reacts to run r finishing segments: failure counters,
 // the governor, chaining at a plan mode boundary, throttling, waiters.
 func (s *Session) progressedLocked(r *run) {
+	s.advanceHandoffLocked(r)
+	if s.cur != r {
+		s.broadcastLocked()
+		return
+	}
 	if r.produced > 0 && s.cur == r {
 		if r.rtx && r.rtxConfirmed.Load() {
 			s.decision.Enhancement.State = "running"
@@ -192,10 +253,12 @@ func (s *Session) progressedLocked(r *run) {
 		}
 		s.failures = 0
 		s.failErr = nil
+		s.headerFallbackPending = ""
 	}
 	s.maybeGovernLocked()
 	s.chainOrHoldLocked(r)
 	s.throttleLocked()
+
 	s.broadcastLocked()
 }
 
@@ -204,6 +267,24 @@ func (s *Session) progressedLocked(r *run) {
 // cap (maxForcedKeySegments) is the same kind of boundary: reaching it
 // while the player is still minutes behind must not start that far run or
 // the encoder head becomes the only window left on disk.
+// traceBufferLocked also runs while no segment completes, exposing stalls and pauses.
+func (s *Session) traceBufferLocked(r *run) {
+	if s.traceOn() && s.cur == r && time.Since(r.traceBufferAt) >= time.Second {
+		r.traceBufferAt = time.Now()
+		r.progressMu.Lock()
+		p := r.progress
+		r.progressMu.Unlock()
+		readyLead := time.Duration(0)
+		if r.produced > 0 {
+			readyLead = max(0, s.segStart(r.maxDone+1)-s.segStart(s.lastReq))
+		}
+		s.log.Debug("encoder buffer trace", "run", r.seq, "track", r.track, "playheadSegment", s.lastReq,
+			"maxDone", r.maxDone, "readyLeadSeconds", readyLead.Seconds(), "paused", r.paused,
+			"wallSeconds", time.Since(r.started).Seconds(), "runStartSeconds", r.spec.Start.Seconds(),
+			"outTimeSeconds", p.OutTime.Seconds(), "frame", p.Frame, "speed", p.Speed, "fps", p.FPS)
+	}
+}
+
 func (s *Session) chainOrHoldLocked(r *run) {
 	if !s.boundaryReadyLocked(r) {
 		return
@@ -277,7 +358,11 @@ func (s *Session) publishBoundaryAliasLocked(n int) bool {
 	}
 	dst := s.trackSegPath(t, n)
 	if s.container == ContainerMatroska {
-		if os.WriteFile(dst, emptyCluster(s.segStart(n)+matroskaOrigin), 0o644) != nil {
+		if os.WriteFile(dst, s.emptyFragmentLocked(n), 0o644) != nil {
+			return false
+		}
+	} else if s.container == ContainerFMP4 && !s.isDASH() {
+		if os.WriteFile(dst, s.emptyFragmentLocked(n), 0o644) != nil {
 			return false
 		}
 	} else if linkOrCopy(s.trackSegPath(t, n-1), dst) != nil {
@@ -306,15 +391,30 @@ func (s *Session) clientNearLocked(seg int) bool {
 // start failure is retried once with a larger probe, and other mid-stream
 // failures are reported to the failure handler.
 func (s *Session) finish(r *run) {
-	err := redactScopedCommandError(r.proc.Err(), r.spec)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// watch calls finish only after Done closes, so Err cannot wait here.
+	err := redactScopedCommandError(r.proc.Err(), r.spec)
+	if err != nil {
+		s.diagnosticLocked(core.HLSDiagnosticRecord{Resource: "encoder", Error: "encoder exited with an error"})
+	}
 	r.finished = true
 	r.err = err
 	r.paused = false
 	defer s.broadcastLocked()
-	if s.closed || r.stopped {
+	if s.closed || r.stopped || s.cur != r {
 		return
+	}
+	var targetErr *liveTargetError
+	if errors.As(err, &targetErr) {
+		if s.liveRejected == nil {
+			s.liveRejected = map[string]bool{}
+		}
+		s.liveRejected[s.input] = true
+		s.failErr = err
+		s.endSeg = r.next() - 1
+		s.notifyInputFailureLocked(r)
+		return // deterministic geometry failure: no hardware or same-source retry
 	}
 	if s.traceOn() {
 		why := "eof"
@@ -322,6 +422,18 @@ func (s *Session) finish(r *run) {
 			why = "error"
 		}
 		s.log.Info("ffmpeg run", "event", "stop", "reason", why, "run", r.seq, "segment", r.startSeg, "maxDone", r.maxDone, "planEnd", r.planEnd, "playhead", s.lastReq, "err", err)
+	}
+	if err != nil && !r.stalled && !s.softwareDecode && decodeInitFailure(r.stderr.String(), r.spec) {
+		s.softwareDecode = true
+		if caps := r.spec.Features.decode; caps != nil {
+			caps.reject(r.spec.Accel, r.spec.Info.Video())
+		}
+		s.log.Warn("hardware decode failed; retrying with software decode and hardware encode", "hwaccel", r.spec.Accel.Name)
+		s.emitTranscodeFallback(r.spec.Accel.Name, "software_decode", "hardware decode init failed; retrying with software decode")
+		if retryErr := s.startRunForLocked(r.next(), r.spec.BigProbe, "software decode fallback"); retryErr != nil {
+			s.failErr = retryErr
+		}
+		return
 	}
 	if err != nil && s.cur == r && s.retryQSVLocked(r) {
 		return
@@ -334,6 +446,7 @@ func (s *Session) finish(r *run) {
 		if err != nil && r.hw && !s.forceCPU && looksLikeEncoderFailure(r.stderr.String(), r.spec) {
 			s.forceCPU = true
 			log.Warn("live hardware encoder failed; falling back to CPU", "hwaccel", r.spec.Accel.Name, "segment", r.next())
+			s.emitTranscodeFallback(r.spec.Accel.Name, "libx264", "live hardware encoder failed")
 		}
 		s.recoverLiveLocked(r, err)
 		return
@@ -405,6 +518,19 @@ func (s *Session) finish(r *run) {
 	if s.cur != r {
 		return
 	}
+	if !s.liveInput && r.produced == 0 && (deterministicHeaderFailure(stderr) || s.headerFallbackPending == s.input) {
+		if s.recoverHeaderLocked(r) {
+			return
+		}
+		if s.headerRejected == nil {
+			s.headerRejected = make(map[string]bool)
+		}
+		s.headerRejected[s.input] = true
+		s.headerFallbackPending = ""
+		s.failErr = fmt.Errorf("ffmpeg header failed: %w: %s", err, tail(stderr, 500))
+		s.notifyInputFailureLocked(r)
+		return
+	}
 	// Normalization changes the output clock. Retry only before an init has
 	// been published in this scope; an established player clock must not move.
 	if errors.Is(err, errNegativeFMP4DecodeTime) && r.produced == 0 && !r.spec.NormalizeNegativeDTS {
@@ -435,6 +561,19 @@ func (s *Session) finish(r *run) {
 		s.decision.Enhancement.State = "fallback"
 		s.decision.Enhancement.Reason = "native VSR input/process failed"
 	}
+	// A DASH hardware graph can fail before writing its first fragment with
+	// driver-specific text, or a missing hardware filter. Try software once
+	// before filter classification can terminate the session. Preserve the
+	// segment number; forceCPU also keeps seeks and later runs on software.
+	if s.isDASH() && r.hw && r.produced == 0 && !s.forceCPU && !r.stalled && !s.inputFailed {
+		s.forceCPU = true
+		log.Warn("hardware encoder failed; falling back to CPU", "hwaccel", r.spec.Accel.Name, "segment", r.startSeg)
+		s.emitTranscodeFallback(r.spec.Accel.Name, "libx264", "hardware DASH startup failed")
+		if retryErr := s.startRunForLocked(r.startSeg, r.spec.BigProbe, "hardware startup fallback"); retryErr != nil {
+			s.failErr = retryErr
+		}
+		return
+	}
 	if r.produced == 0 {
 		if name := missingFilter(stderr); name != "" {
 			if s.tryNextGraphLocked(r, name) {
@@ -452,6 +591,7 @@ func (s *Session) finish(r *run) {
 		s.forceCPU = true
 		next := r.next()
 		log.Warn("hardware encoder failed; falling back to CPU", "hwaccel", r.spec.Accel.Name, "segment", next)
+		s.emitTranscodeFallback(r.spec.Accel.Name, "libx264", "hardware encoder failed")
 		if err := s.startRunForLocked(next, r.spec.BigProbe, "hardware fallback"); err != nil {
 			s.failErr = err
 		}
@@ -472,6 +612,10 @@ func (s *Session) finish(r *run) {
 	} else {
 		s.failErr = fmt.Errorf("ffmpeg: %w: %s", err, tail(stderr, 300))
 	}
+	s.notifyInputFailureLocked(r)
+}
+
+func (s *Session) notifyInputFailureLocked(r *run) {
 	if s.inputFailed {
 		return
 	}
@@ -493,6 +637,7 @@ func (s *Session) finish(r *run) {
 func (s *Session) recoverCopyLocked(r *run, stderr string) bool {
 	v := s.info.Video()
 	if s.copyFallback || s.inputFailed || s.liveInput || s.isDASH() ||
+		(s.m != nil && s.m.VideoTranscodingOff()) ||
 		s.container != ContainerMPEGTS || !r.spec.Decision.VideoCopy ||
 		v == nil || v.Codec != "h264" || encodedRange(v) != rangeSDR ||
 		!strings.Contains(strings.ToLower(stderr), "error applying bitstream filters") {
@@ -717,4 +862,84 @@ func (s *Session) liveRecoveryDelay(now time.Time, r *run) (time.Duration, bool)
 	}
 	s.liveFailures++
 	return 250 * time.Millisecond << min(s.liveFailures-1, 4), true
+}
+
+// Deterministic initialization failures cannot be repaired by probing the same
+// bytes again. Keep this classification narrow: transport outages still use
+// the normal recovery path.
+func deterministicHeaderFailure(stderr string) bool {
+	l := strings.ToLower(stderr)
+	return strings.Contains(l, "no parameter sets in the extradata") ||
+		strings.Contains(l, "could not write header") || strings.Contains(l, "error initializing output stream")
+}
+
+// recoverHeaderLocked permits one copy-to-encode attempt per input and at
+// most eight failing header attempts per minute across all input swaps.
+func (s *Session) recoverHeaderLocked(r *run) bool {
+	if !s.liveInput && s.m != nil && s.m.VideoTranscodingOff() {
+		return false
+	}
+	if s.headerInputs == nil {
+		s.headerInputs = make(map[string]int)
+	}
+	s.headerInputs[s.input]++
+	s.headerLastFailure = time.Now()
+	allowed := s.headerRestarts.take(s.headerLastFailure, 8, time.Minute)
+	if !allowed || len(s.headerRestarts) >= 8 || s.headerInputs[s.input] > 1 || !r.spec.Decision.VideoCopy {
+		return false
+	}
+	v := s.info.Video()
+	if v == nil || (v.Codec != "hevc" && v.Codec != "h264") {
+		return false
+	}
+	// A published Dolby Vision track cannot turn into a base-layer encode.
+	// Fail over instead of silently changing the client's retained format.
+	if s.contract != nil && (s.contract.dv || s.contract.rng == rangeDV) {
+		return false
+	}
+	if encodedRange(v) == rangeDV {
+		return false
+	}
+	d := s.decision
+	d.Kind, d.VideoCopy, d.VideoCodec = core.DecisionTranscode, false, v.Codec
+	d.StripDolbyVision = false
+	if d.BitrateKbps <= 0 {
+		d.BitrateKbps = bitrateCeiling(v.Height, v.Codec)
+	}
+	d.Reason += "; video copy header failed; encoding video"
+	s.decision = d
+	if len(s.rungs) > 0 {
+		s.rungs[0].decision = d
+	}
+	s.playlist = nil
+	s.log.Warn("copy header failed; trying video encode once", "run", r.seq)
+	// Prevent requests from racing the delayed fallback and starting copies.
+	s.headerRecovering = true
+	s.headerFallbackPending = s.input
+	timer := time.NewTimer(headerRecoveryDelay(len(s.headerRestarts)))
+	cancel := s.encoder.cancel
+	s.mu.Unlock()
+	select {
+	case <-timer.C:
+	case <-cancel:
+	}
+	timer.Stop()
+	s.mu.Lock()
+	if s.closed || s.cur != r {
+		return true
+	}
+	s.headerRecovering = false
+	if err := s.startRunForLocked(r.startSeg, true, "copy header fallback"); err != nil {
+		if s.headerRejected == nil {
+			s.headerRejected = make(map[string]bool)
+		}
+		s.headerRejected[s.input] = true
+		s.failErr = err
+		s.notifyInputFailureLocked(r)
+	}
+	return true
+}
+
+func headerRecoveryDelay(attempts int) time.Duration {
+	return 500 * time.Millisecond * time.Duration(1<<min(max(0, attempts-1), 3))
 }

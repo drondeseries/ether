@@ -78,6 +78,16 @@ func MagnetValues(magnet string) url.Values {
 	return values
 }
 
+// BareMagnet builds a trackerless magnet URI containing only the normalized
+// v1 info hash.
+func BareMagnet(infoHash string) string {
+	h := NormalizeInfoHash(infoHash)
+	if h == "" {
+		return ""
+	}
+	return "magnet:?xt=urn:btih:" + h
+}
+
 // MagnetFor builds a magnet URI for an info hash.
 func MagnetFor(infoHash, name string, trackers []string) string {
 	v := "magnet:?xt=urn:btih:" + infoHash
@@ -95,6 +105,7 @@ type TorrentMeta struct {
 	InfoHash string
 	Name     string
 	Trackers []string
+	Private  bool
 }
 
 // ParseTorrent computes the info hash (SHA-1 of the bencoded info
@@ -119,7 +130,7 @@ func ParseTorrent(data []byte) (TorrentMeta, error) {
 			}
 			sum := sha1.Sum(data[start:d.pos])
 			meta.InfoHash = hex.EncodeToString(sum[:])
-			meta.Name = torrentName(data[start:d.pos])
+			meta.Name, meta.Private = parseTorrentInfo(data[start:d.pos])
 		case "announce":
 			v, err := d.str()
 			if err != nil {
@@ -164,29 +175,35 @@ func appendTracker(list []string, tr string) []string {
 	return append(list, tr)
 }
 
-func torrentName(info []byte) string {
+func parseTorrentInfo(info []byte) (name string, private bool) {
 	d := &bdecoder{b: info}
 	if d.peek() != 'd' {
-		return ""
+		return "", false
 	}
 	d.pos++
 	for d.peek() == '0' || (d.peek() >= '1' && d.peek() <= '9') {
 		key, err := d.str()
 		if err != nil {
-			return ""
+			return name, private
 		}
-		if string(key) == "name" {
+		switch string(key) {
+		case "name":
 			v, err := d.str()
 			if err != nil {
-				return ""
+				return name, private
 			}
-			return string(v)
-		}
-		if err := d.skip(0); err != nil {
-			return ""
+			name = string(v)
+		case "private":
+			if n, ok := d.integer(); ok && n == 1 {
+				private = true
+			}
+		default:
+			if err := d.skip(0); err != nil {
+				return name, private
+			}
 		}
 	}
-	return ""
+	return name, private
 }
 
 // bdecoder is a minimal bencode reader: enough to find the info dictionary
@@ -203,6 +220,21 @@ func (d *bdecoder) peek() byte {
 		return 0
 	}
 	return d.b[d.pos]
+}
+
+func (d *bdecoder) integer() (int64, bool) {
+	if d.peek() != 'i' {
+		_ = d.skip(0)
+		return 0, false
+	}
+	end := bytes.IndexByte(d.b[d.pos:], 'e')
+	if end < 2 {
+		d.pos = len(d.b)
+		return 0, false
+	}
+	n, err := strconv.ParseInt(string(d.b[d.pos+1:d.pos+end]), 10, 64)
+	d.pos += end + 1
+	return n, err == nil
 }
 
 func (d *bdecoder) str() ([]byte, error) {
@@ -304,13 +336,18 @@ func (d *bdecoder) skip(depth int) error {
 func knownTorrent(r core.Release) (core.Release, bool) {
 	if h := NormalizeInfoHash(r.InfoHash); h != "" {
 		r.InfoHash = h
-		if r.MagnetURL == "" {
+		if r.Private {
+			r.MagnetURL = BareMagnet(h)
+		} else if r.MagnetURL == "" {
 			r.MagnetURL = MagnetFor(h, r.Name, nil)
 		}
 		return r, true
 	}
 	if h := InfoHashFromMagnet(r.MagnetURL); h != "" {
 		r.InfoHash = h
+		if r.Private {
+			r.MagnetURL = BareMagnet(h)
+		}
 		return r, true
 	}
 	return r, false
@@ -330,48 +367,79 @@ func (c *Client) resolveTorrentCached(ctx context.Context, r core.Release) (core
 		return known, true, nil
 	}
 	key := torrentDescriptorKey(c.Config(), r)
-	if hash, magnet, ok := c.torrents.get(key, c.now()); ok {
-		r.InfoHash, r.MagnetURL = hash, magnet
+	if hash, magnet, priv, ok := c.torrents.get(key, c.now()); ok {
+		r.InfoHash, r.MagnetURL, r.Private = hash, magnet, r.Private || priv
+		if r.Private {
+			r.MagnetURL = BareMagnet(r.InfoHash)
+		}
+		c.emit(Event{Kind: "cache", Purpose: usagePurpose(ctx), Success: true, Cached: true})
 		return r, true, nil
 	}
-	out, err := c.resolveTorrent(ctx, r)
-	if err == nil && out.InfoHash != "" {
-		c.torrents.put(key, out.InfoHash, out.MagnetURL, c.now())
+	if err := ctx.Err(); err != nil {
+		return r, false, err
 	}
+	started := time.Now()
+	out, reserved, err := c.resolveTorrent(ctx, r)
+	if err == nil && out.InfoHash != "" {
+		c.torrents.put(key, out.InfoHash, out.MagnetURL, out.Private, c.now())
+	}
+	c.emitGrab(ctx, r.Name, started, reserved, err, false)
 	return out, false, err
 }
 
-func (c *Client) resolveTorrent(ctx context.Context, r core.Release) (core.Release, error) {
-	if c.Config().UsesBackend() {
+func (c *Client) resolveTorrent(ctx context.Context, r core.Release) (core.Release, bool, error) {
+	if cfg := c.Config(); cfg.UsesBackend() {
 		b, err := c.backend()
 		if err != nil {
-			return r, err
+			return r, false, err
 		}
-		return b.ResolveTorrent(ctx, r, c.reserve)
+		hctx := ctx
+		if cfg.IsStremio() {
+			var releaseHost func()
+			hctx, releaseHost, err = c.acquireHost(ctx, cfg.URL)
+			if err != nil {
+				return r, false, err
+			}
+			defer releaseHost()
+		}
+		reserved := false
+		out, err := b.ResolveTorrent(hctx, r, func(rctx context.Context, kind string) error {
+			if err := c.reserve(rctx, kind); err != nil {
+				return err
+			}
+			reserved = true
+			return nil
+		})
+		return out, reserved, err
 	}
 	if r.NZBURL == "" {
-		return r, fmt.Errorf("newznab: torrent %q has no info hash, magnet or download URL: %w", r.Name, core.ErrReleaseRejected)
+		return r, false, fmt.Errorf("newznab: torrent %q has no info hash, magnet or download URL: %w", r.Name, core.ErrReleaseRejected)
 	}
 	rawURL := r.NZBURL
 	if !strings.HasPrefix(rawURL, "http://") && !strings.HasPrefix(rawURL, "https://") {
 		base, err := url.Parse(strings.TrimRight(c.Config().URL, "/") + "/")
 		if err != nil {
-			return r, redactURLError(err)
+			return r, false, redactURLError(err)
 		}
 		ref, err := url.Parse(rawURL)
 		if err != nil {
-			return r, redactURLError(err)
+			return r, false, redactURLError(err)
 		}
 		rawURL = base.ResolveReference(ref).String()
 	}
+	hctx, releaseHost, err := c.acquireHost(ctx, rawURL)
+	if err != nil {
+		return r, false, err
+	}
+	defer releaseHost()
 	// The download URL comes from the feed (untrusted): fetch it through
 	// the safefetch guard, like FetchNZB. Only the owner-configured
 	// indexer origin may be private; redirects away from it (other than
 	// magnet, handled below) are revalidated at dial time.
-	id := c.clientIdentityFor(releaseIsTV(r), true)
-	req, err := http.NewRequestWithContext(c.trustedCtx(ctx, rawURL), http.MethodGet, rawURL, nil)
+	id := c.grabIdentity()
+	req, err := http.NewRequestWithContext(c.trustedCtx(hctx, rawURL), http.MethodGet, rawURL, nil)
 	if err != nil {
-		return r, redactURLError(err)
+		return r, false, redactURLError(err)
 	}
 	c.applyIdentity(req, id)
 	// Torznab download links commonly redirect to a magnet URI, which
@@ -394,8 +462,8 @@ func (c *Client) resolveTorrent(ctx context.Context, r core.Release) (core.Relea
 	if hc.Timeout == 0 {
 		hc.Timeout = defaultHTTPTimeout
 	}
-	if err := c.reserve(ctx, "grab"); err != nil {
-		return r, err
+	if err := c.reserve(hctx, "grab"); err != nil {
+		return r, false, err
 	}
 	resp, err := hc.Do(req)
 	if err != nil {
@@ -404,35 +472,49 @@ func (c *Client) resolveTorrent(ctx context.Context, r core.Release) (core.Relea
 		if errors.As(err, &ue) {
 			err = ue.Err
 		}
-		return r, fmt.Errorf("newznab: download torrent for %q: %w", r.Name, err)
+		return r, true, fmt.Errorf("newznab: download torrent for %q: %w", r.Name, err)
 	}
 	defer resp.Body.Close()
 	if loc := resp.Header.Get("Location"); resp.StatusCode/100 == 3 && strings.HasPrefix(strings.ToLower(loc), "magnet:") {
 		if h := InfoHashFromMagnet(loc); h != "" {
-			r.InfoHash, r.MagnetURL = h, loc
-			return r, nil
+			r.InfoHash = h
+			if r.Private {
+				r.MagnetURL = BareMagnet(h)
+			} else {
+				r.MagnetURL = loc
+			}
+			return r, true, nil
 		}
-		return r, fmt.Errorf("newznab: torrent %q redirected to a magnet without an info hash: %w", r.Name, core.ErrReleaseRejected)
+		return r, true, fmt.Errorf("newznab: torrent %q redirected to a magnet without an info hash: %w", r.Name, core.ErrReleaseRejected)
 	}
 	if resp.StatusCode == http.StatusTooManyRequests {
 		// Honor the throttle like API requests do, so the next play does
 		// not immediately hit the throttled indexer again.
-		return r, c.recordRateLimit(ctx, resp.Header.Get("Retry-After"), apiError(429, "too many requests"))
+		return r, true, c.recordRateLimit(hctx, resp.Header.Get("Retry-After"), apiError(429, "too many requests"))
 	}
 	if resp.StatusCode != http.StatusOK {
-		return r, apiError(resp.StatusCode, resp.Status)
+		return r, true, apiError(resp.StatusCode, resp.Status)
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxTorrentBytes+1))
+	decoded, derr := decodeBody(resp)
+	if derr != nil {
+		return r, true, derr
+	}
+	body, err := io.ReadAll(io.LimitReader(decoded, maxTorrentBytes+1))
 	if err != nil {
-		return r, err
+		return r, true, err
 	}
 	if len(body) > maxTorrentBytes {
-		return r, fmt.Errorf("newznab: torrent exceeds %d bytes", maxTorrentBytes)
+		return r, true, fmt.Errorf("newznab: torrent exceeds %d bytes", maxTorrentBytes)
 	}
 	if trimmed := bytes.TrimSpace(body); bytes.HasPrefix(bytes.ToLower(trimmed), []byte("magnet:")) {
 		if h := InfoHashFromMagnet(string(trimmed)); h != "" {
-			r.InfoHash, r.MagnetURL = h, string(trimmed)
-			return r, nil
+			r.InfoHash = h
+			if r.Private {
+				r.MagnetURL = BareMagnet(h)
+			} else {
+				r.MagnetURL = string(trimmed)
+			}
+			return r, true, nil
 		}
 	}
 	meta, err := ParseTorrent(body)
@@ -440,18 +522,23 @@ func (c *Client) resolveTorrent(ctx context.Context, r core.Release) (core.Relea
 		if _, perr := parseFeed(body, c.Name()); perr != nil {
 			var ae *APIError
 			if errors.As(perr, &ae) {
-				return r, perr
+				return r, true, perr
 			}
 		}
-		return r, fmt.Errorf("newznab: torrent %q: %w", r.Name, err)
+		return r, true, fmt.Errorf("newznab: torrent %q: %w", r.Name, err)
 	}
 	r.InfoHash = meta.InfoHash
+	r.Private = r.Private || meta.Private
+	if r.Private {
+		r.MagnetURL = BareMagnet(meta.InfoHash)
+		return r, true, nil
+	}
 	name := meta.Name
 	if name == "" {
 		name = r.Name
 	}
 	r.MagnetURL = MagnetFor(meta.InfoHash, name, meta.Trackers)
-	return r, nil
+	return r, true, nil
 }
 
 // ResolveTorrent implements the debrid indexer's torrent resolution by
@@ -464,10 +551,6 @@ func (m *Manager) ResolveTorrent(ctx context.Context, r core.Release) (core.Rele
 	if err != nil {
 		return r, err
 	}
-	started := time.Now()
-	out, cached, err := cl.resolveTorrentCached(ctx, r)
-	if !cached {
-		m.emitEvent(Event{Indexer: cl.Name(), Kind: "grab", Success: err == nil, BudgetExhausted: errors.Is(err, core.ErrBudgetExhausted), Duration: time.Since(started), At: time.Now()})
-	}
+	out, _, err := cl.resolveTorrentCached(ctx, r)
 	return out, err
 }

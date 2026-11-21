@@ -10,9 +10,8 @@ import (
 
 	"github.com/braedonsaunders/ether/internal/config"
 	"github.com/braedonsaunders/ether/internal/core"
+	"github.com/braedonsaunders/ether/internal/httpclient"
 )
-
-const servarrAccept = "application/rss+xml, text/rss+xml, application/xml, text/xml"
 
 type wireRequest struct {
 	ua          string
@@ -86,67 +85,83 @@ func tvSearch() core.SearchRequest {
 func TestClientIdentityOnWire(t *testing.T) {
 	ws := newWireServer(t)
 	ctx := context.Background()
+	wantDefaultUA := httpclient.UserAgent()
 
-	// The default policy keeps today's bytes.
+	// Empty policy sends Ether's honest user agent and Go's normal query order.
 	c := New(wireConfig(ws.srv.URL), nil, Options{})
 	if _, err := c.Caps(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got := ws.last(); got.ua != "Ether/1.0" || got.rawQuery != "apikey=secret&t=caps" || got.accept != "" {
-		t.Fatalf("default caps: %+v", got)
+	if got := ws.last(); got.ua != wantDefaultUA || got.rawQuery != "apikey=secret&t=caps" || got.accept != "" {
+		t.Fatalf("default caps: %+v (want ua=%q)", got, wantDefaultUA)
 	}
 	ws.reset()
 	if _, err := c.Search(ctx, tvSearch()); err != nil {
 		t.Fatal(err)
 	}
 	const defaultTV = "apikey=secret&cat=5000&ep=2&extended=1&limit=100&season=1&t=tvsearch&tvdbid=81797"
-	if got := ws.last(); got.rawQuery != defaultTV || got.ua != "Ether/1.0" {
+	if got := ws.last(); got.rawQuery != defaultTV || got.ua != wantDefaultUA {
 		t.Fatalf("default tv search: %+v", got)
 	}
 
-	// A persona orders its parameters and sends its own headers.
+	// Global free-text userAgent applies to caps, search, and grab with normal query order.
 	ws.reset()
 	c = New(wireConfig(ws.srv.URL), nil, Options{
-		ClientIdentity: config.ClientIdentity{TVSearch: config.IdentitySonarr},
+		ClientIdentity: config.ClientIdentity{UserAgent: "CustomGlobal/1.0"},
 	})
 	if _, err := c.Caps(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got := ws.last(); got.ua != "Sonarr/4.0.20.3014 (ubuntu 26.04)" || got.rawQuery != "t=caps&apikey=secret" || got.accept != servarrAccept {
-		t.Fatalf("sonarr caps: %+v", got)
+	if got := ws.last(); got.ua != "CustomGlobal/1.0" || got.rawQuery != "apikey=secret&t=caps" || got.accept != "" {
+		t.Fatalf("global caps: %+v", got)
 	}
 	ws.reset()
 	if _, err := c.Search(ctx, tvSearch()); err != nil {
 		t.Fatal(err)
 	}
-	const sonarrTV = "t=tvsearch&cat=5000&extended=1&apikey=secret&offset=0&limit=100&tvdbid=81797&season=1&ep=2"
-	if got := ws.last(); got.rawQuery != sonarrTV {
-		t.Fatalf("sonarr tv search: %+v", got)
+	if got := ws.last(); got.rawQuery != defaultTV || got.ua != "CustomGlobal/1.0" {
+		t.Fatalf("global tv search: %+v", got)
+	}
+
+	// Per-indexer userAgent overrides global userAgent while keeping global headers.
+	ws.reset()
+	ixCfg := wireConfig(ws.srv.URL)
+	ixCfg.UserAgent = "PerIndexer/2.0"
+	c = New(ixCfg, nil, Options{
+		ClientIdentity: config.ClientIdentity{
+			UserAgent: "CustomGlobal/1.0",
+			Headers:   map[string]string{"Accept": "application/xml"},
+		},
+	})
+	movie := core.Release{ID: "r1", Name: "Movie.2026.1080p", GUID: "g1", Category: 2040}
+	if _, err := c.FetchNZB(ctx, movie); err != nil {
+		t.Fatal(err)
+	}
+	if got := ws.last(); got.ua != "PerIndexer/2.0" || got.accept != "application/xml" {
+		t.Fatalf("indexer override grab: %+v", got)
 	}
 }
 
 func TestClientIdentityProbe(t *testing.T) {
 	ws := newWireServer(t)
 	ctx := context.Background()
-	// The save-time probe must match the searches the persona sends: a paged
-	// client always includes offset.
 	if err := TestWithOptions(ctx, wireConfig(ws.srv.URL), Options{
-		ClientIdentity: config.ClientIdentity{TVSearch: config.IdentitySonarr},
+		ClientIdentity: config.ClientIdentity{UserAgent: "ProbeAgent/1.0"},
 	}); err != nil {
 		t.Fatal(err)
 	}
 	got := ws.last()
-	if got.rawQuery != "t=search&extended=1&apikey=secret&offset=0&limit=1&q=test" {
-		t.Fatalf("sonarr probe: %+v", got)
+	if got.rawQuery != "apikey=secret&extended=1&limit=1&q=test&t=search" {
+		t.Fatalf("probe query: %+v", got)
 	}
-	if got.ua != "Sonarr/4.0.20.3014 (ubuntu 26.04)" {
-		t.Fatalf("sonarr probe user agent: %q", got.ua)
+	if got.ua != "ProbeAgent/1.0" {
+		t.Fatalf("probe user agent: %q", got.ua)
 	}
 	ws.reset()
 	if err := TestWithOptions(ctx, wireConfig(ws.srv.URL), Options{}); err != nil {
 		t.Fatal(err)
 	}
-	if got := ws.last(); got.rawQuery != "apikey=secret&extended=1&limit=1&q=test&t=search" || got.ua != "Ether/1.0" {
+	if got := ws.last(); got.rawQuery != "apikey=secret&extended=1&limit=1&q=test&t=search" || got.ua != httpclient.UserAgent() {
 		t.Fatalf("default probe: %+v", got)
 	}
 }
@@ -155,7 +170,7 @@ func TestClientIdentityCacheSeparated(t *testing.T) {
 	ws := newWireServer(t)
 	ctx := context.Background()
 	c := New(wireConfig(ws.srv.URL), nil, Options{
-		ClientIdentity: config.ClientIdentity{TVSearch: config.IdentitySonarr},
+		ClientIdentity: config.ClientIdentity{UserAgent: "MyClient/1.0"},
 	})
 	if _, err := c.Search(ctx, tvSearch()); err != nil {
 		t.Fatal(err)
@@ -167,31 +182,13 @@ func TestClientIdentityCacheSeparated(t *testing.T) {
 	if got := len(ws.all()); got != before {
 		t.Fatalf("same identity re-searched the indexer: %d -> %d requests", before, got)
 	}
-	// A different persona may be answered differently, so its answer cannot
-	// come from the previous persona's cache entry.
-	c.SetClientIdentity(config.ClientIdentity{TVSearch: config.IdentityProwlarr})
+	// Editing the user agent must not reuse the previous identity's cached answer.
+	c.SetClientIdentity(config.ClientIdentity{UserAgent: "MyClient/2.0"})
 	if _, err := c.Search(ctx, tvSearch()); err != nil {
 		t.Fatal(err)
 	}
 	if got := len(ws.all()); got == before {
-		t.Fatal("switching the identity served the old identity's cached answer")
-	}
-	if got := ws.last().ua; got != "Prowlarr/2.7.0.5723 (ubuntu 26.04)" {
-		t.Fatalf("re-search used %q", got)
-	}
-	// A custom identity is keyed by what it sends, not by its name: editing
-	// the user agent must not reuse the previous custom identity's answer.
-	c.SetClientIdentity(config.ClientIdentity{TVSearch: config.IdentityCustom, UserAgent: "MyClient/1.0"})
-	if _, err := c.Search(ctx, tvSearch()); err != nil {
-		t.Fatal(err)
-	}
-	before = len(ws.all())
-	c.SetClientIdentity(config.ClientIdentity{TVSearch: config.IdentityCustom, UserAgent: "MyClient/2.0"})
-	if _, err := c.Search(ctx, tvSearch()); err != nil {
-		t.Fatal(err)
-	}
-	if got := len(ws.all()); got == before {
-		t.Fatal("editing the custom user agent kept the old cached answer")
+		t.Fatal("editing the user agent kept the old cached answer")
 	}
 	if got := ws.last().ua; got != "MyClient/2.0" {
 		t.Fatalf("edited user agent not sent: %q", got)
@@ -226,8 +223,8 @@ func TestTorznabNumberAttribute(t *testing.T) {
 func TestClientIdentityHeadersStayOnTheIndexerOrigin(t *testing.T) {
 	c := New(wireConfig("https://ix.example.com"), nil, Options{})
 	id := config.Identity{
-		Preset: "custom", UserAgent: "MyClient/1.0",
-		Headers: map[string]string{"X-Api-Client": "s3cret"},
+		UserAgent: "MyClient/1.0",
+		Headers:   map[string]string{"X-Api-Client": "s3cret"},
 	}
 	// A feed-supplied download URL on another host is untrusted data.
 	req, _ := http.NewRequest(http.MethodGet, "https://cdn.example.net/nzb", nil)
@@ -258,70 +255,8 @@ func TestClientIdentityHeadersStayOnTheIndexerOrigin(t *testing.T) {
 	}
 }
 
-func TestClientIdentityGrab(t *testing.T) {
-	ws := newWireServer(t)
-	ctx := context.Background()
-	c := New(wireConfig(ws.srv.URL), nil, Options{
-		ClientIdentity: config.ClientIdentity{MovieGrab: config.IdentityNZBGet},
-	})
-	movie := core.Release{ID: "r1", Name: "Movie.2026.1080p", GUID: "g1", Category: 2040}
-	if _, err := c.FetchNZB(ctx, movie); err != nil {
-		t.Fatal(err)
-	}
-	if got := ws.last(); got.ua != "nzbget/26.3" || got.accept != "*/*" {
-		t.Fatalf("movie grab: %+v", got)
-	}
-	episode := core.Release{ID: "r2", Name: "Show.S01E02.1080p", GUID: "g2", Category: 5040}
-	if _, err := c.FetchNZB(ctx, episode); err != nil {
-		t.Fatal(err)
-	}
-	if got := ws.last(); got.ua != "Ether/1.0" {
-		t.Fatalf("only the movie grab was overridden: %+v", got)
-	}
-}
-
-func TestClientIdentityNoEtherLeak(t *testing.T) {
-	presets := []string{
-		config.IdentitySonarr, config.IdentityRadarr, config.IdentityProwlarr,
-		config.IdentityNZBHydra2, config.IdentitySABnzbd, config.IdentityNZBGet,
-	}
-	ctx := context.Background()
-	for _, preset := range presets {
-		ws := newWireServer(t)
-		c := New(wireConfig(ws.srv.URL), nil, Options{
-			ClientIdentity: config.ClientIdentity{
-				TVSearch: preset, MovieSearch: preset, TVGrab: preset, MovieGrab: preset,
-			},
-		})
-		if _, err := c.Caps(ctx); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := c.Search(ctx, tvSearch()); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := c.Search(ctx, core.SearchRequest{
-			Type: core.TypeMovie, IDs: core.IDs{IMDB: "tt0133093"}, Title: "Movie", Year: 2026,
-		}); err != nil {
-			t.Fatal(err)
-		}
-		for _, r := range []core.Release{
-			{ID: "t", Name: "Show.S01E02", GUID: "g1", Category: 5040},
-			{ID: "m", Name: "Movie.2026", GUID: "g2", Category: 2040},
-		} {
-			if _, err := c.FetchNZB(ctx, r); err != nil {
-				t.Fatal(err)
-			}
-		}
-		for _, got := range ws.all() {
-			if got.ua == "" || got.ua == "Ether/1.0" {
-				t.Fatalf("%s: request carried %q", preset, got.ua)
-			}
-		}
-	}
-}
-
 // Torznab lists the standard category and then the site's own; the standard
-// one decides the media type, so a movie is grabbed with the movie identity.
+// one wins when parsing.
 func TestTorznabStandardCategoryWins(t *testing.T) {
 	const xmlFeed = `<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0" xmlns:torznab="http://torznab.com/schemas/2015/feed">
@@ -335,21 +270,7 @@ func TestTorznabStandardCategoryWins(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rs) != 1 || rs[0].Category != 2000 || releaseIsTV(rs[0]) {
+	if len(rs) != 1 || rs[0].Category != 2000 {
 		t.Fatalf("multi-category movie: %+v", rs)
-	}
-}
-
-// Caps, the connection test and the recent feed are neither TV nor movie:
-// with only movie searches moved off Ether they use the movie identity, so a
-// site that rejects Ether/1.0 still answers them.
-func TestGeneralRequestsFollowTheOnlyCustomSearchIdentity(t *testing.T) {
-	ws := newWireServer(t)
-	c := New(wireConfig(ws.srv.URL), nil, Options{ClientIdentity: config.ClientIdentity{MovieSearch: config.IdentityRadarr}})
-	if _, err := c.Caps(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if got := ws.last(); got.ua != "Radarr/6.4.4.10685 (ubuntu 26.04)" {
-		t.Fatalf("caps with only movie searches set: %+v", got)
 	}
 }

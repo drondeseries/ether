@@ -2,17 +2,21 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"github.com/braedonsaunders/ether/internal/frontend/kit/authhdr"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/braedonsaunders/ether/internal/config"
 	"github.com/braedonsaunders/ether/internal/core"
+	"github.com/braedonsaunders/ether/internal/diagnostics"
 	"github.com/braedonsaunders/ether/internal/egress"
 	experiencepkg "github.com/braedonsaunders/ether/internal/experience"
 	"github.com/braedonsaunders/ether/internal/frontend"
@@ -21,19 +25,22 @@ import (
 	"github.com/braedonsaunders/ether/internal/frontends/dlna"
 	"github.com/braedonsaunders/ether/internal/frontends/m3u"
 	"github.com/braedonsaunders/ether/internal/frontends/mediabrowser"
+	"github.com/braedonsaunders/ether/internal/frontends/plex"
 	"github.com/braedonsaunders/ether/internal/frontends/silo"
 	"github.com/braedonsaunders/ether/internal/frontends/stremio"
+	"github.com/braedonsaunders/ether/internal/frontends/vela"
 	"github.com/braedonsaunders/ether/internal/frontends/webdav"
 	"github.com/braedonsaunders/ether/internal/frontends/xtream"
 	"github.com/braedonsaunders/ether/internal/identity"
 	"github.com/braedonsaunders/ether/internal/livetv"
-	"github.com/braedonsaunders/ether/internal/plex"
 	"github.com/braedonsaunders/ether/internal/plextv"
 	"github.com/braedonsaunders/ether/internal/sessions"
 	"github.com/braedonsaunders/ether/internal/trackprefs"
+	"github.com/braedonsaunders/ether/internal/updater"
 	"github.com/braedonsaunders/ether/internal/watchparty"
 )
 
+// plexDiscovery is the injected discovery responder for the main listener.
 type plexDiscovery interface {
 	Start(context.Context) error
 	Stop()
@@ -43,6 +50,8 @@ type plexDiscovery interface {
 type frontendRuntime struct {
 	app            *App
 	registry       *frontend.Registry
+	siloExperience *surfaceExperience
+	plex           plex.Frontend
 	control        *frontendControl
 	events         *sessions.EventBus
 	broker         *sessions.Broker
@@ -85,8 +94,13 @@ func newFrontendRuntime(a *App, cfg config.Config) (*frontendRuntime, error) {
 	if err != nil {
 		return nil, err
 	}
+	a.wireIdentityLocal(local)
+	a.wireIdentityGrants(grants)
+	a.wireIdentityLimiter(login, "login")
+	a.wireIdentityLimiter(poll, "poll")
+	a.wireIdentityQuickConnect(quick)
 	times := grants.ViewerTimes()
-	resolver, err := identity.NewResolver(a.users, grants)
+	resolver, err := identity.NewResolver(map[string]identity.Authenticator{"plex": a.users}, grants)
 	if err != nil {
 		return nil, err
 	}
@@ -110,23 +124,34 @@ func newFrontendRuntime(a *App, cfg config.Config) (*frontendRuntime, error) {
 	}
 	var artwork frontend.Artwork
 	var channelArtwork func(*core.Viewer, livetv.Channel) frontend.Image
+	var programmeArtwork func(*core.Viewer, livetv.Programme) []frontend.Image
 	if a.tmdb != nil {
 		source, wait := a.newSharedArtwork(ctx)
 		a.artwork = source
 		r.artworkWait = wait
 		artwork = source
 		channelArtwork = source.ChannelImage
+		programmeArtwork = source.ProgrammeImages
 	}
 
 	experiences := make(map[frontend.Protocol]frontend.Experience)
 	for _, protocol := range []frontend.Protocol{"plex", "jellyfin", "emby", "silo"} {
-		experience, err := a.newSurfaceExperience(protocol, artwork)
+		surfaceArtwork := artwork
+		if source, ok := artwork.(interface {
+			WithLandscapeThumb(bool) frontend.Artwork
+		}); ok {
+			surfaceArtwork = source.WithLandscapeThumb(frontendHostPolicy(protocol).LandscapeThumb)
+		}
+		experience, err := a.newSurfaceExperience(protocol, surfaceArtwork)
 		if err != nil {
 			return nil, err
 		}
 		if scoped, ok := experience.(*surfaceExperience); ok {
 			scoped.playability = func(ctx context.Context, req frontend.ItemRequest) *bool {
-				return detailCanPlay(ctx, req, protocol, surfaceCapabilities{app: a, surface: protocol}, r.broker)
+				return detailCanPlay(ctx, req, protocol, surfaceCapabilities{app: a, surface: protocol, policy: frontendHostPolicy(protocol)}, r.broker)
+			}
+			if protocol == "silo" {
+				r.siloExperience = scoped
 			}
 		}
 		experiences[protocol] = experience
@@ -144,7 +169,7 @@ func newFrontendRuntime(a *App, cfg config.Config) (*frontendRuntime, error) {
 			if r.broker == nil || viewer == nil || viewer.StreamLimit <= 0 {
 				return nil
 			}
-			rows, err := sessions.BindSurface(r.broker, protocol).Sessions(ctx, frontend.SessionAccess{Viewer: viewer, Device: device, Protocol: protocol})
+			rows, err := sessions.BindSurface(r.broker, protocol, sessionPolicy(protocol)).Sessions(ctx, frontend.SessionAccess{Viewer: viewer, Device: device, Protocol: protocol})
 			if err != nil {
 				return err
 			}
@@ -159,15 +184,19 @@ func newFrontendRuntime(a *App, cfg config.Config) (*frontendRuntime, error) {
 			return nil
 		},
 		ItemID: ids.RatingKeyGUID,
-		JellyfinUser: func(id int64) string {
-			value, err := ids.GUID(ids.User, id)
-			if err != nil {
-				return ""
-			}
-			return value
-		},
 	})
+	repoFile := repoFileURL(sourceRef(updater.Version, updater.Commit, buildRevision()))
+	metadataHTTP := egress.Client(egress.CapMetadata, 20*time.Second)
+	spikeCfg := cfg.Spike
+	watchRefresh := experiencepkg.BindWatchRefresh(a.state)
+	var homeInvalidation frontend.HomeInvalidationSubscriber
+	if a.db != nil {
+		homeInvalidation = experiencepkg.BindHomeInvalidation(a.state)
+	}
 	r.registry = frontend.NewRegistry(func(id frontend.Protocol) frontend.Host {
+		if frontendHostPolicy(id).ExternalIdentity {
+			_ = a.ensurePlexAccountServices()
+		}
 		settings := func() frontend.Settings {
 			value, err := r.control.Settings(r.ctx, id)
 			if err != nil || value == nil {
@@ -188,6 +217,46 @@ func newFrontendRuntime(a *App, cfg config.Config) (*frontendRuntime, error) {
 			out["serverName"] = name
 			return out
 		}
+		var hostConfig func() frontend.HostConfig
+		if a.cfg != nil {
+			// Domain construction fixes the spike library for this runtime;
+			// live config reads reflect current identity and settings without
+			// switching the underlying library mid-run.
+			hostConfig = func() frontend.HostConfig {
+				c := a.cfg.Read()
+				c.Spike = spikeCfg
+				return c
+			}
+		}
+		currentCfg := cfg
+		if hostConfig != nil {
+			currentCfg = hostConfig()
+		}
+		serverIdentity := frontend.ServerIdentity{
+			MachineID:    currentCfg.Server.MachineIdentifier,
+			FriendlyName: currentCfg.Server.FriendlyName,
+			Version:      plextv.DefaultServerVersion,
+			Platform:     plexPlatform(),
+		}
+		ownerSub := func() (bool, []string) {
+			if a.registrar == nil {
+				return false, nil
+			}
+			st := a.registrar.Status()
+			return st.PlexPass, st.OwnerFeatures
+		}
+		publicOrigin := func() string {
+			if a.registrar == nil {
+				return ""
+			}
+			return publicPlexOrigin(a.registrar.Status().Connections)
+		}
+		artwork := artwork
+		if source, ok := artwork.(interface {
+			WithLandscapeThumb(bool) frontend.Artwork
+		}); ok {
+			artwork = source.WithLandscapeThumb(frontendHostPolicy(id).LandscapeThumb)
+		}
 		experience := experiences[id]
 		if experience == nil {
 			var err error
@@ -197,15 +266,18 @@ func newFrontendRuntime(a *App, cfg config.Config) (*frontendRuntime, error) {
 			}
 			if scoped, ok := experience.(*surfaceExperience); ok {
 				scoped.playability = func(ctx context.Context, req frontend.ItemRequest) *bool {
-					return detailCanPlay(ctx, req, id, surfaceCapabilities{app: a, surface: id}, r.broker)
+					return detailCanPlay(ctx, req, id, surfaceCapabilities{app: a, surface: id, policy: frontendHostPolicy(id)}, r.broker)
 				}
 			}
 		}
+		if scoped, ok := experience.(*surfaceExperience); ok && scoped.artwork != nil {
+			artwork = scoped.artwork
+		}
 		tickets, _ := identity.NewTicketService(a.db, id, grants, nil)
 		var lanViewer func(context.Context, *http.Request) (*core.Viewer, error)
-		if id == "dlna" {
+		if descriptor, ok := r.control.descriptor(id); ok && descriptor.Auth == "none_lan" {
 			lanViewer = func(ctx context.Context, req *http.Request) (*core.Viewer, error) {
-				return a.dlnaViewer(ctx, req, settings())
+				return a.lanViewer(ctx, req, settings())
 			}
 		}
 		var lanStreams frontend.LANLazyStreams
@@ -217,7 +289,7 @@ func newFrontendRuntime(a *App, cfg config.Config) (*frontendRuntime, error) {
 			}
 		}
 		lazy, lazyErr := sessions.NewLazyStreams(a.db, r.broker, id, grants, time.Hour, func(req *http.Request) bool { ip, ok := a.frontendClientIP(req); return !ok || !identity.LAN(ip) })
-		versionHandles, handleErr := sessions.NewVersionHandles(a.db, r.broker, id)
+		versionHandles, handleErr := sessions.NewVersionHandles(a.db, r.broker, id, a.cfg.DerivedKey("ether-version-id-v1"))
 		if handleErr != nil {
 			a.log.Error("version handles unavailable", "surface", id, "err", handleErr)
 		}
@@ -234,13 +306,20 @@ func newFrontendRuntime(a *App, cfg config.Config) (*frontendRuntime, error) {
 		}
 		var imageGrants frontend.ImageGrants
 		var imageRevision func() uint64
-		if id != "plex" {
+		if !frontendHostPolicy(id).ExternalIdentity {
+			imageOptions := identity.ImageGrantOptions{
+				LibraryLiveThumbs: surfaceLibraryLive{app: a, surface: string(id)},
+			}
+			if frontendHostPolicy(id).PublicContentTags {
+				imageOptions.Token = authhdr.MediaBrowserToken
+				imageOptions.PublicContentTags = true
+			}
 			var svc *identity.ImageGrantService
 			var err error
 			if artwork != nil {
-				svc, err = identity.NewArtworkImageGrantService(a.db, id, grants, func() frontend.Experience { return experience }, artwork, 10*time.Minute, nil)
+				svc, err = identity.NewArtworkImageGrantService(a.db, id, grants, func() frontend.Experience { return experience }, artwork, 10*time.Minute, nil, imageOptions)
 			} else {
-				svc, err = identity.NewImageGrantService(a.db, id, grants, func() frontend.Experience { return experience }, a.images, 10*time.Minute, nil)
+				svc, err = identity.NewImageGrantService(a.db, id, grants, func() frontend.Experience { return experience }, a.images, 10*time.Minute, nil, imageOptions)
 			}
 			if err == nil && svc != nil {
 				if a.cfg != nil {
@@ -253,6 +332,12 @@ func newFrontendRuntime(a *App, cfg config.Config) (*frontendRuntime, error) {
 					}
 					if a.cfg != nil {
 						gen ^= a.cfg.Generation()
+					}
+					if a.libraries != nil {
+						gen ^= a.libraries.Generation()
+					}
+					if a.pluginsRT != nil && a.pluginsRT.pluginitems != nil {
+						gen ^= a.pluginsRT.pluginitems.Generation()
 					}
 					return gen
 				})
@@ -274,14 +359,29 @@ func newFrontendRuntime(a *App, cfg config.Config) (*frontendRuntime, error) {
 		if a.subtitles != nil {
 			subtitleCatalog = subtitleSurface{app: a, exp: experience, surface: string(id)}
 		}
-		return frontend.Host{Support: a.support, IDs: ids.Codecs{Allocator: compact}, DirectProxy: egress.ProxyFunc(egress.CapDirect), Experience: experience, LastPlayedSource: surfaceLastPlayedSource{experience: experience, state: a.state}, VersionHandles: versionHandles, SourceOffers: sourceOffers, Editions: surfaceEditions{app: a}, VirtualPaths: surfaceVirtualPaths{experience: experience, index: &pathIndex{}, stamp: func(v *core.Viewer) string {
+		var kindStreams frontend.KindStreams
+		if a.pluginsRT != nil && a.pluginsRT.kindResolver != nil {
+			kindStreams = a.pluginsRT.kindResolver
+		}
+		return frontend.Host{Support: a.support, IDs: ids.Codecs{Allocator: compact}, DirectProxy: egress.ProxyFunc(egress.CapExtras), MetadataHTTP: metadataHTTP, Experience: experience, KindStreams: kindStreams, LastPlayedSource: surfaceLastPlayedSource{experience: experience, state: a.state}, VersionHandles: versionHandles, SourceOffers: sourceOffers, Editions: surfaceEditions{app: a}, VirtualPaths: surfaceVirtualPaths{experience: experience, index: &pathIndex{}, stamp: func(v *core.Viewer) string {
 			if v == nil || a.catalog == nil || a.cfg == nil {
 				return ""
 			}
-			return fmt.Sprintf("%d|%d|%d|%s|%v", a.catalog.WriteGeneration(), a.cfg.Generation(), v.ID, v.MaxContentRating, v.AllowedSections)
-		}, enabled: func() bool { _, ok := r.registry.Instance("webdav"); return ok }, base: func(ctx context.Context, req *http.Request) (string, error) { return r.surfaceURL(ctx, "webdav", req) }}, ViewerCapabilities: a.viewerCapabilities(local, experience), ViewerPolicy: surfaceViewerPolicy{app: a}, ImageGrants: imageGrants, Artwork: artwork, ExtraStreams: extraPlay, Cinema: cinema, Prerolls: prerollIntros, Subtitles: subtitleCatalog, Preferences: identity.NewPreferences(a.db, id), TrackPreferences: surfaceTrackPreferences{app: a}, LiveTV: surfaceLiveTV{app: a, channelArtwork: channelArtwork, artwork: artwork}, Sessions: scorecardSessions(a, sessions.BindSurface(r.broker, id)), LazyStreams: lazy, LANStreams: lanStreams, Capabilities: surfaceCapabilities{app: a, surface: id}, Identity: surfaceIdentity{settings: settings, surface: id, resolver: resolver, local: local, grants: grants, quick: quick, login: login, poll: poll, times: times}, Events: sessions.BindEvents(r.events, id), Tickets: tickets, WatchParty: parties, Images: frontendImages{source: a.images}, Log: a.log.With("frontend", id), ClientSeen: func(deviceID string) { a.frontendClients.observe(id, deviceID) }, ClientIP: a.frontendClientIP, ViewerPortalURL: r.viewerPortalURL, SecurePortalURL: r.viewerPortalSecureURL, SurfaceURL: func(ctx context.Context, req *http.Request) (string, error) {
+			var libGen, kindGen uint64
+			if a.libraries != nil {
+				libGen = a.libraries.Generation()
+			}
+			if a.pluginsRT != nil && a.pluginsRT.pluginitems != nil {
+				kindGen = a.pluginsRT.pluginitems.Generation()
+			}
+			return fmt.Sprintf("%d|%d|%d|%d|%d|%s|%v", a.catalog.WriteGeneration(), a.cfg.Generation(), libGen, kindGen, v.ID, v.MaxContentRating, v.AllowedLibraries)
+		}, enabled: func() bool { _, ok := r.registry.Instance("webdav"); return ok }, base: func(ctx context.Context, req *http.Request) (string, error) { return r.surfaceURL(ctx, "webdav", req) }}, ViewerCapabilities: a.viewerCapabilities(local, experience), ViewerPolicy: surfaceViewerPolicy{app: a}, ImageGrants: imageGrants, Artwork: artwork, ExtraStreams: extraPlay, Themes: a.extras, ThemeTitle: a.themeTitle, Cinema: cinema, Prerolls: prerollIntros, Subtitles: subtitleCatalog, Preferences: identity.NewPreferences(a.db, id), TrackPreferences: surfaceTrackPreferences{app: a}, LiveTV: surfaceLiveTV{app: a, surface: string(id), channelArtwork: channelArtwork, programmeArtwork: programmeArtwork, artwork: artwork}, LibraryLive: surfaceLibraryLive{app: a, surface: string(id)}, Sessions: scorecardSessions(a, sessions.BindSurface(r.broker, id, sessionPolicy(id))), LazyStreams: lazy, LANStreams: lanStreams, Capabilities: surfaceCapabilities{app: a, surface: id, policy: frontendHostPolicy(id)}, Identity: surfaceIdentity{app: a, policy: frontendHostPolicy(id), settings: settings, hostConfig: hostConfig, surface: id, users: a.users, resolver: resolver, local: local, grants: grants, quick: quick, login: login, poll: poll, times: times}, Events: sessions.BindEvents(r.events, id), WatchRefresh: watchRefresh, HomeInvalidation: homeInvalidation, Tickets: tickets, WatchParty: parties, Images: frontendImages{source: a.images}, Log: a.log.With("frontend", id), ClientSeen: func(deviceID string) { a.frontendClients.observe(id, deviceID) }, RemoteClientSeen: func(address string) {
+			if a.registrar != nil {
+				a.registrar.ObserveRemoteClient(address)
+			}
+		}, ClientIP: a.frontendClientIP, ViewerPortalURL: r.viewerPortalURL, SecurePortalURL: r.viewerPortalSecureURL, SecureOrigins: r.secureOrigins, SurfaceURL: func(ctx context.Context, req *http.Request) (string, error) {
 			return scorecardSurfaceURL(ctx, r, id, req)
-		}, LANViewer: lanViewer, PageFreshness: func() frontend.PageFreshness {
+		}, PublicOrigin: publicOrigin, RepoFileURL: repoFile, TracePlayback: a.tracePlayback, ServerIdentity: serverIdentity, OwnerSubscription: ownerSub, LANViewer: lanViewer, PageFreshness: func() frontend.PageFreshness {
 			f := a.browseFreshness()
 			if imageRevision != nil {
 				f.Images = imageRevision()
@@ -290,14 +390,18 @@ func newFrontendRuntime(a *App, cfg config.Config) (*frontendRuntime, error) {
 				f.Grants = grants.Generation()
 			}
 			return f
-		}, Config: settings, MetadataLanguage: func() string {
+		}, Config: settings, HostConfig: hostConfig, Now: parityClock(), MetadataLanguage: func() string {
 			if a.cfg == nil {
 				return ""
 			}
 			return a.cfg.Get().Catalog.Language
-		}, AudioOrder: trackprefs.AudioOrder, PickAudio: experiencepkg.PickAudio, PersonalHomes: a.personalHomeDisk()}
+		}, AudioOrder: trackprefs.AudioOrder, PickAudio: experiencepkg.PickAudio, PersonalHomes: a.personalHomeDisk(), CacheDir: a.frontendCacheDir(id), ClientsDir: a.frontendClientsDir()}
 	})
 	r.control = newFrontendControl(r.registry, a.cfg)
+	r.control.db = a.db
+	r.control.portChanged = func() {
+		time.AfterFunc(time.Second, func() { a.requestRestart("listening port changed") })
+	}
 	r.control.listeners.log = a.log
 	r.control.listeners.perf = a.perf
 	r.control.listeners.discovery = newSharedDiscovery(r.ctx)
@@ -310,25 +414,8 @@ func newFrontendRuntime(a *App, cfg config.Config) (*frontendRuntime, error) {
 		return countFrontendStreams((ownerPlayback{Playback: a.playback, app: a}).Sessions()), true
 	}
 	r.control.sharedStatus = r.sharedStatus
-	if err := r.registry.Register(plex.Frontend{NewServer: func() (*plex.Server, error) {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		current := a.cfg.Get()
-		// Domain construction fixes the spike library for this runtime. First mount
-		// uses current identity/settings without changing the underlying library.
-		current.Spike = cfg.Spike
-		handler, err := a.buildPlex(ctx, current)
-		if err != nil {
-			return nil, err
-		}
-		srv := handler.(*plex.Server)
-		srv.UsePlexStreams(sessions.BindPlexStreams(r.broker))
-		if a.deployment != nil {
-			srv.UsePlexEncoder(r.broker)
-		}
-		return srv, nil
-	}, WatchState: a.state, ExplicitWatchOnly: cfg.Spike.Enabled, StatusFunc: r.plexStatus, ListenersFunc: r.plexListeners}); err != nil {
+	r.plex = plex.NewFrontend()
+	if err := r.registry.Register(r.plex); err != nil {
 		return nil, err
 	}
 	if err := r.registry.Register(mediabrowser.Jellyfin{MachineID: cfg.Server.MachineIdentifier}); err != nil {
@@ -338,6 +425,9 @@ func newFrontendRuntime(a *App, cfg config.Config) (*frontendRuntime, error) {
 		return nil, err
 	}
 	if err := r.registry.Register(silo.Frontend{MachineID: cfg.Server.MachineIdentifier}); err != nil {
+		return nil, err
+	}
+	if err := r.registry.Register(vela.Frontend{AssetsDir: filepath.Join(a.frontendClientsDir(), "vela"), DB: a.db, ReplayKey: a.cfg.DerivedKey("vela-idempotency-v0"), Skins: a.velaSkinsStore()}); err != nil {
 		return nil, err
 	}
 	if err := r.registry.Register(stremio.Frontend{}); err != nil {
@@ -355,10 +445,18 @@ func newFrontendRuntime(a *App, cfg config.Config) (*frontendRuntime, error) {
 	if err := r.registry.Register(m3u.Frontend{}); err != nil {
 		return nil, err
 	}
+	// Plugin-provided protocol surfaces (spec §6.5): register one generic
+	// adapter frontend per declaration and keep them in step with plugin
+	// lifecycle. OnSync replays every installed plugin, so this also does
+	// the initial registration.
+	if _, err := a.buildAdapterController(r.registry); err != nil {
+		return nil, err
+	}
 	if cfg.Frontends == nil || cfg.Frontends["plex"].Enabled {
 		if err := r.control.listeners.start(ctx, "plex"); err != nil {
 			return nil, err
 		}
+		r.publishLibrarySections()
 	}
 	if a.deployment != nil && a.deployment.playback != nil {
 		// Resolve the current protocol mounts through the original public dispatcher.
@@ -398,11 +496,21 @@ func (a *App) trustedProxyPrefixes() []netip.Prefix {
 	a.proxyReady = true
 	return a.proxyPrefixes
 }
+
+// plexHandler wires the main protocol mount into the public dispatcher.
 func (r *frontendRuntime) plexHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if handler := r.control.listeners.sharedHandler(req.URL.Path); handler != nil {
 			handler.ServeHTTP(w, req)
 			return
+		}
+		if xtreamRootPath(req.URL.Path) {
+			// Many IPTV apps drop the "/xtream" path from the server URL and
+			// call the standard Xtream paths at the root. Plex has none of them.
+			if handler := r.control.listeners.sharedHandler("/xtream"); handler != nil {
+				handler.ServeHTTP(w, req)
+				return
+			}
 		}
 		if siloProbeMiss(w, req) {
 			return
@@ -415,23 +523,20 @@ func (r *frontendRuntime) plexHandler() http.Handler {
 		r.control.listeners.observe("plex", inst.Handler()).ServeHTTP(w, req)
 	})
 }
-func (r *frontendRuntime) plexListeners() []frontend.ListenerSpec {
-	r.mu.Lock()
-	addr := r.mainAddr
-	r.mu.Unlock()
-	address := ""
-	if addr != nil {
-		address = addr.String()
-	}
-	return []frontend.ListenerSpec{{Address: address, PathPrefix: "/", Shared: true}}
-}
 
 func (r *frontendRuntime) sharedStatus(id frontend.Protocol, status *frontend.Status) {
-	if id == "plex" {
-		return
-	}
 	instance, ok := r.registry.Instance(id)
 	if !ok {
+		return
+	}
+	if frontendHostPolicy(id).MainListener {
+		mounted := status.Mounted
+		errText := status.Error
+		*status = r.plexStatus(context.Background())
+		status.Mounted = mounted
+		if errText != "" {
+			status.Error = errText
+		}
 		return
 	}
 	r.mu.Lock()
@@ -453,6 +558,8 @@ func (r *frontendRuntime) sharedStatus(id frontend.Protocol, status *frontend.St
 		break
 	}
 }
+
+// plexStatus wires account publication and main-listener reachability into status.
 func (r *frontendRuntime) plexStatus(ctx context.Context) frontend.Status {
 	r.mu.Lock()
 	addr := r.mainAddr
@@ -481,10 +588,15 @@ func (r *frontendRuntime) plexStatus(ctx context.Context) frontend.Status {
 	}
 	if r.app.registrar != nil {
 		remote := r.app.registrar.Status()
+		// ConnectURLs are the at-home addresses. The public host, custom
+		// outside routes and the WAN address belong to Away from home.
 		for _, connection := range remote.Connections {
-			st.ConnectURLs = append(st.ConnectURLs, connection.URI)
+			if connection.Local {
+				st.ConnectURLs = append(st.ConnectURLs, connection.URI)
+			}
 		}
-		st.WAN = remote.WANState()
+		wan := remote.WANCheck()
+		st.WAN, st.WANReason, st.WANAddress, st.WANCheckedAt = wan.State, wan.Reason, wan.Address, wan.CheckedAt
 	}
 	if snapshot, ok := ctx.Value(frontendStreamCountsKey{}).(frontendStreamCounts); ok {
 		st.LiveStreams, st.LiveStreamsKnown = snapshot.counts["plex"], snapshot.known
@@ -529,6 +641,7 @@ func (r *frontendRuntime) reconcile(cfg config.Config) {
 			_ = r.control.listeners.stop(r.ctx, "plex")
 		}
 	}
+	r.publishLibrarySections()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.syncDiscoveryLocked()
@@ -547,6 +660,7 @@ func (r *frontendRuntime) start(ctx context.Context, addr net.Addr) {
 	r.lanGeneration++
 	r.mu.Unlock()
 	r.control.Reconcile(r.ctx, r.app.cfg.Get())
+	r.publishLibrarySections()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.syncDiscoveryLocked()
@@ -612,21 +726,128 @@ func (r *frontendRuntime) close() {
 	if r.artworkWait != nil {
 		r.artworkWait()
 	}
+	if r.registry != nil {
+		_ = r.registry.Shutdown(context.Background())
+	}
 	if r.app != nil {
-		r.app.plexBuildMu.Lock()
-		closePlex := r.app.plexClose
-		r.app.plexClose = nil
-		r.app.plexBuildMu.Unlock()
-		if closePlex != nil {
-			closePlex()
+		r.app.closePlexAccountServices()
+	}
+}
+
+func (r *frontendRuntime) publishLibrarySections() {
+	if r == nil || r.app == nil || r.app.registrar == nil || r.registry == nil {
+		return
+	}
+	inst, ok := r.registry.Instance("plex")
+	if !ok {
+		return
+	}
+	provider, ok := inst.(frontend.PublishedLibraryProvider)
+	if !ok {
+		return
+	}
+	secs := provider.PublishedLibraries()
+	libraries := make([]plextv.LibrarySection, 0, len(secs))
+	for _, sec := range secs {
+		libraries = append(libraries, plextv.LibrarySection{
+			Key: sec.ID, Type: string(sec.Type), Title: sec.Title,
+			UUID: sec.UUID, Language: sec.Language,
+		})
+	}
+	r.app.registrar.SetLibrarySections(libraries)
+}
+
+func (r *frontendRuntime) noteOwnerStop(sessionID, reason string) {
+	if r == nil || r.registry == nil {
+		return
+	}
+	for _, d := range r.registry.Descriptors() {
+		if inst, ok := r.registry.Instance(d.ID); ok {
+			if stopper, ok := inst.(frontend.OwnerSessionStopper); ok {
+				stopper.NoteOwnerStop(sessionID, reason)
+			}
 		}
 	}
 }
 
-// browseFreshness is the stamp of a cached Jellyfin or Emby page. Image
-// grants last ten minutes, so the art bucket rotates well inside that.
+func (r *frontendRuntime) notifyLiveLineup(viewerID int64) {
+	if r == nil || r.registry == nil {
+		return
+	}
+	for _, d := range r.registry.Descriptors() {
+		if inst, ok := r.registry.Instance(d.ID); ok {
+			if obs, ok := inst.(frontend.LiveLineupObserver); ok {
+				obs.NotifyLiveLineupChanged(viewerID)
+			}
+		}
+	}
+}
+
+func (r *frontendRuntime) supportViewer(ctx context.Context, viewer *core.User) (diagnostics.ViewerFacts, error) {
+	if r != nil && r.registry != nil {
+		if inst, ok := r.registry.Instance("plex"); ok {
+			if diag, ok := inst.(frontend.ViewerDiagnostics); ok {
+				return diag.SupportViewer(ctx, viewer)
+			}
+		}
+		for _, d := range r.registry.Descriptors() {
+			if inst, ok := r.registry.Instance(d.ID); ok {
+				if diag, ok := inst.(frontend.ViewerDiagnostics); ok {
+					return diag.SupportViewer(ctx, viewer)
+				}
+			}
+		}
+	}
+	return diagnostics.ViewerFacts{}, errors.New("Plex unavailable")
+}
+
+func (r *frontendRuntime) prune(ctx context.Context, id frontend.Protocol) (int64, error) {
+	if r == nil || r.registry == nil {
+		return 0, nil
+	}
+	return r.registry.Prune(ctx, id)
+}
+
+// frontendCacheDir is the node-local directory a frontend may fill with
+// files it regenerates (Xtream's whole-library exports), under the data
+// directory's cache, which Kubernetes keeps on the writable data volume.
+func (a *App) frontendCacheDir(id frontend.Protocol) string {
+	if a == nil || a.opts.DataDir == "" {
+		return ""
+	}
+	return filepath.Join(a.opts.DataDir, "cache", "frontends", string(id))
+}
+
+// frontendClientsDir is the persistent directory for third-party client
+// builds downloaded at runtime (the official Jellyfin Web build the native
+// apps load from /web). It must survive restarts, unlike the node-local
+// frontend cache, so a completed download is reused forever.
+func (a *App) frontendClientsDir() string {
+	if a == nil || a.opts.DataDir == "" {
+		return ""
+	}
+	return filepath.Join(a.opts.DataDir, "clients")
+}
+
+// backgroundBusy counts work mounted frontends run behind their
+// requests (Plex home/enrichment and Xtream export builds).
+func (r *frontendRuntime) backgroundBusy() int {
+	if r == nil || r.registry == nil {
+		return 0
+	}
+	busy := 0
+	for _, d := range r.registry.Descriptors() {
+		if inst, ok := r.registry.Instance(d.ID); ok {
+			if b, ok := inst.(frontend.BackgroundWorker); ok {
+				busy += b.BackgroundBusy()
+			}
+		}
+	}
+	return busy
+}
+
 func (a *App) browseFreshness() frontend.PageFreshness {
-	f := frontend.PageFreshness{ArtBucket: time.Now().Unix() / 120}
+	var f frontend.PageFreshness
 	if a == nil {
 		return f
 	}
@@ -654,5 +875,33 @@ func (a *App) browseFreshness() frontend.PageFreshness {
 	if a.safety != nil {
 		f.Safety = a.safety.Generation()
 	}
+	if a.personalize != nil {
+		f.Layout = a.personalize.LayoutVersion()
+	}
+	if a.libraries != nil {
+		f.Libraries = a.libraries.Generation()
+	}
+	if a.pluginsRT != nil && a.pluginsRT.pluginitems != nil {
+		f.KindSync = a.pluginsRT.pluginitems.Generation()
+	}
 	return f
+}
+
+// xtreamRootPath reports a standard Xtream Codes API or stream path at the
+// server root: player_api.php, xmltv.php, get.php, or
+// /{live,movie,series}/<username>/<password>/<file>.
+func xtreamRootPath(path string) bool {
+	switch path {
+	case "/player_api.php", "/xmltv.php", "/get.php":
+		return true
+	}
+	parts := strings.Split(strings.TrimPrefix(path, "/"), "/")
+	if len(parts) != 4 || parts[1] == "" || parts[2] == "" || parts[3] == "" {
+		return false
+	}
+	switch parts[0] {
+	case "live", "movie", "series":
+		return true
+	}
+	return false
 }

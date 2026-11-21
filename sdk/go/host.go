@@ -11,14 +11,16 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // HostFetchRequest describes an outbound HTTP call via the host service.
 type HostFetchRequest struct {
-	Method  string            `json:"method,omitempty"`
-	URL     string            `json:"url"`
-	Headers map[string]string `json:"headers,omitempty"`
-	Body    string            `json:"body,omitempty"`
+	TimeoutMS int64             `json:"timeoutMs,omitempty"`
+	Method    string            `json:"method,omitempty"`
+	URL       string            `json:"url"`
+	Headers   map[string]string `json:"headers,omitempty"`
+	Body      string            `json:"body,omitempty"`
 }
 
 // HostFetchResponse is returned by Host.Fetch.
@@ -26,6 +28,25 @@ type HostFetchResponse struct {
 	Status  int               `json:"status"`
 	Headers map[string]string `json:"headers"`
 	Body    string            `json:"body"`
+}
+
+// FolderHashJob is a pollable background hash. Bytes is the progress so far.
+// Terminal states are done, canceled and error. Only done carries Result.
+type FolderHashJob struct {
+	ID     string      `json:"id"`
+	State  string      `json:"state"`
+	Bytes  int64       `json:"bytes"`
+	Result *FolderHash `json:"result,omitempty"`
+	Error  string      `json:"error,omitempty"`
+}
+
+// FolderHash contains digests, never file contents. ModTime is Unix seconds.
+type FolderHash struct {
+	Size    int64  `json:"size"`
+	ModTime int64  `json:"modTime"`
+	CRC32   string `json:"crc32"`
+	MD5     string `json:"md5"`
+	SHA1    string `json:"sha1"`
 }
 
 // FolderEntry describes one entry returned by Host.FoldersList or Host.FoldersStat.
@@ -71,8 +92,107 @@ type Host interface {
 	UpsertCollection(ctx context.Context, collection map[string]any) error
 	FoldersList(ctx context.Context, root, path string) ([]FolderEntry, error)
 	FoldersStat(ctx context.Context, root, path string) (FolderEntry, error)
+	FoldersHash(ctx context.Context, root, path string) (FolderHash, error)
+	FoldersHashStart(ctx context.Context, root, path string) (FolderHashJob, error)
+	FoldersHashPoll(ctx context.Context, id string) (FolderHashJob, error)
+	FoldersHashCancel(ctx context.Context, id string) (FolderHashJob, error)
 	NotifyOwner(ctx context.Context, text string) error
 	Log(ctx context.Context, level, message string, attrs map[string]any) error
+	// Content-kind host services. KindUpsert/KindDelete need a push-mode
+	// kind; ResolveSources needs permissions.sources.
+	KindUpsert(ctx context.Context, kindKey string, items []KindItem) (accepted int, err error)
+	KindDelete(ctx context.Context, kindKey string, externalIDs []string) error
+	KindItems(ctx context.Context, kindKey, cursor string, limit int) (KindPage, error)
+	ResolveSources(ctx context.Context, q SourceQuery) ([]SourceCandidate, error)
+	CachePut(ctx context.Context, libraryKey, name string, data []byte) (blobRef string, err error)
+	CacheOpen(ctx context.Context, blobRef string) ([]byte, error)
+	// StreamURL mints a short-lived, scoped ticket for one of this plugin's
+	// own kind items and returns the Ether stream URL to embed in a
+	// frontend adapter response (spec §6.5). viewerID is the viewer the
+	// adapter authenticated.
+	StreamURL(ctx context.Context, viewerID int64, itemRef string) (string, error)
+}
+
+// KVUsage reports a plugin's current KV bytes (including the 256-byte charge
+// per key), key count, and configured quotas (#591).
+type KVUsage struct {
+	Bytes      int64 `json:"bytes"`
+	Keys       int64 `json:"keys"`
+	QuotaBytes int64 `json:"quotaBytes"`
+	QuotaKeys  int64 `json:"quotaKeys"`
+}
+
+// KVUsageHost reports current KV usage and quotas (#591).
+// RemoteHostClient and MockHost implement it.
+type KVUsageHost interface {
+	KVUsage(ctx context.Context) (KVUsage, error)
+}
+
+// BadgesHost pushes, clears, and inspects plugin-owned poster badges (#594).
+// RemoteHostClient and MockHost implement it.
+type BadgesHost interface {
+	BadgesSet(ctx context.Context, setKey string, entries []BadgeEntry) error
+	BadgesClear(ctx context.Context, setKey string) error
+	BadgesUsage(ctx context.Context) (BadgeUsage, error)
+}
+
+// EventsHost emits declared plugin events onto Ether's event bus.
+// RemoteHostClient and MockHost implement it; Context.PublishEvent uses it automatically.
+type EventsHost interface {
+	PublishEvent(ctx context.Context, key string, payload any, corr *EventCorrelation) error
+}
+
+// PartStreamHost mints a short-lived, scoped ticket for a specific zero-based
+// part of a multi-file kind item (#576). RemoteHostClient and MockHost
+// implement it; Context.StreamPartURL uses it automatically.
+type PartStreamHost interface {
+	StreamPartURL(ctx context.Context, viewerID int64, itemRef string, partIndex int) (string, error)
+}
+
+// CacheDeleteHost deletes cached blobs from this plugin's own library cache
+// namespaces. RemoteHostClient and MockHost implement it.
+type CacheDeleteHost interface {
+	CacheDelete(ctx context.Context, blobRef string) error
+}
+
+const (
+	// MaxKindVisibleIDs is the per-call batch cap for kinds.visible (#615).
+	MaxKindVisibleIDs = 500
+	// HeaderViewerToken carries the host-minted, request-scoped adapter viewer
+	// proof header on frontend adapter calls (#615).
+	HeaderViewerToken = "X-Ether-Viewer-Token"
+)
+
+type viewerTokenContextKey struct{}
+
+// WithViewerToken attaches the host-minted X-Ether-Viewer-Token from an
+// incoming frontend adapter request onto ctx so KindVisible and KindBrowse
+// authenticate as that request's viewer without passing a viewer ID (#615).
+func WithViewerToken(ctx context.Context, token string) context.Context {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, viewerTokenContextKey{}, token)
+}
+
+// ViewerTokenFromContext returns the adapter viewer token attached by
+// WithViewerToken (or automatically during FrontendAdapter dispatch).
+func ViewerTokenFromContext(ctx context.Context) (string, bool) {
+	if ctx == nil {
+		return "", false
+	}
+	tok, ok := ctx.Value(viewerTokenContextKey{}).(string)
+	return tok, ok && tok != ""
+}
+
+// KindPolicyHost evaluates a plugin library's Rules and viewer access policy
+// for the requesting frontend-adapter viewer (#615). RemoteHostClient and
+// MockHost implement it. The viewer identity comes solely from the request's
+// authenticated X-Ether-Viewer-Token on ctx, never from caller-supplied IDs.
+type KindPolicyHost interface {
+	KindVisible(ctx context.Context, kindKey string, ids []string) ([]string, error)
+	KindBrowse(ctx context.Context, kindKey string, query KindBrowseQuery) (KindPage, error)
 }
 
 // RemoteHostOptions configures a RemoteHostClient for sidecar plugins.
@@ -133,6 +253,17 @@ func (c *RemoteHostClient) callJSON(
 	out any,
 	allow404 bool,
 ) (bool, error) {
+	return c.callJSONWithHeaders(ctx, method, path, nil, in, out, allow404)
+}
+
+func (c *RemoteHostClient) callJSONWithHeaders(
+	ctx context.Context,
+	method, path string,
+	extraHeaders map[string]string,
+	in any,
+	out any,
+	allow404 bool,
+) (bool, error) {
 	var bodyReader io.Reader
 	if in != nil {
 		b, err := json.Marshal(in)
@@ -150,13 +281,18 @@ func (c *RemoteHostClient) callJSON(
 	if in != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	for k, v := range extraHeaders {
+		if v != "" {
+			req.Header.Set(k, v)
+		}
+	}
 	resp, err := c.client.Do(req)
 	if err != nil {
 		return false, err
 	}
 	defer resp.Body.Close() //nolint:errcheck
 
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, (MaxDataReadBytes+2)/3*4+(4<<20)))
 	if err != nil {
 		return false, err
 	}
@@ -229,6 +365,46 @@ func (c *RemoteHostClient) KVList(ctx context.Context, prefix string) ([]string,
 	return res.Keys, nil
 }
 
+// KVUsage reads the plugin's current KV byte/key usage and quotas.
+func (c *RemoteHostClient) KVUsage(ctx context.Context) (KVUsage, error) {
+	var res KVUsage
+	if _, err := c.callJSON(ctx, http.MethodGet, "/ether/plugin-host/kv-usage", nil, &res, false); err != nil {
+		return KVUsage{}, err
+	}
+	return res, nil
+}
+
+// BadgesSet pushes poster badges for one declared badge set (#594).
+func (c *RemoteHostClient) BadgesSet(ctx context.Context, setKey string, entries []BadgeEntry) error {
+	if entries == nil {
+		entries = []BadgeEntry{}
+	}
+	_, err := c.callJSON(
+		ctx,
+		http.MethodPut,
+		"/ether/plugin-host/badges/"+url.PathEscape(setKey),
+		map[string]any{"entries": entries},
+		nil,
+		false,
+	)
+	return err
+}
+
+// BadgesClear removes every badge in one declared set (#594).
+func (c *RemoteHostClient) BadgesClear(ctx context.Context, setKey string) error {
+	_, err := c.callJSON(ctx, http.MethodDelete, "/ether/plugin-host/badges/"+url.PathEscape(setKey), nil, nil, false)
+	return err
+}
+
+// BadgesUsage reads the plugin's current badged title count and quota (#594).
+func (c *RemoteHostClient) BadgesUsage(ctx context.Context) (BadgeUsage, error) {
+	var res BadgeUsage
+	if _, err := c.callJSON(ctx, http.MethodGet, "/ether/plugin-host/badges-usage", nil, &res, false); err != nil {
+		return BadgeUsage{}, err
+	}
+	return res, nil
+}
+
 // SecretGet is only available in hosted mode; remote plugins receive secrets via /ether/configure.
 func (c *RemoteHostClient) SecretGet(_ context.Context, _ string) (string, error) {
 	return "", fmt.Errorf("secret.get is only available in hosted plugins; remote plugins receive secrets via /ether/configure")
@@ -236,6 +412,11 @@ func (c *RemoteHostClient) SecretGet(_ context.Context, _ string) (string, error
 
 // Fetch performs an outbound HTTP request.
 func (c *RemoteHostClient) Fetch(ctx context.Context, r HostFetchRequest) (HostFetchResponse, error) {
+	if r.TimeoutMS > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(min(r.TimeoutMS, int64(86400000)))*time.Millisecond)
+		defer cancel()
+	}
 	method := r.Method
 	if method == "" {
 		method = http.MethodGet
@@ -363,6 +544,26 @@ func (c *RemoteHostClient) FoldersStat(_ context.Context, _, _ string) (FolderEn
 	return FolderEntry{}, fmt.Errorf("folders.stat is for hosted plugins; sidecar plugins read their local fileRoot directly")
 }
 
+// HeaderIdempotencyKey carries the Flow step idempotency key on plugin flow action calls.
+const HeaderIdempotencyKey = "X-Ether-Idempotency-Key"
+
+// PublishEvent emits a declared plugin event ("plugin:<id>/<key>") onto Ether's
+// event bus through POST /ether/plugin-host/events/publish.
+func (c *RemoteHostClient) PublishEvent(ctx context.Context, key string, payload any, corr *EventCorrelation) error {
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	body := map[string]any{
+		"key":     key,
+		"payload": payload,
+	}
+	if corr != nil {
+		body["correlation"] = corr
+	}
+	_, err := c.callJSON(ctx, http.MethodPost, "/ether/plugin-host/events/publish", body, nil, false)
+	return err
+}
+
 // NotifyOwner sends an owner notification through Ether.
 func (c *RemoteHostClient) NotifyOwner(ctx context.Context, text string) error {
 	_, err := c.callJSON(
@@ -387,4 +588,210 @@ func (c *RemoteHostClient) Log(ctx context.Context, level, message string, attrs
 	}
 	_, err := c.callJSON(ctx, http.MethodPost, "/ether/plugin-host/log", payload, nil, false)
 	return err
+}
+
+// KindUpsert pushes items into a push-mode kind library.
+func (c *RemoteHostClient) KindUpsert(ctx context.Context, kindKey string, items []KindItem) (int, error) {
+	var out struct {
+		Accepted int `json:"accepted"`
+	}
+	_, err := c.callJSON(ctx, http.MethodPost, "/ether/plugin-host/kinds/"+url.PathEscape(kindKey)+"/upsert",
+		map[string]any{"items": items}, &out, false)
+	return out.Accepted, err
+}
+
+// KindDelete removes items from a push-mode kind library.
+func (c *RemoteHostClient) KindDelete(ctx context.Context, kindKey string, externalIDs []string) error {
+	_, err := c.callJSON(ctx, http.MethodPost, "/ether/plugin-host/kinds/"+url.PathEscape(kindKey)+"/delete",
+		map[string]any{"externalIds": externalIDs}, nil, false)
+	return err
+}
+
+// KindItems reads the plugin's own kind library back, keyset-paged.
+func (c *RemoteHostClient) KindItems(ctx context.Context, kindKey, cursor string, limit int) (KindPage, error) {
+	path := "/ether/plugin-host/kinds/" + url.PathEscape(kindKey) + "/items?cursor=" + url.QueryEscape(cursor)
+	if limit > 0 {
+		path += "&limit=" + strconv.Itoa(limit)
+	}
+	var page KindPage
+	_, err := c.callJSON(ctx, http.MethodGet, path, nil, &page, false)
+	return page, err
+}
+
+// KindVisible evaluates the library's Rules and viewer access policy for a
+// bounded batch (at most MaxKindVisibleIDs) of external IDs in kindKey (#615).
+// ctx must carry the incoming frontend adapter's X-Ether-Viewer-Token (via
+// WithViewerToken, attached automatically by FrontendAdapter dispatch).
+func (c *RemoteHostClient) KindVisible(ctx context.Context, kindKey string, ids []string) ([]string, error) {
+	tok, ok := ViewerTokenFromContext(ctx)
+	if !ok {
+		return nil, fmt.Errorf("kinds.visible: no authenticated frontend adapter viewer token on context")
+	}
+	if len(ids) > MaxKindVisibleIDs {
+		return nil, fmt.Errorf("kinds.visible: batch larger than %d ids", MaxKindVisibleIDs)
+	}
+	var out struct {
+		IDs []string `json:"ids"`
+	}
+	_, err := c.callJSONWithHeaders(
+		ctx,
+		http.MethodPost,
+		"/ether/plugin-host/kinds/"+url.PathEscape(kindKey)+"/visible",
+		map[string]string{HeaderViewerToken: tok},
+		map[string]any{"ids": ids},
+		&out,
+		false,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if out.IDs == nil {
+		out.IDs = []string{}
+	}
+	return out.IDs, nil
+}
+
+// KindBrowse browses or searches kindKey with the library's Rules and viewer
+// access policy applied for the requesting frontend-adapter viewer (#615).
+// ctx must carry the incoming frontend adapter's X-Ether-Viewer-Token (via
+// WithViewerToken, attached automatically by FrontendAdapter dispatch).
+func (c *RemoteHostClient) KindBrowse(ctx context.Context, kindKey string, query KindBrowseQuery) (KindPage, error) {
+	tok, ok := ViewerTokenFromContext(ctx)
+	if !ok {
+		return KindPage{}, fmt.Errorf("kinds.browse: no authenticated frontend adapter viewer token on context")
+	}
+	var page KindPage
+	_, err := c.callJSONWithHeaders(
+		ctx,
+		http.MethodPost,
+		"/ether/plugin-host/kinds/"+url.PathEscape(kindKey)+"/browse",
+		map[string]string{HeaderViewerToken: tok},
+		query,
+		&page,
+		false,
+	)
+	if err != nil {
+		return KindPage{}, err
+	}
+	if page.Items == nil {
+		page.Items = []KindItem{}
+	}
+	return page, nil
+}
+
+// ResolveSources asks Ether to find sources through its indexers/debrid.
+func (c *RemoteHostClient) ResolveSources(ctx context.Context, q SourceQuery) ([]SourceCandidate, error) {
+	var out struct {
+		Candidates []SourceCandidate `json:"candidates"`
+	}
+	_, err := c.callJSON(ctx, http.MethodPost, "/ether/plugin-host/sources/resolve", q, &out, false)
+	return out.Candidates, err
+}
+
+// CachePut stores one blob in a kind library's cache; the ref is content-addressed.
+func (c *RemoteHostClient) CachePut(ctx context.Context, libraryKey, name string, data []byte) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.baseURL+"/ether/plugin-host/cache/"+url.PathEscape(libraryKey)+"?name="+url.QueryEscape(name),
+		bytes.NewReader(data))
+	if err != nil {
+		return "", err
+	}
+	if c.credential != "" {
+		req.Header.Set("X-Ether-Plugin-Credential", c.credential)
+	}
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode >= 300 {
+		return "", fmt.Errorf("plugin-host cache put: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var out struct {
+		Blob string `json:"blob"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		return "", err
+	}
+	return out.Blob, nil
+}
+
+// CacheOpen reads one cached blob back.
+func (c *RemoteHostClient) CacheOpen(ctx context.Context, blobRef string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		c.baseURL+"/ether/plugin-host/cache/"+strings.TrimPrefix(blobRef, "/"), nil)
+	if err != nil {
+		return nil, err
+	}
+	if c.credential != "" {
+		req.Header.Set("X-Ether-Plugin-Credential", c.credential)
+	}
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("plugin-host cache open: status %d", resp.StatusCode)
+	}
+	return io.ReadAll(resp.Body)
+}
+
+// CacheDelete removes one cached blob from this plugin's own library cache
+// namespaces, freeing its quota immediately. Deleting an absent or already
+// evicted ref succeeds.
+func (c *RemoteHostClient) CacheDelete(ctx context.Context, blobRef string) error {
+	_, err := c.callJSON(ctx, http.MethodDelete, "/ether/plugin-host/cache/"+url.PathEscape(blobRef), nil, nil, false)
+	return err
+}
+
+// StreamURL mints a scoped stream ticket and returns the Ether stream URL
+// for one of this plugin's own kind items (spec §6.5).
+func (c *RemoteHostClient) StreamURL(ctx context.Context, viewerID int64, itemRef string) (string, error) {
+	var out struct {
+		URL string `json:"url"`
+	}
+	_, err := c.callJSON(ctx, http.MethodPost, "/ether/plugin-host/frontend/stream-url",
+		map[string]any{"viewerId": viewerID, "itemRef": itemRef}, &out, false)
+	if err != nil {
+		return "", err
+	}
+	return out.URL, nil
+}
+
+// StreamPartURL mints a scoped stream ticket for one zero-based part of a
+// multi-file kind item (#576).
+func (c *RemoteHostClient) StreamPartURL(ctx context.Context, viewerID int64, itemRef string, partIndex int) (string, error) {
+	if partIndex < 0 {
+		return "", fmt.Errorf("stream url: partIndex must be non-negative")
+	}
+	var out struct {
+		URL string `json:"url"`
+	}
+	_, err := c.callJSON(ctx, http.MethodPost, "/ether/plugin-host/frontend/stream-url",
+		map[string]any{"viewerId": viewerID, "itemRef": itemRef, "partIndex": partIndex}, &out, false)
+	if err != nil {
+		return "", err
+	}
+	return out.URL, nil
+}
+
+func (*RemoteHostClient) FoldersHash(context.Context, string, string) (FolderHash, error) {
+	return FolderHash{}, fmt.Errorf("folders.hash requires the hosted runtime")
+}
+
+func (*RemoteHostClient) FoldersHashStart(context.Context, string, string) (FolderHashJob, error) {
+	return FolderHashJob{}, fmt.Errorf("folders.hash requires the hosted runtime")
+}
+
+func (*RemoteHostClient) FoldersHashPoll(context.Context, string) (FolderHashJob, error) {
+	return FolderHashJob{}, fmt.Errorf("folders.hash requires the hosted runtime")
+}
+
+func (*RemoteHostClient) FoldersHashCancel(context.Context, string) (FolderHashJob, error) {
+	return FolderHashJob{}, fmt.Errorf("folders.hash requires the hosted runtime")
 }

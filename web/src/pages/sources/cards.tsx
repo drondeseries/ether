@@ -1,6 +1,6 @@
-import { Button } from "@braedonsaunders/appkit-ui";
+import { Button, Input } from "@braedonsaunders/appkit-ui";
 import { Pencil } from "lucide-react";
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { DragHandle, type DragHandleProps } from "../../components/Sortable";
 import { Drawer } from "../../components/Drawer";
 import { t } from "../../i18n";
@@ -8,7 +8,7 @@ import { usenetProblem } from "../../lib/health";
 import type { DebridKind } from "../../lib/types";
 import { StremioMark, debridMark } from "./marks";
 
-export { PluginSourceCards, PluginSourceUsage } from "./PluginSources";
+export { PluginSourceCards } from "./PluginSources";
 
 /** Where each service shows the token Ether asks for. */
 export const DEBRID_TOKEN_URL: Record<DebridKind, string> = {
@@ -46,11 +46,23 @@ export function sourceMonogram(name: string): string {
   return letters || "?";
 }
 
-function SourceMark({ name, logo }: { name: string; logo?: ReactNode }) {
+function SourceMark({
+  name,
+  logo,
+  compact,
+}: {
+  name: string;
+  logo?: ReactNode;
+  compact?: boolean;
+}) {
   return (
     <span
       aria-hidden
-      className="flex size-11 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-bg-subtle text-sm font-semibold text-fg-muted"
+      className={
+        compact
+          ? "flex size-9 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-bg-subtle text-sm font-semibold text-fg-muted sm:size-11"
+          : "flex size-11 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-bg-subtle text-sm font-semibold text-fg-muted"
+      }
     >
       {logo ?? sourceMonogram(name)}
     </span>
@@ -84,6 +96,7 @@ export function SourceCard({
   position,
   description,
   meta,
+  notice,
   problem,
   editLabel,
   onEdit,
@@ -96,6 +109,7 @@ export function SourceCard({
   position: number;
   description?: ReactNode;
   meta?: ReactNode;
+  notice?: string | null;
   problem?: string | null;
   editLabel: string;
   onEdit: () => void;
@@ -104,29 +118,48 @@ export function SourceCard({
   /** Vendored brand mark. Omitted brands keep the monogram. */
   logo?: ReactNode;
 }) {
+  const hasDetails = Boolean(description || notice || problem);
   return (
-    <article className="flex items-start gap-3 rounded-xl border border-border bg-surface p-4">
-      {handle ? <DragHandle handle={handle} label={t("Drag to reorder {name}", { name })} /> : null}
-      <SourceMark name={name} logo={logo} />
-      <div className="min-w-0 flex-1">
-        <div className="flex flex-wrap items-center gap-2">
-          <span className="text-xs font-medium tabular-nums text-fg-subtle">{position}</span>
-          <h3 className="font-semibold text-fg">{name}</h3>
-          {meta}
-        </div>
-        {description ? <div className="mt-1 text-sm text-fg-muted">{description}</div> : null}
-        {problem ? (
-          <p className="mt-2 text-sm text-danger" role="status">
-            {problem}
-          </p>
+    <article className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-x-2.5 gap-y-2 rounded-xl border border-border bg-surface p-3.5 sm:gap-x-3 sm:gap-y-1 sm:p-4">
+      <div className="col-start-1 row-start-1 flex shrink-0 items-center gap-2 sm:row-span-2">
+        {handle ? (
+          <DragHandle handle={handle} label={t("Drag to reorder {name}", { name })} />
         ) : null}
+        <SourceMark name={name} logo={logo} compact />
       </div>
-      <div className="flex shrink-0 items-center gap-1">
+      <div className="col-start-2 row-start-1 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 self-center">
+        <span className="text-xs font-medium tabular-nums text-fg-subtle">{position}</span>
+        <h3 className="font-semibold text-fg">{name}</h3>
+        {meta}
+      </div>
+      <div className="col-start-3 row-start-1 flex shrink-0 items-center gap-1 self-center sm:row-span-2 sm:self-start">
         {order}
         <Button variant="outline" size="sm" onClick={onEdit} aria-label={editLabel}>
-          <Pencil size={13} /> {t("Edit")}
+          <Pencil size={13} />
+          <span className="hidden sm:inline">{t("Edit")}</span>
         </Button>
       </div>
+      {hasDetails ? (
+        <div className="col-span-full row-start-2 min-w-0 sm:col-span-1 sm:col-start-2">
+          {description ? <div className="text-sm text-fg-muted">{description}</div> : null}
+          {notice ? (
+            <p
+              className={description ? "mt-2 text-sm text-fg-muted" : "text-sm text-fg-muted"}
+              role="status"
+            >
+              {notice}
+            </p>
+          ) : null}
+          {problem ? (
+            <p
+              className={description || notice ? "mt-2 text-sm text-danger" : "text-sm text-danger"}
+              role="status"
+            >
+              {problem}
+            </p>
+          ) : null}
+        </div>
+      ) : null}
     </article>
   );
 }
@@ -205,6 +238,111 @@ function GalleryGroup({
   );
 }
 
+interface GalleryItem {
+  name: string;
+  description: string;
+  logo?: ReactNode;
+  choice: GalleryChoice;
+}
+
+interface GallerySection {
+  title: string;
+  hint?: string;
+  items: GalleryItem[];
+}
+
+function gallerySections(): GallerySection[] {
+  return [
+    {
+      title: t("Debrid services"),
+      hint: t(
+        "These stream torrent releases. You also need a torrent indexer, site or Stremio addon.",
+      ),
+      items: DEBRID_KINDS.map((kind) => ({
+        name: kind.label,
+        description: debridBlurb(kind.value),
+        logo: debridMark(kind.value) ?? undefined,
+        choice: { type: "debrid", kind: kind.value },
+      })),
+    },
+    {
+      title: t("Usenet"),
+      hint: t(
+        "An NNTP account. Block accounts can be marked as backfill, used only when an article is missing elsewhere.",
+      ),
+      items: [
+        {
+          name: t("Usenet provider"),
+          description: t(
+            "Host, username and password from your Usenet plan. Ether tries providers in order.",
+          ),
+          choice: { type: "usenet" },
+        },
+      ],
+    },
+    {
+      title: t("IPTV"),
+      items: [
+        {
+          name: t("Xtream Codes login"),
+          description: `${t("Live TV")} · ${t("Movies & shows index")}`,
+          choice: { type: "iptv", kind: "xtream" },
+        },
+        {
+          name: t("M3U playlist"),
+          description: t("An M3U playlist, optionally with a guide."),
+          choice: { type: "iptv", kind: "playlist" },
+        },
+        {
+          name: t("Plugin source"),
+          description: t("Live TV"),
+          choice: { type: "iptv", kind: "addon" },
+        },
+        {
+          name: t("Guide source"),
+          description: t("XMLTV listings for any channel."),
+          choice: { type: "iptv", kind: "guide" },
+        },
+      ],
+    },
+    {
+      title: t("Where to search"),
+      hint: t(
+        "Ether searches these when someone presses Play. Limits from the service are followed automatically.",
+      ),
+      items: [
+        {
+          name: t("Tracker site"),
+          description: t(
+            "A site Ether already knows how to sign in to. Its settings come from the site's definition.",
+          ),
+          choice: { type: "site" },
+        },
+        {
+          name: t("Newznab or Torznab"),
+          description: t(
+            "A search address and API key. Torznab results need a debrid account to play.",
+          ),
+          choice: { type: "newznab" },
+        },
+        {
+          name: t("Stremio addon"),
+          description: t(
+            "An addon install link that returns torrents. Ether streams them through your debrid accounts.",
+          ),
+          logo: <StremioMark />,
+          choice: { type: "stremio" },
+        },
+        {
+          name: t("Prowlarr"),
+          description: t("Copy the indexers a Prowlarr instance already manages."),
+          choice: { type: "prowlarr" },
+        },
+      ],
+    },
+  ];
+}
+
 /** Pick what to add. Choosing one opens that record's drawer. */
 export function AddSourceGallery({
   open,
@@ -215,101 +353,58 @@ export function AddSourceGallery({
   onClose: () => void;
   onPick: (choice: GalleryChoice) => void;
 }) {
+  const [query, setQuery] = useState("");
+  const q = query.trim().toLowerCase();
+  const sections = gallerySections()
+    .map((section) => ({
+      ...section,
+      items: q
+        ? section.items.filter((item) =>
+            `${item.name} ${item.description} ${section.title}`.toLowerCase().includes(q),
+          )
+        : section.items,
+    }))
+    .filter((section) => section.items.length > 0);
   return (
     <Drawer
       open={open}
-      onClose={onClose}
+      onClose={() => {
+        setQuery("");
+        onClose();
+      }}
       title={t("Add a source")}
       description={t("An account to stream from, or a place that searches for releases.")}
       size="lg"
     >
       <div className="space-y-6">
-        <GalleryGroup
-          title={t("Debrid services")}
-          hint={t(
-            "These stream torrent releases. You also need a torrent indexer, site or Stremio addon.",
-          )}
-        >
-          {DEBRID_KINDS.map((kind) => (
-            <GalleryButton
-              key={kind.value}
-              name={kind.label}
-              description={debridBlurb(kind.value)}
-              logo={debridMark(kind.value) ?? undefined}
-              onClick={() => onPick({ type: "debrid", kind: kind.value })}
-            />
-          ))}
-        </GalleryGroup>
-        <GalleryGroup
-          title={t("Usenet")}
-          hint={t(
-            "An NNTP account. Block accounts can be marked as backfill, used only when an article is missing elsewhere.",
-          )}
-        >
-          <GalleryButton
-            name={t("Usenet provider")}
-            description={t(
-              "Host, username and password from your Usenet plan. Ether tries providers in order.",
-            )}
-            onClick={() => onPick({ type: "usenet" })}
-          />
-        </GalleryGroup>
-        <GalleryGroup title={t("IPTV")}>
-          <GalleryButton
-            name={t("Xtream Codes login")}
-            description={`${t("Live TV")} · ${t("Movies & shows index")}`}
-            onClick={() => onPick({ type: "iptv", kind: "xtream" })}
-          />
-          <GalleryButton
-            name={t("M3U playlist")}
-            description={t("An M3U playlist, optionally with a guide.")}
-            onClick={() => onPick({ type: "iptv", kind: "playlist" })}
-          />
-          <GalleryButton
-            name={t("Plugin source")}
-            description={t("Live TV")}
-            onClick={() => onPick({ type: "iptv", kind: "addon" })}
-          />
-          <GalleryButton
-            name={t("Guide source")}
-            description={t("XMLTV listings for any channel.")}
-            onClick={() => onPick({ type: "iptv", kind: "guide" })}
-          />
-        </GalleryGroup>
-        <GalleryGroup
-          title={t("Where to search")}
-          hint={t(
-            "Ether searches these when someone presses Play. Limits from the service are followed automatically.",
-          )}
-        >
-          <GalleryButton
-            name={t("Tracker site")}
-            description={t(
-              "A site Ether already knows how to sign in to. Its settings come from the site's definition.",
-            )}
-            onClick={() => onPick({ type: "site" })}
-          />
-          <GalleryButton
-            name={t("Newznab or Torznab")}
-            description={t(
-              "A search address and API key. Torznab results need a debrid account to play.",
-            )}
-            onClick={() => onPick({ type: "newznab" })}
-          />
-          <GalleryButton
-            name={t("Stremio addon")}
-            description={t(
-              "An addon install link that returns torrents. Ether streams them through your debrid accounts.",
-            )}
-            logo={<StremioMark />}
-            onClick={() => onPick({ type: "stremio" })}
-          />
-          <GalleryButton
-            name={t("Prowlarr")}
-            description={t("Copy the indexers a Prowlarr instance already manages.")}
-            onClick={() => onPick({ type: "prowlarr" })}
-          />
-        </GalleryGroup>
+        <Input
+          type="search"
+          aria-label={t("Search sources")}
+          placeholder={t("Search sources")}
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          autoFocus
+        />
+        {sections.length === 0 ? (
+          <p className="text-sm text-fg-muted">{t("No source matches your search.")}</p>
+        ) : (
+          sections.map((section) => (
+            <GalleryGroup key={section.title} title={section.title} hint={section.hint}>
+              {section.items.map((item) => (
+                <GalleryButton
+                  key={item.name}
+                  name={item.name}
+                  description={item.description}
+                  logo={item.logo}
+                  onClick={() => {
+                    setQuery("");
+                    onPick(item.choice);
+                  }}
+                />
+              ))}
+            </GalleryGroup>
+          ))
+        )}
       </div>
     </Drawer>
   );

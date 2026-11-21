@@ -5,15 +5,16 @@ import { Field } from "../../components/fields";
 import { searchSelectLabels } from "../../i18n/appkit-labels";
 import { loadLocale, LOCALES, rememberLocale, t, type Locale } from "../../i18n";
 import { useLocale } from "../../i18n/react";
-import { LANGUAGE_TAGS, REGION_CODES } from "../catalog/CatalogPickers";
+import { LANGUAGE_TAGS, REGION_CODES } from "../libraries/browser/CatalogPickers";
 import {
   ORIGINAL_AUDIO,
+  REGIONAL_TRACK_TAGS,
   baseLanguage,
   withConsoleLanguage,
   type HouseholdLanguage,
 } from "./language";
 
-function displayName(locale: string, type: "language" | "region", code: string) {
+function displayName(locale: string, type: "language" | "region" | "script", code: string) {
   try {
     return new Intl.DisplayNames([locale], { type }).of(code) ?? code;
   } catch {
@@ -22,11 +23,7 @@ function displayName(locale: string, type: "language" | "region", code: string) 
 }
 
 function metadataLabel(locale: string, tag: string) {
-  const [lang, region] = tag.split("-");
-  const name = lang ? displayName(locale, "language", lang) : tag;
-  if (!region) return name;
-  const country = displayName(locale, "region", region);
-  return country && country !== region ? `${name} (${country})` : name;
+  return displayName(locale, "language", tag);
 }
 
 function withCurrent(options: { value: string; label: string }[], current: string, label?: string) {
@@ -81,6 +78,11 @@ export function LanguageStep({
       seen.add(code);
       options.push({ value: code, label: displayName(locale, "language", code) });
     }
+    for (const tag of REGIONAL_TRACK_TAGS) {
+      if (seen.has(tag)) continue;
+      seen.add(tag);
+      options.push({ value: tag, label: metadataLabel(locale, tag) });
+    }
     options.sort((a, b) =>
       a.value === ORIGINAL_AUDIO
         ? -1
@@ -98,6 +100,11 @@ export function LanguageStep({
       if (!code || seen.has(code)) continue;
       seen.add(code);
       options.push({ value: code, label: displayName(locale, "language", code) });
+    }
+    for (const tag of REGIONAL_TRACK_TAGS) {
+      if (seen.has(tag)) continue;
+      seen.add(tag);
+      options.push({ value: tag, label: metadataLabel(locale, tag) });
     }
     options.sort((a, b) => a.label.localeCompare(b.label, locale));
     return withCurrent(options, choice.subtitle);

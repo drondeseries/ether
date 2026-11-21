@@ -48,16 +48,19 @@ func TestCandidateComposerHomeVisitAndPolicy(t *testing.T) {
 	child := core.Title{Key: core.EpisodeKey(8, 1, 1), Type: core.TypeEpisode, ShowKey: show}
 	hidden := core.Title{Key: core.MovieKey(3), Type: core.TypeMovie, Adult: true}
 	good := core.Title{Key: core.MovieKey(4), Type: core.TypeMovie}
-	rank := &candidateRankerFake{rows: []RankedCandidate{{ID: "home.continue"}, {ID: "other"}, {ID: "home.continue"}}}
+	rank := &candidateRankerFake{rows: []RankedCandidate{{ID: "home.continue", Style: "shelf"}, {ID: "other", Style: "shelf"}, {ID: "home.continue", Style: "shelf"}}}
 	resume := &resumeCandidatesFake{items: []core.Title{good}}
 	composer := CandidateComposer{Ranker: rank, Resume: resume, Restricted: func(*core.User) bool { return true }, Visibility: Visibility{GetTitle: func(context.Context, core.RatingKey) (*core.Title, error) {
 		return &core.Title{Key: show, Adult: true}, nil
 	}}}
 	situation := core.HomeSituation{Now: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), ClientID: "client", SessionID: "visit", Device: "tv"}
-	req := frontend.RowRequest{Viewer: &core.User{ID: 1, AllowedSections: []int{1}}, Placement: frontend.PlacementHome, Limit: 3}
+	req := frontend.RowRequest{Viewer: &core.User{ID: 1, AllowedLibraries: []core.LibraryID{1}}, Placement: frontend.PlacementHome, Limit: 3}
 	got, err := composer.Rows(ctx, req, situation)
 	if err != nil || rank.calls != 1 || resume.calls != 1 || !reflect.DeepEqual(rank.seen, situation) || len(got) != 3 || got[0].Items[0].Key != good.Key || got[2].Items[0].Key != good.Key {
 		t.Fatalf("rows=%+v rank=%+v resume=%+v err=%v", got, rank, resume, err)
+	}
+	if got[0].Style != "hero" || !got[0].Promoted || got[2].Style != "hero" || !got[2].Promoted || got[1].Style != "shelf" {
+		t.Fatalf("shared Continue presentation lost or another row promoted: %+v", got)
 	}
 	if rank.allow == nil || rank.allow(ctx, req.Viewer, &hidden) || rank.allow(ctx, req.Viewer, &child) || !rank.allow(ctx, req.Viewer, &good) {
 		t.Fatal("ranking did not receive inherited viewer policy")
@@ -80,16 +83,31 @@ func TestCandidateComposerContinueSkipsHomeRanking(t *testing.T) {
 	}
 }
 
+func TestCandidateComposerRecommendationsKeepRankingWithoutResume(t *testing.T) {
+	rank := &candidateRankerFake{rows: []RankedCandidate{{ID: "taste", Purpose: frontend.RowRecommendation, Items: []core.Title{{Key: core.MovieKey(4)}}}}}
+	resume := &resumeCandidatesFake{err: errors.New("unrelated continuation failed")}
+	composer := CandidateComposer{Ranker: rank, Resume: resume, Restricted: func(*core.User) bool { return true }}
+	req := frontend.RowRequest{Viewer: &core.User{ID: 1}, Placement: frontend.PlacementHome, Purpose: frontend.RowRecommendation, Limit: 5}
+	got, err := composer.Rows(context.Background(), req, core.HomeSituation{})
+	if err != nil || rank.calls != 1 || rank.allow == nil || resume.calls != 0 || !reflect.DeepEqual(got, rank.rows) {
+		t.Fatalf("recommendations=%+v rankCalls=%d policy=%v resumeCalls=%d err=%v", got, rank.calls, rank.allow != nil, resume.calls, err)
+	}
+	rank.err = errors.New("ranking failed")
+	if _, err := composer.Rows(context.Background(), req, core.HomeSituation{}); !errors.Is(err, rank.err) {
+		t.Fatalf("ranking error lost: %v", err)
+	}
+}
+
 func TestCandidateComposerLibraryAndErrors(t *testing.T) {
 	ctx := context.Background()
 	rank := &candidateRankerFake{}
 	resume := &resumeCandidatesFake{}
 	c := CandidateComposer{Ranker: rank, Resume: resume, Libraries: []Library{{ID: 2, Type: core.TypeShow}}, Restricted: func(*core.User) bool { return false }}
-	req := frontend.RowRequest{Viewer: &core.User{ID: 1, AllowedSections: []int{1}}, Placement: frontend.PlacementLibrary, ViewID: "2"}
+	req := frontend.RowRequest{Viewer: &core.User{ID: 1, AllowedLibraries: []core.LibraryID{1}}, Placement: frontend.PlacementLibrary, ViewID: "2"}
 	if _, err := c.Rows(ctx, req, core.HomeSituation{}); !errors.Is(err, core.ErrNotFound) || rank.calls != 0 {
 		t.Fatal("denied library reached ranker", err)
 	}
-	req.Viewer.AllowedSections = []int{2}
+	req.Viewer.AllowedLibraries = []core.LibraryID{2}
 	if _, err := c.Rows(ctx, req, core.HomeSituation{ClientID: "x"}); err != nil || rank.calls != 1 || rank.kind != core.TypeShow || rank.seen.LibraryID != 2 || rank.seen.ClientID != "x" || rank.allow == nil {
 		t.Fatalf("library rank=%+v err=%v", rank, err)
 	}

@@ -14,6 +14,7 @@ import (
 	"github.com/braedonsaunders/ether/internal/cluster"
 	"github.com/braedonsaunders/ether/internal/clusterbus"
 	"github.com/braedonsaunders/ether/internal/core"
+	"github.com/braedonsaunders/ether/internal/onair"
 	"github.com/braedonsaunders/ether/internal/store"
 )
 
@@ -175,7 +176,11 @@ func (a *App) nodeAddrs(ctx context.Context) []string {
 }
 
 func (a *App) nodeCaps() cluster.Caps {
-	caps := cluster.Caps{Diagnostics: a.nodeDiagnostics(), Weight: a.cfg.Get().Server.ClusterWeight, EgressIP: a.egress.get()}
+	cfg := a.cfg.Get()
+	caps := cluster.Caps{Diagnostics: a.nodeDiagnostics(), Weight: cfg.Server.ClusterWeight, EgressIP: a.egress.get()}
+	if cfg.Transcode.VideoTranscodingOff() {
+		caps.VideoTranscoding = "off"
+	}
 	if a.transcoder != nil {
 		caps.Transcode, caps.HWAccel = true, a.transcoder.HWAccel().Name
 	}
@@ -184,6 +189,9 @@ func (a *App) nodeCaps() cluster.Caps {
 		caps.HWAccel = a.deployment.encoder.HWAccel().Name
 	}
 	caps.Diagnostics = a.nodeDiagnostics()
+	if a.onair != nil {
+		caps.OnAirAssets = onair.AssetFilesVersion
+	}
 	return caps
 }
 

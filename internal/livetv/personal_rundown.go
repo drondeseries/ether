@@ -18,6 +18,7 @@ import (
 func init() {
 	store.Register("livetv", 7, `CREATE TABLE livetv_personal(viewer_id INTEGER NOT NULL,channel_id TEXT NOT NULL,day TEXT NOT NULL,rundown TEXT NOT NULL,cursor_ms BIGINT NOT NULL,built_at BIGINT NOT NULL,away_ms BIGINT NOT NULL DEFAULT 0,PRIMARY KEY(viewer_id,channel_id,day));`)
 	store.RegisterViewerTable("livetv", "livetv_personal", "viewer_id", store.ViewerMergeMove, "channel_id", "day")
+	store.RegisterViewerTable("livetv", "livetv_search_virtual", "viewer_id", store.ViewerMergeDrop)
 }
 
 type personalKey struct {
@@ -28,11 +29,28 @@ type personalClock struct {
 	cursor                     int64
 	at, timeAway, welcomeUntil time.Time
 	active                     bool
+	// saved is when advancePersonal last stored cursor_ms.
+	saved time.Time
 }
+
+// personalClockSave spaces advancePersonal's writes of a running clock. A
+// crash loses at most this much channel time; endPersonal saves the exact
+// cursor when the viewer leaves.
+const personalClockSave = 15 * time.Second
+
 type personalRow struct {
 	programmes []Programme
 	cursor     int64
 	built      time.Time
+}
+
+func (s *Service) wakePersonalLoop() {
+	if s.personalWake != nil {
+		select {
+		case s.personalWake <- struct{}{}:
+		default:
+		}
+	}
 }
 
 func (s *Service) readPersonal(ctx context.Context, k personalKey) (personalRow, error) {
@@ -47,11 +65,15 @@ func (s *Service) readPersonal(ctx context.Context, k personalKey) (personalRow,
 	return r, err
 }
 
-func immutablePersonal(old []Programme, now time.Time) ([]Programme, time.Time) {
+// immutablePersonal keeps the frozen part of a rundown: programmes starting
+// by now+30 min, back to since. Before since a programme is history no guide
+// shows and no repeat rule reads; keeping it made every rebuild carry the
+// channel's whole past.
+func immutablePersonal(old []Programme, now, since time.Time) ([]Programme, time.Time) {
 	var keep []Programme
 	end := now
 	for _, p := range old {
-		if !p.Start.After(now.Add(30 * time.Minute)) {
+		if !p.Start.After(now.Add(30*time.Minute)) && p.End.After(since) {
 			keep = append(keep, p)
 			if p.End.After(end) {
 				end = p.End
@@ -64,7 +86,7 @@ func immutablePersonal(old []Programme, now time.Time) ([]Programme, time.Time) 
 // composePersonal preserves all programmes whose start falls in the frozen
 // window, including a programme that straddles its boundary.
 func composePersonal(c Channel, old []Programme, picks []core.PersonalPick, now time.Time) []Programme {
-	out, at := immutablePersonal(old, now)
+	out, at := immutablePersonal(old, now, now.Add(-personalHistory(c)))
 	until := now.Add(48 * time.Hour)
 	last := map[core.RatingKey]time.Time{}
 	showTime := map[string]int64{}
@@ -168,6 +190,31 @@ func composePersonal(c Channel, old []Programme, picks []core.PersonalPick, now 
 	return out
 }
 
+// personalHistory is how far back of the channel clock a rundown keeps
+// programmes: the guide's lookback, or the repeat window when that is
+// longer, since composing reads past starts to avoid repeats. The index
+// only needs the guide's lookback (personalIndexed).
+func personalHistory(c Channel) time.Duration {
+	h := guideLookback
+	if c.Personal != nil {
+		h = max(h, time.Duration(c.Personal.RepeatHours)*time.Hour)
+	}
+	return h
+}
+
+// personalIndexed drops programmes the guide can no longer ask for from the
+// rows indexed for reads.
+func personalIndexed(ps []Programme, cursor time.Time) []Programme {
+	since := cursor.Add(-guideLookback)
+	out := make([]Programme, 0, len(ps))
+	for _, p := range ps {
+		if p.End.After(since) {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 func (s *Service) buildPersonal(ctx context.Context, c Channel, u *core.User) error {
 	k := personalKey{u.ID, c.ID}
 	old, err := s.readPersonal(ctx, k)
@@ -236,7 +283,7 @@ func (s *Service) buildPersonal(ctx context.Context, c Channel, u *core.User) er
 	if err != nil {
 		return err
 	}
-	records := s.personalIndexRecords(ctx, ps)
+	records := s.personalIndexRecords(ctx, personalIndexed(ps, time.UnixMilli(cursor)))
 	tx, err := s.o.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -255,8 +302,16 @@ func (s *Service) buildPersonal(ctx context.Context, c Channel, u *core.User) er
 	if err = s.indexPersonal(ctx, tx, u.ID, c.ID, day, records); err != nil {
 		return err
 	}
+	// Readers take the newest day; earlier days' rundowns are dead copies.
+	if _, err = tx.ExecContext(ctx, `DELETE FROM livetv_personal WHERE viewer_id=? AND channel_id=? AND day<>?`, u.ID, c.ID, day); err != nil {
+		return err
+	}
 	if err = tx.Commit(); err != nil {
 		return err
+	}
+	if err = s.prunePersonalIndex(ctx, u.ID, c.ID, day); err != nil {
+		s.o.Logger.Debug("personal index prune failed", "viewer", u.ID, "channel", c.ID, "error", err)
+		err = nil
 	}
 
 	if err == nil {
@@ -282,7 +337,9 @@ func (s *Service) buildPersonal(ctx context.Context, c Channel, u *core.User) er
 }
 
 func (s *Service) personalProgrammes(ctx context.Context, c Channel, u *core.User, from, until time.Time) ([]Programme, error) {
-	return s.personalProgrammesLimit(ctx, c, u, from, until, 0)
+	s.demandPersonalReadiness(c, u)
+	ps, err := s.personalProgrammesLimit(ctx, c, u, from, until, 0)
+	return s.readyProgrammes(c, ps), err
 }
 func (s *Service) personalProgrammesLimit(ctx context.Context, c Channel, u *core.User, from, until time.Time, limit int) ([]Programme, error) {
 	out := []Programme{}
@@ -335,6 +392,7 @@ func (s *Service) personalProgrammesLimit(ctx context.Context, c Channel, u *cor
 			return nil, err
 		}
 		p := record.Programme
+		p.readinessViewer = u.ID
 		p.policyTag = &broadcastPolicyTag{programme: p, title: record.Title, catalog: record.Catalog}
 		p.Start = p.Start.Add(shift)
 		p.End = p.End.Add(shift)
@@ -348,6 +406,20 @@ func (s *Service) personalProgrammesLimit(ctx context.Context, c Channel, u *cor
 	return out, nil
 }
 
+func (s *Service) enabledPersonalChannels(ctx context.Context) ([]Channel, error) {
+	cs, err := s.virtualChannels(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var out []Channel
+	for _, c := range cs {
+		if c.Personal != nil && c.Enabled {
+			out = append(out, c)
+		}
+	}
+	return out, nil
+}
+
 func (s *Service) personalLoop() {
 	defer s.wg.Done()
 
@@ -357,60 +429,85 @@ func (s *Service) personalLoop() {
 		unsub := source.Subscribe(func(e state.Event) { s.PersonalChanged(e.UserID) })
 		defer unsub()
 	}
-	tick := time.NewTicker(time.Second)
-	defer tick.Stop()
+	timer := time.NewTimer(time.Second)
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	defer timer.Stop()
 	next := time.Time{}
 	for {
 		now := s.o.Now()
-		s.advancePersonal(now)
-		if !now.Before(next) {
+		clockActive := s.advancePersonal(now)
+		personal, err := s.enabledPersonalChannels(s.serviceContext())
+		hasPersonal := err == nil && len(personal) > 0
+		if hasPersonal && !now.Before(next) {
 			next = now.Add(time.Minute)
-			users, err := s.o.Users.Users(s.ctx)
+			users, err := s.o.Users.Users(s.serviceContext())
 			if err == nil {
-				cs, err := s.virtualChannels(s.ctx)
-				if err == nil {
-					for _, u := range users {
-
-						for _, c := range cs {
-							if c.Personal == nil || !c.Enabled {
-								continue
-							}
-							c = s.personalChannel(s.ctx, c, &u)
-							if !s.allowed(s.ctx, &u, c, nil) {
-								continue
-							}
-							if err := s.buildPersonal(s.ctx, c, &u); err != nil {
-								s.o.Logger.Debug("personal rundown build failed", "viewer", u.ID, "channel", c.ID, "error", err)
-							}
-							if c.Look != nil && s.o.Graphics != nil {
-								r, err := s.readPersonal(s.ctx, personalKey{u.ID, c.ID})
-								if err == nil {
-									for _, p := range r.programmes {
-										if p.Start.UnixMilli() <= r.cursor && p.End.UnixMilli() > r.cursor {
-											minutes := (r.cursor - p.Start.UnixMilli()) / 60000
-											p.Item.Slate = "welcome"
-											p.Item.Summary = strconv.FormatInt(minutes, 10)
-											s.o.Graphics.Ensure(s.ctx, s.clipRequest(c, p))
-											break
-										}
+				for _, u := range users {
+					for _, c := range personal {
+						c = s.personalChannel(s.serviceContext(), c, &u)
+						if !s.allowed(s.serviceContext(), &u, c, nil) {
+							continue
+						}
+						if err := s.buildPersonal(s.serviceContext(), c, &u); err != nil {
+							s.o.Logger.Debug("personal rundown build failed", "viewer", u.ID, "channel", c.ID, "error", err)
+						}
+						if c.Look != nil && s.o.Graphics != nil && len(s.recentlyWatched()) > 0 {
+							r, err := s.readPersonal(s.serviceContext(), personalKey{u.ID, c.ID})
+							if err == nil {
+								for _, p := range r.programmes {
+									if p.Start.UnixMilli() <= r.cursor && p.End.UnixMilli() > r.cursor {
+										minutes := (r.cursor - p.Start.UnixMilli()) / 60000
+										p.Item.Slate = "welcome"
+										p.Item.Summary = strconv.FormatInt(minutes, 10)
+										s.o.Graphics.Ensure(s.serviceContext(), s.clipRequest(c, p))
+										break
 									}
 								}
 							}
-
 						}
 					}
 				}
 			}
 		}
+		var wait time.Duration
+		switch {
+		case clockActive:
+			wait = time.Second
+		case hasPersonal && (s.virtualGuideActive(s.o.Now()) || len(s.recentlyWatched()) > 0):
+			wait = max(time.Second, next.Sub(s.o.Now()))
+		}
+		if wait <= 0 {
+			select {
+			case <-s.serviceContext().Done():
+				return
+			case <-s.personalWake:
+				next = time.Time{}
+				continue
+			}
+		}
+		timer.Reset(wait)
 		select {
-		case <-s.ctx.Done():
+		case <-s.serviceContext().Done():
 			return
-		case <-tick.C:
+		case <-timer.C:
+		case <-s.personalWake:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			next = time.Time{}
 		}
 	}
 }
 
-func (s *Service) advancePersonal(now time.Time) {
+func (s *Service) advancePersonal(now time.Time) bool {
 	active := map[personalKey]bool{}
 	s.mu.Lock()
 	for _, ss := range s.sessions {
@@ -421,17 +518,21 @@ func (s *Service) advancePersonal(now time.Time) {
 	s.mu.Unlock()
 	s.personalMu.Lock()
 	defer s.personalMu.Unlock()
+	if len(active) == 0 && len(s.personalClocks) == 0 {
+		return false
+	}
 	if s.personalClocks == nil {
 		s.personalClocks = map[personalKey]*personalClock{}
 	}
 	for k := range active {
 		if s.personalClocks[k] == nil {
-			r, err := s.readPersonal(s.ctx, k)
+			r, err := s.readPersonal(s.serviceContext(), k)
 			if err == nil {
 				s.personalClocks[k] = &personalClock{cursor: r.cursor, at: now, timeAway: now}
 			}
 		}
 	}
+	anyActive := false
 	for k, clock := range s.personalClocks {
 		if !clock.active {
 			continue
@@ -443,13 +544,21 @@ func (s *Service) advancePersonal(now time.Time) {
 			}
 			clock.cursor += now.UnixMilli() - start.UnixMilli()
 		}
-		if clock.active && !active[k] {
+		left := clock.active && !active[k]
+		if left {
 			clock.timeAway = now
 		}
 		clock.active = active[k]
+		if clock.active {
+			anyActive = true
+		}
 		clock.at = now
-		_, _ = s.o.DB.ExecContext(s.ctx, `UPDATE livetv_personal SET cursor_ms=?,away_ms=? WHERE viewer_id=? AND channel_id=?`, clock.cursor, now.UnixMilli(), k.viewer, k.channel)
+		if left || now.Sub(clock.saved) >= personalClockSave {
+			clock.saved = now
+			_, _ = s.o.DB.ExecContext(s.serviceContext(), `UPDATE livetv_personal SET cursor_ms=?,away_ms=? WHERE viewer_id=? AND channel_id=?`, clock.cursor, now.UnixMilli(), k.viewer, k.channel)
+		}
 	}
+	return anyActive
 }
 
 func (s *Service) beginPersonal(c Channel, u *core.User) {
@@ -458,19 +567,18 @@ func (s *Service) beginPersonal(c Channel, u *core.User) {
 	}
 	k := personalKey{u.ID, c.ID}
 	now := s.o.Now()
-	r, err := s.readPersonalClock(s.ctx, k)
+	r, err := s.readPersonalClock(s.serviceContext(), k)
 	if err != nil {
 		return
 	}
 	s.personalMu.Lock()
-	defer s.personalMu.Unlock()
 	if s.personalClocks == nil {
 		s.personalClocks = map[personalKey]*personalClock{}
 	}
 	clock := s.personalClocks[k]
 	if clock == nil {
 		var away int64
-		_ = s.o.DB.QueryRowContext(s.ctx, `SELECT away_ms FROM livetv_personal WHERE viewer_id=? AND channel_id=?`, u.ID, c.ID).Scan(&away)
+		_ = s.o.DB.QueryRowContext(s.serviceContext(), `SELECT away_ms FROM livetv_personal WHERE viewer_id=? AND channel_id=?`, u.ID, c.ID).Scan(&away)
 		clock = &personalClock{cursor: r.cursor}
 		if away > 0 {
 			clock.timeAway = time.UnixMilli(away)
@@ -478,6 +586,7 @@ func (s *Service) beginPersonal(c Channel, u *core.User) {
 		s.personalClocks[k] = clock
 	}
 	if clock.active {
+		s.personalMu.Unlock()
 		return
 	}
 	clock.at = now
@@ -487,6 +596,8 @@ func (s *Service) beginPersonal(c Channel, u *core.User) {
 			clock.welcomeUntil = now.Add(d)
 		}
 	}
+	s.personalMu.Unlock()
+	s.wakePersonalLoop()
 }
 func (s *Service) endPersonal(c Channel, viewer int64) {
 	if c.Personal == nil || !c.Personal.PauseWhenAway {
@@ -524,7 +635,7 @@ func (s *Service) endPersonal(c Channel, viewer int64) {
 	clock.active = false
 	clock.timeAway = now
 	clock.at = now
-	_, _ = s.o.DB.ExecContext(s.ctx, `UPDATE livetv_personal SET cursor_ms=?,away_ms=? WHERE viewer_id=? AND channel_id=?`, clock.cursor, now.UnixMilli(), viewer, c.ID)
+	_, _ = s.o.DB.ExecContext(s.serviceContext(), `UPDATE livetv_personal SET cursor_ms=?,away_ms=? WHERE viewer_id=? AND channel_id=?`, clock.cursor, now.UnixMilli(), viewer, c.ID)
 }
 func (s *Service) personalWelcome(c Channel, now time.Time) (Programme, bool) {
 	if c.Personal == nil || c.personalViewer == nil {
@@ -539,7 +650,7 @@ func (s *Service) personalWelcome(c Channel, now time.Time) (Programme, bool) {
 	}
 	end, cursor := clock.welcomeUntil, clock.cursor
 	s.personalMu.Unlock()
-	r, err := s.readPersonal(s.ctx, k)
+	r, err := s.readPersonal(s.serviceContext(), k)
 	if err != nil {
 		return Programme{}, false
 	}
@@ -566,11 +677,12 @@ func (s *Service) personalWelcome(c Channel, now time.Time) (Programme, bool) {
 // PersonalChanged invalidates only this viewer; recomposition remains throttled.
 func (s *Service) PersonalChanged(viewer int64) {
 	s.personalMu.Lock()
-	defer s.personalMu.Unlock()
 	if s.personalDirty == nil {
 		s.personalDirty = map[int64]uint64{}
 	}
 	s.personalDirty[viewer]++
+	s.personalMu.Unlock()
+	s.wakePersonalLoop()
 }
 
 func personalItem(t core.Title) Item {

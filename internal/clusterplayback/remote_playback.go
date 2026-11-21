@@ -23,7 +23,7 @@ type RemotePlaybackOptions struct {
 	Now func() time.Time
 }
 type RemotePlayback struct {
-	observed map[string]*core.PlaySession
+	observed map[string]*observedSession
 	draining bool
 	r        *Runtime
 	o        RemotePlaybackOptions
@@ -45,6 +45,7 @@ type remotePreparation struct {
 	pins                         int
 	uses                         int
 	activityVersion              uint64
+	forgetAt                     time.Time // forgetRetired grace deadline
 }
 type remoteSource struct {
 	revision, release string
@@ -82,7 +83,7 @@ func NewRemotePlayback(r *Runtime, o RemotePlaybackOptions) (*RemotePlayback, er
 	if o.Now == nil {
 		o.Now = time.Now
 	}
-	p := &RemotePlayback{observed: map[string]*core.PlaySession{}, r: r, o: o, entries: map[string]*remotePreparation{}}
+	p := &RemotePlayback{observed: map[string]*observedSession{}, r: r, o: o, entries: map[string]*remotePreparation{}}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.remotePlayback != nil || r.closed {
@@ -150,7 +151,7 @@ func (p *RemotePlayback) PrepareSurfaceSource(c context.Context, v *core.User, k
 		entry.activity = p.o.Now()
 		entry.mode++
 		entry.prepared = prepared
-		entry.snapshot = &core.PlaySession{ID: id, UserID: v.ID, ClientID: caps.ClientID, Key: k, Client: caps, Info: prepared.Info, StartedAt: entry.activity, PreparedOnly: true, Resolution: &core.Resolution{Title: k, Release: core.Release{ID: prepared.ReleaseID}}, Source: remoteSource{revision: prepared.Revision, release: prepared.ReleaseID, size: prepared.Info.Size}}
+		entry.snapshot = &core.PlaySession{ID: id, UserID: v.ID, ClientID: caps.ClientID, Key: k, Client: caps, Info: prepared.Info, StartedAt: entry.activity, PreparedOnly: true, RequiresRemux: prepared.RequiresRemux, Resolution: &core.Resolution{Title: k, HealthVerified: prepared.HealthVerified, Release: core.Release{ID: prepared.ReleaseID, Protocol: prepared.ReleaseProtocol}}, Source: remoteSource{revision: prepared.Revision, release: prepared.ReleaseID, size: prepared.Info.Size}}
 	} else {
 		entry.retiring = true
 		if err == nil {
@@ -190,8 +191,10 @@ func (p *RemotePlayback) Session(id string) (*core.PlaySession, bool) {
 	defer p.mu.Unlock()
 	e := p.entries[id]
 	if e == nil || e.retired || e.retiring || e.snapshot == nil {
-		snapshot := p.observed[id]
-		return copyPlaySession(snapshot), snapshot != nil
+		if o := p.observed[id]; o != nil {
+			return copyPlaySession(o.snapshot), true
+		}
+		return nil, false
 	}
 	return copyPlaySession(e.snapshot), true
 }

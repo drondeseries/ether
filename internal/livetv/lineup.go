@@ -3,6 +3,7 @@ package livetv
 import (
 	"context"
 	"encoding/json"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -24,24 +25,28 @@ const (
 // ChannelSummary is the console lineup identity: everything the list, search
 // and guide rows need, without stream URLs, items or programming.
 type ChannelSummary struct {
-	ID            string `json:"id"`
-	Number        string `json:"number"`
-	Name          string `json:"name"`
-	Kind          string `json:"kind"`
-	Private       bool   `json:"private,omitempty"`
-	Enabled       bool   `json:"enabled"`
-	Favorite      bool   `json:"favorite"`
-	Rating        string `json:"rating,omitempty"`
-	Logo          string `json:"logo,omitempty"`
-	SourceID      string `json:"sourceId,omitempty"`
-	GuideID       string `json:"guideId,omitempty"`
-	GuideSourceID string `json:"guideSourceId,omitempty"`
-	Group         string `json:"group,omitempty"`
+	ID            string   `json:"id"`
+	Number        string   `json:"number"`
+	Name          string   `json:"name"`
+	Kind          string   `json:"kind"`
+	Private       bool     `json:"private,omitempty"`
+	Enabled       bool     `json:"enabled"`
+	HiddenApps    []string `json:"hiddenApps,omitempty"`
+	ShownApps     []string `json:"shownApps,omitempty"`
+	Favorite      bool     `json:"favorite"`
+	Rating        string   `json:"rating,omitempty"`
+	Logo          string   `json:"logo,omitempty"`
+	SourceID      string   `json:"sourceId,omitempty"`
+	GuideID       string   `json:"guideId,omitempty"`
+	GuideSourceID string   `json:"guideSourceId,omitempty"`
+	Group         string   `json:"group,omitempty"`
+	MergedInto    string   `json:"mergedInto,omitempty"`
 
-	numberKey numberKey
-	sweepKey  string
-	styleID   string
-	reelID    string
+	rawHiddenApps []string
+	numberKey     numberKey
+	sweepKey      string
+	styleID       string
+	reelID        string
 }
 
 type ChannelCounts struct {
@@ -68,6 +73,14 @@ type ChannelPageQuery struct {
 	Q      string
 	Filter string
 	Source string
+	// Group keeps only channels in this provider lineup group (exact name).
+	Group string
+	// OwnerGroup keeps only channels in this Your-groups id (or "none" for ungrouped).
+	OwnerGroup string
+	// App keeps only channels published to this app (or hidden from it when prefixed with "!").
+	App string
+	// Sort orders matching channels by "number", "name", "id", or "source".
+	Sort string
 }
 
 type ChannelPage struct {
@@ -82,40 +95,77 @@ type ChannelPage struct {
 // ChannelSummaries returns the whole lineup in display order. The result is
 // shared and must be treated as read-only.
 func (s *Service) ChannelSummaries(ctx context.Context) ([]ChannelSummary, error) {
-	return s.channelSummaries(ctx)
+	all, err := s.channelSummaries(ctx)
+	if err != nil {
+		return nil, err
+	}
+	hasMerged := false
+	for i := range all {
+		if all[i].MergedInto != "" {
+			hasMerged = true
+			break
+		}
+	}
+	if !hasMerged {
+		return all, nil
+	}
+	out := make([]ChannelSummary, 0, len(all))
+	for _, c := range all {
+		if c.MergedInto == "" {
+			out = append(out, c)
+		}
+	}
+	return out, nil
 }
 
 func (s *Service) channelSummaries(ctx context.Context) ([]ChannelSummary, error) {
+	prevGroupRev, prevGroupIdx := s.getOwnerGroupCacheState()
 	var rev int64
-	if err := s.o.DB.QueryRowContext(ctx, `SELECT generation FROM livetv_channel_epoch WHERE id=1`).Scan(&rev); err != nil {
+	var rawGroups string
+	if err := s.o.DB.QueryRowContext(ctx,
+		`SELECT generation, CASE WHEN generation=? THEN '' ELSE COALESCE((SELECT data FROM livetv_owner_groups WHERE id=1),'[]') END FROM livetv_channel_epoch WHERE id=1`,
+		prevGroupRev,
+	).Scan(&rev, &rawGroups); err != nil {
 		return nil, err
 	}
 	s.lineupMu.Lock()
-	defer s.lineupMu.Unlock()
 	if s.lineupIndex != nil && s.lineupRev == rev {
-		return s.lineupIndex, nil
+		cached := s.lineupIndex
+		s.lineupMu.Unlock()
+		if prevGroupIdx == nil || rev != prevGroupRev {
+			decoded, err := s.loadOwnerGroupIndexWithTargets(ctx, rev, rawGroups, targetsFromSummaries(cached))
+			if err != nil {
+				return nil, err
+			}
+			s.setOwnerGroupCacheState(rev, decoded)
+		}
+		return cached, nil
 	}
+	defer s.lineupMu.Unlock()
 	rows, err := s.o.DB.QueryContext(ctx, `SELECT data FROM livetv_channels`)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	out := make([]ChannelSummary, 0, 1024)
 	for rows.Next() {
 		var b []byte
 		if err = rows.Scan(&b); err != nil {
+			rows.Close()
 			return nil, err
 		}
 		var c ChannelSummary
 		if err = json.Unmarshal(b, &c); err != nil {
+			rows.Close()
 			return nil, err
 		}
+		c.rawHiddenApps = c.HiddenApps
 		var stream struct {
 			Look          *ChannelLook   `json:"look"`
 			StreamURL     string         `json:"streamUrl"`
 			StreamSources []StreamSource `json:"streamSources"`
 		}
 		if err = json.Unmarshal(b, &stream); err != nil {
+			rows.Close()
 			return nil, err
 		}
 		if stream.Look != nil {
@@ -127,10 +177,25 @@ func (s *Service) channelSummaries(ctx context.Context) ([]ChannelSummary, error
 		out = append(out, c)
 	}
 	if err = rows.Err(); err != nil {
+		rows.Close()
 		return nil, err
 	}
-	// Virtual channels lead, then sources in the same id order Sources() uses,
-	// then natural channel number.
+	rows.Close()
+
+	groupIdx := prevGroupIdx
+	if groupIdx == nil || rev != prevGroupRev {
+		decoded, err := s.loadOwnerGroupIndexWithTargets(ctx, rev, rawGroups, targetsFromSummaries(out))
+		if err != nil {
+			return nil, err
+		}
+		groupIdx = decoded
+		s.setOwnerGroupCacheState(rev, groupIdx)
+	}
+	for i := range out {
+		out[i].HiddenApps = groupIdx.effectiveHiddenAppsFor(out[i].SourceID, out[i].Group, out[i].ID, out[i].rawHiddenApps, out[i].ShownApps)
+	}
+
+	// Virtual channels lead, then natural channel number, source and ID.
 	sort.SliceStable(out, func(i, j int) bool {
 		a, b := out[i], out[j]
 		ar, br := 1, 1
@@ -143,14 +208,56 @@ func (s *Service) channelSummaries(ctx context.Context) ([]ChannelSummary, error
 		if ar != br {
 			return ar < br
 		}
-		if a.SourceID != b.SourceID {
-			return a.SourceID < b.SourceID
-		}
 		if cmp := a.numberKey.compare(b.numberKey); cmp != 0 {
 			return cmp < 0
 		}
+		if a.SourceID != b.SourceID {
+			return a.SourceID < b.SourceID
+		}
 		return a.ID < b.ID
 	})
+	// Cache numeric/name/id/source orders once per lineup generation. Paging
+	// never sorts 10,000 channels, and equal keys keep a stable ID tie-break.
+	orders := map[string][]int{}
+	for _, kind := range []string{"number", "source", "name", "id"} {
+		order := make([]int, len(out))
+		for i := range order {
+			order[i] = i
+		}
+		switch kind {
+		case "", "number":
+			sort.SliceStable(order, func(i, j int) bool {
+				a, b := out[order[i]], out[order[j]]
+				if cmp := a.numberKey.compare(b.numberKey); cmp != 0 {
+					return cmp < 0
+				}
+				return strings.ToLower(a.Name) < strings.ToLower(b.Name)
+			})
+		case "source":
+			sort.SliceStable(order, func(i, j int) bool {
+				a, b := out[order[i]], out[order[j]]
+				if a.SourceID != b.SourceID {
+					return a.SourceID < b.SourceID
+				}
+				return a.numberKey.compare(b.numberKey) < 0
+			})
+		case "name":
+			sort.SliceStable(order, func(i, j int) bool {
+				a, b := out[order[i]], out[order[j]]
+				na, nb := strings.ToLower(a.Name), strings.ToLower(b.Name)
+				if na != nb {
+					return na < nb
+				}
+				return a.numberKey.compare(b.numberKey) < 0
+			})
+		case "id":
+			sort.SliceStable(order, func(i, j int) bool {
+				return out[order[i]].ID < out[order[j]].ID
+			})
+		}
+		orders[kind] = order
+	}
+	s.lineupOrders = orders
 	s.lineupIndex = out
 	s.lineupRev = rev
 	return out, nil
@@ -196,6 +303,9 @@ func summaryCovered(c ChannelSummary, stats map[guideKey]guideStat) bool {
 func channelCounts(all []ChannelSummary, stats map[guideKey]guideStat) ChannelCounts {
 	var n ChannelCounts
 	for _, c := range all {
+		if c.MergedInto != "" {
+			continue
+		}
 		n.All++
 		if c.Enabled {
 			n.Live++
@@ -218,7 +328,25 @@ func channelCounts(all []ChannelSummary, stats map[guideKey]guideStat) ChannelCo
 	return n
 }
 
-func channelMatches(c ChannelSummary, q ChannelPageQuery, stats map[guideKey]guideStat) bool {
+func channelMatches(c ChannelSummary, q ChannelPageQuery, stats map[guideKey]guideStat, groupIdx *ownerGroupIndex) bool {
+	if c.MergedInto != "" {
+		return false
+	}
+	if q.Group != "" && c.Group != q.Group {
+		return false
+	}
+	if q.OwnerGroup != "" && !groupIdx.inGroup(q.OwnerGroup, c.SourceID, c.Group, c.ID) {
+		return false
+	}
+	if q.App != "" {
+		if wantHidden, ok := strings.CutPrefix(q.App, "!"); ok {
+			if !slices.Contains(c.HiddenApps, wantHidden) {
+				return false
+			}
+		} else if slices.Contains(c.HiddenApps, q.App) {
+			return false
+		}
+	}
 	if q.Source != "" {
 		if q.Source == "virtual" {
 			if c.Kind != "virtual" {
@@ -250,7 +378,7 @@ func channelMatches(c ChannelSummary, q ChannelPageQuery, stats map[guideKey]gui
 			return false
 		}
 	case "off":
-		if c.Enabled {
+		if !c.Enabled {
 			return false
 		}
 	}
@@ -283,6 +411,9 @@ func channelGroups(all []ChannelSummary, order []int) []ChannelGroup {
 func nextChannelNumber(all []ChannelSummary) string {
 	max := 0
 	for _, c := range all {
+		if c.MergedInto != "" {
+			continue
+		}
 		if n, err := strconv.ParseFloat(c.Number, 64); err == nil && int(n) > max {
 			max = int(n)
 		}
@@ -293,10 +424,11 @@ func nextChannelNumber(all []ChannelSummary) string {
 // ChannelPage returns one page of full channel records for the console list
 // and guide, plus the totals and groups the page needs to lay out the rest.
 func (s *Service) ChannelPage(ctx context.Context, q ChannelPageQuery) (ChannelPage, error) {
-	all, err := s.channelSummaries(ctx)
-	if err != nil {
+	// Builds or refreshes the immutable lineup index read under lineupMu below.
+	if _, err := s.channelSummaries(ctx); err != nil {
 		return ChannelPage{}, err
 	}
+	_, groupIdx := s.getOwnerGroupCacheState()
 	stats, err := s.guideCoverageStats(ctx)
 	if err != nil {
 		return ChannelPage{}, err
@@ -310,9 +442,22 @@ func (s *Service) ChannelPage(ctx context.Context, q ChannelPageQuery) (ChannelP
 	if q.Offset < 0 {
 		q.Offset = 0
 	}
-	order := make([]int, 0, len(all))
-	for i, c := range all {
-		if channelMatches(c, q, stats) {
+	kind := q.Sort
+	if kind == "" {
+		kind = "number"
+	}
+	s.lineupMu.Lock()
+	candidates := s.lineupOrders[kind]
+	// A concurrent generation rebuild may replace the cache after our index
+	// read. Re-read the matching immutable index and its order together.
+	all := s.lineupIndex
+	if candidates == nil {
+		candidates = s.lineupOrders["number"]
+	}
+	s.lineupMu.Unlock()
+	order := make([]int, 0, len(candidates))
+	for _, i := range candidates {
+		if channelMatches(all[i], q, stats, groupIdx) {
 			order = append(order, i)
 		}
 	}
@@ -344,6 +489,7 @@ func (s *Service) ChannelPage(ctx context.Context, q ChannelPageQuery) (ChannelP
 		if !ok {
 			v = channelFromSummary(c)
 		}
+		v.HiddenApps = groupIdx.effectiveHiddenApps(v)
 		page.Channels = append(page.Channels, v)
 	}
 	return page, nil

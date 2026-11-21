@@ -14,7 +14,10 @@ const (
 	refillRetryDelay   = 15 * time.Second // after a budget refusal only
 )
 
-var _ core.SearchCacheRefiller = (*Service)(nil)
+var (
+	_ core.SearchCacheRefiller       = (*Service)(nil)
+	_ core.WarmupSearchCacheRefiller = (*Service)(nil)
+)
 
 type refillSearchContextKey struct{}
 
@@ -25,21 +28,37 @@ type refillMark struct {
 	missed bool
 }
 
-// RefillSearchCache recovers candidates for a detail page or when a detail
-// warm-up reuses a remembered resolution. It never waits for capacity or
-// performs resolution, descriptor fetching, health checks or provider work.
+// RefillSearchCache recovers candidates for an open detail page. It never
+// waits for capacity or performs resolution, descriptor fetching, health
+// checks or provider work.
 //
 // Nobody pressed Play: discovery is speculative indexer work. It draws on
-// the speculative share, asks each indexer its primary query only (no
+// the viewer detail share, asks each indexer its primary query only (no
 // fallback burst, no rescue), skips a title remembered unavailable, and
 // runs at most once per title per unavailable cooloff, whatever it found:
 // a version picker reopened all evening must not search all evening.
 // Errors are best-effort: no retries or queue.
 func (s *Service) RefillSearchCache(title *core.Title) <-chan struct{} {
+	return s.refillSearchCache(title, false)
+}
+
+// RefillWarmupSearchCache recovers picker candidates for a warm-up reusing
+// a remembered source. No viewer is waiting on this work, so it uses the
+// unattended share, even when the warm-up originated from a detail page.
+func (s *Service) RefillWarmupSearchCache(title *core.Title) <-chan struct{} {
+	return s.refillSearchCache(title, true)
+}
+
+func (s *Service) refillSearchCache(title *core.Title, unattended bool) <-chan struct{} {
 	if title == nil {
 		return nil
 	}
 	req := searchRequestFor(title)
+	if !unattended && req.Anime {
+		if e, ok := s.getAvailability(s.bgCtx, int64(title.Key)); !ok || e.available {
+			s.warmSeaDexForOpen(title, req)
+		}
+	}
 	key := searchCacheKey(req)
 	s.bgMu.Lock()
 	defer s.bgMu.Unlock()
@@ -66,7 +85,11 @@ func (s *Service) RefillSearchCache(title *core.Title) <-chan struct{} {
 	s.refills[key] = done
 	cooloff := s.cooloffFor(title)
 	// Use the service lifetime, not the metadata request or source warm-up.
-	ctx, cancel := context.WithTimeout(core.WithIndexerPurpose(context.WithValue(s.bgCtx, refillSearchContextKey{}, true), core.IndexerPurposeDetail), searchRefillBudget)
+	searchCtx := core.WithIndexerPurpose(context.WithValue(s.bgCtx, refillSearchContextKey{}, true), core.IndexerPurposeDetail)
+	if unattended {
+		searchCtx = core.WithUnattendedSearch(core.WithIndexerPurpose(searchCtx, core.IndexerPurposeWarmup))
+	}
+	ctx, cancel := context.WithTimeout(searchCtx, searchRefillBudget)
 	s.bgWG.Add(1)
 	go func() {
 		defer s.bgWG.Done()
@@ -91,7 +114,11 @@ func (s *Service) RefillSearchCache(title *core.Title) <-chan struct{} {
 		}()
 		// Recheck the cache: a foreground search may have filled it since
 		// admission. No admin-console discovery/observation side effects.
-		_, _, err = s.searchCached(ctx, req, false)
+		var results []core.Release
+		results, _, err = s.searchCached(ctx, req, false)
+		if !unattended && err == nil && len(results) > 0 {
+			s.warmReleaseTitlesForSearch(title, req, results)
+		}
 	}()
 	return done
 }

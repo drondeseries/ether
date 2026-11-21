@@ -1,3 +1,4 @@
+import { SourceEditorHeader, SourceEditorMetrics } from "../../components/SourceEditorSummary";
 import {
   Badge,
   Switch,
@@ -19,23 +20,43 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState, type ComponentProps } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ComponentProps,
+  type ReactNode,
+} from "react";
 import { Link } from "react-router-dom";
+import { AddAddonDrawer } from "../../components/addons/AddAddonDrawer";
+import type { AddonSummary } from "../../components/addons/addons";
+import { Drawer } from "../../components/Drawer";
 import { Field, SecretInput, Segmented } from "../../components/fields";
 import { SubtabNav } from "../../components/layout";
 import { localized, t, tn } from "../../i18n";
 import { useLocale } from "../../i18n/react";
 import { searchSelectLabels } from "../../i18n/appkit-labels";
-import { REGION_CODES } from "../catalog/CatalogPickers";
+import { REGION_CODES } from "../libraries/browser/CatalogPickers";
 import { browserLanguageList, regionFromLocales, regionFromTimeZone } from "../setup/language";
 import { api, errorMessage } from "../../lib/api";
 import { isPluginDescriptor, textOf, useRegistry, type Descriptor } from "../../lib/extend";
 import type { ParamField } from "../../lib/rules";
 import { formatBytes, formatNumber, relativeTime } from "../../lib/format";
 import { ChannelGroups, ProviderAccountCard } from "./SourceGroups";
+import {
+  hasM3UHeaderGuide,
+  parseXtreamUrl,
+  stripXtreamServerUrl,
+  type XtreamCredentials,
+} from "./sourceOnboarding";
 import { sourceImportError } from "./sourceErrors";
+import { UnratedChannelRating } from "./UnratedChannelRating";
 import { SourceLimits } from "./SourceLimits";
 import {
+  addonChannelsKind,
   dayClock,
   duration,
   emptySource,
@@ -88,6 +109,122 @@ function uploadError(file: File, key: "playlist" | "guide"): string {
   return "";
 }
 
+/**
+ * Shared drawer for creating or editing an IPTV, Xtream, guide or Stremio
+ * channel source in place over whichever page opened it (Live TV or Sources).
+ */
+export function SourceDrawer({
+  sourceId,
+  adding,
+  sources,
+  onClose,
+  onSaved,
+  onDeleted,
+}: {
+  sourceId: string | null;
+  adding: string | null;
+  /** `null` while the caller's initial sources fetch is still in flight. */
+  sources: Source[] | null;
+  onClose: () => void;
+  onSaved: (s: Source) => Promise<void> | void;
+  onDeleted: () => Promise<void> | void;
+}) {
+  const [footer, setFooter] = useState<ReactNode>(null);
+  const [editorKind, setEditorKind] = useState<SourceKind>(
+    adding === "guide" ? "guide" : "playlist",
+  );
+  useEffect(() => {
+    setEditorKind(adding === "guide" ? "guide" : "playlist");
+  }, [sourceId, adding]);
+
+  const selected = sourceId ? (sources?.find((s) => s.id === sourceId) ?? null) : null;
+  const open = Boolean(sourceId || (adding && adding !== "addon"));
+  const isGuide = selected
+    ? selected.hasPlaylist === false && selected.auth?.type !== "xtream"
+    : adding === "guide" || editorKind === "guide";
+  const title = isGuide ? t("Guide source") : sourceId ? t("Edit IPTV source") : t("IPTV source");
+
+  const addAddonSource = async (addon: AddonSummary) => {
+    const kind = addonChannelsKind(addon.id);
+    const existing = (sources ?? []).find((s) => s.kind === kind || s.playlistUrl === kind);
+    if (existing) {
+      toast.info(t("{name} is already in Live TV", { name: existing.name }));
+      await onSaved(existing);
+      return;
+    }
+    if (!addon.roles?.some((r) => r.role === "livetv_channels" && r.on)) {
+      toast.error(t("Live TV channels are off for {name}", { name: addon.name }), {
+        description: t("Switch them on in Plugins to add its channels."),
+      });
+      return;
+    }
+    const importing = toast.loading(t("Importing channels from {name}…", { name: addon.name }));
+    try {
+      const saved = await tv.saveSource({
+        ...emptySource(),
+        name: addon.name,
+        kind,
+        playlistUrl: kind,
+      });
+      toast.success(t("Source imported"), {
+        id: importing,
+        description: t("Channel numbers, mappings and access rules are kept."),
+      });
+      await onSaved(saved);
+    } catch (e) {
+      toast.error(t("Couldn't import channels from {name}", { name: addon.name }), {
+        id: importing,
+        description: errorMessage(e),
+      });
+    }
+  };
+
+  const fallbackFooter = (
+    <div className="flex w-full justify-end">
+      <Button type="button" variant="outline" size="sm" onClick={onClose}>
+        {t("Cancel")}
+      </Button>
+    </div>
+  );
+
+  return (
+    <>
+      <AddAddonDrawer
+        open={adding === "addon" && sources !== null}
+        role="livetv_channels"
+        onClose={onClose}
+        onAdded={(addon) => void addAddonSource(addon)}
+      />
+      <Drawer
+        open={open}
+        onClose={onClose}
+        title={title}
+        size="lg"
+        footer={sourceId && (sources === null || !selected) ? fallbackFooter : footer}
+      >
+        {sourceId && sources === null ? (
+          <p className="text-sm text-fg-muted">{t("Loading…")}</p>
+        ) : sourceId && !selected ? (
+          <p className="text-sm text-fg-muted">{t("That source no longer exists.")}</p>
+        ) : (
+          <SourceEditor
+            key={sourceId ?? adding}
+            source={selected}
+            kind={adding === "guide" ? "guide" : "playlist"}
+            guideOnly={adding === "guide"}
+            initialXtream={adding === "xtream"}
+            onKindChange={setEditorKind}
+            onCancel={onClose}
+            setFooter={setFooter}
+            onSaved={onSaved}
+            onDeleted={onDeleted}
+          />
+        )}
+      </Drawer>
+    </>
+  );
+}
+
 /** Create or edit an M3U playlist source or a guide-only XMLTV source, in place. */
 export function SourceEditor({
   source,
@@ -96,6 +233,8 @@ export function SourceEditor({
   guideOnly = false,
   onGuideKindChange,
   onKindChange,
+  onCancel,
+  setFooter,
   onSaved,
   onDeleted,
 }: {
@@ -105,10 +244,13 @@ export function SourceEditor({
   guideOnly?: boolean;
   onGuideKindChange?: (kind: "xmltv" | "plex") => void;
   onKindChange?: (kind: SourceKind) => void;
+  onCancel?: () => void;
+  setFooter?: (footer: ReactNode) => void;
   onSaved: (s: Source) => Promise<void> | void;
   onDeleted: () => Promise<void> | void;
 }) {
   const [draft, setDraft] = useState<SourceDraft>(emptySource());
+  const automaticInterval = useRef(0);
   const [kind, setKind] = useState<SourceKind>(initialKind);
   const [busy, setBusy] = useState<"" | "save" | "refresh" | "delete">("");
   const [error, setError] = useState("");
@@ -153,6 +295,7 @@ export function SourceEditor({
     playlist: null,
     guide: null,
   });
+  const [filePlaylistGuide, setFilePlaylistGuide] = useState(false);
   // Source kinds come from the descriptor registry; the editor families
   // (playlist, guide, xtream) are named by each kind's meta.editor.
   const registry = useRegistry<LiveTVSourceMeta>("liveTVSource");
@@ -178,11 +321,13 @@ export function SourceEditor({
     Boolean(draft.kind?.startsWith("plugin:")) ||
     draft.playlistUrl.startsWith("plugin:");
   useEffect(() => {
+    automaticInterval.current = Math.max(0, source?.refreshHours ?? 0);
     setDraft(
       source
         ? {
             ...emptySource(),
             id: source.id,
+            disabled: source.disabled,
             kind: source.kind,
             name: source.kind === "plex" ? plexLineupName(source.name) : source.name,
             lineupId: source.lineupId,
@@ -190,10 +335,13 @@ export function SourceEditor({
             postalCode: source.postalCode,
             playlistUrl: source.playlistUrl ?? "",
             guideUrl: source.guideUrl ?? "",
+            unratedRating: source.unratedRating,
             refreshHours: source.refreshHours,
+            activityRefreshMinutes: source.activityRefreshMinutes,
             useLiveTV: source.useLiveTV,
             useVOD: source.useVOD,
             auth: source.auth ? structuredClone(source.auth) : undefined,
+            logins: structuredClone(source.logins ?? []),
             ...groupRules(source),
             maxConnections: source.maxConnections,
             tuneGapSeconds: source.tuneGapSeconds,
@@ -218,6 +366,7 @@ export function SourceEditor({
     setGuideKind(source?.kind === "plex" ? "plex" : "xmltv");
     setLineups(null);
     setFiles({ playlist: null, guide: null });
+    setFilePlaylistGuide(false);
     setError("");
     setProgress(null);
     setProgressUnavailable(false);
@@ -234,6 +383,16 @@ export function SourceEditor({
       return;
     }
     setError("");
+    if (key === "playlist") {
+      setFilePlaylistGuide(false);
+      if (!/\.gz$/i.test(file.name)) {
+        void file
+          .slice(0, 8192)
+          .text()
+          .then((head) => setFilePlaylistGuide(hasM3UHeaderGuide(head)))
+          .catch(() => {});
+      }
+    }
     setFiles((current) => ({ ...current, [key]: file }));
     setDraft((s) => ({
       ...s,
@@ -244,17 +403,42 @@ export function SourceEditor({
 
   const auth = draft.auth ?? {};
   const xtream = kind === "playlist" && auth.type === "xtream";
-  const setAuth = (patch: SourceAuth) => setDraft((d) => ({ ...d, auth: { ...d.auth, ...patch } }));
+  const inlineXtream = xtream ? parseXtreamUrl(auth.server ?? "") : null;
+  const setAuth = (patch: SourceAuth) =>
+    setDraft((d) => ({
+      ...d,
+      auth: { ...d.auth, ...patch },
+      ...(patch.type && patch.type !== d.auth?.type ? { logins: [] } : {}),
+    }));
+  const applyXtreamUrl = (parsed: XtreamCredentials) =>
+    setAuth({
+      server: parsed.server,
+      username: parsed.username,
+      password: parsed.password,
+      ...(parsed.output ? { output: parsed.output } : {}),
+    });
   const plex = kind === "guide" && guideKind === "plex";
+  // GET never returns inline uploads, but the server keeps a stored upload
+  // when a save sends none (keepStoredUploads), so it still counts here.
+  const storedPlaylist = Boolean(
+    source?.hasPlaylist && !source.playlistUrl && source.auth?.type !== "xtream",
+  );
+  const storedGuide = Boolean(
+    source?.hasGuide && !source.guideUrl && !source.playlistGuide && source.kind !== "plex",
+  );
   const canSave =
     draft.name.trim() !== "" &&
     (xtream
-      ? Boolean(auth.server?.trim() && auth.username?.trim() && auth.password)
+      ? Boolean(
+          (inlineXtream?.server || auth.server?.trim()) &&
+          (inlineXtream?.username || auth.username?.trim()) &&
+          (inlineXtream?.password || auth.password),
+        )
       : kind === "playlist"
-        ? Boolean(files.playlist || draft.playlist || draft.playlistUrl)
+        ? Boolean(files.playlist || draft.playlist || draft.playlistUrl || storedPlaylist)
         : plex
           ? Boolean(draft.lineupId && (draft.country || region) && draft.postalCode)
-          : Boolean(files.guide || draft.guide || draft.guideUrl));
+          : Boolean(files.guide || draft.guide || draft.guideUrl || storedGuide));
 
   const save = async () => {
     setBusy("save");
@@ -393,63 +577,167 @@ export function SourceEditor({
       })),
     [],
   );
-  const urlBacked = plex || xtream || Boolean(draft.playlistUrl || draft.guideUrl);
+  const urlBacked =
+    plex || xtream || Boolean(draft.playlistUrl || draft.guideUrl || source?.playlistGuide);
+  const playlistGuideFound =
+    kind === "playlist" &&
+    !xtream &&
+    !pluginBacked &&
+    !plex &&
+    !files.guide &&
+    !draft.guideUrl.trim() &&
+    !draft.guide.trim() &&
+    !storedGuide &&
+    (files.playlist
+      ? filePlaylistGuide
+      : Boolean(source?.playlistGuide && draft.playlistUrl === (source.playlistUrl ?? "")));
+
+  const latest = useRef({ save, remove, onCancel });
+  useLayoutEffect(() => {
+    latest.current = { save, remove, onCancel };
+  });
+
+  const hasSource = Boolean(source);
+  const hasCancel = Boolean(onCancel);
+  const footerNode = useMemo(
+    () => (
+      <div className="w-full space-y-2">
+        {error ? (
+          <p role="alert" className="text-sm text-danger">
+            {error}
+          </p>
+        ) : null}
+        {busy === "save" ? (
+          <p role="status" className="text-xs text-fg-muted">
+            {progressUnavailable
+              ? t("Import in progress. Detailed progress is unavailable on this server.")
+              : progress
+                ? importProgressText(progress, progressRate)
+                : t("Starting import…")}
+            {progressUnavailable && savedImport ? (
+              <span className="block text-xs text-fg-muted">
+                {tn(
+                  savedImport.channelCount ?? 0,
+                  "{count} channel in the last saved import",
+                  "{count} channels in the last saved import",
+                )}
+              </span>
+            ) : null}
+          </p>
+        ) : null}
+        <div className="flex w-full flex-wrap items-center gap-2">
+          {hasSource ? (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              className="text-danger hover:bg-danger/10"
+              disabled={Boolean(busy)}
+              onClick={() => void latest.current.remove()}
+            >
+              <Trash2 size={14} /> {t("Delete source")}
+            </Button>
+          ) : null}
+          {rulesChanged ? <Badge variant="warning">{t("Unsaved changes")}</Badge> : null}
+          <div className="ml-auto flex items-center gap-2">
+            {hasCancel ? (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={Boolean(busy)}
+                onClick={() => latest.current.onCancel?.()}
+              >
+                {t("Cancel")}
+              </Button>
+            ) : null}
+            <Button
+              type="button"
+              size="sm"
+              disabled={!canSave || Boolean(busy)}
+              onClick={() => void latest.current.save()}
+            >
+              {busy === "save"
+                ? t("Importing…")
+                : hasSource
+                  ? t("Save and re-import")
+                  : t("Import source")}
+            </Button>
+          </div>
+        </div>
+      </div>
+    ),
+    [
+      busy,
+      canSave,
+      error,
+      hasCancel,
+      hasSource,
+      locale,
+      progress,
+      progressRate,
+      progressUnavailable,
+      rulesChanged,
+      savedImport,
+    ],
+  );
+
+  useLayoutEffect(() => {
+    setFooter?.(footerNode);
+  }, [setFooter, footerNode]);
+
+  useEffect(() => {
+    return () => setFooter?.(null);
+  }, [setFooter]);
 
   return (
     <div className="mx-auto max-w-3xl space-y-5 p-3 sm:p-6">
-      <div className="flex items-start gap-4">
-        <span
-          className={
-            kind === "guide"
-              ? "grid size-12 shrink-0 place-items-center rounded-xl bg-info/15 text-info"
-              : "grid size-12 shrink-0 place-items-center rounded-xl bg-primary-subtle text-primary"
-          }
-        >
-          {kind === "guide" ? <CalendarRange size={22} /> : <ListVideo size={22} />}
-        </span>
-        <div className="min-w-0 flex-1">
-          <h2 className="truncate text-xl font-semibold tracking-tight text-fg">
-            {source
-              ? source.kind === "plex"
-                ? plexLineupName(source.name)
-                : source.name
-              : kind === "guide"
-                ? t("New guide source")
-                : t("New IPTV source")}
-          </h2>
-          <p className="text-sm text-fg-muted">
-            {plex
-              ? t("Plex's TV listings for your provider, by postal code.")
-              : textOf(
-                  (
-                    selectedPlugin ??
-                    byEditor(kind === "guide" ? "guide" : xtream ? "xtream" : "playlist")
-                  )?.hint,
-                ) ||
-                (kind === "guide"
-                  ? t("An XMLTV guide on its own. Map any channel to it for listings.")
-                  : t("An M3U playlist of live streams, with an optional XMLTV guide."))}
-          </p>
-        </div>
-        {source ? (
-          <div className="flex shrink-0 gap-2">
-            <Button
-              variant="outline"
-              size="sm"
-              disabled={Boolean(busy) || !urlBacked}
-              onClick={() => void refresh()}
-              title={urlBacked ? undefined : t("Uploaded files can't be refreshed; upload again")}
-            >
-              <RefreshCw size={13} className={busy === "refresh" ? "animate-spin" : ""} />{" "}
-              {t("Refresh now")}
-            </Button>
-          </div>
-        ) : null}
-      </div>
+      <SourceEditorHeader
+        icon={kind === "guide" ? <CalendarRange size={22} /> : <ListVideo size={22} />}
+        tone={kind === "guide" ? "info" : "primary"}
+        title={
+          source
+            ? source.kind === "plex"
+              ? plexLineupName(source.name)
+              : source.name
+            : kind === "guide"
+              ? t("New guide source")
+              : t("New IPTV source")
+        }
+        description={
+          plex
+            ? t("Plex's TV listings for your provider, by postal code.")
+            : textOf(
+                (
+                  selectedPlugin ??
+                  byEditor(kind === "guide" ? "guide" : xtream ? "xtream" : "playlist")
+                )?.hint,
+              ) ||
+              (kind === "guide"
+                ? t("An XMLTV guide on its own. Map any channel to it for listings.")
+                : t("An M3U playlist of live streams, with an optional XMLTV guide."))
+        }
+        actions={
+          source ? (
+            <div className="flex shrink-0 gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={Boolean(busy) || !urlBacked || Boolean(draft.disabled)}
+                onClick={() => void refresh()}
+                title={urlBacked ? undefined : t("Uploaded files can't be refreshed; upload again")}
+              >
+                <RefreshCw size={13} className={busy === "refresh" ? "animate-spin" : ""} />{" "}
+                {t("Refresh now")}
+              </Button>
+            </div>
+          ) : null
+        }
+      />
 
       {source ? (
-        <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-          {[
+        <SourceEditorMetrics
+          items={[
             kind === "guide"
               ? {
                   key: "coverage",
@@ -478,16 +766,21 @@ export function SourceEditor({
               label: t("Guide runs to"),
               value: source.guideUntil ? dayClock(source.guideUntil) : "—",
             },
-          ].map(({ key, label, value: v }) => (
-            <div key={key} className="rounded-xl border border-border bg-surface px-3 py-2.5">
-              <p className="text-[11px] font-medium uppercase tracking-wider text-fg-subtle">
-                {label}
-              </p>
-              <p className="mt-0.5 truncate text-lg font-semibold tabular-nums text-fg">{v}</p>
-            </div>
-          ))}
-        </div>
+          ]}
+        />
       ) : null}
+
+      <div className="flex items-center justify-between gap-4 rounded-xl border border-border bg-surface px-4 py-3">
+        <span className="text-sm font-medium">{t("Enabled")}</span>
+        <Switch
+          aria-label={t("Enabled")}
+          checked={!draft.disabled}
+          onChange={(e) => {
+            const disabled = !e.currentTarget.checked;
+            setDraft((d) => ({ ...d, disabled }));
+          }}
+        />
+      </div>
 
       {source?.lastError ? (
         <div className="flex items-start gap-2 rounded-xl border border-danger/40 bg-danger/10 p-3 text-sm">
@@ -545,8 +838,8 @@ export function SourceEditor({
         hidden={onTab !== "connection"}
         className="space-y-4 rounded-2xl border border-border bg-surface p-5"
       >
-        {!source && !guideOnly ? (
-          <div className="space-y-2">
+        {!source && !guideOnly && !xtream ? (
+          <div className="space-y-4">
             <Segmented
               ariaLabel={t("Source type")}
               value={kind}
@@ -571,30 +864,35 @@ export function SourceEditor({
             ) : registry.loading ? (
               <p className="text-sm text-fg-muted">{t("Loading source kinds…")}</p>
             ) : null}
-            {pluginKinds.length ? (
-              <div className="flex flex-wrap items-center gap-1.5">
-                {pluginKinds.map((d) => (
-                  <button
-                    key={d.id}
-                    type="button"
-                    onClick={() => {
-                      setKind("playlist");
-                      onKindChange?.("playlist");
-                      setDraft((s) => ({
-                        ...s,
-                        playlistUrl: d.id,
-                        playlist: "",
-                        auth: undefined,
-                        name: s.name || textOf(d.label),
-                      }));
-                    }}
-                  >
-                    <Badge variant={draft.playlistUrl === d.id ? "default" : "secondary"}>
-                      {t("{label} (from {owner})", { label: textOf(d.label), owner: d.owner })}
-                    </Badge>
-                  </button>
-                ))}
-              </div>
+            {kind === "playlist" && pluginKinds.length ? (
+              <Field label={t("From plugins")}>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {pluginKinds.map((d) => {
+                    const active = draft.playlistUrl === d.id;
+                    return (
+                      <button
+                        key={d.id}
+                        type="button"
+                        aria-pressed={active}
+                        onClick={() => {
+                          setKind("playlist");
+                          onKindChange?.("playlist");
+                          setDraft((s) => ({
+                            ...s,
+                            playlistUrl: active ? "" : d.id,
+                            playlist: "",
+                            auth: undefined,
+                            name:
+                              active && s.name === textOf(d.label) ? "" : s.name || textOf(d.label),
+                          }));
+                        }}
+                      >
+                        <Badge variant={active ? "default" : "secondary"}>{textOf(d.label)}</Badge>
+                      </button>
+                    );
+                  })}
+                </div>
+              </Field>
             ) : null}
           </div>
         ) : null}
@@ -808,14 +1106,42 @@ export function SourceEditor({
             <Field
               label={t("Server")}
               htmlFor="xt-server"
-              hint={t("The panel address your provider gave you, e.g. {example}", {
-                example: "http://provider.example:8080",
-              })}
+              hint={t(
+                "The panel address (e.g. {example}), or paste a full Xtream link to fill in your sign-in.",
+                { example: "http://provider.example:8080" },
+              )}
             >
               <Input
                 id="xt-server"
                 value={auth.server ?? ""}
-                onChange={(e) => setAuth({ server: e.currentTarget.value })}
+                onPaste={(e) => {
+                  const parsed = parseXtreamUrl(e.clipboardData?.getData("text") ?? "");
+                  if (parsed) {
+                    e.preventDefault();
+                    applyXtreamUrl(parsed);
+                  }
+                }}
+                onChange={(e) => {
+                  const next = e.currentTarget.value;
+                  if (next.length - (auth.server ?? "").length > 1) {
+                    const parsed = parseXtreamUrl(next);
+                    if (parsed) {
+                      applyXtreamUrl(parsed);
+                      return;
+                    }
+                  }
+                  setAuth({ server: next });
+                }}
+                onBlur={() => {
+                  const raw = auth.server ?? "";
+                  const parsed = parseXtreamUrl(raw);
+                  if (parsed) {
+                    applyXtreamUrl(parsed);
+                    return;
+                  }
+                  const cleaned = stripXtreamServerUrl(raw);
+                  if (cleaned && cleaned !== raw) setAuth({ server: cleaned });
+                }}
                 placeholder="http://provider.example:8080"
               />
             </Field>
@@ -825,6 +1151,13 @@ export function SourceEditor({
                   id="xt-user"
                   value={auth.username ?? ""}
                   autoComplete="off"
+                  onPaste={(e) => {
+                    const parsed = parseXtreamUrl(e.clipboardData?.getData("text") ?? "");
+                    if (parsed) {
+                      e.preventDefault();
+                      applyXtreamUrl(parsed);
+                    }
+                  }}
                   onChange={(e) => setAuth({ username: e.currentTarget.value })}
                 />
               </Field>
@@ -865,6 +1198,83 @@ export function SourceEditor({
             onFile={(f) => void upload(f, "playlist")}
           />
         ) : null}
+        {kind === "playlist" && !pluginBacked && !plex ? (
+          <div className="space-y-3">
+            {(draft.logins ?? []).map((login, i) => {
+              const update = (patch: Partial<typeof login>) =>
+                setDraft((d) => ({
+                  ...d,
+                  logins: d.logins?.map((l, n) => (n === i ? { ...l, ...patch } : l)),
+                }));
+              return (
+                <section key={login.id} className="space-y-3 rounded-xl border border-border p-4">
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm font-medium">
+                      {t("Login {number}", { number: i + 2 })}
+                    </span>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() =>
+                        setDraft((d) => ({ ...d, logins: d.logins?.filter((_, n) => n !== i) }))
+                      }
+                    >
+                      {t("Remove")}
+                    </Button>
+                  </div>
+                  {xtream ? (
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      <Field label={t("Username")}>
+                        <Input
+                          autoComplete="off"
+                          value={login.username ?? ""}
+                          onChange={(e) => update({ username: e.currentTarget.value })}
+                        />
+                      </Field>
+                      <Field label={t("Password")}>
+                        <SecretInput
+                          ariaLabel={t("Password")}
+                          value={login.password ?? ""}
+                          onChange={(password) => update({ password })}
+                        />
+                      </Field>
+                    </div>
+                  ) : (
+                    <Field label={t("M3U playlist")}>
+                      <SecretInput
+                        ariaLabel={t("M3U playlist")}
+                        value={login.playlistUrl ?? ""}
+                        onChange={(playlistUrl) => update({ playlistUrl })}
+                      />
+                    </Field>
+                  )}
+                  {login.account ? <ProviderAccountCard account={login.account} /> : null}
+                  {login.error ? (
+                    <p role="status" className="text-sm text-danger">
+                      {login.error === "login refused"
+                        ? t("The provider rejected the login. Check the username and password.")
+                        : t("Provider unavailable; retry scheduled")}
+                    </p>
+                  ) : null}
+                </section>
+              );
+            })}
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={(draft.logins?.length ?? 0) >= 15}
+              onClick={() =>
+                setDraft((d) => ({
+                  ...d,
+                  logins: [...(d.logins ?? []), { id: crypto.randomUUID() }],
+                }))
+              }
+            >
+              <Plus size={13} />
+              {t("Add another login")}
+            </Button>
+          </div>
+        ) : null}
         {!pluginBacked && !plex ? (
           <UrlOrFile
             id="src-xmltv"
@@ -877,11 +1287,14 @@ export function SourceEditor({
             }
             url={draft.guideUrl}
             fileReady={Boolean(files.guide)}
+            badge={playlistGuideFound ? t("Guide found in the playlist") : undefined}
             accept=".xml,.gz,application/xml,text/xml,application/gzip"
             placeholder={
               xtream
                 ? t("Leave blank to use the panel's guide")
-                : t("https://…/guide.xml or .xml.gz")
+                : playlistGuideFound
+                  ? t("Guide found in the playlist")
+                  : t("https://…/guide.xml or .xml.gz")
             }
             hint={
               xtream
@@ -893,7 +1306,9 @@ export function SourceEditor({
           />
         ) : null}
         {!xtream && !pluginBacked && !plex ? <SignIn auth={auth} onChange={setAuth} /> : null}
-        {!pluginBacked && !plex ? <ClientIdentity auth={auth} onChange={setAuth} /> : null}
+        {kind === "playlist" && !pluginBacked && !plex ? (
+          <ClientIdentity auth={auth} onChange={setAuth} />
+        ) : null}
         <Field
           label={t("Keep it fresh")}
           hint={
@@ -912,36 +1327,79 @@ export function SourceEditor({
             ariaLabel={t("Refresh")}
             size="sm"
             value={auto ? "auto" : "manual"}
-            onChange={(v) => setDraft({ ...draft, refreshHours: v === "auto" ? 0 : -1 })}
+            onChange={(v) => {
+              if (v === "manual") automaticInterval.current = Math.max(0, draft.refreshHours ?? 0);
+              setDraft({ ...draft, refreshHours: v === "auto" ? automaticInterval.current : -1 });
+            }}
             options={[
               { value: "auto", label: t("Automatic") },
               { value: "manual", label: t("Manual") },
             ]}
           />
         </Field>
+        {urlBacked && auto ? (
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Field label={t("Maximum refresh interval (hours)")}>
+              <Input
+                type="number"
+                min={1}
+                max={8760}
+                aria-label={t("Maximum refresh interval (hours)")}
+                placeholder="6"
+                value={draft.refreshHours || ""}
+                onChange={(e) =>
+                  setDraft({
+                    ...draft,
+                    refreshHours: e.currentTarget.value
+                      ? Math.max(1, Math.min(8760, Number(e.currentTarget.value)))
+                      : undefined,
+                  })
+                }
+                onBlur={(e) => {
+                  if (!e.currentTarget.value) setDraft({ ...draft, refreshHours: 6 });
+                }}
+              />
+            </Field>
+            <Field
+              label={t("Refresh after inactivity")}
+              hint={t(
+                "Refreshes in the background when an app returns after five idle minutes. Apps keep using the last good playlist and guide.",
+              )}
+            >
+              <SearchSelect
+                value={String(draft.activityRefreshMinutes ?? 0)}
+                onChange={(v) => setDraft({ ...draft, activityRefreshMinutes: Number(v) })}
+                options={[
+                  { value: "0", label: t("Off") },
+                  ...[...new Set([30, 60, 120, 360, draft.activityRefreshMinutes ?? 0])]
+                    .filter((minutes) => minutes > 0)
+                    .sort((a, b) => a - b)
+                    .map((minutes) => ({
+                      value: String(minutes),
+                      label: tn(minutes, "{count} minute", "{count} minutes"),
+                    })),
+                ]}
+                ariaLabel={t("Refresh after inactivity")}
+                searchable={false}
+                {...searchSelectLabels()}
+              />
+            </Field>
+          </div>
+        ) : null}
+        {kind === "playlist" ? (
+          <div className="border-t border-border pt-4">
+            <UnratedChannelRating
+              className="px-0"
+              value={draft.unratedRating ?? ""}
+              onChange={(unratedRating) => setDraft({ ...draft, unratedRating })}
+            />
+          </div>
+        ) : null}
       </section>
-      <div className="space-y-3">
-        {error ? (
-          <p role="alert" className="text-sm text-danger">
-            {error}
-          </p>
-        ) : null}
-        {rulesChanged ? (
-          <p className="flex items-center gap-2 text-xs text-fg-muted">
-            <Badge variant="warning">{t("Unsaved changes")}</Badge>
-            {t("Saving re-imports this source with your channel group choices.")}
-          </p>
-        ) : null}
-        <div className="flex flex-wrap items-center gap-2">
-          <Button disabled={!canSave || Boolean(busy)} onClick={() => void save()}>
-            {busy === "save"
-              ? t("Importing…")
-              : source
-                ? t("Save and re-import")
-                : t("Import source")}
-          </Button>
+      {source || rulesChanged ? (
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-fg-muted">
           {source ? (
-            <span className="text-xs text-fg-muted">
+            <span>
               {source.guideFrom && source.guideUntil
                 ? t("Last imported {when} · {span} of listings", {
                     when: relativeTime(source.updatedAt),
@@ -951,40 +1409,16 @@ export function SourceEditor({
             </span>
           ) : null}
           {source?.skippedVod ? (
-            <span className="text-xs text-fg-muted">
+            <span>
               {tn(source.skippedVod, "{count} VOD entry skipped", "{count} VOD entries skipped")}
             </span>
           ) : null}
-          {source ? (
-            <Button
-              variant="ghost"
-              className="ml-auto text-danger hover:bg-danger/10"
-              disabled={Boolean(busy)}
-              onClick={() => void remove()}
-            >
-              <Trash2 size={14} /> {t("Delete source")}
-            </Button>
+          {rulesChanged ? (
+            <span>{t("Saving re-imports this source with your channel group choices.")}</span>
           ) : null}
         </div>
-        {busy === "save" ? (
-          <p role="status" className="text-xs text-fg-muted">
-            {progressUnavailable
-              ? t("Import in progress. Detailed progress is unavailable on this server.")
-              : progress
-                ? importProgressText(progress, progressRate)
-                : t("Starting import…")}
-            {progressUnavailable && savedImport ? (
-              <span className="block text-xs text-fg-muted">
-                {tn(
-                  savedImport.channelCount ?? 0,
-                  "{count} channel in the last saved import",
-                  "{count} channels in the last saved import",
-                )}
-              </span>
-            ) : null}
-          </p>
-        ) : null}
-      </div>
+      ) : null}
+      {!setFooter ? footerNode : null}
     </div>
   );
 }
@@ -1082,13 +1516,25 @@ function cleanAuth(a: SourceAuth | undefined, kind: SourceKind): SourceAuth | un
   const headers = Object.fromEntries(
     Object.entries(a.headers ?? {}).filter(([k]) => k.trim() !== ""),
   );
+  const xtreamParsed = type === "xtream" ? parseXtreamUrl(a.server ?? "") : null;
+  const xtreamServer =
+    type === "xtream" ? xtreamParsed?.server || stripXtreamServerUrl(a.server ?? "") : undefined;
+  const xtreamReplaceCreds =
+    type === "xtream" && (!a.password || a.password === "••••") && Boolean(xtreamParsed);
   const out: SourceAuth = {
     type,
     ...(type === "basic" || type === "xtream"
-      ? { username: a.username?.trim(), password: a.password }
+      ? {
+          username: xtreamReplaceCreds
+            ? xtreamParsed?.username
+            : a.username?.trim() || xtreamParsed?.username,
+          password: xtreamReplaceCreds ? xtreamParsed?.password : a.password,
+        }
       : {}),
     ...(type === "bearer" ? { token: a.token } : {}),
-    ...(type === "xtream" ? { server: a.server?.trim(), output: a.output ?? "ts" } : {}),
+    ...(type === "xtream"
+      ? { server: xtreamServer, output: a.output ?? xtreamParsed?.output ?? "ts" }
+      : {}),
     ...(Object.keys(headers).length ? { headers } : {}),
     ...(a.userAgent?.trim() ? { userAgent: a.userAgent.trim() } : {}),
     ...(a.referer?.trim() ? { referer: a.referer.trim() } : {}),
@@ -1260,6 +1706,7 @@ function UrlOrFile({
   label,
   url,
   fileReady,
+  badge,
   accept,
   placeholder,
   hint,
@@ -1270,6 +1717,7 @@ function UrlOrFile({
   label: string;
   url: string;
   fileReady: boolean;
+  badge?: string;
   accept: string;
   placeholder: string;
   hint?: string;
@@ -1301,6 +1749,10 @@ function UrlOrFile({
       {fileReady ? (
         <Badge variant="success" className="mt-1.5">
           {t("File ready to import")}
+        </Badge>
+      ) : badge ? (
+        <Badge variant="success" className="mt-1.5">
+          {badge}
         </Badge>
       ) : null}
     </Field>

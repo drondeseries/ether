@@ -88,6 +88,46 @@ var genericKeywords = map[string]bool{
 	"anime": true, "based on manga": true, "biography": true, "sitcom": true, "miniseries": true, "limited series": true,
 	"mini-series": true, "based on young adult novel": true, "shared universe": true, "reboot": true, "prequel": true,
 	"spin off": true, "duringcreditstinger": true, "short film": true, "tv movie": true,
+	"based on true story": true, "based on play or musical": true, "based on video game": true, "based on tv series": true,
+	"based on short story": true, "based on children's book": true, "post-credits scene": true, "mid-credits scene": true,
+	"flashback": true, "voice over": true, "narration": true, "ensemble cast": true, "female protagonist": true,
+	"male protagonist": true, "anthology": true, "feature debut": true, "directorial debut": true, "surprise ending": true,
+	"plot twist": true, "title spoken by character": true, "one word title": true, "character name in title": true,
+	"employer": true, "employee": true, "husband wife relationship": true, "parent child relationship": true,
+	"father son relationship": true, "mother daughter relationship": true, "brother sister relationship": true,
+}
+
+var sensitiveThemePhrases = map[string]bool{
+	"sexual assault": true, "sexual violence": true, "sexual abuse": true, "child abuse": true,
+	"domestic violence": true, "domestic abuse": true, "spousal abuse": true, "human trafficking": true,
+	"sex trafficking": true, "forced prostitution": true, "self-harm": true, "self harm": true,
+	"self-injury": true, "self injury": true, "self-mutilation": true, "suicide attempt": true,
+	"erotic movie": true, "full frontal nudity": true, "female nudity": true, "male nudity": true,
+	"prostitution": true, "prostitute": true, "torture": true, "mutilation": true, "genital mutilation": true,
+	"school shooting": true, "mass shooting": true, "ethnic cleansing": true, "concentration camp": true,
+	"drug overdose": true, "overdose": true, "anorexia": true, "bulimia": true, "eating disorder": true,
+	"miscarriage": true, "stillbirth": true, "abortion": true,
+}
+
+var sensitiveThemeWords = map[string]bool{
+	"rape": true, "raped": true, "rapist": true, "suicide": true, "suicidal": true,
+	"incest": true, "pedophilia": true, "paedophilia": true, "pedophile": true, "paedophile": true,
+	"molestation": true, "necrophilia": true, "bestiality": true, "zoophilia": true,
+	"pornography": true, "erotica": true, "softcore": true, "hardcore": true, "nudity": true, "snuff": true,
+}
+
+// isDisplayThemeKeyword reports whether raw is suitable to surface as a viewer theme.
+func isDisplayThemeKeyword(raw string) bool {
+	k := strings.ToLower(strings.TrimSpace(raw))
+	if k == "" || genericKeywords[k] || sensitiveThemePhrases[k] || namesGenre(k) {
+		return false
+	}
+	for _, w := range strings.FieldsFunc(k, func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) }) {
+		if sensitiveThemeWords[w] {
+			return false
+		}
+	}
+	return true
 }
 
 // cluster is a named slice of the viewer's taste.
@@ -138,7 +178,7 @@ func (b *builder) clustersOfType(typ core.MediaType) []*candRow {
 		for _, g := range gs {
 			for i, k := range e.Title.Keywords {
 				k = strings.ToLower(strings.TrimSpace(k))
-				if i >= 15 || genericKeywords[k] || len(strings.Fields(k)) > 3 || k == "" || namesGenre(k) {
+				if i >= 15 || !isDisplayThemeKeyword(k) || len(strings.Fields(k)) > 3 {
 					continue
 				}
 				add(kw, [2]string{g, k}, e.Weight)
@@ -210,6 +250,7 @@ func (b *builder) clustersOfType(typ core.MediaType) []*candRow {
 		return cands[i].other < cands[j].other
 	})
 	var rows []*candRow
+	var thinFallback *candRow
 	usedOther := map[string]bool{}
 	perGenre := map[string]int{}
 	var shown []map[core.RatingKey]bool
@@ -242,7 +283,22 @@ func (b *builder) clustersOfType(typ core.MediaType) []*candRow {
 		items := b.rankType(in, typ, func(t *core.Title, _, _ int, fit float64, why string) (float64, string) {
 			return 0.5*fit + 0.35*quality(t) + 0.15*popularity(t), withWhy(name+" · "+ratedPhrase(t), why)
 		})
+		if len(items) == 0 {
+			continue
+		}
+		noun := "films"
+		if typ == core.TypeShow {
+			noun = "series"
+		}
+		id := "cluster." + typeTag(typ) + genreSlug(cl.genre) + "." + genreSlug(cl.other)
+		r := newRow(KindTasteCluster, id, name,
+			fmt.Sprintf("You keep coming back to %s: %d %s you enjoyed. More in that vein you haven't seen.", strings.ToLower(name), cl.support, noun),
+			items)
+		r.minItems, r.scale = 5, 0.85+0.15*clamp(cl.score, 0, 1)
 		if len(items) < 5 {
+			if thinFallback == nil {
+				thinFallback = r
+			}
 			continue
 		}
 		// Distinct rows: skip a cluster that would mostly repeat one
@@ -269,16 +325,10 @@ func (b *builder) clustersOfType(typ core.MediaType) []*candRow {
 		shown = append(shown, top)
 		usedOther[cl.other] = true
 		perGenre[cl.genre]++
-		noun := "films"
-		if typ == core.TypeShow {
-			noun = "series"
-		}
-		id := "cluster." + typeTag(typ) + genreSlug(cl.genre) + "." + genreSlug(cl.other)
-		r := newRow(KindTasteCluster, id, name,
-			fmt.Sprintf("You keep coming back to %s: %d %s you enjoyed. More in that vein you haven't seen.", strings.ToLower(name), cl.support, noun),
-			items)
-		r.minItems, r.scale = 5, 0.85+0.15*clamp(cl.score, 0, 1)
 		rows = append(rows, r)
+	}
+	if len(rows) == 0 && thinFallback != nil {
+		rows = append(rows, thinFallback)
 	}
 	return rows
 }
@@ -420,6 +470,7 @@ func (b *builder) genEra() []*candRow {
 		return decades[i] > decades[j]
 	})
 	var rows []*candRow
+	var thinFallback *candRow
 	for _, d := range decades {
 		if len(rows) >= 2 {
 			break
@@ -437,14 +488,23 @@ func (b *builder) genEra() []*candRow {
 		items := b.rankType(in, core.TypeMovie, func(t *core.Title, _, _ int, fit float64, why string) (float64, string) {
 			return 0.5*fit + 0.35*quality(t) + 0.15*popularity(t), withWhy(fmt.Sprintf("%d · %s", t.Year, ratedPhrase(t)), why)
 		})
-		if len(items) < 5 {
+		if len(items) == 0 {
 			continue
 		}
 		r := newRow(KindEra, fmt.Sprintf("era.%d", d), "Best of the "+decadeName(d)+" for You",
 			fmt.Sprintf("You've enjoyed %d films from the %ds; these are that decade's best you haven't seen.", count[d], d), items)
 		r.minItems = 5
 		r.scale = 0.85 + 0.15*b.taste.Decade[d]
+		if len(items) < 5 {
+			if thinFallback == nil {
+				thinFallback = r
+			}
+			continue
+		}
 		rows = append(rows, r)
+	}
+	if len(rows) == 0 && thinFallback != nil {
+		rows = append(rows, thinFallback)
 	}
 	return rows
 }
@@ -503,6 +563,7 @@ func (b *builder) genWorld() []*candRow {
 		return langs[i] < langs[j]
 	})
 	var rows []*candRow
+	var thinFallback *candRow
 	build := func(id, title, reason string, filterLangs []string, keep func(*core.Title) bool) {
 		var src []core.Title
 		for _, l := range filterLangs {
@@ -525,10 +586,16 @@ func (b *builder) genWorld() []*candRow {
 			}
 			return 0.5*fit + 0.4*quality(t) + 0.1*popularity(t), withWhy(r, why)
 		})
-		if len(items) < 4 {
+		if len(items) == 0 {
 			return
 		}
 		r := newRow(KindWorld, id, title, reason, items)
+		if len(items) < 4 {
+			if thinFallback == nil {
+				thinFallback = r
+			}
+			return
+		}
 		rows = append(rows, r)
 	}
 	for _, l := range langs {
@@ -543,6 +610,9 @@ func (b *builder) genWorld() []*candRow {
 		build("world.all", "World Cinema for You",
 			fmt.Sprintf("You've enjoyed %d films beyond %s; acclaimed world cinema picked for your taste.", other, languageOrCode(main)),
 			nil, func(t *core.Title) bool { return t.Language != "" && t.Language != main })
+	}
+	if len(rows) == 0 && thinFallback != nil {
+		rows = append(rows, thinFallback)
 	}
 	return rows
 }
@@ -592,7 +662,7 @@ func (b *builder) genOccasions() []*candRow {
 		items := b.rankType(in, core.TypeMovie, func(t *core.Title, _, _ int, fit float64, tw string) (float64, string) {
 			return 0.5*fit + 0.35*quality(t) + 0.15*popularity(t), withWhy(why(t), tw)
 		})
-		if len(items) < 5 {
+		if len(items) == 0 {
 			return
 		}
 		r := newRow(KindOccasion, id, title, reason, items)
@@ -730,6 +800,7 @@ func (b *builder) genTopGenre() []*candRow {
 			return genres[i] < genres[j]
 		})
 		n := 0
+		var thinFallback *candRow
 		for _, g := range genres {
 			if n >= 3 {
 				break
@@ -744,15 +815,24 @@ func (b *builder) genTopGenre() []*candRow {
 			items := b.rankType(good, typ, func(t *core.Title, _, _ int, fit float64, why string) (float64, string) {
 				return 0.75*quality(t) + 0.25*fit, withWhy(ratedPhrase(t), why)
 			})
-			if len(items) < 5 {
+			if len(items) == 0 {
 				continue
 			}
 			noun := genreNoun(g, typ)
 			r := newRow(KindTopGenre, "toprated.genre."+typeTag(typ)+genreSlug(g), "Top-Rated "+noun,
 				fmt.Sprintf("The best-rated %s with enough votes to trust, in one of your favourite genres.", strings.ToLower(noun)), items)
 			r.minItems = 5
+			if len(items) < 5 {
+				if thinFallback == nil {
+					thinFallback = r
+				}
+				continue
+			}
 			rows = append(rows, r)
 			n++
+		}
+		if n == 0 && thinFallback != nil {
+			rows = append(rows, thinFallback)
 		}
 	}
 	return rows
@@ -789,6 +869,7 @@ func (b *builder) genStudio() []*candRow {
 		return studios[i] < studios[j]
 	})
 	var rows []*candRow
+	var thinFallback *candRow
 	for _, s := range studios {
 		if len(rows) >= 3 {
 			break
@@ -807,14 +888,23 @@ func (b *builder) genStudio() []*candRow {
 		items := b.rankType(in, core.TypeMovie, func(t *core.Title, _, _ int, fit float64, why string) (float64, string) {
 			return 0.55*fit + 0.3*quality(t) + 0.15*popularity(t), withWhy("From "+studio, why)
 		})
-		if len(items) < 4 {
+		if len(items) == 0 {
 			continue
 		}
 		r := newRow(KindStudio, "studio."+genreSlug(s), "More from "+s,
 			fmt.Sprintf("You've enjoyed %d %s films; more from them you haven't seen.", films[s], s), items)
 		r.minItems = 4
 		r.scale = 0.85 + 0.15*clamp(weight[s]/3, 0, 1)
+		if len(items) < 4 {
+			if thinFallback == nil {
+				thinFallback = r
+			}
+			continue
+		}
 		rows = append(rows, r)
+	}
+	if len(rows) == 0 && thinFallback != nil {
+		rows = append(rows, thinFallback)
 	}
 	return rows
 }

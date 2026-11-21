@@ -24,13 +24,13 @@ import { viewerName } from "../../components/pickers";
 import { api, isAbort } from "../../lib/api";
 import type { HomeLayout, HomeRow, RowPolicy, Viewer, ViewerHome } from "../../lib/contract";
 import { t, tn, tx } from "../../i18n";
-import { WEEKDAYS, WEEKDAYS_LONG, fixed as fixedDigits, formatHour } from "../../lib/format";
+import { WEEKDAYS, WEEKDAYS_LONG, formatHour } from "../../lib/format";
 import { useDebouncedValue } from "../../lib/hooks";
 import {
   CONTINUE,
   DAYPARTS,
-  SECTIONS,
   atFor,
+  describeHiddenRow,
   policyChipItems,
   policyIn,
   removePolicy,
@@ -41,11 +41,12 @@ import type { ViewContext } from "./ContextBar";
 import { ImpactBar } from "./ImpactBar";
 
 /**
- * The live Plex Home for the selected viewer (or the typical viewer) and
+ * The live Home for the selected viewer (or the typical viewer) and
  * context, rendered server-side from the draft layout, with each row's
  * provenance: where it came from and why it sits at its slot.
  */
 export function HomeCanvas({
+  ready = true,
   draft,
   dirty,
   saved,
@@ -57,9 +58,12 @@ export function HomeCanvas({
   onSpotCheck,
   refreshNonce,
   onChange,
+  onPreviewChange,
   onEditRow,
   readOnly,
 }: {
+  /** Hold row rendering until Designer controls (viewers + layout) finish loading in parallel. */
+  ready?: boolean;
   draft: HomeLayout;
   dirty: boolean;
   saved: HomeLayout;
@@ -71,6 +75,7 @@ export function HomeCanvas({
   onSpotCheck: (id: number | null) => void;
   refreshNonce: number;
   onChange: (d: HomeLayout) => void;
+  onPreviewChange?: (home: ViewerHome | null) => void;
   onEditRow: (row: string) => void;
   /** Show a viewer's saved Home without layout controls (Viewers page). */
   readOnly?: boolean;
@@ -93,22 +98,23 @@ export function HomeCanvas({
     const when = {
       device: r.ctx.device,
       at: atFor(r.ctx.day, r.ctx.hour).toISOString(),
-      section: r.ctx.section,
     };
     (readOnly && r.viewerId !== null
-      ? api.viewerHome(
-          r.viewerId,
-          { ...when, section: r.ctx.section === "home" ? undefined : r.ctx.section },
-          ctl.signal,
-        )
+      ? api.viewerHome(r.viewerId, when, ctl.signal)
       : api.previewLayout(
-          { viewerId: r.viewerId, ...when, ...(r.layout ? { layout: r.layout } : {}) },
+          {
+            viewerId: r.viewerId,
+            ...when,
+            section: "home",
+            ...(r.layout ? { layout: r.layout } : {}),
+          },
           ctl.signal,
         )
     )
       .then((h) => {
         if (!ctl.signal.aborted) {
           setHome(h);
+          onPreviewChange?.(h);
           setError(null);
         }
       })
@@ -123,11 +129,12 @@ export function HomeCanvas({
 
   const viewer = viewers.find((v) => v.id === viewerId);
   const who = viewer ? viewerName(viewer) : t("the typical viewer");
+  const hiddenWho = viewer ? viewerName(viewer) : t("Typical viewer");
   const visible = (home?.rows ?? []).filter((r) => !r.hidden);
   const hidden = (home?.rows ?? []).filter((r) => r.hidden);
   const arranged = visible.filter((r) => r.slot);
   const fixed = visible.filter((r) => !r.slot);
-  const stale = key !== request || loading;
+  const stale = key !== request || loading || !ready;
   const editingLayer = <strong className="font-medium text-fg">{layerName}</strong>;
 
   // The policy key an action edits: the row's own policy when it lives in
@@ -137,11 +144,11 @@ export function HomeCanvas({
       ? r.policy.row
       : r.kind;
   const baseFor = (r: HomeRow, row: string): RowPolicy =>
-    policyIn(draft, layer, ctx.section, row) ??
+    policyIn(draft, layer, "home", row) ??
     (r.policy?.row === row ? { ...r.policy } : { row, status: "eligible" });
   const act = (r: HomeRow, patch: Partial<RowPolicy>) => {
     const row = keyFor(r);
-    onChange(setPolicy(draft, layer, ctx.section, { ...baseFor(r, row), ...patch, row }));
+    onChange(setPolicy(draft, layer, "home", { ...baseFor(r, row), ...patch, row }));
   };
   const actions = {
     anchor: (r: HomeRow, slot: number) =>
@@ -149,9 +156,9 @@ export function HomeCanvas({
     always: (r: HomeRow) => act(r, { status: "always" }),
     eligible: (r: HomeRow) => act(r, { status: "eligible" }),
     off: (r: HomeRow) => act(r, { status: "off", slot: undefined }),
-    reset: (r: HomeRow) => onChange(removePolicy(draft, layer, ctx.section, keyFor(r))),
+    reset: (r: HomeRow) => onChange(removePolicy(draft, layer, "home", keyFor(r))),
     canReset: (r: HomeRow) =>
-      layer !== "global" && Boolean(policyIn(draft, layer, ctx.section, keyFor(r))),
+      layer !== "global" && Boolean(policyIn(draft, layer, "home", keyFor(r))),
     edit: (r: HomeRow) => onEditRow(keyFor(r)),
   };
 
@@ -168,8 +175,8 @@ export function HomeCanvas({
           )}
           <div className="min-w-0">
             <p className="text-xs text-fg-muted">
-              {t("Plex {section} as", {
-                section: SECTIONS.find((s) => s.value === ctx.section)?.label ?? "",
+              {t("Preview {section} as", {
+                section: t("Home"),
               })}
             </p>
             {layer === "global" && !readOnly ? (
@@ -244,7 +251,7 @@ export function HomeCanvas({
 
       {error ? (
         <ErrorPanel error={error} />
-      ) : !home ? (
+      ) : !home || !ready ? (
         <div className="space-y-6" role="status" aria-label={t("Loading Home")}>
           {Array.from({ length: 3 }, (_, i) => (
             <div key={i}>
@@ -321,7 +328,7 @@ export function HomeCanvas({
             />
           )}
           {hidden.length ? (
-            <HiddenRows rows={hidden} who={who} actions={readOnly ? undefined : actions} />
+            <HiddenRows rows={hidden} who={hiddenWho} actions={readOnly ? undefined : actions} />
           ) : null}
         </div>
       )}
@@ -426,12 +433,6 @@ function RowCard({
             {c}
           </Badge>
         ))}
-        <span
-          className="text-xs tabular-nums text-fg-subtle"
-          title={t("Predicted engagement used for ordering")}
-        >
-          {t("score {score}", { score: fixedDigits(r.score, 2) })}
-        </span>
         {actions ? (
           <div
             className="ml-auto flex flex-wrap gap-0.5 opacity-100 transition-opacity sm:opacity-0 sm:group-hover/row:opacity-100 sm:group-focus-within/row:opacity-100"
@@ -534,6 +535,7 @@ function HiddenRows({ rows, who, actions }: { rows: HomeRow[]; who: string; acti
           {rows.map((r) => {
             const prov = provenance(r, who);
             const off = r.policy?.status === "off" && r.layer !== "personalized";
+            const alreadyAlways = r.policy?.status === "always";
             return (
               <li
                 key={r.hubId}
@@ -544,8 +546,9 @@ function HiddenRows({ rows, who, actions }: { rows: HomeRow[]; who: string; acti
                   <div className="flex flex-wrap items-center gap-1.5">
                     <span className="text-sm font-medium text-fg">{r.title}</span>
                     <Badge variant={prov.variant}>{prov.label}</Badge>
+                    {alreadyAlways ? <Badge variant="outline">{t("Always")}</Badge> : null}
                   </div>
-                  <p className="mt-0.5 text-xs text-fg-muted">{r.hiddenReason}</p>
+                  <p className="mt-0.5 text-xs text-fg-muted">{describeHiddenRow(r, who)}</p>
                 </div>
                 {actions ? (
                   <div className="flex gap-1">
@@ -560,15 +563,27 @@ function HiddenRows({ rows, who, actions }: { rows: HomeRow[]; who: string; acti
                         {t("Eligible")}
                       </Button>
                     ) : null}
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      className="h-7 px-2 text-xs"
-                      aria-label={t("Always show {title}", { title: r.title })}
-                      onClick={() => actions.always(r)}
-                    >
-                      {t("Always")}
-                    </Button>
+                    {alreadyAlways ? (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="h-7 px-2 text-xs"
+                        aria-label={t("Edit constraints for {title}", { title: r.title })}
+                        onClick={() => actions.edit(r)}
+                      >
+                        {t("Edit")}
+                      </Button>
+                    ) : (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="h-7 px-2 text-xs"
+                        aria-label={t("Always show {title}", { title: r.title })}
+                        onClick={() => actions.always(r)}
+                      >
+                        {t("Always")}
+                      </Button>
+                    )}
                     {actions.canReset(r) ? (
                       <Button
                         variant="ghost"

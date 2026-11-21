@@ -127,7 +127,7 @@ func TestIntegrationMatroskaHLSDecodeSeekAndSwap(t *testing.T) {
 	decode := func(n int, name string, wantStart float64) {
 		t.Helper()
 		r := httptest.NewRecorder()
-		hs.ServeSegment(r, httptest.NewRequest(http.MethodGet, "/", nil), n)
+		hs.ServeSegment(r, mediaRequest(hs, httptest.NewRequest(http.MethodGet, "/", nil), n), n)
 		if r.Code != 200 || r.Header().Get("Content-Type") != "video/x-matroska" {
 			t.Fatalf("segment %d: %d %s", n, r.Code, r.Body.String())
 		}
@@ -241,4 +241,59 @@ func TestMatroskaChunkArgsKeepPositiveTitleClock(t *testing.T) {
 	args = buildArgs(s)
 	mustContain(t, args, "-segment_format_options output_ts_offset=210.000", "-bsf:a noise=amount=0:drop='lt(pts*tb,0)'")
 	mustNotContain(t, args, "-copyts", "-segment_time_delta")
+}
+
+// Pin the actual player-visible clock and cadence, including a resumed run.
+// Inspect packets too: every generated segment must open on a video keyframe.
+func TestIntegrationAndroidMatroskaCopyClockAndRate(t *testing.T) {
+	// Indexed long GOPs remain whole even beyond the ordinary snap limit.
+	plan := buildTimeline(40*time.Second, 4*time.Second, timelineOptions{
+		steadyMode: ModeCopy, snap: true, strictKeyframes: true,
+		keyframes: []core.KeyframePoint{{Time: 0}, {Time: 20 * time.Second}},
+	})
+	if plan.Total() != 2 || plan.Dur(0) != 20*time.Second || plan.Dur(1) != 20*time.Second {
+		t.Fatalf("long-GOP plan: %v", plan.durs)
+	}
+	e := newRealEnv(t, WithoutHWDetection())
+	e.gen(t, "android.mkv", 16, "-c:v", "libx264", "-preset", "ultrafast", "-g", "96", "-keyint_min", "96", "-sc_threshold", "0", "-c:a", "aac")
+	info, err := e.m.Probe(t.Context(), e.url("android.mkv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, start := range []time.Duration{0, 8 * time.Second} {
+		d := core.Decision{Kind: core.DecisionRemux, Container: ContainerMatroska, VideoCopy: true, AudioCopy: true, AudioStream: 1, SubtitleStream: -1, AndroidMatroskaHLS: true}
+		hs, err := e.m.StartHLS(t.Context(), core.HLSRequest{SessionID: "android-" + start.String(), InputURL: e.url("android.mkv"), Info: *info, Decision: d, StartOffset: start})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for n := 0; n < 2; n++ {
+			joined := append(fetch(t, hs, InitSegment), fetch(t, hs, n)...)
+			file := e.writeTemp(t, "android-"+start.String()+strconv.Itoa(n)+".mkv", joined)
+			out, err := mediaproc.CommandContext(t.Context(), time.Minute, e.ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=avg_frame_rate:packet=pts_time,flags", "-of", "json", file).Output()
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got struct {
+				Streams []struct {
+					Rate string `json:"avg_frame_rate"`
+				} `json:"streams"`
+				Packets []struct {
+					PTS   string `json:"pts_time"`
+					Flags string `json:"flags"`
+				} `json:"packets"`
+			}
+			if err := json.Unmarshal(out, &got); err != nil {
+				t.Fatal(err)
+			}
+			if len(got.Streams) != 1 || got.Streams[0].Rate != "24/1" || len(got.Packets) == 0 {
+				t.Fatalf("rate/packets: %s", out)
+			}
+			at, err := strconv.ParseFloat(got.Packets[0].PTS, 64)
+			want := start.Seconds() + float64(n)*4 + matroskaOrigin.Seconds()
+			if err != nil || math.Abs(at-want) > 0.05 || !strings.Contains(got.Packets[0].Flags, "K") {
+				t.Fatalf("first video packet %+v at %.3f, want keyframe at %.3f", got.Packets[0], at, want)
+			}
+		}
+		hs.Close()
+	}
 }

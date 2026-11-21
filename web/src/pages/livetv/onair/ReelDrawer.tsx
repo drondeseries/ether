@@ -1,4 +1,5 @@
 import { LinkImport } from "./LinkImport";
+import { friendlyMediaError } from "./mediaErrors";
 import { Badge, Button, Input, Popover, Select, Switch } from "@braedonsaunders/appkit-ui";
 import { MoreHorizontal, Play, UploadCloud } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
@@ -26,6 +27,25 @@ const blank = (): Reel => ({
 });
 const runtime = (ms: number) =>
   `${Math.floor(ms / 60000)}:${String(Math.round(ms / 1000) % 60).padStart(2, "0")}`;
+function mergePolledClips(existing: ReelClip[], incoming: ReelClip[]): ReelClip[] {
+  const byId = new Map(incoming.map((v) => [v.id, v]));
+  const seen = new Set<string>();
+  const out: ReelClip[] = [];
+  for (const c of existing) {
+    const fresh = byId.get(c.id);
+    if (fresh) {
+      seen.add(c.id);
+      out.push({ ...c, ...fresh, name: c.name !== fresh.name ? c.name : fresh.name });
+    } else if (c.status !== "queued" && c.status !== "downloading") {
+      seen.add(c.id);
+      out.push(c);
+    }
+  }
+  for (const c of incoming) {
+    if (!seen.has(c.id)) out.push(c);
+  }
+  return out;
+}
 export function ReelDrawer({
   open,
   reelId = "new",
@@ -47,6 +67,7 @@ export function ReelDrawer({
   const [channels, setChannels] = useState<ChannelSummary[]>([]);
   const upload = useRef<HTMLInputElement>(null),
     replace = useRef<string | null>(null);
+  const pendingPreview = useRef<string | null>(null);
   const current = useRef(draft);
   current.current = draft;
   const localPreviews = useRef(new Map<string, string>());
@@ -58,6 +79,7 @@ export function ReelDrawer({
     setError("");
     setPreview(null);
     setRename(null);
+    pendingPreview.current = null;
     setDraft(blank());
     setSaved(blank());
     if (reelId !== "new")
@@ -95,20 +117,17 @@ export function ReelDrawer({
         .reel(draft.id)
         .then((r) => {
           if (!active) return;
-          setDraft((d) => ({
-            ...d,
-            clips: [
-              ...d.clips
-                .filter((c) => c.status !== "queued" && c.status !== "downloading")
-                .map((c) => ({ ...c, ...r.clips.find((v) => v.id === c.id) })),
-              ...r.clips.filter(
-                (c) =>
-                  !d.clips.some(
-                    (v) => v.id === c.id && v.status !== "queued" && v.status !== "downloading",
-                  ),
-              ),
-            ],
-          }));
+          setDraft((d) => ({ ...d, clips: mergePolledClips(d.clips, r.clips) }));
+          setSaved((s) => ({ ...s, clips: mergePolledClips(s.clips, r.clips) }));
+          if (pendingPreview.current) {
+            const target = r.clips.find((v) => v.id === pendingPreview.current);
+            if (target?.status === "ready" && (!target.link || target.cached)) {
+              setPreview(target.id);
+              pendingPreview.current = null;
+            } else if (target?.status === "error") {
+              pendingPreview.current = null;
+            }
+          }
         })
         .catch((e) => setError(errorMessage(e)));
     }, 500);
@@ -148,7 +167,49 @@ export function ReelDrawer({
       if (upload.current) upload.current.value = "";
     }
   }
+  const removeClip = async (clipId: string) => {
+    setError("");
+    const reelIdToUse = current.current.id;
+    setDraft((d) => ({ ...d, clips: d.clips.filter((v) => v.id !== clipId) }));
+    setSaved((s) => ({ ...s, clips: s.clips.filter((v) => v.id !== clipId) }));
+    if (preview === clipId) setPreview(null);
+    if (pendingPreview.current === clipId) pendingPreview.current = null;
+    if (!reelIdToUse) return;
+    try {
+      await onair.deleteClip(reelIdToUse, clipId);
+    } catch (e) {
+      setError(errorMessage(e));
+    }
+  };
+  const togglePreview = async (c: ReelClip) => {
+    if (preview === c.id) {
+      setPreview(null);
+      pendingPreview.current = null;
+      return;
+    }
+    if (c.link && !c.cached && !localPreviews.current.has(c.id)) {
+      if (!draft.id) return;
+      setError("");
+      try {
+        const next = await onair.resolveClip(draft.id, c.id);
+        setDraft((d) => ({ ...d, clips: d.clips.map((v) => (v.id === c.id ? next : v)) }));
+        setSaved((s) => ({ ...s, clips: s.clips.map((v) => (v.id === c.id ? next : v)) }));
+        if (next.cached) {
+          setPreview(c.id);
+        } else {
+          pendingPreview.current = c.id;
+        }
+      } catch (e) {
+        setError(errorMessage(e));
+      }
+      return;
+    }
+    setPreview(c.id);
+  };
   const clip = draft.clips.find((c) => c.id === preview);
+  const canRenderPreview = Boolean(
+    clip && (!clip.link || clip.cached || localPreviews.current.has(clip.id)),
+  );
   const changeClip = (clip: ReelClip) =>
     setDraft((d) => ({ ...d, clips: d.clips.map((c) => (c.id === clip.id ? clip : c)) }));
   return (
@@ -244,6 +305,7 @@ export function ReelDrawer({
           onImported={async () => {
             const r = await onair.reel(current.current.id);
             setDraft((d) => ({ ...d, clips: r.clips }));
+            setSaved((s) => ({ ...s, clips: r.clips }));
           }}
         />
         {error ? (
@@ -251,7 +313,7 @@ export function ReelDrawer({
             {error}
           </p>
         ) : null}
-        {clip ? (
+        {clip && canRenderPreview ? (
           <PreviewPlayer
             preroll={{
               name: clip.name,
@@ -285,8 +347,8 @@ export function ReelDrawer({
                   <DragHandle handle={handle} label={t("Move {name}", { name: c.name })} />
                   <button
                     type="button"
-                    disabled={c.status !== "ready"}
-                    onClick={() => setPreview(preview === c.id ? null : c.id)}
+                    disabled={c.status !== "ready" && !(c.link && c.status === "error")}
+                    onClick={() => void togglePreview(c)}
                     aria-label={t("Preview {name}", { name: c.name })}
                     className="relative h-12 w-20 shrink-0 overflow-hidden rounded-lg bg-bg-subtle"
                   >
@@ -309,16 +371,28 @@ export function ReelDrawer({
                         }}
                       />
                     ) : (
-                      <p className="truncate text-sm font-medium text-fg">{c.name}</p>
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <p className="truncate text-sm font-medium text-fg">{c.name}</p>
+                        {c.link ? <Badge variant="outline">{t("Link")}</Badge> : null}
+                        {c.link && c.cached ? <Badge variant="success">{t("Cached")}</Badge> : null}
+                      </div>
                     )}
                     <p className="text-xs text-fg-muted">
-                      {c.status === "queued" || c.status === "downloading"
-                        ? t("Importing…")
-                        : c.status === "converting"
-                          ? t("Converting {progress}%", { progress: Math.round(c.progress || 0) })
-                          : c.status === "error"
-                            ? t("Conversion failed")
-                            : t("Ready")}
+                      {c.status === "queued"
+                        ? t("Queued…")
+                        : c.status === "downloading"
+                          ? c.progress && c.progress > 0
+                            ? t("Downloading {progress}%", { progress: Math.round(c.progress) })
+                            : t("Importing…")
+                          : c.status === "converting"
+                            ? t("Converting {progress}%", { progress: Math.round(c.progress || 0) })
+                            : c.status === "error"
+                              ? c.link
+                                ? t("Resolution failed")
+                                : t("Conversion failed")
+                              : c.link && !c.cached
+                                ? t("Resolves when aired")
+                                : t("Ready")}
                     </p>
                     {c.source ? (
                       <a
@@ -333,7 +407,9 @@ export function ReelDrawer({
                     {c.attribution ? (
                       <p className="text-xs text-fg-muted">{c.attribution}</p>
                     ) : null}
-                    {c.error ? <p className="text-xs text-danger">{c.error}</p> : null}
+                    {c.error ? (
+                      <p className="text-xs text-danger">{friendlyMediaError(c.error)}</p>
+                    ) : null}
                     {c.status === "converting" || c.status === "downloading" ? (
                       <progress
                         className="mt-1 h-1 w-full accent-primary"
@@ -343,9 +419,20 @@ export function ReelDrawer({
                       />
                     ) : null}
                   </div>
-                  <span className="text-xs tabular-nums text-fg-muted">
-                    {runtime(c.durationMs)}
-                  </span>
+                  {(c.status === "queued" || c.status === "downloading") && !c.link ? (
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="text-danger"
+                      onClick={() => void removeClip(c.id)}
+                    >
+                      {t("Cancel")}
+                    </Button>
+                  ) : (
+                    <span className="text-xs tabular-nums text-fg-muted">
+                      {c.durationMs > 0 ? runtime(c.durationMs) : "—"}
+                    </span>
+                  )}
                   <Popover
                     open={menu === c.id}
                     onOpenChange={(v) => setMenu(v ? c.id : null)}
@@ -384,8 +471,8 @@ export function ReelDrawer({
                         variant="ghost"
                         className="text-danger"
                         onClick={() => {
-                          setDraft({ ...draft, clips: draft.clips.filter((v) => v.id !== c.id) });
                           setMenu(null);
+                          void removeClip(c.id);
                         }}
                       >
                         {t("Remove")}

@@ -7,10 +7,10 @@ import {
   SearchSelect,
   cn,
 } from "@braedonsaunders/appkit-ui";
-import { Plus, Search, X } from "lucide-react";
+import { ArrowUpRight, ChevronRight, Plus, Search, X } from "lucide-react";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { localized, t, tn } from "../i18n";
-import { api, errorMessage, isAbort } from "../lib/api";
+import { api, apiFetch, errorMessage, isAbort } from "../lib/api";
 import type {
   FacetName,
   FacetValue,
@@ -21,6 +21,8 @@ import type {
 } from "../lib/contract";
 import { NOT_RATED, RATING_LEVELS, ratingExamples } from "../lib/contentRatings";
 import { useDebouncedValue } from "../lib/hooks";
+import type { PickedTitle } from "../lib/rules";
+import { useTitle } from "../lib/titles";
 import { Artwork } from "./Artwork";
 import { titleSubtitle } from "./Poster";
 import { useLocale } from "../i18n/react";
@@ -29,25 +31,36 @@ import { useLocale } from "../i18n/react";
 
 const facetCache = new Map<string, Promise<FacetValue[]>>();
 
-function loadFacet(type: string, facet: FacetName): Promise<FacetValue[]> {
-  const key = `${type}:${facet}`;
+function loadFacet(
+  type: string,
+  facet: FacetName,
+  libraryId?: number,
+  field?: string,
+): Promise<FacetValue[]> {
+  const key = `${type}:${facet}:${libraryId ?? ""}:${field ?? ""}`;
   let p = facetCache.get(key);
   if (!p) {
-    p = api.facets(type, facet);
+    p = libraryId
+      ? apiFetch<{ values: { value: string; count: number }[] }>(
+          `/libraries/${libraryId}/facets/${encodeURIComponent(field ?? facet)}`,
+        ).then((r) =>
+          r.values.map((v) => ({ id: v.value, key: v.value, title: v.value, count: v.count })),
+        )
+      : api.facets(type, facet);
     facetCache.set(key, p);
     p.catch(() => facetCache.delete(key));
   }
   return p;
 }
 
-function useFacet(type: string, facet: FacetName) {
+function useFacet(type: string, facet: FacetName, libraryId?: number, field?: string) {
   const [values, setValues] = useState<FacetValue[] | null>(null);
   const [error, setError] = useState<unknown>(null);
   useEffect(() => {
     let live = true;
     setValues(null);
     setError(null);
-    loadFacet(type, facet)
+    loadFacet(type, facet, libraryId, field)
       .then((v) => {
         if (live) setValues(v);
       })
@@ -57,13 +70,15 @@ function useFacet(type: string, facet: FacetName) {
     return () => {
       live = false;
     };
-  }, [type, facet]);
+  }, [type, facet, libraryId, field]);
   return { values, error };
 }
 
 /** Multi-value picker over a catalogue facet (genres, decades, ratings…). */
 export function FacetPicker({
   type,
+  libraryId,
+  field,
   facet,
   value,
   onChange,
@@ -71,13 +86,15 @@ export function FacetPicker({
   placeholder,
 }: {
   type: string;
+  libraryId?: number;
+  field?: string;
   facet: FacetName;
   value: string[];
   onChange: (v: string[]) => void;
   ariaLabel: string;
   placeholder?: string;
 }) {
-  const { values, error } = useFacet(type, facet);
+  const { values, error } = useFacet(type, facet, libraryId, field);
   const { locale } = useLocale();
   // A facet that groups labels (content-rating levels) shows a stored
   // equivalent ("TV-PG") as its group ("PG").
@@ -161,6 +178,8 @@ function TextListFallback({
 /** Single facet value as a searchable select. */
 export function FacetSelect({
   type,
+  libraryId,
+  field,
   facet,
   value,
   onChange,
@@ -168,6 +187,8 @@ export function FacetSelect({
   omit,
 }: {
   type: string;
+  libraryId?: number;
+  field?: string;
   facet: FacetName;
   value: string;
   onChange: (v: string) => void;
@@ -175,7 +196,7 @@ export function FacetSelect({
   /** Facet keys not offered (e.g. "Not rated" for an "at most" bound). */
   omit?: string[];
 }) {
-  const { values } = useFacet(type, facet);
+  const { values } = useFacet(type, facet, libraryId, field);
   const selected = value ? canonicalFacetValue(value, values) : value;
   const options = (values ?? [])
     .filter((v) => !omit?.includes(v.key))
@@ -427,21 +448,30 @@ export function LookupPicker({
 
 // ---- Title search -------------------------------------------------------------------
 
-/** Search the catalogue and add titles (hand-picked collections, overrides…). */
+export type TitleSearchAction = "add" | "open" | "select";
+
+/** Search the catalogue to open a title, select one, or add titles to a list. */
 export function TitleSearch({
   onPick,
   type,
   excludeKeys,
+  action,
+  includeUnbrowsable,
   placeholder = t("Search the catalogue…"),
   label,
 }: {
   onPick: (title: TitleCard) => void;
   type?: string;
   excludeKeys?: Set<string>;
+  /** Explicit row affordance: "add" for list builders, "open" for inspector, "select" for single-title pickers. */
+  action?: TitleSearchAction;
+  /** Include non-adult titles currently hidden by catalogue rules or release gates. */
+  includeUnbrowsable?: boolean;
   /** Accessible name for the search box. Defaults to "Search titles". */
   label?: string;
   placeholder?: string;
 }) {
+  const resolvedAction: TitleSearchAction = action ?? (excludeKeys ? "add" : "select");
   const [q, setQ] = useState("");
   const debounced = useDebouncedValue(q, 250);
   const [items, setItems] = useState<TitleCard[]>([]);
@@ -457,7 +487,7 @@ export function TitleSearch({
     setLoading(true);
     setError(null);
     api
-      .searchCatalog(needle, type, 12, ctl.signal)
+      .searchCatalog(needle, type, 12, ctl.signal, includeUnbrowsable)
       .then(setItems)
       .catch((e) => {
         if (!isAbort(e)) setError(errorMessage(e));
@@ -466,7 +496,13 @@ export function TitleSearch({
         if (!ctl.signal.aborted) setLoading(false);
       });
     return () => ctl.abort();
-  }, [debounced, type]);
+  }, [debounced, type, includeUnbrowsable]);
+  const actionHint =
+    resolvedAction === "open"
+      ? t("Open title details")
+      : resolvedAction === "add"
+        ? t("Add to list")
+        : t("Select title");
   return (
     <div className="space-y-2">
       <div className="relative">
@@ -499,6 +535,7 @@ export function TitleSearch({
                 <button
                   type="button"
                   disabled={added}
+                  title={added ? undefined : actionHint}
                   onClick={() => onPick(item)}
                   className="flex w-full items-center gap-2.5 rounded-md p-1.5 text-left text-sm hover:bg-surface-hover disabled:opacity-60"
                 >
@@ -516,14 +553,92 @@ export function TitleSearch({
                   </span>
                   {added ? (
                     <Badge variant="secondary">{t("Added")}</Badge>
+                  ) : resolvedAction === "open" ? (
+                    <span className="inline-flex shrink-0 items-center gap-1 text-xs font-medium text-fg-muted">
+                      {t("Open")}
+                      <ArrowUpRight size={14} aria-hidden />
+                    </span>
+                  ) : resolvedAction === "add" ? (
+                    <span className="inline-flex shrink-0 items-center gap-1 text-xs font-medium text-fg-muted">
+                      {t("Add")}
+                      <Plus size={14} aria-hidden />
+                    </span>
                   ) : (
-                    <Plus size={14} className="text-fg-subtle" />
+                    <span className="inline-flex shrink-0 items-center gap-1 text-xs font-medium text-fg-muted">
+                      {t("Select")}
+                      <ChevronRight size={14} aria-hidden />
+                    </span>
                   )}
                 </button>
               </li>
             );
           })}
         </ul>
+      ) : null}
+    </div>
+  );
+}
+
+const MAX_RULE_TITLES = 500;
+
+function TitleChip({ item, onRemove }: { item: PickedTitle; onRemove: () => void }) {
+  const loaded = useTitle(item.title ? undefined : item.key);
+  const name = item.title || loaded?.title || t("Title {id}", { id: item.key });
+  return (
+    <Badge variant="secondary" className="gap-1 py-1 pl-2 pr-1 text-xs font-medium text-fg">
+      <span className="max-w-56 truncate">{name}</span>
+      <button
+        type="button"
+        aria-label={t("Remove {name}", { name })}
+        onClick={onRemove}
+        className="ml-0.5 rounded-full p-0.5 text-fg-subtle hover:bg-surface-hover hover:text-fg"
+      >
+        <X size={12} />
+      </button>
+    </Badge>
+  );
+}
+
+/** Multi-title picker for visibility rules: removable chips plus catalogue search. */
+export function TitleListPicker({
+  value,
+  onChange,
+  type,
+  ariaLabel,
+}: {
+  value: PickedTitle[];
+  onChange: (next: { key: string; title: string }[]) => void;
+  type?: string;
+  ariaLabel: string;
+}) {
+  const excludeKeys = useMemo(() => new Set(value.map((v) => v.key)), [value]);
+  const toNamed = (items: PickedTitle[]) =>
+    items.map((v) => ({ key: v.key, title: v.title || `#${v.key}` }));
+  return (
+    <div className="space-y-2">
+      {value.length ? (
+        <div className="flex flex-wrap gap-1.5">
+          {value.map((v) => (
+            <TitleChip
+              key={v.key}
+              item={v}
+              onRemove={() => onChange(toNamed(value.filter((x) => x.key !== v.key)))}
+            />
+          ))}
+        </div>
+      ) : null}
+      {value.length < MAX_RULE_TITLES ? (
+        <TitleSearch
+          type={type || undefined}
+          excludeKeys={excludeKeys}
+          action="add"
+          includeUnbrowsable
+          label={ariaLabel}
+          onPick={(picked) => {
+            if (excludeKeys.has(picked.key) || value.length >= MAX_RULE_TITLES) return;
+            onChange([...toNamed(value), { key: picked.key, title: picked.title }]);
+          }}
+        />
       ) : null}
     </div>
   );

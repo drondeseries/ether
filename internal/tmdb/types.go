@@ -1,6 +1,10 @@
 package tmdb
 
-import "cmp"
+import (
+	"cmp"
+
+	"github.com/braedonsaunders/ether/internal/core"
+)
 
 // Paged is a TMDB paged list response.
 type Paged[T any] struct {
@@ -81,19 +85,8 @@ type Keywords struct {
 	Keywords []Keyword `json:"keywords"`
 	Results  []Keyword `json:"results"` // tv uses results
 }
-type ImageFile struct {
-	FilePath string  `json:"file_path"`
-	Width    int     `json:"width"`
-	Height   int     `json:"height"`
-	ISO639   string  `json:"iso_639_1"`
-	VoteAvg  float64 `json:"vote_average"`
-}
-type Images struct {
-	Backdrops []ImageFile `json:"backdrops"`
-	Posters   []ImageFile `json:"posters"`
-	Logos     []ImageFile `json:"logos"`
-	Still     []ImageFile `json:"stills"`
-}
+type ImageFile = core.ArtworkImageFile
+type Images = core.ArtworkImages
 
 // Movie is a list/search/discover movie item.
 type Movie struct {
@@ -111,7 +104,10 @@ type Movie struct {
 	VoteAverage      float64 `json:"vote_average"`
 	VoteCount        int     `json:"vote_count"`
 	Adult            bool    `json:"adult"`
-	MediaType        string  `json:"media_type"`
+	// Video marks a video release (a recorded concert, a compilation)
+	// rather than a feature. /discover leaves them out unless asked.
+	Video     bool   `json:"video"`
+	MediaType string `json:"media_type"`
 }
 
 type ReleaseDateEntry struct {
@@ -148,6 +144,20 @@ type AltTitle struct {
 	Type    string `json:"type"`
 }
 
+// Translations is the translations appendix shared by movie and TV details.
+type Translations struct {
+	Translations []Translation `json:"translations"`
+}
+
+type Translation struct {
+	Language string `json:"iso_639_1"`
+	Country  string `json:"iso_3166_1"`
+	Data     struct {
+		Title string `json:"title"`
+		Name  string `json:"name"`
+	} `json:"data"`
+}
+
 // MovieDetails is /movie/{id} with append_to_response.
 type MovieDetails struct {
 	Movie
@@ -167,6 +177,7 @@ type MovieDetails struct {
 	ExternalIDs       *ExternalIDs   `json:"external_ids"`
 	Images            *Images        `json:"images"`
 	Keywords          *Keywords      `json:"keywords"`
+	Translations      *Translations  `json:"translations"`
 	AlternativeTitles *AltTitles     `json:"alternative_titles"`
 	Similar           *Paged[Movie]  `json:"similar"`
 	Recommendations   *Paged[Movie]  `json:"recommendations"`
@@ -241,6 +252,7 @@ type TVDetails struct {
 	ExternalIDs       *ExternalIDs    `json:"external_ids"`
 	Images            *Images         `json:"images"`
 	Keywords          *Keywords       `json:"keywords"`
+	Translations      *Translations   `json:"translations"`
 	AlternativeTitles *AltTitles      `json:"alternative_titles"`
 	Similar           *Paged[TVShow]  `json:"similar"`
 	Recommendations   *Paged[TVShow]  `json:"recommendations"`

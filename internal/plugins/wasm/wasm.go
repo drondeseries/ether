@@ -3,8 +3,10 @@ package wasm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -36,15 +38,30 @@ func (f *Fault) Error() string { return f.Code + ": " + f.Message }
 // Forbidden builds a forbidden Fault, e.g. for a revoked permission.
 func Forbidden(message string) *Fault { return &Fault{Code: string(StatusForbidden), Message: message} }
 
+// ErrPoolBusy is wrapped by an *Error when a call times out waiting for a free
+// WASM instance in the pool. Pool contention is not a plugin crash.
+var ErrPoolBusy = errors.New("timed out waiting for a plugin instance")
+
+// ErrClosed is wrapped by an *Error when a call cannot run because the plugin
+// runtime was closed.
+var ErrClosed = errors.New("plugin is closed")
+
+// ErrRequestEncode is wrapped by an *Error when the host cannot encode the
+// request for the guest (e.g. a body that is not valid JSON). The guest
+// never ran, so it is not a plugin crash.
+var ErrRequestEncode = errors.New("host could not encode the plugin request")
+
 // Error is the error type returned by Plugin calls. It carries the Outcome so
 // WS7's health loop can read the status, trap flag and cost from one value.
 type Error struct {
 	Status  Status
 	Message string
-	Trap    bool // the instance trapped (panic in guest) or was killed by a deadline
+	Trap    bool  // the instance trapped (panic in guest) or was killed by a deadline
+	Err     error // optional wrapped sentinel (e.g. ErrPoolBusy)
 }
 
 func (e *Error) Error() string { return "wasm: " + string(e.Status) + ": " + e.Message }
+func (e *Error) Unwrap() error { return e.Err }
 
 // Outcome accounts for one finished call.
 type Outcome struct {
@@ -65,23 +82,30 @@ type Request struct {
 	Query   map[string][]string `json:"query,omitempty"`
 	Headers map[string]string   `json:"headers,omitempty"`
 	Body    json.RawMessage     `json:"body,omitempty"`
+	// BodyBase64 is the exact request bytes when the caller needs them
+	// byte-for-byte; ContentType is the caller's Content-Type. A non-JSON
+	// body arrives only in BodyBase64.
+	BodyBase64  string `json:"bodyBase64,omitempty"`
+	ContentType string `json:"contentType,omitempty"`
 }
 
 // Response is the plugin's answer. Body is the raw JSON the plugin produced
 // as its body field (usually a JSON string), passed through untouched.
 type Response struct {
+	Blob    json.RawMessage   `json:"blob,omitempty"`
 	Status  int               `json:"status"`
 	Headers map[string]string `json:"headers,omitempty"`
 	Body    json.RawMessage   `json:"body,omitempty"`
 }
 
 // Host is the plugin-to-Ether service surface (SPEC 5.1.5). Name is a dotted
-// service method: kv.get, kv.put, kv.delete, kv.list, secret.get,
-// http.fetch, catalog.search, catalog.get, viewers.history,
-// viewers.setWatchState, collections.upsert, folders.list, folders.stat,
-// notify.owner, log. Args is a JSON array of positional arguments; the
-// result is any JSON value. Return a *Fault to classify the failure
-// (forbidden for a missing or revoked grant).
+// service method: runtime.limits, kv.get, kv.put, kv.delete, kv.list, kv.usage, badges.set, badges.clear, badges.usage, secret.get,
+// http.fetch, http.fetchToCache, archive.list, archive.open, archive.read, archive.extract, catalog.search, catalog.get, viewers.history,
+// viewers.setWatchState, collections.upsert, kinds.upsert, kinds.delete,
+// kinds.items, sources.resolve, cache.put, cache.open, cache.read, cache.rasterize, cache.delete, frontend.streamURL,
+// folders.list, folders.stat, events.publish, notify.owner, log. Args is a JSON array of positional
+// arguments; the result is any JSON value. Return a *Fault to classify the
+// failure (forbidden for a missing or revoked grant).
 type Host interface {
 	CallHost(ctx context.Context, name string, args json.RawMessage) (json.RawMessage, error)
 }
@@ -90,12 +114,16 @@ type Host interface {
 type HostFunc func(ctx context.Context, name string, args json.RawMessage) (json.RawMessage, error)
 
 // Default host-call unit costs, in the spirit of appkit-sandbox's priced
-// host functions. Wall time adds 1 unit per WallUnitInterval.
+// host functions. Wall time adds 1 unit per WallUnitInterval; archive.read
+// adds ArchiveReadUnitsPerMember per requested member; archive.extract
+// additionally charges ArchiveExtractUnitsPerMiB per started MiB streamed.
 var DefaultCosts = map[string]int64{
-	"log": 1, "kv.get": 5, "kv.put": 10, "kv.delete": 5, "kv.list": 10,
-	"secret.get": 5, "http.fetch": 100, "addon.get": 100, "catalog.search": 50, "catalog.get": 20,
+	"log": 1, "runtime.limits": 1, "kv.get": 5, "kv.put": 10, "kv.delete": 5, "kv.list": 10, "kv.usage": 5, "badges.set": 20, "badges.clear": 10, "badges.usage": 5,
+	"secret.get": 5, "http.fetch": 100, "http.fetchToCache": 100, "http.hash": 100, "cache.read": 20, "cache.rasterize": 50, "archive.list": 50, "archive.open": 50, "archive.read": 50, "archive.extract": 50, "addon.get": 100, "catalog.search": 50, "catalog.get": 20,
 	"viewers.history": 50, "viewers.setWatchState": 50, "collections.upsert": 50,
-	"folders.list": 20, "folders.stat": 20, "notify.owner": 20, "settings.get": 5,
+	"kinds.upsert": 50, "kinds.delete": 50, "kinds.items": 20, "kinds.visible": 15, "kinds.browse": 20,
+	"sources.resolve": 100, "cache.put": 50, "cache.open": 20, "cache.delete": 10, "frontend.streamURL": 5,
+	"folders.hashStart": 20, "folders.hashPoll": 20, "folders.hashCancel": 20, "folders.hash": 20, "folders.list": 20, "folders.stat": 20, "events.publish": 20, "notify.owner": 20, "settings.get": 5,
 }
 
 const (
@@ -107,21 +135,97 @@ const (
 	WallUnitInterval = 100 * time.Microsecond
 	// BaseCallUnits is charged once per handle call.
 	BaseCallUnits = 10
+	// ArchiveReadUnitsPerMember is charged per requested item in archive.read
+	// on top of archive.read's 50-unit base call cost, so large batches pay
+	// proportional governance units instead of dodging per-call budgets.
+	ArchiveReadUnitsPerMember = 2
+	// ArchiveExtractUnitsPerMiB is charged per started MiB of uncompressed
+	// archive member streamed by archive.extract on top of its base call cost.
+	ArchiveExtractUnitsPerMiB = 10
 	// MaxMemoryBytes is the hard ceiling for a plugin instance.
-	MaxMemoryBytes = 64 << 20
+	MaxMemoryBytes = 4 << 30
+	// DefaultPoolSize and MaxPoolSize bound instances per hosted plugin pool.
+	DefaultPoolSize = 2
+	MaxPoolSize     = 4
+	// MinDataReadBytes and MaxDataReadBytes bound the per-call readBytes grant
+	// derived from memoryBytes: clamp(memoryBytes/4, 8 MiB, 512 MiB).
+	MinDataReadBytes = 8 << 20
+	MaxDataReadBytes = 512 << 20
 	// MaxResponseBytes caps a plugin response.
 	MaxResponseBytes = 8 << 20
-	// MaxHostResultBytes caps one host-call result returned to a guest.
+	// MaxFetchBodyBytes caps a direct HTTP response before JSON encoding.
+	MaxFetchBodyBytes = 10 << 20
+	// MaxHostResultBytes is the baseline host-result floor; actual per-call
+	// host results scale with HostResultBytes(memoryBytes) so base64-encoded
+	// data reads up to readBytes always fit their JSON envelope.
 	MaxHostResultBytes = 4 << 20
 	maxLogsPerCall     = 100
 )
 
+// DataReadBytes computes the per-call byte ceiling for cache.read,
+// archive.open, and archive.read from a plugin's memory grant:
+// clamp(memoryBytes/4, 8 MiB, 512 MiB), treating 0 as the 32 MiB default.
+func DataReadBytes(memoryBytes uint64) int64 {
+	if memoryBytes == 0 {
+		memoryBytes = 32 << 20
+	}
+	quarter := memoryBytes / 4
+	if quarter < MinDataReadBytes {
+		return MinDataReadBytes
+	}
+	if quarter > MaxDataReadBytes {
+		return MaxDataReadBytes
+	}
+	return int64(quarter)
+}
+
+// HostResultBytes returns the maximum JSON host-result envelope for a plugin
+// with the given memory grant, including base64 expansion of DataReadBytes
+// plus 1 MiB for JSON framing.
+func HostResultBytes(memoryBytes uint64) int64 {
+	readCap := DataReadBytes(memoryBytes)
+	envelope := ((readCap+2)/3)*4 + (1 << 20)
+	if envelope < MaxHostResultBytes {
+		return MaxHostResultBytes
+	}
+	return envelope
+}
+
+type unitChargerKey struct{}
+type callLimitsKey struct{}
+
+// CallLimits returns the effective per-call limits (after route deadline and
+// viewer unit-budget clamps) when called inside an active hosted plugin call.
+func CallLimits(ctx context.Context) (Limits, bool) {
+	lim, ok := ctx.Value(callLimitsKey{}).(Limits)
+	return lim, ok
+}
+
+// ChargeUnits charges additional governance units to the active guest call,
+// returning a StatusGovernance *Fault when the call's UnitBudget is exceeded.
+// Outside a governed wasm call it is a no-op.
+func ChargeUnits(ctx context.Context, units int64) error {
+	if units <= 0 {
+		return nil
+	}
+	fn, _ := ctx.Value(unitChargerKey{}).(func(int64) *Fault)
+	if fn == nil {
+		return nil
+	}
+	if f := fn(units); f != nil {
+		return f
+	}
+	return nil
+}
+
 // Limits bound one plugin. Zero fields take the defaults in normalize.
 type Limits struct {
-	MemoryBytes uint64        // per instance; default 32 MiB, max 64 MiB
+	MemoryBytes uint64        // per instance; default 32 MiB, max wasm32 4 GiB
 	Deadline    time.Duration // per handle call; default 30s
-	UnitBudget  int64         // per handle call; default 10000
-	PoolSize    int           // instances per pool; default 2
+	UnitBudget  int64         // per handle call; default UnitsForDeadline(Deadline)
+	Stremio     bool          // plugin answers Stremio add-on routes (uses StremioDeadline)
+	Busy        func() bool   // background work yields while playback or host load is high
+	PoolSize    int           // instances per pool; default DefaultPoolSize (2), max MaxPoolSize (4)
 	// Hot-path budgets. A manifest may lower these, never raise them:
 	// normalize clamps to the defaults below.
 	RankPerCandidate time.Duration // default (and max) 2ms
@@ -144,11 +248,17 @@ func (l *Limits) normalize() {
 	if l.Deadline <= 0 {
 		l.Deadline = 30 * time.Second
 	}
+	if l.Deadline > 365*24*time.Hour {
+		l.Deadline = 365 * 24 * time.Hour
+	}
 	if l.UnitBudget <= 0 {
-		l.UnitBudget = 10000
+		l.UnitBudget = UnitsForDeadline(l.Deadline)
 	}
 	if l.PoolSize <= 0 {
-		l.PoolSize = 2
+		l.PoolSize = DefaultPoolSize
+	}
+	if l.PoolSize > MaxPoolSize {
+		l.PoolSize = MaxPoolSize
 	}
 	if l.RankPerCandidate <= 0 || (l.RankPerCandidate > DefaultRankPerCandidate && !l.unclamped) {
 		l.RankPerCandidate = DefaultRankPerCandidate
@@ -231,19 +341,62 @@ func (c *counters) snapshot() Stats {
 // instance serves one call at a time, so no locking is needed beyond the
 // exceeded flag (read after the call from the same goroutine).
 type callState struct {
-	ctx       context.Context
-	host      Host
-	lim       *Limits
-	start     time.Time
-	last      time.Time
-	units     int64
-	logs      int
-	hot       bool
-	exceeded  bool
-	aborted   bool
-	abortCode uint32
-	logger    *slog.Logger
-	pluginID  string
+	ctx        context.Context
+	host       Host
+	lim        *Limits
+	path       string
+	start      time.Time
+	last       time.Time
+	units      int64
+	logs       int
+	background bool
+	hot        bool
+	exceeded   bool
+	aborted    bool
+	abortCode  uint32
+	logger     *slog.Logger
+	pluginID   string
+}
+
+func formatBudgetDuration(d time.Duration) string {
+	if d > 0 && d%time.Hour == 0 {
+		return fmt.Sprintf("%d h", d/time.Hour)
+	}
+	if d > 0 && d%time.Minute == 0 {
+		return fmt.Sprintf("%d min", d/time.Minute)
+	}
+	if d > 0 && d%time.Second == 0 {
+		return fmt.Sprintf("%d s", d/time.Second)
+	}
+	if d > 0 && d%time.Millisecond == 0 {
+		return fmt.Sprintf("%d ms", d/time.Millisecond)
+	}
+	return d.String()
+}
+
+func (cs *callState) governanceMessage() string {
+	if cs == nil || cs.lim == nil {
+		return "governance budget exceeded"
+	}
+	if cs.path != "" && ViewerRequestPath(cs.path) && cs.lim.UnitBudget == UnitsForDeadline(cs.lim.Deadline) {
+		return fmt.Sprintf("used the whole %s budget for %s (%d/%d units)",
+			formatBudgetDuration(cs.lim.Deadline), cs.path, cs.units, cs.lim.UnitBudget)
+	}
+	if cs.path != "" {
+		return fmt.Sprintf("used the whole %d-unit budget for %s (%d/%d units)",
+			cs.lim.UnitBudget, cs.path, cs.units, cs.lim.UnitBudget)
+	}
+	return fmt.Sprintf("governance budget exceeded (%d/%d units)", cs.units, cs.lim.UnitBudget)
+}
+
+func (cs *callState) timeoutMessage() string {
+	if cs != nil && cs.lim != nil && cs.lim.Deadline > 0 && time.Since(cs.start)+50*time.Millisecond >= cs.lim.Deadline {
+		if cs.path != "" {
+			return fmt.Sprintf("call exceeded its %s deadline for %s", formatBudgetDuration(cs.lim.Deadline), cs.path)
+		}
+		return fmt.Sprintf("call exceeded its %s deadline", formatBudgetDuration(cs.lim.Deadline))
+	}
+	return "call exceeded its deadline"
 }
 
 func (cs *callState) chargeWall() {
@@ -257,11 +410,14 @@ func (cs *callState) chargeWall() {
 // still ends the call as governance.
 func (cs *callState) charge(name string) *Fault {
 	cs.chargeWall()
-	cs.units += cs.lim.costOf(name)
+	return cs.chargeUnits(cs.lim.costOf(name))
+}
+
+func (cs *callState) chargeUnits(units int64) *Fault {
+	cs.units += units
 	if cs.units > cs.lim.UnitBudget {
 		cs.exceeded = true
-		return &Fault{Code: string(StatusGovernance),
-			Message: fmt.Sprintf("governance budget exceeded (%d/%d units)", cs.units, cs.lim.UnitBudget)}
+		return &Fault{Code: string(StatusGovernance), Message: cs.governanceMessage()}
 	}
 	return nil
 }
@@ -278,6 +434,13 @@ func (cs *callState) finishUnits() int64 {
 // hot-path lockdown. It is the single funnel for JS ether.* and raw
 // ether.host_call.
 func (cs *callState) dispatch(name string, args json.RawMessage) (json.RawMessage, *Fault) {
+	if cs.background {
+		waitedAt := time.Now()
+		if err := WaitBackground(cs.ctx, cs.lim.Busy); err != nil {
+			return nil, &Fault{Code: string(StatusTimeout), Message: err.Error()}
+		}
+		cs.last = cs.last.Add(time.Since(waitedAt))
+	}
 	if cs.hot && name != "log" {
 		return nil, Forbidden("host services are not available on the hot path: " + name)
 	}
@@ -302,7 +465,16 @@ func (cs *callState) dispatch(name string, args json.RawMessage) (json.RawMessag
 	if cs.host == nil {
 		return nil, Forbidden("no host services are configured for this plugin")
 	}
-	out, err := cs.host.CallHost(cs.ctx, name, args)
+	streamCharged := false
+	hostCtx := context.WithValue(cs.ctx, unitChargerKey{}, func(units int64) *Fault {
+		streamCharged = true
+		cs.last = time.Now()
+		return cs.chargeUnits(units)
+	})
+	if cs.lim != nil {
+		hostCtx = context.WithValue(hostCtx, callLimitsKey{}, *cs.lim)
+	}
+	out, err := cs.host.CallHost(hostCtx, name, args)
 	// Time spent waiting on the host (a network fetch, a catalogue query) is
 	// paid by the call's own unit price, not as guest wall time; otherwise
 	// one slow upstream response spent the whole budget. The call deadline
@@ -314,7 +486,24 @@ func (cs *callState) dispatch(name string, args json.RawMessage) (json.RawMessag
 		}
 		return nil, &Fault{Code: "host_error", Message: err.Error()}
 	}
-	if len(out) > MaxHostResultBytes {
+	if name == "archive.extract" && !streamCharged {
+		var extracted struct {
+			Size int64 `json:"size"`
+		}
+		if json.Unmarshal(out, &extracted) == nil && extracted.Size > 0 {
+			mib := (extracted.Size + (1 << 20) - 1) >> 20
+			if f := cs.chargeUnits(mib * ArchiveExtractUnitsPerMiB); f != nil {
+				return nil, f
+			}
+		}
+	}
+	limit := HostResultBytes(cs.lim.MemoryBytes)
+	// JSON can escape each text byte as six bytes. HTTPFetch bounds the raw
+	// body to 10 MiB; leave room for its headers and JSON envelope.
+	if name == "http.fetch" {
+		limit = max(limit, int64((6*MaxFetchBodyBytes)+(1<<20)))
+	}
+	if int64(len(out)) > limit {
 		return nil, &Fault{Code: "host_error", Message: "host result exceeds size cap"}
 	}
 	if len(out) == 0 {
@@ -392,10 +581,11 @@ type pool struct {
 	warm   bool
 	mu     sync.Mutex // orders returning an instance against close
 	done   atomic.Bool
+	doneCh chan struct{}
 }
 
 func newPool(size int, makeFn func(context.Context) (instance, error)) *pool {
-	return &pool{makeFn: makeFn, idle: make(chan instance, size), slots: make(chan struct{}, size)}
+	return &pool{makeFn: makeFn, idle: make(chan instance, size), slots: make(chan struct{}, size), doneCh: make(chan struct{})}
 }
 
 func newWarmPool(size int, makeFn func(context.Context) (instance, error)) *pool {
@@ -406,7 +596,7 @@ func newWarmPool(size int, makeFn func(context.Context) (instance, error)) *pool
 
 func (p *pool) get(ctx context.Context) (instance, error) {
 	if p.done.Load() {
-		return nil, &Error{Status: StatusError, Message: "plugin is closed"}
+		return nil, &Error{Status: StatusError, Message: ErrClosed.Error(), Err: ErrClosed}
 	}
 	select {
 	case in := <-p.idle:
@@ -419,22 +609,35 @@ func (p *pool) get(ctx context.Context) (instance, error) {
 		select {
 		case in := <-p.idle:
 			return in, nil
+		case <-p.doneCh:
+			return nil, &Error{Status: StatusError, Message: ErrClosed.Error(), Err: ErrClosed}
 		case <-ctx.Done():
-			return nil, &Error{Status: StatusTimeout, Message: "timed out waiting for a plugin instance"}
+			return nil, &Error{Status: StatusTimeout, Message: ErrPoolBusy.Error(), Err: ErrPoolBusy}
 		}
 	}
 	select {
 	case in := <-p.idle:
 		return in, nil
 	case p.slots <- struct{}{}:
+		if p.done.Load() {
+			<-p.slots
+			return nil, &Error{Status: StatusError, Message: ErrClosed.Error(), Err: ErrClosed}
+		}
 		in, err := p.makeFn(ctx)
 		if err != nil {
 			<-p.slots
 			return nil, err
 		}
+		if p.done.Load() {
+			in.closeInstance()
+			<-p.slots
+			return nil, &Error{Status: StatusError, Message: ErrClosed.Error(), Err: ErrClosed}
+		}
 		return in, nil
+	case <-p.doneCh:
+		return nil, &Error{Status: StatusError, Message: ErrClosed.Error(), Err: ErrClosed}
 	case <-ctx.Done():
-		return nil, &Error{Status: StatusTimeout, Message: "timed out waiting for a plugin instance"}
+		return nil, &Error{Status: StatusTimeout, Message: ErrPoolBusy.Error(), Err: ErrPoolBusy}
 	}
 }
 
@@ -508,7 +711,9 @@ func (p *pool) refill() {
 func (p *pool) close() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.done.Store(true)
+	if !p.done.Swap(true) && p.doneCh != nil {
+		close(p.doneCh)
+	}
 	for {
 		select {
 		case in := <-p.idle:
@@ -561,10 +766,21 @@ type Plugin struct {
 	caps        caps
 	svc         *pool
 	hot         *pool
+	jobSlots    chan struct{} // sized PoolSize-1 so background jobs leave >= 1 instance for viewer calls
+	closeCh     chan struct{}
 	stats       counters
 	memo        *memo
 	source      string // JS source (rebuild counts / cold start), raw: ""
 	closed      atomic.Bool
+}
+
+func (p *Plugin) initPools(makeSvc, makeHot func(context.Context) (instance, error)) {
+	p.closeCh = make(chan struct{})
+	if p.lim.PoolSize > 1 {
+		p.jobSlots = make(chan struct{}, p.lim.PoolSize-1)
+	}
+	p.svc = newPool(p.lim.PoolSize, makeSvc)
+	p.hot = newWarmPool(p.lim.PoolSize, makeHot)
 }
 
 // ID and Version identify the plugin for memo keys and logs.
@@ -588,6 +804,9 @@ func (p *Plugin) Stats() Stats { return p.stats.snapshot() }
 func (p *Plugin) Close() error {
 	if p.closed.Swap(true) {
 		return nil
+	}
+	if p.closeCh != nil {
+		close(p.closeCh)
 	}
 	if p.svc != nil {
 		p.svc.close()
@@ -615,7 +834,7 @@ func (p *Plugin) CallDetailed(ctx context.Context, req Request) (Response, Outco
 	}()
 	if p.closed.Load() {
 		out.Status = StatusError
-		return Response{}, out, &Error{Status: StatusError, Message: "plugin is closed"}
+		return Response{}, out, &Error{Status: StatusError, Message: ErrClosed.Error(), Err: ErrClosed}
 	}
 	if !p.caps.Handle {
 		out.Status = StatusError
@@ -624,12 +843,29 @@ func (p *Plugin) CallDetailed(ctx context.Context, req Request) (Response, Outco
 	reqJSON, err := json.Marshal(req)
 	if err != nil {
 		out.Status = StatusError
-		return Response{}, out, &Error{Status: StatusError, Message: err.Error()}
+		return Response{}, out, &Error{Status: StatusError, Message: err.Error(), Err: ErrRequestEncode}
 	}
-	callCtx, cancel := context.WithTimeout(ctx, p.lim.Deadline)
+	lim := limitsForRequest(p.lim, req.Path)
+	callCtx, cancel := context.WithTimeout(ctx, lim.Deadline)
 	defer cancel()
-	cs := &callState{ctx: callCtx, host: p.host, lim: &p.lim, start: start, last: start,
-		units: BaseCallUnits, logger: p.eng.logger, pluginID: p.id}
+	if BackgroundPoolPath(req.Path) && p.jobSlots != nil {
+		// Cap background jobs/syncs at PoolSize-1 so interactive viewer calls,
+		// frontend adapter requests and health checks always retain a free
+		// instance. The defer runs after p.svc.put returns the instance.
+		select {
+		case p.jobSlots <- struct{}{}:
+			defer func() { <-p.jobSlots }()
+		case <-p.closeCh:
+			out.Status = StatusError
+			return Response{}, out, &Error{Status: StatusError, Message: ErrClosed.Error(), Err: ErrClosed}
+		case <-callCtx.Done():
+			out.Status = StatusTimeout
+			return Response{}, out, &Error{Status: StatusTimeout, Message: ErrPoolBusy.Error(), Err: ErrPoolBusy}
+		}
+	}
+	cs := &callState{ctx: callCtx, host: p.host, lim: &lim, path: req.Path, start: start, last: start,
+		background: strings.HasPrefix(req.Path, "/ether/job/"),
+		units:      BaseCallUnits, logger: p.eng.logger, pluginID: p.id}
 	in, err := p.svc.get(callCtx)
 	if err != nil {
 		out.Status = StatusTimeout
@@ -645,7 +881,7 @@ func (p *Plugin) CallDetailed(ctx context.Context, req Request) (Response, Outco
 	respJSON, callErr := in.handle(callCtx, cs, reqJSON)
 	out.Units = cs.finishUnits()
 	healthy := callErr == nil || !callErr.Trap
-	if callErr != nil && callErr.Status == StatusTimeout {
+	if (callErr != nil && callErr.Status == StatusTimeout) || callCtx.Err() != nil {
 		healthy = false
 	}
 	p.svc.put(in, healthy)
@@ -655,7 +891,7 @@ func (p *Plugin) CallDetailed(ctx context.Context, req Request) (Response, Outco
 	}
 	if cs.exceeded {
 		out.Status = StatusGovernance
-		return Response{}, out, &Error{Status: StatusGovernance, Message: "governance budget exceeded"}
+		return Response{}, out, &Error{Status: StatusGovernance, Message: cs.governanceMessage()}
 	}
 	if len(respJSON) > MaxResponseBytes {
 		out.Status = StatusError

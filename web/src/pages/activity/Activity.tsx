@@ -2,8 +2,8 @@ import { useEffect, useState } from "react";
 import { DomainPage, useRouteTab } from "../../components/layout";
 import { localized, t } from "../../i18n";
 import { api, apiFetch } from "../../lib/api";
-import { normalizeSessions } from "../../lib/health";
 import { useAsync, useInterval } from "../../lib/hooks";
+import { fetchLiveSessions, LIVE_SESSIONS_MS, useLiveSessionsRefresh } from "../../lib/sessions";
 import { clusterActivity } from "./cluster";
 import { PlayHistory, ViewingFilters } from "./History";
 import { Experience, ExperiencePeriod } from "./Experience";
@@ -52,11 +52,10 @@ export default function Activity() {
 
   const [truncated, setTruncated] = useState(false);
   const sessions = useAsync(async (signal) => {
-    const [body, status] = await Promise.all([
-      apiFetch<{ value: unknown[] | null }>("/status/sessions", { signal }),
+    const [streams, status] = await Promise.all([
+      fetchLiveSessions(signal),
       api.clusterStatus(signal).catch(() => null),
     ]);
-    const streams = normalizeSessions(body.value ?? []);
     if (status?.mode !== "postgres") return streams;
     const console = await api.clusterConsole(signal);
     setTruncated(console.truncated);
@@ -69,17 +68,28 @@ export default function Activity() {
     return body.value ?? {};
   }, []);
   const viewers = useAsync(() => api.users(), []);
-  const viewing = useAsync(async () => {
-    if (!viewingTab) return null;
-    const [summary, history] = await Promise.all([
-      apiFetch<Summary>(`/stats/summary${query}`),
-      apiFetch<Play[] | null>(`/stats/history${query}`),
-    ]);
-    return { summary, history: history ?? [] };
-  }, [query, viewingTab]);
+  const summary = useAsync(
+    async (signal) => {
+      if (!viewingTab) return undefined;
+      return apiFetch<Summary>(`/stats/summary${query}`, { signal });
+    },
+    [query, viewingTab],
+  );
+  const historyTab = tab === "history";
+  const history = useAsync(
+    async (signal) => {
+      if (!historyTab) return undefined;
+      return (await apiFetch<Play[] | null>(`/stats/history${query}`, { signal })) ?? [];
+    },
+    [query, historyTab],
+  );
+  const reloadViewing = () => {
+    void summary.reload();
+    void history.reload();
+  };
 
-  useInterval(() => void sessions.reload(), tab === "now" ? 10_000 : 30_000);
-  useInterval(() => void viewing.reload(), viewingTab ? 30_000 : null);
+  useLiveSessionsRefresh(sessions.reload, tab === "now" ? LIVE_SESSIONS_MS : 30_000);
+  useInterval(reloadViewing, viewingTab ? 30_000 : null);
 
   const live = sessions.data?.length;
   return (
@@ -125,24 +135,20 @@ export default function Activity() {
         <>
           {tab === "history" ? (
             <PlayHistory
-              history={viewing.data?.history}
-              summary={viewing.data?.summary}
-              error={viewing.error}
-              onRetry={() => void viewing.reload()}
+              history={history.data}
+              summary={summary.data}
+              error={history.error}
+              onRetry={reloadViewing}
             />
           ) : tab === "viewing" ? (
             <Viewing
-              summary={viewing.data?.summary}
+              summary={summary.data}
               viewers={viewers.data ?? []}
-              error={viewing.error}
-              onRetry={() => void viewing.reload()}
+              error={summary.error}
+              onRetry={reloadViewing}
             />
           ) : (
-            <Delivery
-              summary={viewing.data?.summary}
-              error={viewing.error}
-              onRetry={() => void viewing.reload()}
-            />
+            <Delivery summary={summary.data} error={summary.error} onRetry={reloadViewing} />
           )}
         </>
       )}

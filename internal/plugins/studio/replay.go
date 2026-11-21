@@ -29,6 +29,7 @@ const (
 	ReplayEvents   ReplayKind = "events"
 	ReplayList     ReplayKind = "list"
 	ReplayChannels ReplayKind = "channels"
+	ReplayKinds    ReplayKind = "kinds"
 )
 
 // Replay bounds keep every replay background-safe with no request-path impact.
@@ -76,8 +77,7 @@ type ReplayParams struct {
 	Operator     string               `json:"operator,omitempty"`
 	Value        json.RawMessage      `json:"value,omitempty"`
 	Action       string               `json:"action,omitempty"`
-	Position     *int                 `json:"position,omitempty"`
-	AfterStep    string               `json:"afterStep,omitempty"`
+	Score        *int                 `json:"score,omitempty"` // a replayed Prefer rule condition's score
 	Config       json.RawMessage      `json:"config,omitempty"`
 	Limit        int                  `json:"limit,omitempty"`
 	Profile      *core.QualityProfile `json:"profile,omitempty"`
@@ -114,6 +114,7 @@ type ReplayReport struct {
 	Events     *EventReplayReport   `json:"events,omitempty"`
 	List       *ListReplayReport    `json:"list,omitempty"`
 	Channels   *ChannelReplayReport `json:"channels,omitempty"`
+	Kinds      *KindReplayReport    `json:"kinds,omitempty"`
 }
 
 // ReplayDeps configures a Studio replay Runner.
@@ -216,6 +217,8 @@ func normalizeKind(k ReplayKind) (ReplayKind, error) {
 		return ReplayList, nil
 	case "channels", "channel", "livetv", "livetv_channels":
 		return ReplayChannels, nil
+	case "kinds", "kind", "content", "catalog_provider":
+		return ReplayKinds, nil
 	default:
 		return "", fmt.Errorf("unsupported replay kind %q", k)
 	}
@@ -286,6 +289,12 @@ func (r *Runner) Replay(ctx context.Context, req ReplayRequest) (ReplayReport, e
 			return ReplayReport{}, err
 		}
 		report.Channels = ch
+	case ReplayKinds:
+		kd, err := r.replayKinds(runCtx, target, req.Params)
+		if err != nil {
+			return ReplayReport{}, err
+		}
+		report.Kinds = kd
 	}
 
 	report.DurationMS = time.Since(start).Milliseconds()

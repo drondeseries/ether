@@ -30,7 +30,7 @@ describe("Release search", () => {
         WAIT,
       ),
     ).toBeInTheDocument();
-    expect(await screen.findByText("above profile max height", {}, WAIT)).toBeInTheDocument();
+    expect(await screen.findByText("above profile max resolution", {}, WAIT)).toBeInTheDocument();
     expect(screen.getByText("cam not allowed")).toBeInTheDocument();
     expect(screen.getByText("Plays first")).toBeInTheDocument();
     expect(calls(fake, "GET", `/releases/search?key=${movie.key}`)).toHaveLength(1);
@@ -91,7 +91,7 @@ describe("Release search", () => {
         calls(fake, "GET", "/releases/search").some((c) => c.path.includes("profile=none")),
       ).toBe(true),
     );
-    await waitFor(() => expect(screen.queryByText("above profile max height")).toBeNull());
+    await waitFor(() => expect(screen.queryByText("above profile max resolution")).toBeNull());
     const menus = screen.getAllByRole("button", { name: /^Actions for .*YTS/ });
     fireEvent.click(menus[0]!);
     fireEvent.click(await screen.findByRole("menuitem", { name: "Check health" }));
@@ -121,6 +121,61 @@ describe("Release search", () => {
         { name: new RegExp(`Releases for ${show.title} S01E02`) },
         WAIT,
       ),
+    ).toBeInTheDocument();
+  });
+
+  it("pins a release for every episode in a season from best candidates or a season pack", async () => {
+    const { fake } = renderApp("/quality/pinned");
+    const show = fake.catalog.find((t) => t.type === "show")!;
+    await pickTitle(show.title);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Season" })).toBeEnabled(), WAIT);
+    await choose("Season", "Season 1");
+
+    const bulkBtn = await screen.findByRole(
+      "button",
+      { name: "Pin a release for every episode" },
+      WAIT,
+    );
+    await waitFor(() => expect(bulkBtn).toBeEnabled(), WAIT);
+    fireEvent.click(bulkBtn);
+
+    const drawer = await screen.findByRole(
+      "dialog",
+      { name: "Pin a release for every episode" },
+      WAIT,
+    );
+    await within(drawer).findByText("E01 · Chapter 1", {}, WAIT);
+    expect(calls(fake, "GET", `/releases/season?key=${show.key}.s1`)).toHaveLength(1);
+
+    // Switch from per-episode best candidates to the discovered season pack.
+    fireEvent.click(within(drawer).getByRole("button", { name: "Release source" }));
+    fireEvent.click(await screen.findByRole("option", { name: /^Season pack · / }));
+    expect(await within(drawer).findByText(/Covers \d+ episodes/)).toBeInTheDocument();
+
+    fireEvent.change(within(drawer).getByLabelText("Note"), {
+      target: { value: "Blu-ray pack for Season 1" },
+    });
+    fireEvent.click(within(drawer).getByRole("button", { name: /^Pin \d+ episodes$/ }));
+
+    await waitFor(() => expect(calls(fake, "POST", "/releases/pins/batch")).toHaveLength(1));
+    const batchBody = calls(fake, "POST", "/releases/pins/batch")[0]!.body as {
+      note: string;
+      pins: { key: string; releaseId: string }[];
+    };
+    expect(batchBody.note).toBe("Blu-ray pack for Season 1");
+    expect(batchBody.pins.length).toBeGreaterThanOrEqual(6);
+    expect(batchBody.pins[0]).toEqual({
+      key: `${show.key}.s1.e1`,
+      releaseId: `${show.key}.s1.e1-pack0`,
+    });
+    expect(batchBody.pins[1]).toEqual({
+      key: `${show.key}.s1.e2`,
+      releaseId: `${show.key}.s1.e2-pack0`,
+    });
+
+    // The pinned episodes appear immediately in the Pinned table below.
+    expect(
+      await screen.findByRole("link", { name: `${show.title} S01E01` }, WAIT),
     ).toBeInTheDocument();
   });
 });
@@ -170,7 +225,7 @@ describe("Release history", () => {
     fireEvent.click(await screen.findByText(first, {}, WAIT));
     const drawer = await screen.findByRole("dialog", { name: first });
     expect(
-      await within(drawer).findByText("above profile max height", {}, WAIT),
+      await within(drawer).findByText("above profile max resolution", {}, WAIT),
     ).toBeInTheDocument();
     expect(within(drawer).getAllByText("Picked").length).toBeGreaterThan(0);
     expect(within(drawer).getAllByText("Auto").length).toBeGreaterThan(0);

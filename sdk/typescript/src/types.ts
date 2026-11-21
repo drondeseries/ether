@@ -10,7 +10,8 @@ export type PluginKind =
   | "integration"
   | "notification_channel"
   | "livetv_source"
-  | "extension";
+  | "extension"
+  | "content";
 
 export type Capability =
   | "stream_source"
@@ -21,12 +22,18 @@ export type Capability =
   | "markers"
   | "notify"
   | "events"
+  | "flow_actions"
   | "ranking_step"
   | "rule_condition"
   | "tools"
-  | "ui";
+  | "ui"
+  | "catalog_provider"
+  | "kind_resolver"
+  | "frontend_adapter"
+  | "matcher"
+  | "poster_badges";
 
-export type EtherEventName =
+export type LegacyEtherEventName =
   | "playback.started"
   | "playback.paused"
   | "playback.resumed"
@@ -39,6 +46,100 @@ export type EtherEventName =
   | "viewer.access_changed"
   | "collection.rebuilt"
   | "server.health_changed";
+
+export type EtherEventName = LegacyEtherEventName | (string & {});
+
+export type EventFieldType =
+  | "string"
+  | "int"
+  | "float"
+  | "bool"
+  | "duration_ms"
+  | "timestamp"
+  | "enum"
+  | "string_list"
+  | "object";
+
+export interface EventEnumOption {
+  value: string;
+  label?: string;
+}
+
+export interface EventFieldMeta {
+  name: string;
+  type: EventFieldType;
+  label: string;
+  description?: string;
+  unit?: string;
+  enum?: EventEnumOption[];
+  pii?: boolean;
+  secret?: boolean;
+  filterable?: boolean;
+  example?: unknown;
+}
+
+export interface PublishedEventMeta {
+  key: string;
+  label: string;
+  description?: string;
+  version?: number;
+  fields?: EventFieldMeta[];
+}
+
+export interface FlowActionParamMeta {
+  key: string;
+  type: EventFieldType;
+  label: string;
+  description?: string;
+  required?: boolean;
+  secret?: boolean;
+  template?: boolean;
+  default?: unknown;
+  enum?: EventEnumOption[];
+  unit?: string;
+  picker?: "channel" | "viewer" | "library" | "source" | "event" | "plugin";
+}
+
+export interface FlowActionMeta {
+  key: string;
+  label: string;
+  description?: string;
+  icon?: string;
+  route: string;
+  idempotent?: boolean;
+  sideEffect?: boolean;
+  timeout?: string;
+  params?: FlowActionParamMeta[];
+  outputs?: EventFieldMeta[];
+}
+
+export interface EventCorrelation {
+  key?: string;
+  sessionId?: string;
+  playId?: string;
+  titleId?: string;
+  viewerId?: number;
+  channelId?: string;
+  sourceId?: string;
+  pluginId?: string;
+  deviceId?: string;
+  libraryId?: string;
+}
+
+export interface FlowActionRequest {
+  key: string;
+  flowId: string;
+  runId: string;
+  nodeId: string;
+  idempotencyKey: string;
+  dryRun?: boolean;
+  params: Record<string, unknown>;
+}
+
+export interface FlowActionResponse {
+  output?: Record<string, unknown>;
+  branch?: string;
+}
 
 export interface StremioCatalogDecl {
   type: string;
@@ -63,10 +164,24 @@ export interface PluginAuthor {
   url?: string;
 }
 
+/** Hosted/data requests are clamped to the owner's global or per-plugin ceilings. */
+export interface RuntimeLimits {
+  fetchBytes?: number;
+  archiveMemberBytes?: number;
+  archiveExpandedBytes?: number;
+  archiveMembers?: number;
+  maxItems?: number;
+  memoryBytes?: number;
+  readBytes?: number;
+  deadline?: string;
+  unitBudget?: number;
+  poolSize?: number;
+}
 export interface RuntimeDecl {
   kind: "hosted" | "remote";
   entry?: string;
   module?: string;
+  limits?: RuntimeLimits;
 }
 
 export interface HealthDecl {
@@ -91,6 +206,8 @@ export interface Permissions {
   collections?: "none" | "write";
   folders?: "none" | "read";
   secrets?: string[];
+  /** Lets a kind resolver ask Ether to find bytes: search to look, acquire to open. */
+  sources?: "none" | "search" | "acquire";
 }
 
 export type SettingFieldKind =
@@ -178,7 +295,8 @@ export interface NotificationMeta {
 }
 
 export interface EventsMeta {
-  subscribe: EtherEventName[];
+  subscribe?: EtherEventName[];
+  publish?: PublishedEventMeta[];
 }
 
 export interface IntegrationMeta {
@@ -204,7 +322,6 @@ export interface RankingStepMeta {
   label: string;
   hint?: string;
   editor?: unknown;
-  defaultPosition?: number;
   budget?: unknown;
 }
 
@@ -213,6 +330,28 @@ export interface RuleConditionMeta {
   label: string;
   operators?: string[];
   editor?: unknown;
+}
+
+export interface PosterBadgeSetMeta {
+  key: string;
+  label: string;
+  description?: string;
+}
+
+export interface BadgeTitleRef {
+  type: "movie" | "show";
+  tmdb?: number;
+  imdb?: string;
+}
+
+export interface BadgeEntry {
+  title: BadgeTitleRef;
+  labels: string[];
+}
+
+export interface BadgeUsage {
+  titles: number;
+  quotaTitles: number;
 }
 
 export interface ToolMeta {
@@ -267,14 +406,425 @@ export interface Contributes {
   markers?: MarkersMeta;
   notification?: NotificationMeta;
   events?: EventsMeta;
+  flowActions?: FlowActionMeta[];
   integration?: IntegrationMeta;
   listSources?: ListSourceMeta[];
   rankingSteps?: RankingStepMeta[];
   ruleConditions?: RuleConditionMeta[];
+  posterBadges?: PosterBadgeSetMeta[];
   tools?: ToolMeta[];
   pages?: PageMeta[];
   slots?: SlotMeta[];
   commands?: CommandMeta[];
+  mediaKinds?: MediaKindMeta[];
+  frontendAdapters?: FrontendAdapterMeta[];
+  setup?: SetupMeta;
+}
+
+/** A Jellyfin/Emby item type a level can present as. */
+export type MediaBrowserItemType =
+  | "Movie" | "Series" | "Season" | "Episode"
+  | "MusicArtist" | "MusicAlbum" | "Audio" | "AudioBook"
+  | "Book" | "PhotoAlbum" | "Photo";
+
+/** How a library is published per protocol (Ether v0.3.8 content kinds). */
+export interface Presentations {
+  adapterOnly?: boolean;
+  vela?: { type: "movies" | "shows" };
+  plex?: { base: "movie" | "show" | "artist" | "photo" };
+  /**
+   * Jellyfin/Emby. `itemTypes` maps each level key to its item type; the
+   * declared type drives the item's Type, MediaType (Audio/Book/Photo/
+   * Video), IsFolder and IncludeItemTypes filtering. Unmapped levels keep
+   * the video projection, so declare every level of a music/book kind.
+   */
+  mediaBrowser?: { collectionType: string; itemTypes?: Record<string, MediaBrowserItemType> };
+  stremio?: { type: "movie" | "series" | "channel" | "tv" };
+  xtream?: { category: string };
+  silo?: { type: string };
+}
+
+export interface KindLevel {
+  key: string;
+  label: string;
+  playable?: boolean;
+  container?: boolean;
+}
+
+export interface KindField {
+  key: string;
+  type: "string" | "int" | "float" | "bool" | "date" | "duration" | "enum" | "strings" | "people";
+  label: string;
+  indexed?: boolean;
+  enum?: string[];
+}
+
+export interface KindArt {
+  role: string;
+  label: string;
+}
+
+export interface KindLibraryTabRule {
+  field: string;
+  op: string;
+  value?: unknown;
+}
+
+export interface KindLibraryTabFilter {
+  match?: "all" | "any";
+  rules?: KindLibraryTabRule[];
+  exclude?: KindLibraryTabRule[];
+}
+
+export interface KindLibraryTab {
+  key: string;
+  label: string;
+  kind: "recommended" | "library" | "collections" | "people" | "view" | "live";
+  /** Declared browse.facets entry (optional on collections; required people-type facet on people). */
+  facet?: string;
+  /** Bucket/person ordering: "count" (default on collections) or "name" (case-insensitive alphabetical, default on people). */
+  order?: "count" | "name";
+  /** Card aspect ratio on "live" tabs (default "landscape"). */
+  card?: "poster" | "landscape" | "square";
+  /** Presentation layout on "view" tabs: "grid" (default), "list", or "timeline". */
+  layout?: "grid" | "list" | "timeline";
+  /** Enables in-tab search on "collections", "people", "view", and "live" tabs (default true). */
+  search?: boolean;
+  /** Optional localizable search input placeholder (at most 60 characters; "$t:" supported) when search is enabled. */
+  searchPlaceholder?: string;
+  sort?: "title" | "added" | "released" | "year" | "rating" | "index" | "lastViewed";
+  direction?: "asc" | "desc";
+  /** Saved filter rules on "view" tabs (indexed fields and/or viewer-state rules). */
+  filters?: KindLibraryTabFilter;
+}
+
+export interface KindLibraryShelf {
+  /** Unique shelf key in this library, matching ^[a-z][a-z0-9-]{0,39}$. Stable row ID: "plugin:<viewID>:shelf:<key>". */
+  key: string;
+  /** Localizable shelf title (literal or "$t:<key>", at most 60 characters). */
+  label: string;
+  /** Optional sort field (defaults to "released"). */
+  sort?: "title" | "added" | "released" | "year" | "rating" | "index";
+  /** Sort direction (defaults to "desc"). */
+  direction?: "asc" | "desc";
+  /** Single-facet filter shorthand; must name a declared and indexed field (or year/released/rating). */
+  facet?: string;
+  /** Single value for `facet`. */
+  value?: string;
+  /** OR values for `facet`. */
+  values?: string[];
+  /** Multi-facet filter (AND across facets, OR within each facet); cannot be combined with `facet`. */
+  filters?: Record<string, string[]>;
+}
+
+export interface KindLibraryDecl {
+  name: string;
+  icon?: string;
+  card?: "poster" | "landscape" | "square";
+  /** How item release dates are rendered on cards and detail headers: "year" (default) or "date" (YYYY-MM-DD). */
+  dateDisplay?: "year" | "date";
+  /** Up to 50 sub-tabs shown inside the library; defaults to Recommended + Library. */
+  tabs?: KindLibraryTab[];
+  /** Up to 40 default Recommended shelves evaluated in order when present. */
+  shelves?: KindLibraryShelf[];
+}
+
+/** On-demand background expansion settings for declared browse facets. */
+export interface KindBrowseExpand {
+  facets: string[];
+  /** Freshness TTL in hours before an expanded slice may be refreshed (default 168). */
+  ttlHours?: number;
+}
+
+/** One declared content kind; each kind becomes its own library. */
+export interface MediaKindMeta {
+  key: string;
+  label: string;
+  library: KindLibraryDecl;
+  levels: KindLevel[];
+  fields?: KindField[];
+  art?: KindArt[];
+  present: Presentations;
+  browse: {
+    sorts?: string[];
+    facets?: string[];
+    search: boolean;
+    searchFields?: string[];
+    /** Client searches also call /search live; results are upserted and merged. */
+    liveSearch?: boolean;
+    /** On-demand background slice expansion when a viewer opens a bucket or person. */
+    expand?: KindBrowseExpand;
+  };
+  sync: { mode: "pull" | "push"; refresh?: string };
+  cache?: { maxBytes?: number; ttl?: string };
+  match?: { thresholdDefault?: number };
+}
+
+export interface FrontendAdapterMeta {
+  key: string;
+  label: string;
+  protocolHint: "opds" | "subsonic" | "custom";
+  pathPrefix: string;
+  defaultPort?: number;
+  clients?: string[];
+  auth?: "ether_token" | "basic" | "none_lan";
+}
+
+export interface SetupStep {
+  key: string;
+  label: string;
+  hint?: string;
+  fields: string[];
+  test: string;
+  required: boolean;
+}
+
+export interface SetupMeta {
+  steps: SetupStep[];
+}
+
+/** The standardised plugin item envelope. */
+export interface KindItem {
+  unavailable?: { code: string; detail?: string };
+  id: string;
+  level: string;
+  parentId?: string;
+  index?: number;
+  title: string;
+  sortTitle?: string;
+  summary?: string;
+  year?: number;
+  released?: number;
+  rating?: number;
+  playable?: boolean;
+  childCount?: number;
+  leafCount?: number;
+  art?: Array<{ role: string; url: string; width?: number; height?: number }>;
+  fields?: Record<string, unknown>;
+  hints?: Record<string, unknown>;
+  etag?: string;
+}
+
+export interface KindItemPart {
+  index?: number;
+  name?: string;
+  mime?: string;
+  size?: number;
+  durationSec?: number;
+}
+
+export interface KindPage {
+  items: KindItem[];
+  nextCursor?: string;
+  total?: number;
+}
+
+export interface KindBrowseRequest {
+  kind: string;
+  parentId?: string;
+  level?: string;
+  cursor?: string;
+  limit?: number;
+  sort?: string;
+  desc?: boolean;
+  /** Any of the listed values per field (OR within a field, AND across fields). */
+  facets?: Record<string, string[]>;
+  /** Every listed value per field must be present. */
+  allFacets?: Record<string, string[]>;
+  /** Items having any listed value per field are dropped. */
+  excludeFacets?: Record<string, string[]>;
+  query?: string;
+}
+
+/** Query passed to kinds.browse from a frontend adapter (#615). */
+export type KindBrowseQuery = Omit<KindBrowseRequest, "kind">;
+
+export interface KindExpandRequest {
+  kind: string;
+  facet: string;
+  value: string;
+  valueId?: number;
+  cursor?: string;
+}
+
+export interface KindExpandResponse {
+  items?: KindItem[];
+  cursor?: string;
+  nextCursor?: string;
+  job?: string;
+}
+
+export interface KindChangePage {
+  upserts?: KindItem[];
+  deletes?: string[];
+  nextCursor?: string;
+  complete: boolean;
+}
+
+export interface SourceQuery {
+  kind: "indexer_search" | "debrid_check" | "debrid_acquire" | "release_files";
+  query?: string;
+  /** Comma-separated Newznab category IDs or standard family names; with empty query, fetches recent releases. */
+  category?: string;
+  /** Quality profile name to score video release names against on indexer_search; empty uses default. */
+  profile?: string;
+  infoHashes?: string[];
+  infoHash?: string;
+  magnet?: string;
+  /** A candidate from indexer_search handed back for release_files, so an NZB is fetched through its indexer. */
+  candidate?: SourceCandidate;
+}
+
+/** One file inside a candidate release, from a release_files query. Index is the order Ether's file selection counts. */
+export interface ReleaseFile {
+  index: number;
+  path: string;
+  size: number;
+}
+
+export interface SourceCandidate {
+  infoHash?: string;
+  magnet?: string;
+  nzbUrl?: string;
+  /** Zero-based index in the provider torrent file list. Omit for normal video selection. */
+  fileIndex?: number;
+  title?: string;
+  size?: number;
+  seeders?: number;
+  cached?: boolean;
+  indexer?: string;
+  indexerId?: string;
+  /** Quality-profile score and parsed video facts; omitted on non-video candidates. */
+  score?: number;
+  resolution?: number;
+  source?: string;
+  codec?: string;
+  /** Files inside this release; populated only by a release_files query. */
+  files?: ReleaseFile[];
+}
+
+export interface KindMatchRequest {
+  kind: string;
+  item: KindItem;
+  candidates: SourceCandidate[];
+  settings?: Record<string, unknown>;
+}
+
+export interface KindMatchScore {
+  candidateRef: string;
+  score: number;
+  reasons?: string[];
+}
+
+export interface PlayableSource {
+  path?: string;
+  id: string;
+  label?: string;
+  pattern: "range" | "download" | "direct" | "container" | "release" | "file";
+  mime: string;
+  size?: number;
+  durationSec?: number;
+  url?: string;
+  headers?: Record<string, string>;
+  blobRef?: string;
+  sha256?: string;
+  /** Hex digests checked against the served bytes (including a release file or container member); size is checked too. */
+  sha1?: string;
+  crc32?: string;
+  maxBytes?: number;
+  expiresAt?: number;
+  container?: {
+    format?: string;
+    volumes: Array<{ url?: string; headers?: Record<string, string>; blobRef?: string; size: number }>;
+    member?: string;
+    memberIndex?: number;
+    passwordSecret?: string;
+  };
+  release?: {
+    nzbUrl?: string;
+    magnet?: string;
+    infoHash?: string;
+    candidate?: SourceCandidate;
+    /** Zero-based torrent file index; overrides candidate.fileIndex. Invalid selections fail. */
+    fileIndex?: number;
+    /** Exact torrent path or unique basename, including non-video files. */
+    file?: string;
+    /** Archive member name when composing a release with container extraction. */
+    fileHint?: string;
+    passwordSecret?: string;
+  };
+}
+
+export interface KindResolveRequest {
+  kind: string;
+  libraryKey: string;
+  item: KindItem;
+  partIndex?: number;
+  client?: Record<string, unknown>;
+}
+
+export interface PendingReply { pending: true; retryInMs?: number; job?: string; sources?: never; matches?: never }
+
+export interface KindResolveResponse {
+  pending?: boolean;
+  retryInMs?: number;
+  job?: string;
+  sources: PlayableSource[];
+  ttlSec?: number;
+}
+
+export interface KindLiveRequest {
+  kind: string;
+  tab?: string;
+  q?: string;
+  filter?: string;
+  cursor?: string;
+  limit?: number;
+}
+
+export interface KindLiveItem {
+  id: string;
+  title: string;
+  subtitle?: string;
+  badge?: string;
+  viewers?: number;
+  tags?: string[];
+  thumb?: string;
+  live?: boolean;
+}
+
+export interface KindLiveFilter {
+  key: string;
+  label: string;
+}
+
+export interface KindLivePage {
+  items: KindLiveItem[];
+  filters?: KindLiveFilter[];
+  nextCursor?: string;
+}
+
+export interface KindLiveResolveRequest {
+  kind: string;
+  id: string;
+}
+
+export interface KindLiveResolveResponse {
+  url: string;
+  headers?: Record<string, string>;
+  mime?: string;
+  title?: string;
+}
+
+export interface SetupTestRequest {
+  step: string;
+  fields?: Record<string, unknown>;
+}
+
+export interface SetupTestResult {
+  ok: boolean;
+  detail?: string;
+  fields?: Record<string, string>;
 }
 
 export interface EtherManifestBlock {
@@ -673,9 +1223,17 @@ export type ToolResponse = Record<string, unknown>;
 
 export interface JobRequest {
   name: string;
+  continuation?: unknown;
 }
 
 export interface JobResponse {
+  /** Presence asks Ether to call again after 0..300000 ms (minimum pause 100ms). */
+  continueInMs?: number;
+  /** Opaque JSON checkpoint forwarded as the next request's continuation. */
+  continuation?: unknown;
+  progress?: string;
+  done?: boolean;
+  failed?: string;
   ok?: boolean;
   [key: string]: unknown;
 }
@@ -741,10 +1299,21 @@ export interface RawRequest {
   query?: Record<string, string | string[]>;
   headers?: Record<string, string | string[]>;
   body?: unknown;
+  /** Exact request bytes, base64-encoded (frontend adapter routes). A non-JSON body arrives only here. */
+  bodyBase64?: string;
+  contentType?: string;
   locale?: string;
 }
 
+/** Host-served cached bytes for an authenticated frontend adapter response. */
+export interface FrontendBlob {
+  libraryKey: string;
+  ref: string;
+  memberIndex?: number;
+}
+
 export interface RawResponse {
+  blob?: FrontendBlob;
   status: number;
   headers?: Record<string, string>;
   body?: unknown;

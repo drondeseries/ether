@@ -73,6 +73,34 @@ func (s *lazyStreams) Issue(ctx context.Context, credential string, req frontend
 	return s.issue(ctx, credential, req, false)
 }
 
+// Warm implements frontend.LazyStreamWarmer with playback's detail warm-up:
+// the same viewer, device caps and title a GET of the issued URL plays, so
+// that Prepare joins or takes the warm resolution instead of resolving after
+// the pick. It rechecks the grant, policy and title like Issue.
+func (s *lazyStreams) Warm(ctx context.Context, credential string, req frontend.PlanRequest) {
+	if req.Protocol != s.protocol || req.Device.ID == "" || req.Viewer == nil || req.Item == 0 || req.Channel != "" || req.Intent.Hints != nil {
+		return
+	}
+	warm, ok := s.broker.deps.Playback.(core.Prewarmer)
+	if !ok || s.broker.deps.MediaLookup == nil {
+		return
+	}
+	_, viewer, err := s.grants.GrantReference(ctx, string(s.protocol), credential)
+	if err != nil || viewer == nil || viewer.ID != req.Viewer.ID {
+		return
+	}
+	if viewer, err = s.broker.confirm(ctx, viewer, req.Caps); err != nil {
+		return
+	}
+	title, err := s.broker.deps.MediaLookup(core.WithLiveApp(ctx, string(req.Protocol)), viewer, req.Device, req.Item)
+	if err != nil || title == nil || title.Key != req.Item || (!title.Released.IsZero() && title.Released.After(s.broker.deps.Now())) {
+		return
+	}
+	// Plan keys and profiles the later Prepare with the broker's caps, not
+	// the declaration; warm with the same caps or Play never finds the entry.
+	warm.Prewarm(context.WithoutCancel(ctx), viewer, req.Item, s.broker.playCaps(viewer, req.Protocol, req.Device, req.Caps), core.PrewarmOptions{Reason: core.PrewarmDetail})
+}
+
 func (s *lazyStreams) issue(ctx context.Context, credential string, req frontend.PlanRequest, stable bool) (string, error) {
 	return s.issueOutput(ctx, credential, req, stable, nil, false, false)
 }
@@ -97,7 +125,7 @@ func (s *lazyStreams) IssueLineup(ctx context.Context, credential string, req fr
 }
 
 func (s *lazyStreams) issueOutput(ctx context.Context, credential string, req frontend.PlanRequest, stable bool, output *frontend.StreamRequest, lineup, activeReuse bool) (string, error) {
-	if req.Protocol != s.protocol || req.Device.ID == "" || req.Viewer == nil || req.Intent.Plex != nil || (!lineup && (req.Item == 0) == (req.Channel == "")) || (stable && req.Channel != "") {
+	if req.Protocol != s.protocol || req.Device.ID == "" || req.Viewer == nil || req.Intent.Hints != nil || (!lineup && (req.Item == 0) == (req.Channel == "")) || (stable && req.Channel != "") {
 		return "", core.ErrUnauthorized
 	}
 	ref, viewer, err := s.grants.GrantReference(ctx, string(s.protocol), credential)
@@ -110,23 +138,7 @@ func (s *lazyStreams) issueOutput(ctx context.Context, credential string, req fr
 		if _, err = s.broker.confirm(ctx, viewer, req.Caps); err != nil || s.broker.deps.Live == nil {
 			return "", core.ErrUnauthorized
 		}
-	} else if stable {
-		// Authenticated paths are requested for every range. Check only local
-		// policy facts here; resolving a release belongs to the first GET.
-		if s.broker.deps.MediaLookup == nil {
-			return "", core.ErrUnauthorized
-		}
-		if viewer, err = s.broker.confirm(ctx, viewer, req.Caps); err != nil {
-			return "", core.ErrUnauthorized
-		}
-		title, err := s.broker.deps.MediaLookup(ctx, viewer, req.Device, req.Item)
-		if err != nil || title == nil || title.Key != req.Item || (!title.Released.IsZero() && title.Released.After(s.broker.deps.Now())) {
-			if errors.Is(err, core.ErrUnauthorized) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return "", err
-			}
-			return "", core.ErrNotFound
-		}
-	} else {
+	} else if !stable {
 		estimate := req
 		estimate.Version = "" // Version lookup may resolve releases; defer it until GET.
 		// Track positions can only be validated against the opened source.
@@ -175,6 +187,27 @@ func (s *lazyStreams) issueOutput(ctx context.Context, credential string, req fr
 		_, _ = mac.Write([]byte("ether-authenticated-lazy-v1\x00"))
 		_, _ = mac.Write(identity)
 		token = base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	}
+	if stable && !lineup {
+		// Authenticated paths are requested for every range. Check only local
+		// policy facts here; resolving a release belongs to the first GET.
+		if s.broker.deps.MediaLookup == nil {
+			return "", core.ErrUnauthorized
+		}
+		if viewer, err = s.broker.confirm(ctx, viewer, req.Caps); err != nil {
+			return "", core.ErrUnauthorized
+		}
+		lookup := s.broker.deps.MediaLookup
+		if activeReuse && s.broker.deps.CurrentMediaLookup != nil && s.broker.activeLazyBinding(lazyHash(token), viewer.ID, s.protocol, req.Device.ID) {
+			lookup = s.broker.deps.CurrentMediaLookup
+		}
+		title, err := lookup(core.WithLiveApp(ctx, string(req.Protocol)), viewer, req.Device, req.Item)
+		if err != nil || title == nil || title.Key != req.Item || (!title.Released.IsZero() && title.Released.After(s.broker.deps.Now())) {
+			if errors.Is(err, core.ErrUnauthorized) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return "", err
+			}
+			return "", core.ErrNotFound
+		}
 	}
 	now := s.broker.deps.Now()
 	expires := now.Add(s.ttl)
@@ -394,7 +427,7 @@ func (s *lazyStreams) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	req.Caps.Remote = req.Caps.Remote || s.remote(r)
-	fresh, err := s.broker.confirm(ctx, viewer, req.Caps)
+	fresh, err := s.broker.confirmCurrent(ctx, viewer, req.Caps)
 	if err != nil || (req.Item == 0) == (req.Channel == "") {
 		http.NotFound(w, r)
 		return
@@ -402,7 +435,7 @@ func (s *lazyStreams) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	viewer = fresh
 	req.Viewer = viewer
 	if req.Channel != "" {
-		if !strings.HasPrefix(tail, "live/") || s.broker.deps.Live == nil || s.broker.deps.Live.Allowed(ctx, viewer, req.Channel) != nil {
+		if !strings.HasPrefix(tail, "live/") || s.broker.deps.Live == nil || s.broker.deps.Live.Allowed(core.WithLiveApp(ctx, string(s.protocol)), viewer, req.Channel) != nil {
 			http.NotFound(w, r)
 			return
 		}
@@ -413,7 +446,17 @@ func (s *lazyStreams) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
-		title, err := s.broker.deps.MediaLookup(ctx, viewer, req.Device, req.Item)
+		lookup := s.broker.deps.MediaLookup
+		s.broker.mu.Lock()
+		existingID := s.broker.lazySessions[binding].id
+		s.broker.mu.Unlock()
+		access := frontend.SessionAccess{Viewer: viewer, Device: req.Device, Protocol: s.protocol}
+		if existingID != "" && s.broker.deps.CurrentMediaLookup != nil {
+			if _, _, err := s.broker.access(ctx, access, existingID); err == nil {
+				lookup = s.broker.deps.CurrentMediaLookup
+			}
+		}
+		title, err := lookup(core.WithLiveApp(ctx, string(req.Protocol)), viewer, req.Device, req.Item)
 		if err != nil || title == nil || title.Key != req.Item || (!title.Released.IsZero() && title.Released.After(s.broker.deps.Now())) {
 			http.NotFound(w, r)
 			return
@@ -424,7 +467,7 @@ func (s *lazyStreams) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
-		if (req.Channel != "" && tail != "live/index.m3u8") || (stored.HLS != nil && tail != "hls/master.m3u8") {
+		if (req.Channel != "" && !liveEntryTail(tail)) || (stored.HLS != nil && tail != "hls/master.m3u8") {
 			s.broker.mu.Lock()
 			id := s.broker.lazySessions[binding].id
 			s.broker.mu.Unlock()
@@ -433,6 +476,8 @@ func (s *lazyStreams) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				http.NotFound(w, r)
 				return
 			}
+		} else if req.Channel != "" && tail == "live/stream.ts" {
+			w.Header().Set("Content-Type", "video/mp2t")
 		} else if stored.HLS != nil {
 			w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 		} else if req.Item != 0 {
@@ -501,7 +546,7 @@ func (s *lazyStreams) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			existingHLS = existing
 		}
 	}
-	if req.Channel != "" && tail != "live/index.m3u8" && id == "" {
+	if req.Channel != "" && !liveEntryTail(tail) && id == "" {
 		http.NotFound(w, r)
 		return
 	}
@@ -661,7 +706,7 @@ func (s *lazyStreams) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *lazyStreams) sourceGone(w http.ResponseWriter, r *http.Request) {
-	serveSourceGone(s.protocol, w, r)
+	serveSourceGone(s.broker.policy(s.protocol), w, r)
 }
 
 // writePlaybackError answers a static open. A missing file is Jellyfin's
@@ -689,8 +734,8 @@ func (s *lazyStreams) writePlaybackError(w http.ResponseWriter, r *http.Request,
 	}
 	http.Error(w, "playback unavailable", http.StatusServiceUnavailable)
 }
-func serveSourceGone(protocol frontend.Protocol, w http.ResponseWriter, r *http.Request) {
-	if protocol == "jellyfin" {
+func serveSourceGone(policy core.SessionPolicy, w http.ResponseWriter, r *http.Request) {
+	if policy.PlainSourceGone {
 		w.Header().Set("Content-Type", "text/plain")
 		w.WriteHeader(http.StatusNotFound)
 		if r.Method != http.MethodHead {
@@ -705,7 +750,7 @@ func serveSourceGone(protocol frontend.Protocol, w http.ResponseWriter, r *http.
 // new transfers fail closed with 503 until a worker exits or the process restarts.
 const maxLazyHeartbeats = 1024
 
-type lazyTransfer struct{ marker byte }
+type lazyTransfer struct{ _ byte }
 
 func (b *Broker) registerLazyTransfer(id string, cancel context.CancelFunc) (func(), bool) {
 	b.mu.Lock()
@@ -764,7 +809,7 @@ func (s *lazyStreams) heartbeatBinding(ctx context.Context, cancel context.Cance
 			return
 		case <-ticks:
 			viewer, err := s.broker.deps.ActiveViewer(ctx, viewerID)
-			if _, confirmErr := s.broker.confirm(ctx, viewer, req.Caps); err != nil || viewer == nil || s.grants.ValidateGrantReference(ctx, string(s.protocol), reference, viewerID) != nil || confirmErr != nil {
+			if _, confirmErr := s.broker.confirmCurrent(ctx, viewer, req.Caps); err != nil || viewer == nil || s.grants.ValidateGrantReference(ctx, string(s.protocol), reference, viewerID) != nil || confirmErr != nil {
 				cancel()
 				return
 			}
@@ -774,7 +819,7 @@ func (s *lazyStreams) heartbeatBinding(ctx context.Context, cancel context.Cance
 				return
 			}
 			if req.Channel != "" {
-				if s.broker.deps.Live == nil || s.broker.deps.Live.Allowed(ctx, viewer, req.Channel) != nil {
+				if s.broker.deps.Live == nil || s.broker.deps.Live.Allowed(core.WithLiveApp(ctx, string(s.protocol)), viewer, req.Channel) != nil {
 					cancel()
 					return
 				}
@@ -783,7 +828,11 @@ func (s *lazyStreams) heartbeatBinding(ctx context.Context, cancel context.Cance
 					cancel()
 					return
 				}
-				title, err := s.broker.deps.MediaLookup(ctx, viewer, req.Device, req.Item)
+				lookup := s.broker.deps.CurrentMediaLookup
+				if lookup == nil {
+					lookup = s.broker.deps.MediaLookup
+				}
+				title, err := lookup(core.WithLiveApp(ctx, string(req.Protocol)), viewer, req.Device, req.Item)
 				if err != nil || title == nil || title.Key != req.Item || (!title.Released.IsZero() && title.Released.After(s.broker.deps.Now())) {
 					cancel()
 					return
@@ -891,4 +940,10 @@ func (s *lazyStreams) renewHeader(ctx context.Context, tx *sql.Tx, hash string, 
 		return core.ErrUnauthorized
 	}
 	return nil
+}
+
+// liveEntryTail is a path that may open a lazy live session: the HLS playlist,
+// or the continuous MPEG-TS stream for IPTV apps that request ".ts".
+func liveEntryTail(tail string) bool {
+	return tail == "live/index.m3u8" || tail == "live/stream.ts"
 }

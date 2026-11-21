@@ -2,11 +2,48 @@ package playback
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/braedonsaunders/ether/internal/core"
+	"github.com/braedonsaunders/ether/internal/transcode"
 )
+
+func (m *Manager) videoTranscodingOff() bool {
+	if m.config().Transcode.VideoTranscodingOff() {
+		return true
+	}
+	if v, ok := m.deps.Transcoder.(interface{ VideoTranscodingOff() bool }); ok && v.VideoTranscodingOff() {
+		return true
+	}
+	return false
+}
+
+func (m *Manager) probedNeedsVideoTranscode(info core.MediaInfo, caps core.ClientCaps) (core.Decision, bool) {
+	if info.Estimated || info.Video() == nil {
+		return core.Decision{}, false
+	}
+	if len(caps.VideoCodecs) == 0 && len(caps.Containers) == 0 && caps.MaxHeight == 0 &&
+		caps.MaxBitrateKbps == 0 && len(caps.VideoMaxHeights) == 0 &&
+		caps.Product == "" && caps.Platform == "" && caps.Protocol == "" && !caps.ExplicitNoHDR {
+		return core.Decision{}, false
+	}
+	opts := core.DecideOptions{DirectPlay: true, DirectStream: true, AudioStream: -1, SubtitleStream: -1}
+	var dec core.Decision
+	if m.deps.Transcoder != nil {
+		dec = m.deps.Transcoder.Decide(info, caps, opts)
+	} else {
+		dec = transcode.Decide(info, caps, opts, transcode.Policy{RemoteMaxBitrateKbps: m.config().Transcode.RemoteMaxBitrateKbps})
+	}
+	if dec.Kind == "" || dec.Kind == core.DecisionDirectPlay {
+		return dec, false
+	}
+	if dec.VideoCopy && dec.Kind != core.DecisionTranscode {
+		return dec, false
+	}
+	return dec, true
+}
 
 // swapChecker is implemented by HLS sessions whose delivered format is
 // fixed for their lifetime (a segmented-Matroska header the player never
@@ -20,6 +57,11 @@ type swapChecker interface {
 // incompatible candidate is released and the next one tried. The mismatch
 // is specific to this session: the release is not marked bad.
 func (m *Manager) preflightSwap(ctx context.Context, s *session, g *generation) error {
+	if m.videoTranscodingOff() {
+		if _, needs := m.probedNeedsVideoTranscode(g.infoSnapshot(), s.caps); needs {
+			return core.ErrVideoTranscodingDisabled
+		}
+	}
 	if m.deps.HLSLookup == nil {
 		return nil
 	}
@@ -32,6 +74,9 @@ func (m *Manager) preflightSwap(ctx context.Context, s *session, g *generation) 
 		return nil
 	}
 	if err := c.CheckSwap(g.infoSnapshot()); err != nil {
+		if errors.Is(err, core.ErrVideoTranscodingDisabled) {
+			return err
+		}
 		return fmt.Errorf("%w: %v", core.ErrNotAvailable, err)
 	}
 	if preparer, ok := hls.(interface {

@@ -5,9 +5,11 @@ import { Link } from "react-router-dom";
 import { Artwork } from "../../../components/Artwork";
 import { ErrorPanel } from "../../../components/feedback";
 import { Section } from "../../../components/layout";
-import { getLocale, t, tx } from "../../../i18n";
+import { t, tx } from "../../../i18n";
 import { apiFetch, errorMessage } from "../../../lib/api";
-import { useAsync } from "../../../lib/hooks";
+import { useAsync, useInterval } from "../../../lib/hooks";
+import { relativeTime } from "../../../lib/format";
+import { titlePosterURL } from "../../../lib/titles";
 import type { DiscoverySettings } from "./WatchlistDefaults";
 
 type Item = {
@@ -18,8 +20,9 @@ type Item = {
 };
 
 const known = (value?: string) => Boolean(value && !value.startsWith("0001"));
-const day = (value?: string) =>
-  known(value) ? new Date(value!).toLocaleDateString(getLocale()) : t("Date not announced");
+
+const formatSources = (sources: string[]) =>
+  Array.from(new Set(sources.map((s) => (s.startsWith("plex-community:") ? "plex-community" : s))));
 
 /** One viewer's watched-for titles: sync, check and remove (viewer profile › Watchlist). */
 export function ViewerWatchlist({ viewerId }: { viewerId: number }) {
@@ -27,6 +30,25 @@ export function ViewerWatchlist({ viewerId }: { viewerId: number }) {
   const items = useAsync(
     (signal) => apiFetch<Item[]>(`/discovery/users/${viewerId}/`, { signal }),
     [viewerId],
+  );
+  type CheckStatus = {
+    state: string;
+    done: number;
+    total: number;
+    enabled: boolean;
+    nextCheck: string;
+  };
+  const status = useAsync(
+    (signal) => apiFetch<CheckStatus>(`/discovery/users/${viewerId}/check`, { signal }),
+    [viewerId],
+  );
+  const checking = status.data?.state === "running";
+  useInterval(
+    () => {
+      void status.reload();
+      void items.reload();
+    },
+    checking ? 2000 : 30_000,
   );
   const [busy, setBusy] = useState<string | null>(null);
   const enabled = Boolean(settings.data?.enabled);
@@ -41,15 +63,45 @@ export function ViewerWatchlist({ viewerId }: { viewerId: number }) {
       setBusy(null);
     }
   };
-  const refreshWith = (action: "sync" | "check", done: string) =>
+  const refreshWith = (action: "sync" | "check") =>
     run(action, async () => {
-      items.setData(
-        await apiFetch<Item[]>(`/discovery/users/${viewerId}/${action}`, {
+      if (action === "sync") {
+        type SyncJob = { id: number; state: string; plex: string; count: number };
+        let job = await apiFetch<SyncJob>(`/discovery/users/${viewerId}/sync/jobs`, {
           method: "POST",
           body: "{}",
-        }),
-      );
-      toast.success(done);
+        });
+        const deadline = Date.now() + 6 * 60_000;
+        while ((job.state === "queued" || job.state === "running") && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 1500));
+          job = await apiFetch<SyncJob>(`/discovery/users/${viewerId}/sync/jobs/${job.id}`);
+        }
+        const result = { ...job, failed: job.state !== "completed" };
+        items.setData(await apiFetch<Item[]>(`/discovery/users/${viewerId}/`));
+        const message =
+          result.failed && result.plex === "synced"
+            ? t("Watchlist sync incomplete")
+            : result.plex === "friend"
+              ? t(
+                  "This viewer's Plex watchlist can't be read: they're a friend you share with, not a Plex Home member. Use Friends' Watchlist RSS in Viewers › Watchlists, or have them link Trakt.",
+                )
+              : result.plex === "pin"
+                ? t("Plex asked for this Home member's PIN")
+                : result.plex === "disabled"
+                  ? t("Plex watchlists are turned off in Viewers › Watchlists")
+                  : result.plex === "synced"
+                    ? t("Synced {count} titles", { count: result.count })
+                    : t("Plex refused access to this Home member's watchlist");
+        if (result.plex === "synced" && !result.failed) toast.success(message);
+        else toast.info(message);
+      } else {
+        status.setData(
+          await apiFetch<CheckStatus>(`/discovery/users/${viewerId}/check`, {
+            method: "POST",
+            body: "{}",
+          }),
+        );
+      }
     });
   const remove = (item: Item) =>
     run(`remove-${item.title.key}`, async () => {
@@ -69,16 +121,16 @@ export function ViewerWatchlist({ viewerId }: { viewerId: number }) {
           <Button
             variant="outline"
             size="sm"
-            disabled={busy !== null || !enabled}
-            onClick={() => void refreshWith("sync", t("Watchlist synced"))}
+            disabled={busy !== null}
+            onClick={() => void refreshWith("sync")}
           >
             <RefreshCw size={14} /> {t("Sync viewer")}
           </Button>
           <Button
             variant="outline"
             size="sm"
-            disabled={busy !== null || !enabled}
-            onClick={() => void refreshWith("check", t("Availability checked"))}
+            disabled={busy !== null || !enabled || checking || !status.data?.enabled}
+            onClick={() => void refreshWith("check")}
           >
             <BellRing size={14} /> {t("Check availability")}
           </Button>
@@ -89,11 +141,33 @@ export function ViewerWatchlist({ viewerId }: { viewerId: number }) {
         <p className="text-sm text-fg-muted">
           {tx("Watchlist monitoring is off. {link} to sync and check this viewer's watchlist.", {
             link: (
-              <Link to="/catalog/settings" className="font-medium text-fg underline">
-                {t("Turn it on in Catalog settings")}
+              <Link to="/viewers" className="font-medium text-fg underline">
+                {t("Turn it on in Viewers")}
               </Link>
             ),
           })}
+        </p>
+      ) : null}
+      {status.error ? (
+        <ErrorPanel error={status.error} onRetry={() => void status.reload()} />
+      ) : null}
+      {status.data?.enabled ? (
+        <p className="text-sm text-fg-muted" aria-live="polite">
+          {checking
+            ? t("Checking availability · {done} of {total} titles", {
+                done: status.data.done,
+                total: status.data.total,
+              })
+            : t("Checked {checked} of {total} titles · next check {time}", {
+                checked: list.filter((item) => known(item.checkedAt)).length,
+                total: list.length,
+                time: relativeTime(status.data.nextCheck),
+              })}
+        </p>
+      ) : null}
+      {status.data && ["failed", "interrupted"].includes(status.data.state) ? (
+        <p role="status" className="text-sm text-fg-muted">
+          {t("Availability check incomplete")}
         </p>
       ) : null}
       {items.error ? (
@@ -116,11 +190,15 @@ export function ViewerWatchlist({ viewerId }: { viewerId: number }) {
             return (
               <li key={String(item.title.key)} className="flex items-center gap-3 py-2.5">
                 <Artwork
-                  src={
-                    item.title.posterPath
-                      ? `https://image.tmdb.org/t/p/w92${item.title.posterPath}`
-                      : undefined
-                  }
+                  src={titlePosterURL(
+                    {
+                      ...item.title,
+                      year: known(item.title.released)
+                        ? Number(item.title.released?.slice(0, 4))
+                        : undefined,
+                    },
+                    92,
+                  )}
                   alt=""
                   title={item.title.title}
                   className="h-12 w-8 shrink-0 rounded"
@@ -129,9 +207,13 @@ export function ViewerWatchlist({ viewerId }: { viewerId: number }) {
                   <p className="truncate text-sm font-medium text-fg">{item.title.title}</p>
                   <p className="truncate text-xs text-fg-muted">
                     {available
-                      ? t("Available since {date}", { date: day(item.availableAt) })
-                      : t("Waiting for a stream · {date}", { date: day(item.title.released) })}
-                    {item.sources.length ? ` · ${item.sources.join(", ")}` : ""}
+                      ? t("Available")
+                      : known(item.checkedAt)
+                        ? t("No stream found yet · checked {time}", {
+                            time: relativeTime(item.checkedAt),
+                          })
+                        : t("Not checked yet")}
+                    {item.sources.length ? ` · ${formatSources(item.sources).join(", ")}` : ""}
                   </p>
                 </div>
                 {available ? <Badge variant="success">{t("Available")}</Badge> : null}

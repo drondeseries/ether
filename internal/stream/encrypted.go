@@ -16,6 +16,25 @@ func (b *builder) rarOptions(ctx context.Context, maxFiles int) *archive.RAROpti
 	return &archive.RAROptions{Context: ctx, Password: b.rel.doc.Password(), MaxFiles: maxFiles, PasswordCache: &b.rel.rarPasswords}
 }
 
+func (b *builder) rarOptionsFor(ctx context.Context, pf *postedFile, maxFiles int) *archive.RAROptions {
+	opts := b.rarOptions(ctx, maxFiles)
+	opts.SizeEstimated = pf != nil && !pf.SizeKnown()
+	return opts
+}
+
+// rarVolSize returns the volume size to record in a RAR layout: pf.Size() when
+// exact, else at least dataOff+dataSize so an underestimated postedFile size
+// cannot reject a header-verified RAR extent.
+func rarVolSize(pf *postedFile, dataOff, dataSize int64) int64 {
+	size := pf.Size()
+	if !pf.SizeKnown() && dataOff >= 0 && dataSize >= 0 && dataSize <= math.MaxInt64-dataOff {
+		if end := dataOff + dataSize; end > size {
+			size = end
+		}
+	}
+	return size
+}
+
 // encryptedPlan retains ciphertext in the existing segment caches. Only bounded
 // requested ranges are decrypted, and neither keys nor plaintext are persisted.
 func (b *builder) encryptedPlan(ctx context.Context, kind planKind, member *archive.Member, vols []*postedFile, info []volInfo) (*plan, error) {
@@ -23,7 +42,13 @@ func (b *builder) encryptedPlan(ctx context.Context, kind planKind, member *arch
 		return nil, ErrCorrupt
 	}
 	for i, pf := range vols {
-		if !pf.SizeKnown() || info[i].size != pf.Size() {
+		if pf.SizeKnown() {
+			if info[i].size != pf.Size() {
+				return nil, fmt.Errorf("stream: encrypted archive volume size is unverified: %w", ErrCorrupt)
+			}
+		} else if kind == kindRAR && info[i].size >= pf.Size() {
+			pf.setAssumed(info[i].size)
+		} else {
 			return nil, fmt.Errorf("stream: encrypted archive volume size is unverified: %w", ErrCorrupt)
 		}
 	}
@@ -72,6 +97,26 @@ func (b *builder) encryptedPlan(ctx context.Context, kind planKind, member *arch
 	head := make([]byte, min(int64(4096), p.size))
 	if _, err := r.ReadAt(head, 0); err != nil {
 		return nil, err
+	}
+	if isISOName(p.name) {
+		// A disc image has no video signature; its volume descriptors are the
+		// check (ISO 9660 "CD001", or UDF's "BEA01", at sector 16).
+		sig := make([]byte, 6)
+		if p.size < 16*2048+6 {
+			return nil, fmt.Errorf("stream: decrypted archive member is too small for a disc image: %w", ErrCorrupt)
+		}
+		if _, err := r.ReadAt(sig, 16*2048); err != nil {
+			return nil, err
+		}
+		if s := string(sig[1:]); s != "CD001" && s != "BEA01" {
+			return nil, fmt.Errorf("stream: decrypted archive member is not a disc image (incorrect password or damaged content): %w", ErrCorrupt)
+		}
+		return p, nil
+	}
+	if f := archive.Detect(head); f == archive.FormatRAR4 || f == archive.FormatRAR5 {
+		// A RAR volume packed inside an encrypted archive: its signature is
+		// the check; the video inside is checked when it is read.
+		return p, nil
 	}
 	if !looksLikeVideo(head) {
 		return nil, fmt.Errorf("stream: decrypted archive member has no supported video signature (incorrect password or damaged content): %w", ErrCorrupt)

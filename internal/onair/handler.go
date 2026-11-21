@@ -1,16 +1,18 @@
 package onair
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/braedonsaunders/ether/internal/extras"
 	"github.com/go-chi/chi/v5"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -24,21 +26,41 @@ import (
 func (s *Service) Handler(resources ...func(chi.Router)) http.Handler {
 	r := chi.NewRouter()
 	s.StudioRoutes(r)
+	r.Get("/downloader", func(w http.ResponseWriter, r *http.Request) {
+		result(w, s.DownloaderStatus(), nil)
+	})
+	r.Post("/downloader/install", func(w http.ResponseWriter, r *http.Request) {
+		var in struct {
+			Update bool `json:"update"`
+		}
+		if r.ContentLength > 0 && !body(w, r, &in) {
+			return
+		}
+		v, e := s.InstallDownloader(r.Context(), in.Update)
+		result(w, v, e)
+	})
 	r.Post("/assets/import", s.importHandler(false))
 	r.Post("/reels/{id}/clips/import", s.importHandler(true))
 	r.Get("/fonts/{id}", func(w http.ResponseWriter, r *http.Request) {
 		r.SetPathValue("id", chi.URLParam(r, "id"))
 		ServeFont(w, r)
 	})
+	r.Get("/showcase-bugs/{file}", func(w http.ResponseWriter, r *http.Request) {
+		serveShowcaseBug(w, r, chi.URLParam(r, "file"))
+	})
 
 	r.Get("/system-screens", ServeSystemScreens)
 	r.Get("/templates", func(w http.ResponseWriter, r *http.Request) { v, e := s.Templates(r.Context()); result(w, v, e) })
 	r.Post("/scenes/validate", func(w http.ResponseWriter, r *http.Request) {
-		var sc StyleScene
-		if !body(w, r, &sc) {
+		var raw json.RawMessage
+		if !body(w, r, &raw) {
 			return
 		}
-		e := sc.Document.Validate()
+		sc, e := ParseSceneDraft(raw)
+		if e == nil {
+			cleanOverlayScene(&sc)
+			e = sc.Document.Validate()
+		}
 		if e == nil && len(sc.Sounds) > 4 {
 			e = fmt.Errorf("scene %q: use at most four sounds", sc.Name)
 		}
@@ -123,6 +145,7 @@ func (s *Service) Handler(resources ...func(chi.Router)) http.Handler {
 		v, e := s.o.Bindings(r.Context(), r.URL.Query().Get("channel"), r.URL.Query().Get("viewer"), at)
 		result(w, v, e)
 	})
+	r.Get("/artwork", s.serveArtwork)
 	s.LibraryRoutes(r)
 	r.Get("/assets", func(w http.ResponseWriter, r *http.Request) { v, e := s.Library(r.Context()); result(w, v, e) })
 	r.Post("/assets", func(w http.ResponseWriter, r *http.Request) {
@@ -139,20 +162,7 @@ func (s *Service) Handler(resources ...func(chi.Router)) http.Handler {
 		a, e := s.UploadAsset(r.Context(), h.Filename, r.FormValue("kind"), r.FormValue("license"), f)
 		result(w, a, e)
 	})
-	r.Get("/assets/{id}", func(w http.ResponseWriter, r *http.Request) {
-		var b []byte
-		var mime string
-		e := s.db.QueryRowContext(r.Context(), "SELECT content,mime FROM onair_assets WHERE digest=?", chi.URLParam(r, "id")).Scan(&b, &mime)
-		if e != nil {
-			result(w, nil, ErrNotFound)
-			return
-		}
-		w.Header().Set("ETag", `"`+chi.URLParam(r, "id")+`"`)
-		w.Header().Set("Content-Type", mime)
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-		w.Header().Set("Cache-Control", "private, max-age=31536000, immutable")
-		http.ServeContent(w, r, "asset", time.Time{}, bytes.NewReader(b))
-	})
+	r.Get("/assets/{id}", func(w http.ResponseWriter, r *http.Request) { s.serveAsset(w, r, chi.URLParam(r, "id")) })
 	r.Delete("/assets/{id}", func(w http.ResponseWriter, r *http.Request) {
 		result(w, nil, s.DeleteAsset(r.Context(), chi.URLParam(r, "id")))
 	})
@@ -217,6 +227,7 @@ func (s *Service) Handler(resources ...func(chi.Router)) http.Handler {
 					return
 				}
 				c.Name = in.Name
+				c.AutoName = false
 				result(w, c, s.setClip(r.Context(), v.ID, c))
 				return
 			}
@@ -226,11 +237,41 @@ func (s *Service) Handler(resources ...func(chi.Router)) http.Handler {
 	r.Delete("/reels/{id}/clips/{clip}", func(w http.ResponseWriter, r *http.Request) {
 		result(w, nil, s.DeleteClip(r.Context(), chi.URLParam(r, "id"), chi.URLParam(r, "clip")))
 	})
+	r.Post("/reels/{id}/clips/{clip}/resolve", func(w http.ResponseWriter, r *http.Request) {
+		c, e := s.ResolveReelClip(r.Context(), chi.URLParam(r, "id"), chi.URLParam(r, "clip"))
+		if e != nil {
+			result(w, nil, e)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if c.Cached {
+			w.WriteHeader(http.StatusOK)
+		} else {
+			w.WriteHeader(http.StatusAccepted)
+		}
+		_ = json.NewEncoder(w).Encode(c)
+	})
 	r.Get("/reels/{id}/clips/{clip}/preview", func(w http.ResponseWriter, r *http.Request) {
-		v, e := s.Reel(r.Context(), chi.URLParam(r, "id"))
+		reelID := chi.URLParam(r, "id")
+		clipID := chi.URLParam(r, "clip")
+		v, e := s.Reel(r.Context(), reelID)
 		if e == nil {
 			for _, c := range v.Clips {
-				if c.ID == chi.URLParam(r, "clip") && c.Status == "ready" {
+				if c.ID != clipID {
+					continue
+				}
+				if c.Link {
+					if p, ok := s.CachedReelClip(reelID, clipID); ok {
+						if _, statErr := os.Stat(p); statErr == nil {
+							http.ServeFile(w, r, p)
+							return
+						}
+					}
+					_, _ = s.ResolveReelClip(r.Context(), reelID, clipID)
+					result(w, nil, fmt.Errorf("preview resolving; retry shortly"))
+					return
+				}
+				if c.Status == "ready" {
 					p := filepath.Join(s.o.Dir, "reel-"+c.ID+".mp4")
 					if _, e = os.Stat(p); e == nil {
 						http.ServeFile(w, r, p)
@@ -246,6 +287,49 @@ func (s *Service) Handler(resources ...func(chi.Router)) http.Handler {
 	})
 	return r
 }
+
+func (s *Service) serveArtwork(w http.ResponseWriter, r *http.Request) {
+	ref := strings.TrimSpace(r.URL.Query().Get("ref"))
+	if ref == "" || s.o.ArtworkBytes == nil {
+		result(w, nil, ErrNotFound)
+		return
+	}
+	data, ct, err := s.o.ArtworkBytes(r.Context(), ref)
+	if err != nil || len(data) == 0 {
+		result(w, nil, ErrNotFound)
+		return
+	}
+	if ct == "" {
+		ct = http.DetectContentType(data)
+	}
+	h := w.Header()
+	h.Set("Content-Type", ct)
+	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("Content-Security-Policy", "default-src 'none'; img-src data:; style-src 'unsafe-inline'; sandbox")
+	h.Set("Cache-Control", "private, max-age=300")
+	h.Set("Content-Length", strconv.Itoa(len(data)))
+	w.WriteHeader(http.StatusOK)
+	if r.Method != http.MethodHead {
+		_, _ = w.Write(data)
+	}
+}
+
+// DownloaderStatus returns the active yt-dlp-compatible command status for link imports.
+func (s *Service) DownloaderStatus() extras.DownloaderStatus {
+	if s.o.Downloader == nil {
+		return extras.DownloaderStatus{Source: "none", PinnedVersion: extras.PinnedYTDLPVersion}
+	}
+	return s.o.Downloader.Status()
+}
+
+// InstallDownloader installs or updates the managed yt-dlp standalone release binary.
+func (s *Service) InstallDownloader(ctx context.Context, update bool) (extras.DownloaderStatus, error) {
+	if s.o.Downloader == nil {
+		return extras.DownloaderStatus{Source: "none", PinnedVersion: extras.PinnedYTDLPVersion}, fmt.Errorf("downloader is not configured")
+	}
+	return s.o.Downloader.Install(ctx, update)
+}
+
 func multipart(w http.ResponseWriter, r *http.Request, max int64) bool {
 	r.Body = http.MaxBytesReader(w, r.Body, max+(1<<20))
 	if e := r.ParseMultipartForm(1 << 20); e != nil {

@@ -159,7 +159,7 @@ func TestProwlarrImportKeepsIndexerClientIdentity(t *testing.T) {
 	if err := store.Update(func(c *config.Config) error {
 		for i := range c.Indexers {
 			if c.Indexers[i].ID == prefix+"4" {
-				c.Indexers[i].ClientIdentity = config.IdentitySonarr
+				c.Indexers[i].UserAgent = "CustomAgent/1.0"
 			}
 		}
 		return nil
@@ -171,7 +171,7 @@ func TestProwlarrImportKeepsIndexerClientIdentity(t *testing.T) {
 	}
 	for _, ix := range store.Get().Indexers {
 		if ix.ID == prefix+"4" {
-			if ix.ClientIdentity != config.IdentitySonarr {
+			if ix.UserAgent != "CustomAgent/1.0" {
 				t.Fatalf("override lost on sync: %+v", ix)
 			}
 			return

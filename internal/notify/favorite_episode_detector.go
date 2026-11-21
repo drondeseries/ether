@@ -15,14 +15,28 @@ func init() {
 	store.Register("viewer_alerts", 2, `CREATE TABLE viewer_episode_alerts (viewer_id INTEGER NOT NULL, episode_key TEXT NOT NULL, show_title TEXT NOT NULL, episode_title TEXT NOT NULL, detected_at INTEGER NOT NULL, preference_generation INTEGER NOT NULL, PRIMARY KEY(viewer_id,episode_key)); CREATE TABLE viewer_episode_scan (viewer_id INTEGER PRIMARY KEY, enabled_at INTEGER NOT NULL, scanned_at INTEGER NOT NULL); CREATE TABLE viewer_episode_seen (viewer_id INTEGER NOT NULL, episode_key TEXT NOT NULL, PRIMARY KEY(viewer_id,episode_key));`)
 }
 
+// DetectedEpisode describes a newly aired episode detected for one or more
+// viewers following a favourited show.
+type DetectedEpisode struct {
+	ShowKey       core.RatingKey
+	ShowTitle     string
+	EpisodeKey    core.RatingKey
+	EpisodeTitle  string
+	Season        int
+	Episode       int
+	AirDate       string
+	FollowerCount int
+}
+
 // FavoriteEpisodeDetector scans only currently authorized favorites. The caller
 // runs it under the cluster leader lease. The database uniqueness constraint
 // also protects against overlap during a leader handoff.
 type FavoriteEpisodeDetector struct {
 	Preferences *ViewerAlerts
 	// Episodes must return only visible, currently favorited shows and episodes.
-	Episodes func(context.Context, *core.User) ([]core.Title, error)
-	Now      func() time.Time
+	Episodes   func(context.Context, *core.User) ([]core.Title, error)
+	Now        func() time.Time
+	OnDetected func([]DetectedEpisode)
 }
 
 func (d *FavoriteEpisodeDetector) Scan(ctx context.Context) error {
@@ -52,6 +66,8 @@ func (d *FavoriteEpisodeDetector) Scan(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	detectedByKey := map[core.RatingKey]*DetectedEpisode{}
+	var detectedOrder []core.RatingKey
 	for _, p := range prefs {
 		viewer, err := d.Preferences.Active(ctx, p.id)
 		if err != nil && !errors.Is(err, core.ErrUnauthorized) && !errors.Is(err, core.ErrNotFound) {
@@ -81,11 +97,14 @@ func (d *FavoriteEpisodeDetector) Scan(ctx context.Context) error {
 		// An initial scan, a new opt-in, or a gap over two polling intervals
 		// starts a new baseline instead of sending historical episodes.
 		baseline := err == sql.ErrNoRows || generation != p.enabledAt || now.Unix()-previous > int64((30*time.Minute).Seconds()) || now.Unix() < previous
+		var viewerDetected []core.Title
 		for _, episode := range episodes {
-			if episode.Type != core.TypeEpisode || episode.Key == 0 || episode.Released.IsZero() || episode.Released.After(now) {
+			// An episode released before the alert window never alerts, so
+			// it needs no seen row either (see PruneViewerAlerts).
+			if episode.Type != core.TypeEpisode || episode.Key == 0 || episode.Released.IsZero() || episode.Released.After(now) || episode.Released.Before(now.Add(-episodeAlertWindow)) {
 				continue
 			}
-			res, err := tx.ExecContext(ctx, `INSERT INTO viewer_episode_seen(viewer_id,episode_key) VALUES(?,?) ON CONFLICT(viewer_id,episode_key) DO NOTHING`, p.id, episode.Key.String())
+			res, err := tx.ExecContext(ctx, `INSERT INTO viewer_episode_seen(viewer_id,episode_key,seen_at) VALUES(?,?,?) ON CONFLICT(viewer_id,episode_key) DO NOTHING`, p.id, episode.Key.String(), now.Unix())
 			if err != nil {
 				tx.Rollback()
 				return err
@@ -95,13 +114,16 @@ func (d *FavoriteEpisodeDetector) Scan(ctx context.Context) error {
 				tx.Rollback()
 				return err
 			}
-			if baseline || added == 0 || episode.Released.Before(now.Add(-48*time.Hour)) {
+			if baseline || added == 0 {
 				continue
 			}
-			_, err = tx.ExecContext(ctx, `INSERT INTO viewer_episode_alerts(viewer_id,episode_key,show_title,episode_title,detected_at,preference_generation) SELECT ?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM viewer_alert_preferences WHERE viewer_id=? AND enabled=1 AND enabled_at=?) ON CONFLICT(viewer_id,episode_key) DO NOTHING`, p.id, episode.Key.String(), episode.ShowTitle, episode.Title, now.Unix(), p.enabledAt, p.id, p.enabledAt)
+			alertRes, err := tx.ExecContext(ctx, `INSERT INTO viewer_episode_alerts(viewer_id,episode_key,show_title,episode_title,detected_at,preference_generation) SELECT ?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM viewer_alert_preferences WHERE viewer_id=? AND enabled=1 AND enabled_at=?) ON CONFLICT(viewer_id,episode_key) DO NOTHING`, p.id, episode.Key.String(), episode.ShowTitle, episode.Title, now.Unix(), p.enabledAt, p.id, p.enabledAt)
 			if err != nil {
 				tx.Rollback()
 				return err
+			}
+			if n, _ := alertRes.RowsAffected(); n > 0 {
+				viewerDetected = append(viewerDetected, episode)
 			}
 		}
 
@@ -113,7 +135,38 @@ func (d *FavoriteEpisodeDetector) Scan(ctx context.Context) error {
 		if err = tx.Commit(); err != nil {
 			return err
 		}
-
+		for _, ep := range viewerDetected {
+			cur, ok := detectedByKey[ep.Key]
+			if !ok {
+				showKey := ep.ShowKey
+				if showKey == 0 && ep.Key.Kind() == core.KindEpisode {
+					showKey = core.ShowKey(ep.Key.TMDB())
+				}
+				airDate := ""
+				if !ep.Released.IsZero() {
+					airDate = ep.Released.UTC().Format("2006-01-02")
+				}
+				cur = &DetectedEpisode{
+					ShowKey:      showKey,
+					ShowTitle:    ep.ShowTitle,
+					EpisodeKey:   ep.Key,
+					EpisodeTitle: ep.Title,
+					Season:       ep.Season,
+					Episode:      ep.Episode,
+					AirDate:      airDate,
+				}
+				detectedByKey[ep.Key] = cur
+				detectedOrder = append(detectedOrder, ep.Key)
+			}
+			cur.FollowerCount++
+		}
+	}
+	if d.OnDetected != nil && len(detectedOrder) > 0 {
+		out := make([]DetectedEpisode, 0, len(detectedOrder))
+		for _, k := range detectedOrder {
+			out = append(out, *detectedByKey[k])
+		}
+		d.OnDetected(out)
 	}
 	return nil
 }

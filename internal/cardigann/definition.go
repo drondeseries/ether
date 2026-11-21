@@ -49,6 +49,11 @@ type Definition struct {
 	Download *Download
 }
 
+// IsPrivate reports whether the definition declares a private tracker.
+func (d *Definition) IsPrivate() bool {
+	return d != nil && strings.EqualFold(strings.TrimSpace(d.Type), "private")
+}
+
 // Caps is the definition's capabilities block.
 type Caps struct {
 	// CategoryMappings maps a site category id to a Newznab category.
@@ -931,8 +936,7 @@ func (d *Definition) validate() (errs, warnings []string) {
 		}
 	}
 	unknown := map[string]bool{}
-	var checkFilters func([]Filter)
-	checkFilters = func(fs []Filter) {
+	checkFilters := func(fs []Filter) {
 		for _, f := range fs {
 			if !knownFilters[f.Name] {
 				unknown[f.Name] = true

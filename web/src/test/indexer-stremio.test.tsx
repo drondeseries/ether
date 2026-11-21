@@ -24,6 +24,10 @@ describe("Sources › Indexers Stremio addons", () => {
       target: { value: "  stremio://addon.example/opts=1/manifest.json " },
     });
     expect(within(drawer).queryByText(/includes a debrid API key/)).toBeNull();
+    const orderSwitch = within(drawer).getByRole("switch", { name: "Use the add-on's order" });
+    expect(orderSwitch).not.toBeChecked();
+    fireEvent.click(orderSwitch);
+    expect(orderSwitch).toBeChecked();
 
     fireEvent.click(within(drawer).getByRole("button", { name: /Test/ }));
     await waitFor(() => expect(calls(fake, "POST", "/test/indexer")).toHaveLength(1));
@@ -40,10 +44,12 @@ describe("Sources › Indexers Stremio addons", () => {
       kind: "stremio",
       protocol: "torrent",
       url: "https://addon.example/opts=1/manifest.json",
+      useAddonOrder: true,
       enabled: true,
     });
     const list = screen.getByRole("region", { name: "Indexers" });
     await waitFor(() => expect(within(list).getAllByText("Stremio addon")).toHaveLength(2));
+    expect(within(list).getByText("Add-on order")).toBeInTheDocument();
   });
 
   it("warns when the link embeds a debrid key", async () => {

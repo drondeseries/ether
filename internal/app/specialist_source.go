@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/braedonsaunders/ether/internal/auth"
@@ -40,10 +41,30 @@ func (a *App) buildSourceRole(ctx context.Context, cfg config.Config) error {
 		}
 		return safety.PlexShare{FilterMovies: d.FilterMovies, FilterTelevision: d.FilterTelevision, AllowSync: d.AllowSync}
 	})
+	a.catalog.SetOwnerContentPolicy(func(ctx context.Context, t *core.Title) bool {
+		if a.users == nil || a.safety == nil {
+			return true
+		}
+		owner, err := a.users.Owner(ctx)
+		if errors.Is(err, core.ErrNotFound) || owner == nil {
+			return true
+		}
+		if err != nil {
+			return false
+		}
+		return a.safety.PolicyAllowed(owner, t)
+	})
 	bus := a.clusterNode()
 	a.users.SetBus(bus)
 	a.safety.SetBus(bus)
-	a.closers = append(a.closers, func() { a.users.Close(); a.safety.Close() })
+	a.catalog.SetViewerRulesBus(bus)
+	a.catalog.SetIncludesBus(bus)
+	a.closers = append(a.closers, func() {
+		a.users.Close()
+		a.safety.Close()
+		a.catalog.SetViewerRulesBus(nil)
+		a.catalog.SetIncludesBus(nil)
+	})
 	cfg.Cache = cfg.EffectiveCache()
 	if err = a.buildSources(ctx, cfg); err != nil {
 		return err
@@ -57,18 +78,20 @@ func (a *App) buildSourceRole(ctx context.Context, cfg config.Config) error {
 	a.closers = append(a.closers, func() { _ = a.sourceProber.Close() })
 	var tc core.Transcoder = sourceProbeOnly{prober: a.sourceProber}
 	a.playback, err = playback.New(playback.Deps{
-		Resolver: a.resolver, Engine: playbackEngine(a), Transcoder: tc, Catalog: a.catalog, Cache: a.cache, DB: a.db, Logger: a.log, Cluster: a.clusterNode(), Availability: a.dbAvail,
+		OpenResolution: a.openVaultResolution,
+		Resolver:       a.resolver, Engine: playbackEngine(a), Transcoder: tc, Catalog: a.catalog, Cache: a.cache, DB: a.db, Logger: a.log, Cluster: a.clusterNode(), Availability: a.dbAvail,
 		NativeProbe: func(ctx context.Context, src core.MediaSource) (*core.MediaInfo, error) {
 			return transcode.ProbeSource(ctx, src, src.Size())
 		},
 		NativeTrailer: func(ctx context.Context, src core.MediaSource, info *core.MediaInfo) bool {
 			return transcode.ProbeTrailer(ctx, src, src.Size(), info)
 		},
-		FetchNZB: playbackFetchNZB(a, a.opts.DataDir),
+		FetchNZB:           playbackFetchNZB(a, a.opts.DataDir),
+		SelectTitleProfile: a.playbackProfile,
 		SelectProfile: func(caps core.ClientCaps, u *core.User, media string) core.QualityProfile {
 			return resolver.SelectProfileForMedia(a.cfg.Read().Quality, caps, u, media)
 		},
-	}, cfg, playback.Options{IdleTimeout: specialistPlaybackIdleTimeout, DataDir: a.opts.DataDir, PayloadReplayGrace: 5 * time.Second})
+	}, cfg, playback.Options{SessionSurface: sessionSurface, IdleTimeout: specialistPlaybackIdleTimeout, DataDir: a.opts.DataDir, PayloadReplayGrace: 5 * time.Second})
 	if err != nil {
 		return err
 	}

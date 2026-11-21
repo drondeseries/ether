@@ -23,7 +23,7 @@ export const descriptors: Descriptor<SettingsSchemaMeta>[] = [
               source: "What viewers see",
             },
             description: {
-              source: "The names apps show for this server and its libraries.",
+              source: "The name apps show for this server.",
             },
             fields: [
               {
@@ -33,26 +33,6 @@ export const descriptors: Descriptor<SettingsSchemaMeta>[] = [
                 },
                 help: {
                   source: "How the server appears in apps.",
-                },
-                kind: "text",
-              },
-              {
-                key: "moviesLibraryName",
-                label: {
-                  source: "Movies library name",
-                },
-                help: {
-                  source: "Name shown in Plex. A rename inside Plex does not stick.",
-                },
-                kind: "text",
-              },
-              {
-                key: "tvShowsLibraryName",
-                label: {
-                  source: "TV Shows library name",
-                },
-                help: {
-                  source: "Name shown in Plex. A rename inside Plex does not stick.",
                 },
                 kind: "text",
               },
@@ -116,13 +96,14 @@ export const descriptors: Descriptor<SettingsSchemaMeta>[] = [
               {
                 key: "trustedProxyCIDRs",
                 label: {
-                  source: "Trusted proxy networks",
+                  source: "Trusted reverse proxies",
                 },
                 help: {
-                  source: "Networks whose forwarding headers Ether trusts. Empty trusts none.",
+                  source:
+                    "IP addresses or CIDR ranges of reverse proxies on other machines (such as Caddy or Nginx) whose forwarded client IP headers Ether should trust. Proxies on this computer are already trusted.",
                 },
                 kind: "list",
-                placeholder: "10.0.0.0/8",
+                placeholder: "192.168.1.5, 10.0.0.0/8",
               },
               {
                 key: "logLevel",
@@ -262,7 +243,8 @@ export const descriptors: Descriptor<SettingsSchemaMeta>[] = [
                   source: "Public host name",
                 },
                 help: {
-                  source: "Optional. Leave empty to detect your public address.",
+                  source:
+                    "Optional. Enter a name like plex.example.com, or the full https:// address of your reverse proxy. Leave empty to detect your public address.",
                 },
                 kind: "text",
               },
@@ -338,6 +320,42 @@ export const descriptors: Descriptor<SettingsSchemaMeta>[] = [
                 },
                 kind: "text",
                 wide: true,
+              },
+            ],
+          },
+          {
+            id: "delivery",
+            title: {
+              source: "Media delivery",
+            },
+            description: {
+              source: "How a direct play reaches the player.",
+            },
+            fields: [
+              {
+                key: "delivery",
+                label: {
+                  source: "Delivery",
+                },
+                help: {
+                  source:
+                    "Relay is the default. Redirect gives eligible Plex players a temporary TorBox file URL that they can use until it expires. Ether cannot measure bytes delivered directly by TorBox.",
+                },
+                kind: "select",
+                options: [
+                  {
+                    value: "relay",
+                    label: {
+                      source: "Relay through Ether",
+                    },
+                  },
+                  {
+                    value: "redirect",
+                    label: {
+                      source: "Redirect to the provider",
+                    },
+                  },
+                ],
               },
             ],
           },
@@ -643,6 +661,24 @@ export const descriptors: Descriptor<SettingsSchemaMeta>[] = [
                 step: 1,
               },
               {
+                key: "alternativesPerResolution",
+                label: { source: "Offer alternatives at every resolution" },
+                help: {
+                  source:
+                    "Apply the alternatives count to each available resolution, up to seven versions total. Auto stays first; profile and device limits still apply.",
+                },
+                kind: "bool",
+              },
+              {
+                key: "alternativesPerSource",
+                label: { source: "Offer each source at every resolution" },
+                help: {
+                  source:
+                    "Keep one WEB-DL, Blu-ray and Remux choice at each resolution in Play Version when available. Auto still follows your profile.",
+                },
+                kind: "bool",
+              },
+              {
                 key: "offerHigherVersions",
                 label: {
                   source: "Offer higher versions",
@@ -803,6 +839,31 @@ export const descriptors: Descriptor<SettingsSchemaMeta>[] = [
                 "Ether plays the file directly when the app can. It converts the video on this computer only when it has to.",
             },
             fields: [
+              {
+                key: "videoTranscoding",
+                label: {
+                  source: "Video transcoding",
+                },
+                help: {
+                  source:
+                    "Turn off to never re-encode video for movies and shows. Direct play, remuxing, and audio or subtitle conversion still work. Live TV is unaffected.",
+                },
+                kind: "select",
+                options: [
+                  {
+                    value: "on",
+                    label: {
+                      source: "On",
+                    },
+                  },
+                  {
+                    value: "off",
+                    label: {
+                      source: "Off",
+                    },
+                  },
+                ],
+              },
               {
                 key: "hwAccel",
                 label: {
@@ -1213,6 +1274,17 @@ export const descriptors: Descriptor<SettingsSchemaMeta>[] = [
                 },
                 kind: "secret",
               },
+              {
+                key: "automaticPreferred",
+                label: {
+                  source: "Download a subtitle automatically when playback starts",
+                },
+                help: {
+                  source:
+                    "When a viewer's subtitle setting asks for subtitles and none in their language is available, Ether downloads one once the video starts playing. Uses one OpenSubtitles download per title per viewer, so standard accounts may run out sooner.",
+                },
+                kind: "bool",
+              },
             ],
           },
         ],
@@ -1242,7 +1314,7 @@ export const descriptors: Descriptor<SettingsSchemaMeta>[] = [
                   source: "Check for updates",
                 },
                 help: {
-                  source: "Checks the signed release feed once a day.",
+                  source: "Checks the signed release feed every few hours.",
                 },
                 kind: "bool",
               },
@@ -1407,6 +1479,27 @@ export const descriptors: Descriptor<SettingsSchemaMeta>[] = [
                 },
                 kind: "secret",
               },
+              {
+                key: "skipDb",
+                label: {
+                  source: "Also look up SkipDB",
+                },
+                help: {
+                  source:
+                    "Add the open SkipDB lookup as a second source, cached per episode and runtime.",
+                },
+                kind: "bool",
+              },
+              {
+                key: "skipDbApiKey",
+                label: {
+                  source: "Optional SkipDB key",
+                },
+                help: {
+                  source: "Reading SkipDB is open; a key only raises its rate limit.",
+                },
+                kind: "secret",
+              },
             ],
           },
         ],
@@ -1559,7 +1652,7 @@ export const descriptors: Descriptor<SettingsSchemaMeta>[] = [
                   source: "Highest resolution",
                 },
                 help: {
-                  source: "Downloads are capped at this height. 0 uses 1080p.",
+                  source: "Downloads are capped at this resolution. 0 uses 1080p.",
                 },
                 kind: "number",
                 min: 0,
@@ -1819,7 +1912,7 @@ export const descriptors: Descriptor<SettingsSchemaMeta>[] = [
               source: "What viewers see",
             },
             description: {
-              source: "The names apps show for this server and its libraries.",
+              source: "The name apps show for this server.",
             },
             fields: [
               {
@@ -1829,26 +1922,6 @@ export const descriptors: Descriptor<SettingsSchemaMeta>[] = [
                 },
                 help: {
                   source: "How the server appears in apps.",
-                },
-                kind: "text",
-              },
-              {
-                key: "moviesLibraryName",
-                label: {
-                  source: "Movies library name",
-                },
-                help: {
-                  source: "Name shown in Plex. A rename inside Plex does not stick.",
-                },
-                kind: "text",
-              },
-              {
-                key: "tvShowsLibraryName",
-                label: {
-                  source: "TV Shows library name",
-                },
-                help: {
-                  source: "Name shown in Plex. A rename inside Plex does not stick.",
                 },
                 kind: "text",
               },
@@ -1962,13 +2035,14 @@ export const descriptors: Descriptor<SettingsSchemaMeta>[] = [
               {
                 key: "trustedProxyCIDRs",
                 label: {
-                  source: "Trusted proxy networks",
+                  source: "Trusted reverse proxies",
                 },
                 help: {
-                  source: "Networks whose forwarding headers Ether trusts. Empty trusts none.",
+                  source:
+                    "IP addresses or CIDR ranges of reverse proxies on other machines (such as Caddy or Nginx) whose forwarded client IP headers Ether should trust. Proxies on this computer are already trusted.",
                 },
                 kind: "list",
-                placeholder: "10.0.0.0/8",
+                placeholder: "192.168.1.5, 10.0.0.0/8",
               },
               {
                 key: "logLevel",

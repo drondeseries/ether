@@ -57,11 +57,30 @@ func DescriptorsFor(man Manifest) []extend.Descriptor {
 	}
 	for _, rs := range c.RankingSteps {
 		add(extend.KindRankingStep, rs.Key, textOf(id, rs.Label), map[string]any{
-			"editor": rs.Editor, "defaultPosition": rs.DefaultPosition, "budget": rs.Budget, "hint": rs.Hint})
+			"editor": rs.Editor, "budget": rs.Budget, "hint": rs.Hint})
 	}
 	for _, rc := range c.RuleConditions {
 		add(extend.KindRuleField, rc.Key, textOf(id, rc.Label), map[string]any{
 			"operators": rc.Operators, "editor": rc.Editor})
+	}
+	if man.HasCapability(CapPosterBadges) {
+		for _, pb := range c.PosterBadges {
+			d := extend.Descriptor{
+				Kind:  extend.KindPosterBadge,
+				ID:    extend.PluginID(id, pb.Key),
+				Owner: id,
+				Label: textOf(id, pb.Label),
+				Group: man.Name,
+			}
+			if pb.Description != "" {
+				d.Hint = textOf(id, pb.Description)
+			}
+			out = append(out, d.WithMeta(map[string]any{
+				"key":        pb.Key,
+				"layerKey":   "plugin:" + id + ":" + pb.Key,
+				"pluginName": man.Name,
+			}))
+		}
 	}
 	for _, ls := range c.ListSources {
 		if !man.HasCapability(CapListSource) {
@@ -157,6 +176,8 @@ func (m *Manager) syncDescriptors(ctx context.Context, r Record) {
 	m.mu.Lock()
 	m.shadow[r.ID] = r.Shadow
 	m.mu.Unlock()
+	m.syncPosterBadgeSets(ctx, r)
+	m.syncFlowsPlugin(ctx, r)
 	if m.deps.Registry != nil {
 		var ds []extend.Descriptor
 		if r.Enabled {
@@ -279,8 +300,19 @@ func PermissionSheet(man Manifest) (lines []string, needsViewers, needsFolders b
 		lines = append(lines, "Connects to the add-on it was made from")
 	}
 	p := man.Ether.Permissions
+	var localHosts []string
 	for _, h := range p.Network {
-		lines = append(lines, "Connects to "+h)
+		switch {
+		case strings.EqualFold(strings.TrimSpace(h), OperatorNetworkEntry):
+			lines = append(lines, "Connects to addresses you approve")
+		case IsLocalNetworkHost(h):
+			localHosts = append(localHosts, h)
+		default:
+			lines = append(lines, "Connects to "+h)
+		}
+	}
+	if len(localHosts) > 0 {
+		lines = append(lines, "May reach on your network: "+strings.Join(localHosts, ", "))
 	}
 	if normLevel(p.Catalog) == "read" {
 		lines = append(lines, "Reads your catalogue")
@@ -304,11 +336,39 @@ func PermissionSheet(man Manifest) (lines []string, needsViewers, needsFolders b
 		lines = append(lines, "Reads folders you choose")
 		needsFolders = true
 	}
+	switch normLevel(p.Sources) {
+	case "search":
+		lines = append(lines, "Searches your indexers for sources")
+	case "acquire":
+		lines = append(lines, "Searches your indexers and opens sources through your debrid accounts")
+	}
+	for _, k := range man.Ether.Contributes.MediaKinds {
+		if !k.HasLibrary() {
+			continue
+		}
+		name := k.Library.Name
+		if strings.HasPrefix(name, "$t:") {
+			name = k.Key
+		}
+		lines = append(lines, "Adds a library: "+name)
+	}
 	for range p.Secrets {
 		lines = append(lines, "Stores an access token")
 	}
 	if man.HasCapability(CapEvents) {
-		lines = append(lines, "Gets play and new-release events")
+		ev := man.Ether.Contributes.Events
+		if ev == nil || len(ev.Subscribe) > 0 || len(ev.Publish) == 0 {
+			lines = append(lines, "Gets play and new-release events")
+		}
+		if ev != nil && len(ev.Publish) > 0 {
+			lines = append(lines, "Publishes custom events to Flows")
+		}
+	}
+	if man.HasCapability(CapFlowActions) {
+		lines = append(lines, "Adds actions to Flows")
+	}
+	if man.HasCapability(CapPosterBadges) {
+		lines = append(lines, "Adds badges to library posters")
 	}
 	if len(lines) == 0 {
 		lines = []string{"Needs no access to your server or the network"}
@@ -332,10 +392,21 @@ func PermissionDiff(cur, next Manifest) []string {
 	for _, h := range a.Network {
 		have[h] = true
 	}
+	var addedLocal []string
 	for _, h := range b.Network {
 		if !have[h] {
-			added = append(added, "Connects to "+h)
+			switch {
+			case strings.EqualFold(strings.TrimSpace(h), OperatorNetworkEntry):
+				added = append(added, "Connects to addresses you approve")
+			case IsLocalNetworkHost(h):
+				addedLocal = append(addedLocal, h)
+			default:
+				added = append(added, "Connects to "+h)
+			}
 		}
+	}
+	if len(addedLocal) > 0 {
+		added = append(added, "May reach on your network: "+strings.Join(addedLocal, ", "))
 	}
 	level := map[string]int{"none": 0, "granted_viewers": 1, "read": 1, "write": 1, "all": 2}
 	raised := func(x, y string) bool { return level[normLevel(y)] > level[normLevel(x)] }
@@ -357,6 +428,29 @@ func PermissionDiff(cur, next Manifest) []string {
 	if raised(a.Folders, b.Folders) {
 		added = append(added, "Reads folders you choose")
 	}
+	sourcesLevel := map[string]int{"none": 0, "search": 1, "acquire": 2}
+	if sourcesLevel[normLevel(b.Sources)] > sourcesLevel[normLevel(a.Sources)] {
+		if normLevel(b.Sources) == "acquire" {
+			added = append(added, "Searches your indexers and opens sources through your debrid accounts")
+		} else {
+			added = append(added, "Searches your indexers for sources")
+		}
+	}
+	haveKindLib := map[string]bool{}
+	for _, k := range cur.Ether.Contributes.MediaKinds {
+		if k.HasLibrary() {
+			haveKindLib[k.Key] = true
+		}
+	}
+	for _, k := range next.Ether.Contributes.MediaKinds {
+		if k.HasLibrary() && !haveKindLib[k.Key] {
+			name := k.Library.Name
+			if strings.HasPrefix(name, "$t:") {
+				name = k.Key
+			}
+			added = append(added, "Adds a library: "+name)
+		}
+	}
 	haveSecret := map[string]bool{}
 	for _, s := range a.Secrets {
 		haveSecret[s] = true
@@ -367,7 +461,25 @@ func PermissionDiff(cur, next Manifest) []string {
 		}
 	}
 	if !cur.HasCapability(CapEvents) && next.HasCapability(CapEvents) {
-		added = append(added, "Gets play and new-release events")
+		ev := next.Ether.Contributes.Events
+		if ev == nil || len(ev.Subscribe) > 0 || len(ev.Publish) == 0 {
+			added = append(added, "Gets play and new-release events")
+		}
+		if ev != nil && len(ev.Publish) > 0 {
+			added = append(added, "Publishes custom events to Flows")
+		}
+	} else if cur.HasCapability(CapEvents) && next.HasCapability(CapEvents) {
+		curPub := cur.Ether.Contributes.Events != nil && len(cur.Ether.Contributes.Events.Publish) > 0
+		nextPub := next.Ether.Contributes.Events != nil && len(next.Ether.Contributes.Events.Publish) > 0
+		if !curPub && nextPub {
+			added = append(added, "Publishes custom events to Flows")
+		}
+	}
+	if !cur.HasCapability(CapFlowActions) && next.HasCapability(CapFlowActions) {
+		added = append(added, "Adds actions to Flows")
+	}
+	if !cur.HasCapability(CapPosterBadges) && next.HasCapability(CapPosterBadges) {
+		added = append(added, "Adds badges to library posters")
 	}
 	return added
 }

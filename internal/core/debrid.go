@@ -23,25 +23,76 @@ const (
 	ProtocolHTTP = "http"
 )
 
-// ReleaseTarget is the episode wanted from a multi-file release such as a
-// season pack.
+// ReleaseTarget is the episode or movie wanted from a multi-file release such
+// as a season pack or dual-language movie pack.
 type ReleaseTarget struct {
+	// CanonicalSeason/CanonicalEpisode retain TMDB identity when Season/Episode
+	// select a file using the owner's alternate release numbering.
+	CanonicalSeason  int `json:"canonicalSeason,omitempty"`
+	CanonicalEpisode int `json:"canonicalEpisode,omitempty"`
+	// Aliases lists verified alternate season/episode numbers for the same
+	// canonical episode so open-time file checks accept alias-numbered files.
+	Aliases []EpisodeNumber `json:"aliases,omitempty"`
+	// MovieTitles and MovieYear constrain file selection inside movie collections.
+	MovieTitles []string `json:"movieTitles,omitempty"`
+	MovieYear   int      `json:"movieYear,omitempty"`
+	// WantedLanguages and OriginalLanguage rank full-length language versions
+	// inside multi-file movie torrents and NZB archives before falling back to
+	// byte size (additive).
+	WantedLanguages  []string `json:"wantedLanguages,omitempty"`
+	OriginalLanguage string   `json:"originalLanguage,omitempty"`
+	// FileIndex is a zero-based index in the complete torrent file list; the selected file must be a video unless AllowNonVideo is set.
+	FileIndex *int `json:"fileIndex,omitempty"`
+	// ExactFile selects a plugin-requested path or unambiguous basename.
+	ExactFile string `json:"exactFile,omitempty"`
+	// AllowNonVideo permits an explicit FileIndex or ExactFile selector to choose a non-video file.
+	AllowNonVideo bool `json:"allowNonVideo,omitempty"`
+	// FileName is the source-matched file hint, never proof of episode identity.
+	FileName string `json:"fileName,omitempty"`
 	// AbsoluteEpisode is the verified anime episode number across seasons.
-	AbsoluteEpisode int    `json:"absoluteEpisode,omitempty"`
-	Season          int    `json:"season,omitempty"`
-	Episode         int    `json:"episode,omitempty"`
-	ShowYear        int    `json:"showYear,omitempty"`
-	EpisodeTitle    string `json:"episodeTitle,omitempty"`
+	AbsoluteEpisode int `json:"absoluteEpisode,omitempty"`
+	// Cour and CourEpisode identify the cour (part) and relative episode
+	// within a multi-cour anime season pack (0 when unmapped).
+	Cour          int      `json:"cour,omitempty"`
+	CourEpisode   int      `json:"courEpisode,omitempty"`
+	Season        int      `json:"season,omitempty"`
+	Episode       int      `json:"episode,omitempty"`
+	ShowYear      int      `json:"showYear,omitempty"`
+	EpisodeTitle  string   `json:"episodeTitle,omitempty"`
+	ShowTitles    []string `json:"showTitles,omitempty"`
+	SpecialTitles []string `json:"specialTitles,omitempty"`
+	// AddonSpecialEpisode is the verified IMDb number before catalogue renumbering.
+	AddonSpecialEpisode int `json:"addonSpecialEpisode,omitempty"`
+	// PackID is the untargeted release ID of a FullSeason pack before
+	// TargetReleaseID derives the per-episode ID (additive).
+	PackID string `json:"packId,omitempty"`
 	// ExpectedIDs identify the requested series; ReportedIDs are the
 	// release's indexer-reported series IDs, retained for file validation.
 	ExpectedIDs IDs `json:"expectedIds,omitempty"`
 	ReportedIDs IDs `json:"reportedIds,omitempty"`
 }
 
+// ErrWrongContent is a request-specific release mismatch, never an account
+// failure or proof that the torrent is unusable for another title.
+var ErrWrongContent = fmt.Errorf("release contains different content: %w", ErrNotAvailable)
+
 // ErrNotCached reports that no debrid provider can serve a torrent release
 // instantly. It is a per-release skip, never proof the release is broken,
 // so it wraps ErrNotAvailable and is not a permanent failure.
 var ErrNotCached = fmt.Errorf("not cached by any debrid provider: %w", ErrNotAvailable)
+
+// PrivateTorrentReason explains why an uncached private-tracker torrent is
+// skipped rather than added to or downloaded by a debrid service.
+const PrivateTorrentReason = "private tracker torrent: only an existing debrid cache is used"
+
+type privateUncachedError struct{}
+
+func (privateUncachedError) Error() string { return PrivateTorrentReason }
+func (privateUncachedError) Unwrap() error { return ErrNotCached }
+
+// ErrPrivateUncached reports that a private-tracker torrent is not already
+// cached on any debrid provider and therefore was never added or queued.
+var ErrPrivateUncached error = privateUncachedError{}
 
 // ErrDownloadQueued reports that an uncached torrent was handed to a debrid
 // account to download (cached-only off): not playable yet, but it will be.

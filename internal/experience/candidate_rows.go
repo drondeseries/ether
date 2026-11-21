@@ -12,7 +12,7 @@ import (
 func CandidateRows(candidates []RankedCandidate) []frontend.Row {
 	out := make([]frontend.Row, 0, len(candidates))
 	for _, c := range candidates {
-		row := frontend.Row{ID: c.ID, Title: c.Title, Purpose: c.Purpose, Style: c.Style, Promoted: c.Promoted, More: c.More, Collection: c.Key}
+		row := frontend.Row{ID: c.ID, Title: c.Title, PreviewOnFocus: c.PreviewOnFocus, RankedTop10: c.RankedTop10, Purpose: c.Purpose, Style: c.Style, Promoted: c.Promoted, More: c.More, Collection: c.Key}
 		for i := range c.Items {
 			item := c.Items[i]
 			row.Entries = append(row.Entries, frontend.RowEntry{Kind: frontend.RowEntryTitle, Title: &item})
@@ -71,24 +71,5 @@ func (s CandidateRowSource) Rows(ctx context.Context, req frontend.RowRequest) (
 	return rows, nil
 }
 
-// homePurpose translates producer identifiers at the Plex boundary; no wire
-// context or hub identifier is included in the neutral candidate.
-func HomePurpose(h core.Hub) core.RowPurpose {
-	id := strings.ToLower(h.ID)
-	switch {
-	case id == "home.continue":
-		return "continue"
-	case strings.Contains(id, "upnext") || strings.Contains(id, "ondeck"):
-		return "nextUp"
-	case strings.Contains(id, "watchlist"):
-		return "watchlist"
-	case h.Key != 0 || strings.Contains(id, "collection"):
-		return "collection"
-	case strings.Contains(id, "recentlyreleased") || strings.Contains(id, "recently.released"):
-		return "recentlyReleased"
-	case strings.Contains(id, "livetv"):
-		return "live"
-	default:
-		return "recommendation"
-	}
-}
+// HomePurpose lives in internal/frontend (host_sessions_experience.go).
+var HomePurpose = frontend.HomePurpose

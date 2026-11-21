@@ -153,7 +153,6 @@ func newListTestHarness(t *testing.T) *listTestHarness {
 		db,
 		cat,
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
-		collections.WithoutDefaults(),
 		collections.WithIndexTTL(time.Hour),
 		collections.WithLiveTTL(time.Hour),
 	)
@@ -161,14 +160,16 @@ func newListTestHarness(t *testing.T) *listTestHarness {
 		t.Fatal(err)
 	}
 	pers, err := personalize.New(personalize.Options{
-		DB:          db,
-		Catalog:     cat,
-		Collections: cols,
-		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		DB:           db,
+		Catalog:      cat,
+		Collections:  cols,
+		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		RefreshEvery: -1,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { pers.Close() })
 	reg := extend.New()
 	rt := &listChannelFakeRuntime{routes: map[string]func(plugins.Request) (plugins.Response, error){}}
 
@@ -353,7 +354,21 @@ func TestListSourceLifecycleAndMatching(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateSpec failed: %v", err)
 	}
-	// A remote list builds in the background; wait for that build.
+	// CreateSpec starts the remote build asynchronously; wait for it to finish
+	// before calling Rebuild so its background call cannot race viewer reads.
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		sp, err := h.cols.GetSpec(ctx, created.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sp.LastBuiltAt != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("initial build did not finish")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	if created, err = h.cols.Rebuild(ctx, created.ID); err != nil {
 		t.Fatalf("Rebuild failed: %v", err)
 	}
@@ -527,8 +542,21 @@ func TestCollectionViewerUsesSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.cols.Rebuild(ctx, created.ID); err != nil {
-		t.Fatal(err)
+	// CreateSpec starts the remote build asynchronously. An immediate Rebuild
+	// can finish before that goroutine starts, leaving its later catalogue
+	// call incorrectly attributed to the viewer reads below.
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		sp, err := h.cols.GetSpec(ctx, created.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sp.LastBuiltAt != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("initial snapshot did not finish")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	h.rt.resetCalls()
 	got, err := h.cols.List(ctx, &core.User{ID: 1, IsOwner: true}, core.TypeMovie)

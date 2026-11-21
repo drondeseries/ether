@@ -35,7 +35,7 @@ describe("Owner usability", () => {
   it.each([
     { path: "/sources/usenet", trigger: "Add a Usenet provider", dialog: "New provider" },
     { path: "/sources/debrid", trigger: "Add a debrid service", dialog: "New debrid provider" },
-    { path: "/sources/indexers", trigger: "Import from Prowlarr", dialog: "Import from Prowlarr" },
+    { path: "/sources/indexers", trigger: "Add a source", dialog: "Add a source" },
     { path: "/cache", trigger: "Edit policy", dialog: "Edit cache policy" },
     { path: "/notifications/channels", trigger: "New channel", dialog: "New notification channel" },
   ])("keeps $path mounted while its drawer opens and closes", async ({ path, trigger, dialog }) => {
@@ -57,7 +57,8 @@ describe("Owner usability", () => {
     fireEvent.click(within(editor).getByRole("button", { name: "Close" }));
     await waitFor(() => expect(screen.queryByRole("dialog", { name: dialog })).toBeNull(), WAIT);
     expect(control.isConnected).toBe(true);
-    expect(screen.getByRole("button", { name: trigger })).toBe(control);
+    // The dialog unmounts before its exit animation releases the page from inert.
+    await waitFor(() => expect(screen.getByRole("button", { name: trigger })).toBe(control), WAIT);
   });
 
   it("closes a nested collection assistant with Escape while keeping the editor open", async () => {
@@ -81,24 +82,27 @@ describe("Owner usability", () => {
   it("shows newest logs first, including entries sharing a timestamp", async () => {
     const { fake } = renderApp("/maintenance/logs", {}, (f) => {
       f.state.logs = [
-        { time: "2026-10-19T09:00:00Z", level: "info", message: "oldest" },
-        { time: "2026-10-19T10:00:00Z", level: "info", message: "first at ten" },
-        { time: "2026-10-19T10:00:00Z", level: "warn", message: "last at ten" },
+        { id: 1, time: "2026-10-19T09:00:00Z", level: "info", message: "oldest" },
+        { id: 2, time: "2026-10-19T10:00:00Z", level: "info", message: "first at ten" },
+        { id: 3, time: "2026-10-19T10:00:00Z", level: "warn", message: "last at ten" },
       ];
     });
     const log = await screen.findByRole("log", { name: "Server logs" }, WAIT);
     await within(log).findByText("last at ten");
-    expect(
-      Array.from(log.querySelectorAll("time")).map((t) => t.parentElement!.textContent),
-    ).toEqual([
+    expect(Array.from(log.querySelectorAll("[data-log-entry]")).map((e) => e.textContent)).toEqual([
       expect.stringContaining("last at ten"),
       expect.stringContaining("first at ten"),
       expect.stringContaining("oldest"),
     ]);
-    fake.state.logs.push({ time: "2026-10-19T11:00:00Z", level: "info", message: "new arrival" });
+    fake.state.logs.push({
+      id: 4,
+      time: "2026-10-19T11:00:00Z",
+      level: "info",
+      message: "new arrival",
+    });
     fireEvent.click(screen.getByRole("button", { name: "Reload" }));
     await within(log).findByText("new arrival");
-    expect(log.querySelector("time")!.parentElement).toHaveTextContent("new arrival");
+    expect(log.querySelector("[data-log-entry]")).toHaveTextContent("new arrival");
     expect(screen.getByLabelText("Live updates")).not.toBeChecked();
   });
 });

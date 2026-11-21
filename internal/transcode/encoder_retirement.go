@@ -169,6 +169,9 @@ func (l *encoderLifetime) advance() {
 		if s != nil {
 			s.mu.Lock()
 			s.closed = true
+			if s.resumeWarm != nil {
+				s.resumeWarm.encoder.seal()
+			}
 			s.stopRunForLocked("session close")
 			s.broadcastLocked()
 			s.mu.Unlock()
@@ -306,7 +309,9 @@ func (l *encoderLifetime) markStarted() {
 	}
 }
 func (l *encoderLifetime) runWork(encoding bool) ([]*encoderWork, error) {
-	work, err := l.reserve(2)
+	// Exit, ordinary stop/serving, and the independent cancellation fence
+	// each own a ticket. Process exit cannot prove that Stop has returned.
+	work, err := l.reserve(3)
 	if err != nil || l == nil {
 		return work, err
 	}
@@ -319,7 +324,7 @@ func (l *encoderLifetime) runWork(encoding bool) ([]*encoderWork, error) {
 		}
 		l.mu.Unlock()
 		var remaining atomic.Int32
-		remaining.Store(2)
+		remaining.Store(3)
 		for _, w := range work {
 			w.after = func() {
 				if remaining.Add(-1) == 0 {
@@ -329,6 +334,30 @@ func (l *encoderLifetime) runWork(encoding bool) ([]*encoderWork, error) {
 		}
 	}
 	return work, nil
+}
+
+// runEncoderPreflight owns probes started before a Session is published.
+// Supersession cancels them, but retirement still waits for Run to reap the
+// process; cancellation alone is not evidence that an input producer exited.
+func (m *Manager) runEncoderPreflight(ctx context.Context, life *encoderLifetime, cmd Command) error {
+	work, err := life.reserve(1)
+	if err != nil {
+		return err
+	}
+	defer work[0].finish()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if life != nil {
+		go func() {
+			select {
+			case <-life.cancel:
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
+	}
+	life.markStarted()
+	return m.runner.Run(ctx, cmd)
 }
 
 func (s *Session) encoderRun(ctx context.Context, cmd Command) error {
@@ -426,12 +455,15 @@ func (l *encoderLifetime) decisionEncoding(encoding bool) {
 
 // fenceProcess bypasses session locks and the shared cleanup queue. A blocked
 // response or unrelated cleanup must never keep an expired encoder running.
-// The existing run tickets retain responsibility until actual process exit.
-func (l *encoderLifetime) fenceProcess(p Process) {
+// Its pre-reserved ticket retains responsibility until this Stop call returns,
+// even if a separate process-exit watcher has already finished.
+func (l *encoderLifetime) fenceProcess(p Process, work *encoderWork) {
 	if l == nil || p == nil {
+		work.finish()
 		return
 	}
 	go func() {
+		defer work.finish()
 		select {
 		case <-l.cancel:
 			p.Stop()

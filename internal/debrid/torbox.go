@@ -7,12 +7,15 @@ import (
 	"errors"
 	"fmt"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/net/publicsuffix"
 
 	"github.com/braedonsaunders/ether/internal/core"
 )
@@ -35,11 +38,14 @@ const (
 )
 
 type torBox struct {
-	key     string
-	opts    ProviderOptions
-	list    listCache
-	knownMu sync.Mutex
-	known   map[string]string // validated owned ids; no network lock on Play
+	key  string
+	opts ProviderOptions
+	// edgeApproval, when set (tests), aliases fixture hosts as CDN edges of
+	// each other; production approval runs without it.
+	edgeApproval func(raw, candidate string) bool
+	list         listCache
+	knownMu      sync.Mutex
+	known        map[string]string // validated owned ids; no network lock on Play
 }
 
 func newTorBox(key string, opts ProviderOptions) *torBox {
@@ -48,11 +54,69 @@ func newTorBox(key string, opts ProviderOptions) *torBox {
 
 func (p *torBox) Kind() string { return "torbox" }
 
+// edgePortableLinks: TorBox download links stand on the nexus CDN as a
+// whole. During the 2026-11-09 maintenance window a link minted on the
+// dying nexus-096 returned byte-for-byte 206 answers from nexus-132, -366
+// and -370: same path, same token, no re-mint. A file whose pinned node
+// died may therefore replay its link on a live edge.
+func (p *torBox) edgePortableLinks() bool { return true }
+
+// approvesCDNEdge keeps a link's token inside the issued host's
+// registrable domain. IP literals have no registrable domain.
+func (p *torBox) approvesCDNEdge(raw, candidate string) bool {
+	if p.edgeApproval != nil && p.edgeApproval(raw, candidate) {
+		return true // test fixtures alias loopback hosts to one CDN
+	}
+	issuedURL, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	cand, _, err := net.SplitHostPort(candidate)
+	if err != nil {
+		cand = candidate
+	}
+	cand = strings.Trim(strings.ToLower(cand), "[]") // [::1]:443 is an address, not a zone
+	issued := strings.ToLower(issuedURL.Hostname())
+	if cand == "" || issued == "" {
+		return false
+	}
+	if net.ParseIP(issued) != nil || net.ParseIP(cand) != nil {
+		return false
+	}
+	candDomain, cerr := publicsuffix.EffectiveTLDPlusOne(cand)
+	issuedDomain, ierr := publicsuffix.EffectiveTLDPlusOne(issued)
+	if cerr != nil || ierr != nil {
+		return false
+	}
+	// The shared registrable domain, publicsuffix's judgement rather than a
+	// stripped label: two tenants of a public suffix share the suffix, not
+	// the domain under it.
+	return candDomain == issuedDomain
+}
+
 type tbEnvelope struct {
 	Success bool            `json:"success"`
 	Error   string          `json:"error"`
 	Detail  string          `json:"detail"`
 	Data    json.RawMessage `json:"data"`
+}
+
+// TorBox uses false as well as null for an absent error. Decode diagnostic
+// fields independently so a successful payload is never rejected for its copy.
+func (e *tbEnvelope) UnmarshalJSON(body []byte) error {
+	var wire struct {
+		Success bool            `json:"success"`
+		Error   json.RawMessage `json:"error"`
+		Detail  json.RawMessage `json:"detail"`
+		Data    json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(body, &wire); err != nil {
+		return err
+	}
+	e.Success, e.Data = wire.Success, wire.Data
+	_ = json.Unmarshal(wire.Error, &e.Error)
+	_ = json.Unmarshal(wire.Detail, &e.Detail)
+	return nil
 }
 
 type tbTorrent struct {
@@ -63,9 +127,10 @@ type tbTorrent struct {
 	DownloadFinished bool        `json:"download_finished"`
 	DownloadState    string      `json:"download_state"`
 	Files            []struct {
-		ID   json.Number `json:"id"`
-		Name string      `json:"name"`
-		Size int64       `json:"size"`
+		ID       json.Number `json:"id"`
+		Name     string      `json:"name"`
+		Size     int64       `json:"size"`
+		MIMEType string      `json:"mimetype"`
 	} `json:"files"`
 }
 
@@ -83,6 +148,9 @@ func (p *torBox) do(ctx context.Context, r apiRequest) (json.RawMessage, error) 
 	derr := decodeJSON("torbox", body, &env)
 	if status >= 200 && status < 300 && derr == nil && env.Success {
 		return env.Data, nil
+	}
+	if derr != nil {
+		return nil, derr
 	}
 	logProviderResponse(ctx, p.key, status, env.Error, env.Detail)
 	return nil, p.classify(status, env)
@@ -186,6 +254,13 @@ func (p *torBox) torrent(ctx context.Context, id string) (*tbTorrent, error) {
 }
 
 func (p *torBox) Acquire(ctx context.Context, req AcquireRequest) (*Acquired, error) {
+	if req.Private && !req.privateChecked {
+		var perr error
+		req, perr = prepareAcquire(ctx, p, req, false)
+		if perr != nil {
+			return nil, perr
+		}
+	}
 	id, added := req.TorrentID, false
 	if id == "" {
 		// createtorrent enforces add_only_if_cached atomically. An extra
@@ -257,7 +332,7 @@ func (p *torBox) Acquire(ctx context.Context, req AcquireRequest) (*Acquired, er
 	}
 	files := make([]File, 0, len(t.Files))
 	for _, f := range t.Files {
-		files = append(files, File{ID: f.ID.String(), Path: f.Name, Size: f.Size})
+		files = append(files, File{ID: f.ID.String(), Path: f.Name, Size: f.Size, MIMEType: f.MIMEType})
 	}
 	chosen, err := req.Choose(files)
 	if err != nil {

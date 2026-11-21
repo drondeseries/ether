@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"context"
+	"strings"
 
 	"github.com/braedonsaunders/ether/internal/core"
 	"github.com/braedonsaunders/ether/internal/store"
@@ -56,19 +57,25 @@ CREATE TRIGGER catalog_show_episodes_count AFTER INSERT OR DELETE OR UPDATE OF t
 }
 
 // countStoredEpisodesBySeries counts what StoredEpisodesByKey pages for a
-// filter that only constrains the series: the sum of each admitted series'
-// known episodes, less those not yet aired. ok is false when the filter also
-// constrains the episodes themselves; the caller counts those directly.
+// filter that constrains the series, and the episodes only by the viewer's
+// rating cap and share filter: the sum of each admitted series' known
+// episodes (under a restriction, of its rating histogram rows the
+// restriction admits), less those not yet aired. ok is false when the filter
+// also constrains the episodes otherwise; the caller counts those directly.
 func (c *Catalog) countStoredEpisodesBySeries(ctx context.Context, f core.Filter) (int, bool, error) {
 	show, childExclude := splitStoredFilter(f, core.KindEpisode)
-	if conds, _ := c.childVisibilityConds(f.ChildVisibility); len(conds) > 0 {
+	if !c.histogramVisible(f.ChildVisibility) {
 		return 0, false, nil
 	}
+	// The restriction's episode conditions, re-checked on the few episodes
+	// subtracted below.
+	vis, visArgs := c.childVisibilityConds(f.ChildVisibility)
 	// The availability hidden set is the one episode condition counted here:
 	// it is few episodes (the evidence window), subtracted below, where a
 	// direct count would join every stored episode.
 	rest := f
-	rest.HiddenEpisodeGeneration, rest.AvailabilityKeepKeys = "", nil
+	clearGateFields(&rest)
+	rest.HiddenEpisodeSeq, rest.AvailabilityKeepKeys = 0, nil
 	if conds, _ := c.childFilterConds("e", rest, nil); len(conds) > 0 {
 		return 0, false, nil
 	}
@@ -88,36 +95,79 @@ func (c *Catalog) countStoredEpisodesBySeries(ctx context.Context, f core.Filter
 		args = append(args, vals...)
 	}
 	var known int
-	if err := c.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(a.known),0) FROM catalog_titles t JOIN catalog_show_episodes a ON a.show_key=t.key WHERE `+where, args...).Scan(&known); err != nil {
+	if len(vis) == 0 {
+		err = c.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(a.known),0) FROM catalog_titles t JOIN catalog_show_episodes a ON a.show_key=t.key WHERE `+where, args...).Scan(&known)
+	} else {
+		// The same conditions over each admitted series' histogram rows.
+		hist, histArgs := c.childVisibilityCondsOn(f.ChildVisibility, childCols{rating: "h.content_rating", rank: "h.rating_rank", collection: "h.collection_name"})
+		err = c.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(h.known),0) FROM catalog_titles t JOIN catalog_show_episode_ratings h ON h.show_key=t.key WHERE `+strings.Join(hist, " AND ")+` AND `+where,
+			append(append([]any{}, histArgs...), args...)...).Scan(&known)
+	}
+	if err != nil {
 		return 0, false, err
 	}
-	// Unaired episodes are few; the recent-episode index reads only them.
+	// Episodes subtracted below must pass the restriction too. Probing each
+	// candidate episode's show by primary key (with OFFSET 0 so PostgreSQL
+	// never hashes catalog_titles t under generic parameters) keeps unaired
+	// and recent-gate subtractions seeking catalog_titles_episode_release,
+	// while keeping both t and e in scope for childVisibilityConds.
+	probeCond := `t.key=e.show_key AND ` + where
+	episodeArgs := append([]any{}, args...)
+	if len(vis) > 0 {
+		probeCond += ` AND ` + strings.Join(vis, " AND ")
+		episodeArgs = append(episodeArgs, visArgs...)
+	}
+	episodes := `EXISTS(SELECT 1 FROM catalog_titles t WHERE ` + probeCond + ` LIMIT 1 OFFSET 0)`
+	// Unaired episodes are few; catalog_titles_episode_release reads only them.
 	var unaired int
-	if err := c.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM catalog_titles e JOIN catalog_titles t ON t.key=e.show_key
-		WHERE e.type='episode' AND e.release_known=1 AND e.released_ts>? AND e.adult=0 AND e.show_key<>0 AND `+where,
-		append([]any{c.now().Unix()}, args...)...).Scan(&unaired); err != nil {
+	if err := c.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM catalog_titles e
+		WHERE e.type='episode' AND e.release_known=1 AND e.released_ts>? AND e.adult=0 AND e.show_key<>0 AND `+episodes,
+		append([]any{c.now().Unix()}, episodeArgs...)...).Scan(&unaired); err != nil {
 		return 0, false, err
 	}
 	hidden := 0
 	if len(childExclude) > 0 {
-		vals := make([]any, 0, len(childExclude)+1+len(args))
+		vals := make([]any, 0, len(childExclude)+1+len(episodeArgs))
 		for _, k := range childExclude {
 			vals = append(vals, k)
 		}
 		vals = append(vals, c.now().Unix())
-		vals = append(vals, args...)
-		q := `SELECT COUNT(*) FROM catalog_titles e JOIN catalog_titles t ON t.key=e.show_key WHERE e.key IN (` + placeholders(len(childExclude)) + `) AND e.type='episode' AND e.adult=0 AND e.release_known=1 AND e.released_ts<=? AND ` + where
+		vals = append(vals, episodeArgs...)
+		q := `SELECT COUNT(*) FROM catalog_titles e WHERE e.key IN (` + placeholders(len(childExclude)) + `) AND e.type='episode' AND e.adult=0 AND e.release_known=1 AND e.released_ts<=? AND e.show_key<>0 AND ` + episodes
 		if err := c.db.QueryRowContext(ctx, q, vals...).Scan(&hidden); err != nil {
 			return 0, false, err
 		}
 	}
-	if f.HiddenEpisodeGeneration != "" {
+	if f.GatePolicy != "" && f.EpisodeGateCutoff != 0 {
+		gNow := gateNowTS(f, c.now().Unix())
+		vals := []any{f.EpisodeGateCutoff, gNow, f.GatePolicy, c.now().Unix()}
+		q := `SELECT COUNT(*) FROM catalog_titles e
+		WHERE e.type='episode' AND e.adult=0 AND e.release_known=1 AND e.released_ts>? AND e.released_ts<=?
+		AND NOT EXISTS (SELECT 1 FROM availability_gate ag WHERE ag.policy=? AND ag.rating_key=e.key LIMIT 1 OFFSET 0)
+		AND e.released_ts<=? AND e.show_key<>0 AND ` + episodes
+		vals = append(vals, episodeArgs...)
+		for _, keys := range [][]core.RatingKey{f.AvailabilityKeepKeys, childExclude} {
+			if len(keys) == 0 {
+				continue
+			}
+			q += ` AND e.key NOT IN (` + placeholders(len(keys)) + `)`
+			for _, k := range keys {
+				vals = append(vals, k)
+			}
+		}
+		var unavailable int
+		if err := c.db.QueryRowContext(ctx, q, vals...).Scan(&unavailable); err != nil {
+			return 0, false, err
+		}
+		hidden += unavailable
+	}
+	if f.HiddenEpisodeSeq != 0 {
 		// Aired episodes of admitted series in the published hidden set,
 		// less those kept and those already excluded above.
-		vals := []any{f.HiddenEpisodeGeneration, c.now().Unix()}
-		q := `SELECT COUNT(*) FROM availability_hidden ah JOIN catalog_titles e ON e.key=ah.rating_key JOIN catalog_titles t ON t.key=e.show_key
-		WHERE ah.kind='episode' AND ah.generation=? AND e.type='episode' AND e.adult=0 AND e.release_known=1 AND e.released_ts<=? AND ` + where
-		vals = append(vals, args...)
+		vals := []any{f.HiddenEpisodeSeq, f.HiddenEpisodeSeq, c.now().Unix()}
+		q := `SELECT COUNT(*) FROM availability_hidden ah JOIN catalog_titles e ON e.key=ah.rating_key
+		WHERE ah.kind='episode' AND ah.from_seq<=? AND ah.to_seq>? AND e.type='episode' AND e.adult=0 AND e.release_known=1 AND e.released_ts<=? AND e.show_key<>0 AND ` + episodes
+		vals = append(vals, episodeArgs...)
 		for _, keys := range [][]core.RatingKey{f.AvailabilityKeepKeys, childExclude} {
 			if len(keys) == 0 {
 				continue

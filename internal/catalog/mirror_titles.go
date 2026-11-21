@@ -19,6 +19,71 @@ func (m *Mirror) TitlesIncludingFuture(ctx context.Context, keys []core.RatingKe
 	return m.titles(ctx, keys, true)
 }
 
+// ValidKeys filters keys to stored, non-adult mirror entries matching Titles
+// (or TitlesIncludingFuture when includeFuture is true) in requested order,
+// without hydrating facet or credit join tables.
+func (m *Mirror) ValidKeys(ctx context.Context, keys []core.RatingKey, includeFuture bool) ([]core.RatingKey, error) {
+	if len(keys) == 0 {
+		return []core.RatingKey{}, nil
+	}
+	now := m.now()
+	valid := make(map[core.RatingKey]bool, len(keys))
+	const chunk = 400
+	for start := 0; start < len(keys); start += chunk {
+		end := start + chunk
+		if end > len(keys) {
+			end = len(keys)
+		}
+		part := keys[start:end]
+		args := make([]any, len(part))
+		for i, k := range part {
+			args[i] = int64(k)
+		}
+		ph := placeholders(len(part))
+		rows, err := m.db.QueryContext(ctx, `SELECT key,type,released_ts,adult,
+			COALESCE((SELECT h.checked FROM catalog_home_release h WHERE h.key=catalog_titles.key),0),
+			COALESCE((SELECT h.earliest_ts FROM catalog_home_release h WHERE h.key=catalog_titles.key),0)
+			FROM catalog_titles WHERE key IN (`+ph+`)`, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var key, released, home int64
+			var adult, checked int
+			var typ string
+			if err := rows.Scan(&key, &typ, &released, &adult, &checked, &home); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			var t core.Title
+			t.Key = core.RatingKey(key)
+			t.Type = core.MediaType(typ)
+			t.Adult = adult != 0
+			t.HomeReleaseChecked = checked != 0
+			if home != 0 {
+				t.HomeReleased = time.Unix(home, 0).UTC()
+			}
+			if released != 0 {
+				t.Released = time.Unix(released, 0).UTC()
+			}
+			if !t.Adult && (t.IsReleased(now) || includeFuture && !t.Released.IsZero()) {
+				valid[t.Key] = true
+			}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+	}
+	out := make([]core.RatingKey, 0, len(keys))
+	for _, k := range keys {
+		if valid[k] {
+			out = append(out, k)
+		}
+	}
+	return out, nil
+}
+
 func (m *Mirror) titles(ctx context.Context, keys []core.RatingKey, includeFuture bool) ([]core.Title, error) {
 	if len(keys) == 0 {
 		return []core.Title{}, nil
@@ -36,8 +101,8 @@ func (m *Mirror) titles(ctx context.Context, keys []core.RatingKey, includeFutur
 			args[i] = int64(k)
 		}
 		ph := placeholders(len(part))
-		rows, err := m.db.QueryContext(ctx, `SELECT key,type,tmdb_id,imdb,tvdb,title,original_title,sort_title,tagline,summary,year,
-			released_ts,runtime_sec,status,language,content_rating,rating,vote_count,popularity,poster,backdrop,logo,
+		rows, err := m.db.QueryContext(ctx, `SELECT key,type,tmdb_id,imdb,tvdb,title,original_title,english_title,sort_title,tagline,summary,year,
+			released_ts,runtime_sec,status,language,content_rating,enforcement_rating,rating,vote_count,popularity,poster,backdrop,logo,
 			collection_id,collection_name,child_count,leaf_count,fetched_at,adult,last_air_ts,
    COALESCE((SELECT h.checked FROM catalog_home_release h WHERE h.key=catalog_titles.key),0),
    COALESCE((SELECT h.earliest_ts FROM catalog_home_release h WHERE h.key=catalog_titles.key),0),
@@ -52,8 +117,8 @@ func (m *Mirror) titles(ctx context.Context, keys []core.RatingKey, includeFutur
 			var adult, checked, fallback int
 			var home int64
 			var typ string
-			if err := rows.Scan(&key, &typ, &t.IDs.TMDB, &t.IDs.IMDB, &t.IDs.TVDB, &t.Title, &t.OriginalTitle, &t.SortTitle,
-				&t.Tagline, &t.Summary, &t.Year, &released, &runtime, &t.Status, &t.Language, &t.ContentRating,
+			if err := rows.Scan(&key, &typ, &t.IDs.TMDB, &t.IDs.IMDB, &t.IDs.TVDB, &t.Title, &t.OriginalTitle, &t.EnglishTitle, &t.SortTitle,
+				&t.Tagline, &t.Summary, &t.Year, &released, &runtime, &t.Status, &t.Language, &t.ContentRating, &t.EnforcementRating,
 				&t.Rating, &t.VoteCount, &t.Popularity, &t.PosterPath, &t.BackdropPath, &t.LogoPath,
 				&t.CollectionID, &t.CollectionName, &t.ChildCount, &t.LeafCount, &fetched, &adult, &lastAir, &checked, &home, &fallback); err != nil {
 				rows.Close()

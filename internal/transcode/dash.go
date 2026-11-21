@@ -6,6 +6,7 @@ import (
 	"html"
 	"math"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/braedonsaunders/ether/internal/core"
@@ -40,14 +41,15 @@ func PlexDASHURLs(sessionID string) (string, string) {
 
 // dashRep is one Representation of a DASH session's MPD.
 type dashRep struct {
-	ID         int
-	Kind       string // "video" or "audio"
-	Codecs     string
-	Bandwidth  int // bits per second
-	Width      int
-	Height     int
-	SampleRate int
-	Channels   int
+	ID            int
+	Kind          string // "video" or "audio"
+	Codecs        string
+	Bandwidth     int // bits per second
+	Width         int
+	Height        int
+	SampleRate    int
+	ChannelLayout string
+	Channels      int
 }
 
 func (r dashRep) mimeType() string {
@@ -85,8 +87,15 @@ func mpdSeconds(d time.Duration) string {
 // duration, so players can seek anywhere before anything is transcoded.
 // The layout follows real PMS output byte for byte where it can.
 func renderMPD(duration, segDur time.Duration, initURL, mediaURL string, reps []dashRep) []byte {
+	return renderMPDWithBuffer(duration, segDur, segDur, initURL, mediaURL, reps)
+}
+
+func renderMPDWithBuffer(duration, segDur, minBuffer time.Duration, initURL, mediaURL string, reps []dashRep) []byte {
 	if segDur <= 0 {
 		segDur = DefaultDASHSegmentDuration
+	}
+	if minBuffer <= 0 {
+		minBuffer = segDur
 	}
 	timescale, segTicks := int64(1), int64(segDur/time.Second)
 	if segDur%time.Second != 0 {
@@ -104,7 +113,7 @@ func renderMPD(duration, segDur time.Duration, initURL, mediaURL string, reps []
 	fmt.Fprintf(&b, "\tmaxSegmentDuration=%q\n", mpdSeconds(2*segDur))
 	// One segment: Shaka (Plex Web) waits for max(minBufferTime, 2s)
 	// before starting. Two segments held every start for a second GOP.
-	fmt.Fprintf(&b, "\tminBufferTime=%q>\n", mpdSeconds(segDur))
+	fmt.Fprintf(&b, "\tminBufferTime=%q>\n", mpdSeconds(minBuffer))
 	fmt.Fprintf(&b, "\t<Period start=\"PT0S\" id=\"0\" duration=%q>\n", mpdDuration(duration))
 	// Several video representations form one AdaptationSet (an ABR
 	// ladder the player may switch within); a single video keeps the
@@ -115,7 +124,18 @@ func renderMPD(duration, segDur time.Duration, initURL, mediaURL string, reps []
 			videoReps++
 		}
 	}
-	if videoReps > 1 {
+	// Init-derived codecs can replace estimates. Keep the invariant at the
+	// renderer too: never group different codec families in one set.
+	family, mixed := "", false
+	for _, r := range reps {
+		if r.Kind == "video" {
+			if family != "" && family != dashCodecFamily(r.Codecs) {
+				mixed = true
+			}
+			family = dashCodecFamily(r.Codecs)
+		}
+	}
+	if videoReps > 1 && !mixed {
 		var rest []dashRep
 		b.WriteString("\t\t<AdaptationSet segmentAlignment=\"true\" contentType=\"video\">\n")
 		fmt.Fprintf(&b, "\t\t\t<SegmentTemplate timescale=\"%d\" duration=\"%d\" initialization=\"%s\" media=\"%s\" startNumber=\"0\">\n",
@@ -149,7 +169,7 @@ func renderMPD(duration, segDur time.Duration, initURL, mediaURL string, reps []
 			}
 			b.WriteString(">\n")
 			if r.Channels > 0 {
-				fmt.Fprintf(&b, "\t\t\t\t<AudioChannelConfiguration schemeIdUri=\"urn:mpeg:dash:23003:3:audio_channel_configuration:2011\" value=\"%d\"/>\n", r.Channels)
+				writeDASHChannelConfiguration(&b, r)
 			}
 		} else {
 			if r.Width > 0 && r.Height > 0 {
@@ -221,12 +241,16 @@ func dashReps(info core.MediaInfo, d core.Decision) []dashRep {
 			r.Bandwidth = copiedAudioKbps(a) * 1000
 			r.SampleRate = a.SampleRate
 			r.Channels = a.Channels
+			r.ChannelLayout = a.ChannelLayout
 		} else {
 			codec = d.AudioCodec
 			if codec == "" {
 				codec = "aac"
 			}
 			r.Channels = decisionAudioChannels(d, a)
+			if r.Channels == a.Channels {
+				r.ChannelLayout = a.ChannelLayout
+			}
 			r.SampleRate = decisionAudioRate(d)
 			r.Bandwidth = audioBitrateKbps(codec, r.Channels) * 1000
 		}
@@ -462,4 +486,58 @@ func renderLiveMPD(start, now time.Time, segDur time.Duration, last int, initURL
 	}
 	b.WriteString(`</Period></MPD>`)
 	return b.Bytes()
+}
+
+// Dolby uses a speaker-position bit mask, not the MPEG channel count.
+// DASH-IF IOP 4.2 section 9.4.2; Dolby's AudioChannelConfiguration table
+// assigns pairs (Lc/Rc, Lrs/Rrs) a single bit, rather than one bit per speaker.
+func writeDASHChannelConfiguration(b *bytes.Buffer, r dashRep) {
+	scheme, value := "urn:mpeg:dash:23003:3:audio_channel_configuration:2011", strconv.Itoa(r.Channels)
+	if r.Codecs == "ec-3" || r.Codecs == "ac-3" {
+		scheme = "tag:dolby.com,2014:dash:audio_channel_configuration:2011"
+		layout := r.ChannelLayout
+		if layout == "" {
+			layout = defaultChannelLayout("eac3", r.Channels)
+		}
+		switch layout {
+		case "mono":
+			value = "4000"
+		case "stereo":
+			value = "A000"
+		case "2.1":
+			value = "A001"
+		case "3.0":
+			value = "E000"
+		case "3.0(back)":
+			value = "A100"
+		case "4.0":
+			value = "E100"
+		case "quad", "quad(side)":
+			value = "B800"
+		case "5.0", "5.0(side)":
+			value = "F800"
+		case "5.1", "5.1(side)":
+			value = "F801"
+		case "6.1":
+			value = "F901"
+		case "7.1":
+			value = "FA01"
+		default:
+			return // An unknown layout cannot be inferred from channel count.
+		}
+	}
+	fmt.Fprintf(b, "\t\t\t\t<AudioChannelConfiguration schemeIdUri=\"%s\" value=\"%s\"/>\n", scheme, value)
+}
+
+// dashCodecFamily ignores profile/level while treating alternate sample entry
+// names for the same codec as one family.
+func dashCodecFamily(codecs string) string {
+	family, _, _ := strings.Cut(codecs, ".")
+	switch family {
+	case "avc1", "avc3":
+		return "h264"
+	case "hev1", "hvc1":
+		return "hevc"
+	}
+	return family
 }

@@ -202,7 +202,7 @@ func (s *Service) SourceKindOf(src Source) string {
 }
 
 func builtinSourceKinds() []SourceKind {
-	return []SourceKind{plexGuideKind{}, xtreamKind{}, guideOnlyKind{}, m3uKind{}, virtualKind{}}
+	return []SourceKind{providerGuideKind{}, xtreamKind{}, guideOnlyKind{}, m3uKind{}, virtualKind{}}
 }
 
 func authParams() []extend.ParamField {
@@ -299,10 +299,10 @@ func (virtualKind) Fetch(context.Context, *Service, *Source) (Fetched, error) {
 }
 
 // fetchPlaylistGuide is the shared M3U/XMLTV fetch: download the playlist,
-// parse channels, then fetch and filter the guide. Behaviour is unchanged
-// from the pre-registry ImportSource.
+// parse channels, then fetch and filter the guide.
 func fetchPlaylistGuide(ctx context.Context, s *Service, src *Source, withChannels bool) (Fetched, error) {
 	var err error
+	src.PlaylistGuide = false
 	progress := importProgress(ctx)
 	if progress != nil {
 		progress.setPhase("playlist")
@@ -311,6 +311,10 @@ func fetchPlaylistGuide(ctx context.Context, s *Service, src *Source, withChanne
 		s.o.Logger.Info("Live TV source fetching", "sourceId", src.ID, "source", src.Name, "url", sourceOrigin(*src), "step", "playlist")
 		src.Playlist, err = s.readURLWith(ctx, src.PlaylistURL, maxPlaylistBytes, src.Auth.header(), "playlist")
 		if err != nil {
+			if len(src.Logins) > 0 && withChannels {
+				src.Account = &ProviderAccount{Status: "Disabled", CheckedAt: s.o.Now()}
+				return s.cachedPrimaryLineup(ctx, src, fmt.Errorf("playlist: %w", err))
+			}
 			return Fetched{}, fmt.Errorf("playlist: %w", err)
 		}
 	}
@@ -318,29 +322,50 @@ func fetchPlaylistGuide(ctx context.Context, s *Service, src *Source, withChanne
 		return Fetched{}, fmt.Errorf("source needs a playlist or an XMLTV guide")
 	}
 	var cs []Channel
+	var playlistGuides []string
 	if withChannels && strings.TrimSpace(src.Playlist) != "" {
 		var stats m3uStats
 		cs, stats, err = parseM3U(strings.NewReader(src.Playlist), src.ID)
 		if err != nil {
 			return Fetched{}, fmt.Errorf("playlist: %w", err)
 		}
+		if len(cs) == 0 {
+			if err := s.refuseEmptyLineup(ctx, src); err != nil {
+				return Fetched{}, fmt.Errorf("playlist: %w", err)
+			}
+		}
 		src.SkippedVOD = stats.SkippedVOD
+		playlistGuides = stats.GuideURLs
 		cs = s.applyGroupRules(ctx, src, cs)
 		if progress != nil {
 			progress.setChannels(len(cs))
 		}
 		s.o.Logger.Info("Live TV source read", "sourceId", src.ID, "source", src.Name, "step", "playlist", "bytes", len(src.Playlist), "channels", len(cs), "skippedVod", stats.SkippedVOD)
 	}
-	g, err := fetchSourceGuide(ctx, s, src, cs, withChannels && strings.TrimSpace(src.Playlist) != "")
+	g, err := fetchSourceGuide(ctx, s, src, cs, withChannels && strings.TrimSpace(src.Playlist) != "", playlistGuides)
 	if err != nil {
 		return Fetched{}, err
 	}
 	return Fetched{Channels: cs, Guide: g}, nil
 }
 
+// playlistGuideHeaders scopes source credentials to same-origin playlist guide
+// URLs so third-party x-tvg-url hosts never receive provider logins.
+func playlistGuideHeaders(src Source, guideURL string) http.Header {
+	if src.Auth == nil || src.PlaylistURL == "" {
+		return nil
+	}
+	origin := urlOrigin(guideURL)
+	if origin == "" || origin != urlOrigin(src.PlaylistURL) {
+		return nil
+	}
+	return src.Auth.header()
+}
+
 // fetchSourceGuide reads a source's guide, keeping only the channels it
-// lists (all of them for a guide-only source).
-func fetchSourceGuide(ctx context.Context, s *Service, src *Source, cs []Channel, hasChannels bool) (XMLGuide, error) {
+// lists (all of them for a guide-only source). When the owner has not set a
+// guide, playlistGuides discovered in #EXTM3U (x-tvg-url / url-tvg) are used.
+func fetchSourceGuide(ctx context.Context, s *Service, src *Source, cs []Channel, hasChannels bool, playlistGuides []string) (XMLGuide, error) {
 	allow, err := s.guideAllow(ctx, *src, cs, hasChannels)
 	if err != nil {
 		return XMLGuide{}, err
@@ -350,7 +375,7 @@ func fetchSourceGuide(ctx context.Context, s *Service, src *Source, cs []Channel
 	if len(cs) > 0 {
 		filter.Resolve = func(channels map[string]Channel, names map[string][]string) map[string]struct{} {
 			candidates := nameCandidates(cs, channels, names)
-			nameCandidateCount = len(candidates)
+			nameCandidateCount += len(candidates)
 			return candidates
 		}
 	}
@@ -366,7 +391,7 @@ func fetchSourceGuide(ctx context.Context, s *Service, src *Source, cs []Channel
 		if err != nil {
 			return XMLGuide{}, fmt.Errorf("guide: %w", err)
 		}
-	} else if src.Guide != "" {
+	} else if strings.TrimSpace(src.Guide) != "" {
 		var dropped bool
 		g, dropped, err = parseXMLTV(strings.NewReader(src.Guide), filter)
 		if err != nil {
@@ -379,13 +404,59 @@ func fetchSourceGuide(ctx context.Context, s *Service, src *Source, cs []Channel
 			}
 			src.Guide = trimmed
 		}
+	} else if len(playlistGuides) > 0 {
+		loaded := 0
+		var lastErr error
+		for _, raw := range playlistGuides {
+			s.o.Logger.Info("Live TV source fetching", "sourceId", src.ID, "source", src.Name, "url", urlOrigin(raw), "step", "guide")
+			part, readErr := s.readGuide(ctx, raw, playlistGuideHeaders(*src, raw), filter)
+			if readErr != nil {
+				if ctx.Err() != nil {
+					return XMLGuide{}, fmt.Errorf("guide: %w", readErr)
+				}
+				lastErr = readErr
+				s.o.Logger.Warn("Live TV playlist guide fetch failed", "sourceId", src.ID, "source", src.Name, "url", urlOrigin(raw), "error", readErr)
+				continue
+			}
+			mergeXMLGuide(&g, part)
+			loaded++
+		}
+		if loaded > 0 {
+			src.PlaylistGuide = true
+		} else if lastErr != nil {
+			if old, e := s.storedSourceByID(ctx, src.ID); e == nil && old.PlaylistGuide {
+				return XMLGuide{}, fmt.Errorf("guide: %w", lastErr)
+			}
+		}
 	}
 	g.Programmes = dedupeProgrammes(g.Programmes)
-	if src.Guide != "" || src.GuideURL != "" {
+	if src.Guide != "" || src.GuideURL != "" || src.PlaylistGuide {
 		if progress != nil {
 			progress.setProgrammes(len(g.Programmes))
 		}
 		s.o.Logger.Info("Live TV source read", "sourceId", src.ID, "source", src.Name, "step", "guide", "guideChannels", len(g.Channels), "nameCandidates", nameCandidateCount, "lateChannels", g.LateChannels, "programmes", len(g.Programmes))
 	}
 	return g, nil
+}
+
+// GuideFeatures describes upstream behavior without identifying a frontend.
+type GuideFeatures struct{ Remote, ReviewedAliases bool }
+type guideFeatureSource interface{ GuideFeatures() GuideFeatures }
+
+func (providerGuideKind) GuideFeatures() GuideFeatures {
+	return GuideFeatures{Remote: true, ReviewedAliases: true}
+}
+func (s *Service) sourceGuideFeatures(src Source) GuideFeatures {
+	k, ok := s.kindRegistry().Classify(src)
+	if ok {
+		if p, ok := k.(guideFeatureSource); ok {
+			return p.GuideFeatures()
+		}
+	}
+	return GuideFeatures{}
+}
+
+func defaultGuideFeatures(src Source) GuideFeatures {
+	s := &Service{}
+	return s.sourceGuideFeatures(src)
 }

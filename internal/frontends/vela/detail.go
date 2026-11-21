@@ -1,0 +1,256 @@
+package vela
+
+import (
+	"net/http"
+	"strconv"
+
+	"github.com/braedonsaunders/ether/internal/frontend"
+)
+
+// mediaSummary reports only facts already present on the authorized detail.
+// Reading a title must not resolve a source just to fill a badge.
+func mediaSummary(d frontend.ItemDetail) object {
+	tracks := d.Tracks
+	if d.TracksEstimated {
+		tracks = nil
+		for _, v := range d.Versions {
+			if !v.Media.Estimated && len(v.Media.Streams) > 0 {
+				tracks = v.Media.Streams
+				break
+			}
+		}
+		if len(tracks) == 0 {
+			return nil
+		}
+	}
+	video, audio := []object{}, []object{}
+	for _, s := range tracks {
+		entry := object{}
+		if s.Codec != "" {
+			entry["codec"] = s.Codec
+		}
+		switch s.Type {
+		case "video":
+			if s.Width > 0 {
+				entry["width"] = s.Width
+			}
+			if s.Height > 0 {
+				entry["height"] = s.Height
+			}
+			depth := s.BitDepth
+			if s.BitsPerRawSample != nil && *s.BitsPerRawSample > 0 {
+				depth = *s.BitsPerRawSample
+			}
+			if depth > 0 {
+				entry["bitDepth"] = depth
+			}
+			if s.ColorTransfer != "" {
+				entry["colorTransfer"] = s.ColorTransfer
+			}
+			profile := s.DolbyVisionProfile
+			if s.ProbedDolbyVisionProfile != nil {
+				profile = *s.ProbedDolbyVisionProfile
+			}
+			if profile > 0 {
+				entry["dolbyVisionProfile"] = profile
+			}
+			if len(entry) > 0 {
+				video = append(video, entry)
+			}
+		case "audio":
+			if s.Channels > 0 {
+				entry["channels"] = s.Channels
+			}
+			if s.Language != "" {
+				entry["language"] = s.Language
+			}
+			if len(entry) > 0 {
+				audio = append(audio, entry)
+			}
+		}
+	}
+	if len(video) == 0 && len(audio) == 0 {
+		return nil
+	}
+	return object{"video": video, "audio": audio}
+}
+
+func crewPeople(t frontend.Title) []frontend.Person {
+	out := []frontend.Person{}
+	seen := map[string]bool{}
+	for _, group := range [][]frontend.Person{t.Crew, t.Directors, t.Writers} {
+		for _, p := range group {
+			if p.Name == "" {
+				continue
+			}
+			identity := p.Name
+			if p.TMDB > 0 {
+				identity = "tmdb:" + strconv.FormatInt(p.TMDB, 10)
+			} else if p.IMDB != "" {
+				identity = "imdb:" + p.IMDB
+			} else if p.ID != "" {
+				identity = "id:" + p.ID
+			}
+			key := identity + "\x00" + p.Role
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// Detail children are bounded first pages in the neutral service's order.
+// Subsequent selections use /titles/:id/children; no episode is inferred.
+func (i *instance) detailChildren(r *http.Request, v *frontend.Viewer, token string, d frontend.ItemDetail, out object) error {
+	key := d.Title.Key
+	isShow := key.Kind() == frontend.KindShow || d.Title.Type == frontend.TypeShow
+	isSeason := key.Kind() == frontend.KindSeason || d.Title.Type == frontend.TypeSeason
+	if !isShow && !isSeason {
+		return nil
+	}
+	page, err := i.host.Experience.Children(r.Context(), v, requestDevice(r), key, frontend.ItemQuery{Limit: 50, NoTotal: true})
+	if err != nil {
+		return err
+	}
+	converted, err := i.titles(r, v, token, page.Items)
+	if err != nil {
+		return err
+	}
+	if isSeason {
+		out["episodes"] = converted
+		return nil
+	}
+	out["seasons"] = converted
+	for _, season := range page.Items {
+		if season.Key.Kind() != frontend.KindSeason && season.Type != frontend.TypeSeason {
+			continue
+		}
+		episodes, err := i.host.Experience.Children(r.Context(), v, requestDevice(r), season.Key, frontend.ItemQuery{Limit: 50, NoTotal: true})
+		if err != nil {
+			return err
+		}
+		converted, err = i.titles(r, v, token, episodes.Items)
+		if err != nil {
+			return err
+		}
+		out["episodes"] = converted
+		break
+	}
+	return nil
+}
+
+func (i *instance) creditIDs(r *http.Request, v *frontend.Viewer, d frontend.ItemDetail) map[int64]string {
+	var ids []int64
+	seen := map[int64]bool{}
+	for _, group := range [][]frontend.Person{d.Title.Cast, d.Title.Crew, d.Title.Directors, d.Title.Writers} {
+		for _, person := range group {
+			if person.TMDB > 0 && !seen[person.TMDB] {
+				seen[person.TMDB] = true
+				ids = append(ids, person.TMDB)
+			}
+		}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	result := make(map[int64]string, len(ids))
+	for start := 0; start < len(ids); start += 256 {
+		allowed, err := i.host.Experience.PersonFacetIDs(r.Context(), v, requestDevice(r), d.Title.Key, ids[start:min(start+256, len(ids))])
+		if err != nil {
+			return nil
+		}
+		for id, value := range allowed {
+			if seen[id] && value != "" {
+				result[id] = value
+			}
+		}
+	}
+	return result
+}
+
+// Cast and crew share one current-credit proof and admission transaction.
+func (i *instance) credits(r *http.Request, v *frontend.Viewer, token string, d frontend.ItemDetail) ([]object, []object, error) {
+	facetIDs := i.creditIDs(r, v, d)
+	people := append([]frontend.Person(nil), d.Title.Cast...)
+	out := make([]object, 0, len(people))
+	for _, person := range people {
+		entry := object{"name": person.Name, "role": person.Role}
+		if id := facetIDs[person.TMDB]; id != "" {
+			entry["id"] = id
+		}
+		out = append(out, entry)
+	}
+	castCount := len(out)
+	crew := crewPeople(d.Title)
+	people = append(people, crew...)
+	for _, person := range crew {
+		entry := object{"name": person.Name}
+		if id := facetIDs[person.TMDB]; id != "" {
+			entry["id"] = id
+		}
+		if person.Role != "" {
+			entry["role"] = person.Role
+		}
+		out = append(out, entry)
+	}
+	out, err := i.creditArtwork(r, token, d, people, out)
+	if err != nil {
+		return nil, nil, err
+	}
+	// Keep empty groups as JSON arrays.
+	castOut, crewOut := []object{}, []object{}
+	castOut = append(castOut, out[:castCount]...)
+	crewOut = append(crewOut, out[castCount:]...)
+	return castOut, crewOut, nil
+}
+
+// Each batch proves current credit membership and admits portrait grants;
+// no person lookup or metadata refresh is needed here.
+func (i *instance) creditArtwork(r *http.Request, token string, d frontend.ItemDetail, people []frontend.Person, out []object) ([]object, error) {
+	portraits := map[string]frontend.Image{}
+	if d.ImagesAuthoritative {
+		for _, image := range d.Images {
+			if image.Kind == frontend.ImagePerson && image.Subject != "" && image.Path != "" {
+				if _, exists := portraits[image.Subject]; !exists {
+					portraits[image.Subject] = image
+				}
+			}
+		}
+	}
+	targets := []frontend.PersonImageTarget{}
+	positions := []int{}
+	for n, person := range people {
+		if person.TMDB <= 0 {
+			continue
+		}
+		if image, ok := portraits["tmdb:"+strconv.FormatInt(person.TMDB, 10)]; ok {
+			targets = append(targets, frontend.PersonImageTarget{Item: d.Title.Key, Image: image})
+			positions = append(positions, n)
+		}
+	}
+	signer, ok := i.host.ImageGrants.(frontend.PersonImageGrantBatch)
+	if !ok {
+		return out, nil
+	}
+	for start := 0; start < len(targets); start += 100 {
+		end := min(start+100, len(targets))
+		secrets, err := signer.IssuePersonImages(r.Context(), token, requestDevice(r), targets[start:end])
+		if err != nil {
+			return nil, err
+		}
+		if len(secrets) != end-start {
+			return nil, frontend.ErrNotAvailable
+		}
+		for n, secret := range secrets {
+			if secret == "" {
+				continue
+			}
+			image := targets[start+n].Image
+			out[positions[start+n]]["artwork"] = object{"id": hash(image.Path), "kind": frontend.ImagePerson, "tag": image.Tag, "sizes": []object{imageSize(image, secret)}, "blurHash": image.BlurHash, "thumbHash": image.ThumbHash}
+		}
+	}
+	return out, nil
+}

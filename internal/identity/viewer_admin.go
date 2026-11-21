@@ -36,6 +36,7 @@ func (l *Local) CreateViewer(ctx context.Context, username, password string) (in
 	if err = tx.Commit(); err != nil {
 		return 0, err
 	}
+	l.emitViewerCreated(id, username, "local", "local")
 	return id, nil
 }
 

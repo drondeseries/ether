@@ -7,6 +7,7 @@ import (
 	"compress/gzip"
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,6 +24,7 @@ import (
 
 	"github.com/braedonsaunders/ether/internal/core"
 	"github.com/braedonsaunders/ether/internal/flight"
+	"github.com/braedonsaunders/ether/internal/httpclient"
 	_ "modernc.org/sqlite"
 )
 
@@ -84,7 +86,7 @@ func NewDictionarry(o DictionarryOptions) *Dictionarry {
 	if o.Client == nil {
 		o.Client = &http.Client{Timeout: 30 * time.Second}
 	}
-	o.UserAgent = cmpOr(o.UserAgent, "Ether (+https://github.com/braedonsaunders/ether)")
+	o.UserAgent = cmpOr(o.UserAgent, httpclient.UserAgent())
 	if o.TTL <= 0 {
 		o.TTL = time.Hour
 	}
@@ -251,7 +253,8 @@ func compileDictionarryArchive(ctx context.Context, archiveBytes []byte) (*dicti
 		if entries > dictionarryMaxTarEntries {
 			return nil, fmt.Errorf("%w: archive has too many entries", ErrDictionarryUnavailable)
 		}
-		if hdr.Typeflag != tar.TypeReg && hdr.Typeflag != tar.TypeRegA {
+		// tar.Reader already normalises legacy TypeRegA headers to TypeReg.
+		if hdr.Typeflag != tar.TypeReg {
 			continue
 		}
 		clean := path.Clean(strings.TrimLeft(hdr.Name, "/"))
@@ -518,13 +521,38 @@ func extractDictionarryCatalog(ctx context.Context, db *sql.DB) (*dictionarryCat
 	}
 	sRows.Close()
 
-	// 5. Compile custom formats for both apps.
+	// 5. Allocate IDs from all source names before compiling either app. A
+	// profile's subset must not decide which colliding name keeps an ID.
+	nameRows, err := db.QueryContext(ctx, `SELECT name FROM custom_formats ORDER BY name`)
+	if err != nil {
+		return nil, fmt.Errorf("%w: query format names: %v", ErrDictionarryUnavailable, err)
+	}
+	var formatNames []string
+	for nameRows.Next() {
+		var name string
+		if err := nameRows.Scan(&name); err != nil {
+			nameRows.Close()
+			return nil, err
+		}
+		formatNames = append(formatNames, name)
+	}
+	if err := nameRows.Err(); err != nil {
+		nameRows.Close()
+		return nil, err
+	}
+	nameRows.Close()
+	formatIDs := map[string]map[string]string{}
+	for _, app := range []string{AppRadarr, AppSonarr} {
+		formatIDs[app] = dictionarryFormatIDs(app, formatNames)
+	}
+
+	// Compile custom formats for both apps.
 	formats := map[string]map[string]core.CustomFormat{
 		AppRadarr: {},
 		AppSonarr: {},
 	}
 	for _, app := range []string{AppRadarr, AppSonarr} {
-		cfMap, err := extractDictionarryFormats(ctx, db, app, profileScores[app])
+		cfMap, err := extractDictionarryFormats(ctx, db, app, profileScores[app], formatIDs[app])
 		if err != nil {
 			return nil, err
 		}
@@ -552,7 +580,7 @@ func extractDictionarryCatalog(ctx context.Context, db *sql.DB) (*dictionarryCat
 		group := dictionarryProfileGroup(p.name, p.tags)
 
 		for _, app := range []string{AppRadarr, AppSonarr} {
-			imp, ok := buildDictionarryImport(app, id, p, qItems, apiNames[app], profileScores[app][p.name])
+			imp, ok := buildDictionarryImport(app, id, p, qItems, apiNames[app], profileScores[app][p.name], formatIDs[app])
 			if !ok {
 				continue
 			}
@@ -638,6 +666,7 @@ func buildDictionarryImport(
 	qItems []dictionarryQualityItem,
 	apiMap map[string]string,
 	scores map[string]int,
+	formatIDs map[string]string,
 ) (QualityImport, bool) {
 	type starrItem struct {
 		Name    string   `json:"name"`
@@ -666,7 +695,7 @@ func buildDictionarryImport(
 
 	formatItems := make(map[string]string, len(scores))
 	for cfName := range scores {
-		formatItems[cfName] = dictionarryFormatID(app, cfName)
+		formatItems[cfName] = formatIDs[cfName]
 	}
 
 	var lang string
@@ -691,7 +720,7 @@ func buildDictionarryImport(
 		"items":                 items,
 		"formatItems":           formatItems,
 	}
-	if lang != "" && !strings.EqualFold(lang, "Any") && !strings.EqualFold(lang, "Unknown") {
+	if lang != "" && !strings.EqualFold(lang, "Unknown") {
 		payload["language"] = lang
 	}
 	raw, err := json.Marshal(payload)
@@ -708,9 +737,9 @@ func buildDictionarryImport(
 		imp.Warnings = append(imp.Warnings, fmt.Sprintf("Excluded language rules (%s) are handled by custom format scoring rather than a hard profile filter.", strings.Join(excludedLangs, ", ")))
 	}
 
-	// Refine HDR, Dolby Vision, codec, and audio preferences from Dictionarry's
-	// profile tags and custom format scores (e.g. 1080p Efficient and
-	// 1080p Quality HDR allow HDR/DV and prefer HEVC at 1080p).
+	// Allow HDR and Dolby Vision where Dictionarry's profile tags or format
+	// scores want them (1080p Quality HDR, the 2160p profiles). Codec and
+	// audio preferences are the profile's own custom format scores.
 	hasTag := func(want string) bool {
 		return slices.ContainsFunc(p.tags, func(t string) bool { return strings.EqualFold(t, want) })
 	}
@@ -721,17 +750,28 @@ func buildDictionarryImport(
 		imp.Profile.AllowHDR = true
 		imp.Profile.AllowDolbyVision = true
 	}
-	if (hasTag("h265") || hasTag("x265") || hasTag("HEVC")) && (!hasTag("h264") && !hasTag("x264") || hasTag("HDR") || imp.Profile.MaxHeight >= 2160) {
-		imp.Profile.PreferredCodecs = []string{"hevc", "h264"}
-	}
-	if hasTag("Lossless Audio") {
-		imp.Profile.PreferredAudio = []string{"truehd", "dts", "eac3", "ac3", "aac"}
-	}
 	return imp, true
 }
 
-func dictionarryFormatID(app, cfName string) string {
-	return "dictionarry-" + app + "-" + trashSlug(cfName)
+// dictionarryFormatIDs preserves readable IDs for unambiguous names. For
+// colliding slugs ("Dolby Digital" / "Dolby Digital +"), every member gets
+// its exact UTF-8 name encoded after a colon. Slugs cannot contain a colon,
+// and hex is lossless, so neither another slug nor another name can alias it.
+// Both definitions and profile references use this same catalog-wide mapping.
+func dictionarryFormatIDs(app string, names []string) map[string]string {
+	counts := map[string]int{}
+	for _, name := range names {
+		counts[trashSlug(name)]++
+	}
+	ids := make(map[string]string, len(names))
+	for _, name := range names {
+		slug := trashSlug(name)
+		if counts[slug] > 1 {
+			slug += ":" + hex.EncodeToString([]byte(name))
+		}
+		ids[name] = "dictionarry-" + app + "-" + slug
+	}
+	return ids
 }
 
 func extractDictionarryFormats(
@@ -739,6 +779,7 @@ func extractDictionarryFormats(
 	db *sql.DB,
 	app string,
 	profileScores map[string]map[string]int,
+	formatIDs map[string]string,
 ) (map[string]core.CustomFormat, error) {
 	// Load all regex patterns once.
 	regexes := map[string]string{}
@@ -835,9 +876,10 @@ func extractDictionarryFormats(
 
 	out := make(map[string]core.CustomFormat, len(specsByCF))
 	for cfName, specs := range specsByCF {
-		fid := dictionarryFormatID(app, cfName)
+		fid := formatIDs[cfName]
 		scores := map[string]int{}
-		for profName, profMap := range profileScores {
+		for _, profName := range slices.Sorted(maps.Keys(profileScores)) {
+			profMap := profileScores[profName]
 			if sc, ok := profMap[cfName]; ok {
 				scores[profName] = sc
 				if _, hasDef := scores["default"]; !hasDef {

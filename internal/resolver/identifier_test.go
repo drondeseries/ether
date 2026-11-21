@@ -21,8 +21,8 @@ func TestReportedIDsDisambiguateWithoutBypassingEpisodeOrYear(t *testing.T) {
 		want          string
 	}{
 		{"translated title with evidence", "Pilote.Spatial.S02E02.Pierre.et.Ciel.1080p.WEB.H264-GRP", core.IDs{TMDB: 123}, ""},
-		{"query ID alone proves nothing", "Pilote.Spatial.S02E02.1080p.WEB.H264-GRP", core.IDs{}, "title mismatch"},
-		{"obfuscated without reported ID", "a1b2c3d4e5f6g7h8.S02E02.1080p.WEB.H264-GRP", core.IDs{}, "title mismatch"},
+		{"query ID alone proves nothing", "Pilote.Spatial.S02E02.1080p.WEB.H264-GRP", core.IDs{}, `title mismatch (parsed "Pilote Spatial"; expected "Space Pilot")`},
+		{"obfuscated without reported ID", "a1b2c3d4e5f6g7h8.S02E02.1080p.WEB.H264-GRP", core.IDs{}, `title mismatch (parsed "a1b2c3d4e5f6g7h8"; expected "Space Pilot")`},
 		{"conflicting ID with exact name", "Space.Pilot.S02E02.1080p.WEB.H264-GRP", core.IDs{TMDB: 456}, "indexer title identifier mismatch"},
 		{"wrong episode despite matching ID", "Space.Pilot.S02E03.1080p.WEB.H264-GRP", core.IDs{TMDB: 123}, "season/episode mismatch"},
 		{"wrong reboot despite matching ID", "Space.Pilot.2023.S02E02.1080p.WEB.H264-GRP", core.IDs{TMDB: 123}, "series year mismatch"},
@@ -83,7 +83,9 @@ func TestSeriesYearDisambiguatesInsteadOfFiltering(t *testing.T) {
 		}
 		return false, errors.New("lookup failed")
 	}})
-	profile := SelectProfile(cfg.Quality, webCaps(), nil)
+	// "Series year differs" is a TV-only format: only a Shows profile
+	// scores it, as Resolve picks for an episode.
+	profile := SelectProfileForMedia(cfg.Quality, webCaps(), nil, titleMedia(title))
 	sreq := searchRequestFor(title)
 	mk := func(id, name string) core.Release {
 		r := rel(id, name, 1500)

@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { PluginSourceCards, PluginSourceUsage } from "./PluginSources";
+import { PluginSourceCards, usePluginSourceSummaries } from "./PluginSources";
 
 const mockDescriptors = [
   {
@@ -90,10 +90,17 @@ describe("PluginSources", () => {
         );
       }
       if (url.endsWith("/api/plugins/org.ether.fixture-source/test") && init?.method === "POST") {
-        return new Response(JSON.stringify({ ok: true, durationMs: 12 }), {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-        });
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            durationMs: 12,
+            message: "Anonymous mode active; add a key for higher limits.",
+          }),
+          {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          },
+        );
       }
       return new Response(JSON.stringify({}), {
         status: 200,
@@ -140,13 +147,16 @@ describe("PluginSources", () => {
         expect.objectContaining({ method: "POST" }),
       );
     });
+    expect(
+      (await screen.findAllByText("Anonymous mode active; add a key for higher limits.")).length,
+    ).toBeGreaterThanOrEqual(2);
   });
 
   it("filters debrid plugin sources on the Debrid tab and renders usage summary", async () => {
     render(
       <MemoryRouter>
         <PluginSourceCards classes={["debrid"]} />
-        <PluginSourceUsage />
+        <PluginSummaries />
       </MemoryRouter>,
     );
 
@@ -160,3 +170,15 @@ describe("PluginSources", () => {
     expect(screen.getByText(/50 grabs a day/)).toBeTruthy();
   });
 });
+
+function PluginSummaries() {
+  return (
+    <ul>
+      {usePluginSourceSummaries().map((p) => (
+        <li key={p.id}>
+          <span>{p.label}</span> <span>{p.summary}</span>
+        </li>
+      ))}
+    </ul>
+  );
+}

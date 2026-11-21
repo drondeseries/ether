@@ -9,7 +9,7 @@
       "groups": [
         {
           "description": {
-            "source": "The names apps show for this server and its libraries."
+            "source": "The name apps show for this server."
           },
           "fields": [
             {
@@ -20,26 +20,6 @@
               "kind": "text",
               "label": {
                 "source": "Server name"
-              }
-            },
-            {
-              "help": {
-                "source": "Name shown in Plex. A rename inside Plex does not stick."
-              },
-              "key": "moviesLibraryName",
-              "kind": "text",
-              "label": {
-                "source": "Movies library name"
-              }
-            },
-            {
-              "help": {
-                "source": "Name shown in Plex. A rename inside Plex does not stick."
-              },
-              "key": "tvShowsLibraryName",
-              "kind": "text",
-              "label": {
-                "source": "TV Shows library name"
               }
             }
           ],
@@ -102,14 +82,14 @@
             },
             {
               "help": {
-                "source": "Networks whose forwarding headers Ether trusts. Empty trusts none."
+                "source": "IP addresses or CIDR ranges of reverse proxies on other machines (such as Caddy or Nginx) whose forwarded client IP headers Ether should trust. Proxies on this computer are already trusted."
               },
               "key": "trustedProxyCIDRs",
               "kind": "list",
               "label": {
-                "source": "Trusted proxy networks"
+                "source": "Trusted reverse proxies"
               },
-              "placeholder": "10.0.0.0/8"
+              "placeholder": "192.168.1.5, 10.0.0.0/8"
             },
             {
               "key": "logLevel",
@@ -239,7 +219,7 @@
             },
             {
               "help": {
-                "source": "Optional. Leave empty to detect your public address."
+                "source": "Optional. Enter a name like plex.example.com, or the full https:// address of your reverse proxy. Leave empty to detect your public address."
               },
               "key": "publicHost",
               "kind": "text",
@@ -323,6 +303,41 @@
           ],
           "title": {
             "source": "Secure connections"
+          }
+        },
+        {
+          "description": {
+            "source": "How a direct play reaches the player."
+          },
+          "fields": [
+            {
+              "help": {
+                "source": "Relay is the default. Redirect gives eligible Plex players a temporary TorBox file URL that they can use until it expires. Ether cannot measure bytes delivered directly by TorBox."
+              },
+              "key": "delivery",
+              "kind": "select",
+              "label": {
+                "source": "Delivery"
+              },
+              "options": [
+                {
+                  "value": "relay",
+                  "label": {
+                    "source": "Relay through Ether"
+                  }
+                },
+                {
+                  "value": "redirect",
+                  "label": {
+                    "source": "Redirect to the provider"
+                  }
+                }
+              ]
+            }
+          ],
+          "id": "delivery",
+          "title": {
+            "source": "Media delivery"
           }
         },
         {
@@ -605,6 +620,26 @@
             },
             {
               "help": {
+                "source": "Apply the alternatives count to each available resolution, up to seven versions total. Auto stays first; profile and device limits still apply."
+              },
+              "key": "alternativesPerResolution",
+              "kind": "bool",
+              "label": {
+                "source": "Offer alternatives at every resolution"
+              }
+            },
+            {
+              "help": {
+                "source": "Keep one WEB-DL, Blu-ray and Remux choice at each resolution in Play Version when available. Auto still follows your profile."
+              },
+              "key": "alternativesPerSource",
+              "kind": "bool",
+              "label": {
+                "source": "Offer each source at every resolution"
+              }
+            },
+            {
+              "help": {
                 "source": "Version menus can list releases taller than the profile. Off keeps the ceiling you set. HDR and file-size limits still apply."
               },
               "key": "offerHigherVersions",
@@ -760,6 +795,30 @@
             "source": "Ether plays the file directly when the app can. It converts the video on this computer only when it has to."
           },
           "fields": [
+            {
+              "help": {
+                "source": "Turn off to never re-encode video for movies and shows. Direct play, remuxing, and audio or subtitle conversion still work. Live TV is unaffected."
+              },
+              "key": "videoTranscoding",
+              "kind": "select",
+              "label": {
+                "source": "Video transcoding"
+              },
+              "options": [
+                {
+                  "value": "on",
+                  "label": {
+                    "source": "On"
+                  }
+                },
+                {
+                  "value": "off",
+                  "label": {
+                    "source": "Off"
+                  }
+                }
+              ]
+            },
             {
               "help": {
                 "source": "Automatic uses this computer's graphics chip when an app can't play the file as-is. Choose Off only if converted video looks wrong."
@@ -1149,6 +1208,16 @@
               "label": {
                 "source": "Password"
               }
+            },
+            {
+              "help": {
+                "source": "When a viewer's subtitle setting asks for subtitles and none in their language is available, Ether downloads one once the video starts playing. Uses one OpenSubtitles download per title per viewer, so standard accounts may run out sooner."
+              },
+              "key": "automaticPreferred",
+              "kind": "bool",
+              "label": {
+                "source": "Download a subtitle automatically when playback starts"
+              }
             }
           ],
           "title": {
@@ -1170,7 +1239,7 @@
           "fields": [
             {
               "help": {
-                "source": "Checks the signed release feed once a day."
+                "source": "Checks the signed release feed every few hours."
               },
               "key": "enabled",
               "kind": "bool",
@@ -1327,6 +1396,26 @@
               "label": {
                 "source": "Optional TheIntroDB key"
               }
+            },
+            {
+              "help": {
+                "source": "Add the open SkipDB lookup as a second source, cached per episode and runtime."
+              },
+              "key": "skipDb",
+              "kind": "bool",
+              "label": {
+                "source": "Also look up SkipDB"
+              }
+            },
+            {
+              "help": {
+                "source": "Reading SkipDB is open; a key only raises its rate limit."
+              },
+              "key": "skipDbApiKey",
+              "kind": "secret",
+              "label": {
+                "source": "Optional SkipDB key"
+              }
             }
           ],
           "title": {
@@ -1460,7 +1549,7 @@
           "more": [
             {
               "help": {
-                "source": "Downloads are capped at this height. 0 uses 1080p."
+                "source": "Downloads are capped at this resolution. 0 uses 1080p."
               },
               "key": "maxHeight",
               "kind": "number",
@@ -1704,7 +1793,7 @@
       "groups": [
         {
           "description": {
-            "source": "The names apps show for this server and its libraries."
+            "source": "The name apps show for this server."
           },
           "fields": [
             {
@@ -1715,26 +1804,6 @@
               "kind": "text",
               "label": {
                 "source": "Server name"
-              }
-            },
-            {
-              "help": {
-                "source": "Name shown in Plex. A rename inside Plex does not stick."
-              },
-              "key": "moviesLibraryName",
-              "kind": "text",
-              "label": {
-                "source": "Movies library name"
-              }
-            },
-            {
-              "help": {
-                "source": "Name shown in Plex. A rename inside Plex does not stick."
-              },
-              "key": "tvShowsLibraryName",
-              "kind": "text",
-              "label": {
-                "source": "TV Shows library name"
               }
             }
           ],
@@ -1845,14 +1914,14 @@
             },
             {
               "help": {
-                "source": "Networks whose forwarding headers Ether trusts. Empty trusts none."
+                "source": "IP addresses or CIDR ranges of reverse proxies on other machines (such as Caddy or Nginx) whose forwarded client IP headers Ether should trust. Proxies on this computer are already trusted."
               },
               "key": "trustedProxyCIDRs",
               "kind": "list",
               "label": {
-                "source": "Trusted proxy networks"
+                "source": "Trusted reverse proxies"
               },
-              "placeholder": "10.0.0.0/8"
+              "placeholder": "192.168.1.5, 10.0.0.0/8"
             },
             {
               "key": "logLevel",

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -31,6 +32,9 @@ type ToolCall struct {
 	ID    string
 	Name  string
 	Input json.RawMessage
+	// Signature is an opaque provider token that must return with the call
+	// when the conversation is replayed (Gemini 3 thoughtSignature).
+	Signature string
 }
 
 // ToolResult is one tool outcome fed back to the model.
@@ -58,6 +62,8 @@ type ToolRequest struct {
 	Tools       []ToolDef
 	Temperature float64
 	MaxTokens   int
+	// ToolChoice is empty for automatic selection, "required", or a tool name.
+	ToolChoice string
 }
 
 // EventKind classifies stream events.
@@ -84,7 +90,9 @@ type Event struct {
 	InputTokens  int
 	OutputTokens int
 	FinishReason string
-	Err          error
+	// Signature accompanies EventToolCall; see ToolCall.Signature.
+	Signature string
+	Err       error
 }
 
 // ProviderID returns the configured provider id.
@@ -119,11 +127,25 @@ func (c *Client) ToolsSupported() (bool, string) {
 	return true, ""
 }
 
+// toolMentionRe spots an error that is about tools or functions at all.
+var toolMentionRe = regexp.MustCompile(`(?i)\b(tools?|functions?|function[-_ ]?calls?|tool_choice)\b`)
+
+// toolUnsupportedRe spots the words providers use when a model or endpoint
+// cannot take tools. Both this and toolMentionRe must match before a
+// 400/404/422 becomes ErrToolsUnsupported; a generic 400 that merely names a
+// tool (bad arguments, unknown tool name) keeps its own message.
+var toolUnsupportedRe = regexp.MustCompile(`(?i)(not\s+(?:supported|available|allowed|permitted|enabled)|unsupport|does\s*n[o']?t\s+support|isn'?t\s+support|does\s*n[o']?t\s+(?:accept|allow|support)|is\s+not\s+supported|can'?t\s+(?:use|call|accept|handle)|no\s+(?:tools?|functions?)\b)`)
+
+// isToolRefusal reports whether a provider error body clearly says tools or
+// functions are unsupported by this model or endpoint.
+func isToolRefusal(msg string) bool {
+	return toolMentionRe.MatchString(msg) && toolUnsupportedRe.MatchString(msg)
+}
+
 func toolsRefusal(status int, body []byte) error {
 	msg := providerMessage(body)
-	lower := strings.ToLower(msg)
 	if (status == http.StatusBadRequest || status == http.StatusNotFound || status == http.StatusUnprocessableEntity) &&
-		(strings.Contains(lower, "tool") || strings.Contains(lower, "function")) {
+		isToolRefusal(msg) {
 		return fmt.Errorf("%w: %s", ErrToolsUnsupported, msg)
 	}
 	return fmt.Errorf("llm stream: %s", msg)
@@ -144,10 +166,16 @@ func (c *Client) StreamTools(ctx context.Context, req ToolRequest) (<-chan Event
 	go func() {
 		defer close(out)
 		var err error
-		switch p.API {
-		case config.LLMAPIAnthropic:
+		finish := ""
+		switch {
+		// api.openai.com's reasoning models take function tools only on the
+		// Responses API (/v1/responses); OpenAI-compatible servers (including
+		// OpenRouter, Groq and custom endpoints) stay on chat/completions.
+		case p.ID == "openai":
+			finish, err = c.streamOpenAIResponses(ctx, base, cfg, req, out)
+		case p.API == config.LLMAPIAnthropic:
 			err = c.streamAnthropic(ctx, base, cfg, req, out)
-		case config.LLMAPIGoogle:
+		case p.API == config.LLMAPIGoogle:
 			err = c.streamGemini(ctx, base, cfg, req, out)
 		default:
 			err = c.streamOpenAI(ctx, base, cfg, req, out)
@@ -159,7 +187,7 @@ func (c *Client) StreamTools(ctx context.Context, req ToolRequest) (<-chan Event
 			sendEvent(ctx, out, Event{Kind: EventError, Err: err})
 			return
 		}
-		sendEvent(ctx, out, Event{Kind: EventDone})
+		sendEvent(ctx, out, Event{Kind: EventDone, FinishReason: finish})
 	}()
 	return out, nil
 }
@@ -363,11 +391,26 @@ func (c *Client) streamOpenAI(ctx context.Context, base string, cfg config.LLM, 
 	if len(tools) > 0 {
 		body["tools"] = tools
 	}
+	if req.ToolChoice != "" {
+		choice := any(req.ToolChoice)
+		if req.ToolChoice != "required" {
+			choice = map[string]any{"type": "function", "function": map[string]any{"name": req.ToolChoice}}
+		}
+		body["tool_choice"] = choice
+	}
 	if req.Temperature != 0 {
 		body["temperature"] = req.Temperature
 	}
-	if req.MaxTokens > 0 {
-		body["max_tokens"] = req.MaxTokens
+	// Always bound the reply, as in chatOnce (#649): an unbounded request
+	// makes some routers drop every provider.
+	maxTokens := req.MaxTokens
+	if maxTokens <= 0 {
+		maxTokens = defaultChatMaxTokens
+	}
+	if useMaxCompletionTokens(cfg) {
+		body["max_completion_tokens"] = maxTokens
+	} else {
+		body["max_tokens"] = maxTokens
 	}
 	rc, err := c.openStream(ctx, base+"/chat/completions", openAIHeaders(cfg.APIKey), body)
 	if err != nil && strings.Contains(strings.ToLower(err.Error()), "stream_options") {
@@ -476,6 +519,207 @@ func schemaOrEmptyInput(raw json.RawMessage) json.RawMessage {
 	return raw
 }
 
+// --- OpenAI Responses API (api.openai.com) ---
+//
+// OpenAI's newer reasoning models accept function tools (with reasoning)
+// only on /v1/responses, and reject max_tokens and non-default
+// temperatures there. Ether mirrors appkit-ai (Vercel AI SDK), whose OpenAI
+// provider speaks the Responses API. It returns the finish reason the
+// chat/completions path would report: "tool-calls" when a function call was
+// emitted, else "stop".
+
+type oaiResponsesInput struct {
+	Type      string `json:"type"`
+	Role      string `json:"role,omitempty"`
+	Content   string `json:"content,omitempty"`
+	CallID    string `json:"call_id,omitempty"`
+	Name      string `json:"name,omitempty"`
+	Arguments string `json:"arguments,omitempty"`
+	Output    string `json:"output,omitempty"`
+}
+
+type oaiResponsesTool struct {
+	Type        string          `json:"type"`
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	Parameters  json.RawMessage `json:"parameters"`
+	// Keep optional builder fields optional rather than provider-normalizing them.
+	Strict bool `json:"strict"`
+}
+
+func (c *Client) streamOpenAIResponses(ctx context.Context, base string, cfg config.LLM, req ToolRequest, out chan<- Event) (string, error) {
+	input := make([]oaiResponsesInput, 0, len(req.Messages))
+	for _, m := range req.Messages {
+		switch m.Role {
+		case "tool":
+			for _, r := range m.ToolResults {
+				input = append(input, oaiResponsesInput{Type: "function_call_output", CallID: r.ToolCallID, Output: r.Content})
+			}
+		case "assistant":
+			if m.Content != "" {
+				input = append(input, oaiResponsesInput{Type: "message", Role: "assistant", Content: m.Content})
+			}
+			for _, tc := range m.ToolCalls {
+				input = append(input, oaiResponsesInput{Type: "function_call", CallID: tc.ID, Name: tc.Name, Arguments: string(schemaOrEmptyInput(tc.Input))})
+			}
+		default:
+			input = append(input, oaiResponsesInput{Type: "message", Role: m.Role, Content: m.Content})
+		}
+	}
+	tools := make([]oaiResponsesTool, 0, len(req.Tools))
+	for _, t := range req.Tools {
+		tools = append(tools, oaiResponsesTool{Type: "function", Name: t.Name, Description: t.Description, Parameters: schemaOrEmpty(t.InputSchema)})
+	}
+	body := map[string]any{"model": cfg.Model, "input": input, "stream": true, "store": false}
+	if req.System != "" {
+		body["instructions"] = req.System
+	}
+	if len(tools) > 0 {
+		body["tools"] = tools
+	}
+	if req.ToolChoice != "" {
+		choice := any(req.ToolChoice)
+		if req.ToolChoice != "required" {
+			choice = map[string]any{"type": "function", "name": req.ToolChoice}
+		}
+		body["tool_choice"] = choice
+	}
+	if req.MaxTokens > 0 {
+		body["max_output_tokens"] = req.MaxTokens
+	}
+	rc, err := c.openStream(ctx, base+"/responses", openAIHeaders(cfg.APIKey), body)
+	if err != nil {
+		return "", err
+	}
+	defer rc.Close()
+	type acc struct {
+		id, name string
+		args     strings.Builder
+	}
+	calls := map[int]*acc{}
+	order := []int{}
+	anyCall := false
+	var failed error
+	err = scanSSE(ctx, rc, func(data []byte) bool {
+		var ev struct {
+			Type   string `json:"type"`
+			Delta  string `json:"delta"`
+			ItemID string `json:"item_id"`
+			Item   struct {
+				Type      string `json:"type"`
+				ID        string `json:"id"`
+				CallID    string `json:"call_id"`
+				Name      string `json:"name"`
+				Arguments string `json:"arguments"`
+			} `json:"item"`
+			OutputIndex int `json:"output_index"`
+			Response    struct {
+				Usage *struct {
+					InputTokens  int `json:"input_tokens"`
+					OutputTokens int `json:"output_tokens"`
+				} `json:"usage"`
+				Error *struct {
+					Message string `json:"message"`
+				} `json:"error"`
+			} `json:"response"`
+			Error *struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if json.Unmarshal(data, &ev) != nil {
+			return true
+		}
+		switch ev.Type {
+		case "response.output_text.delta":
+			if ev.Delta != "" {
+				sendEvent(ctx, out, Event{Kind: EventTextDelta, Text: ev.Delta})
+			}
+		case "response.output_item.added":
+			if ev.Item.Type == "function_call" {
+				id := ev.Item.CallID
+				if id == "" {
+					id = ev.Item.ID
+				}
+				a, ok := calls[ev.OutputIndex]
+				if !ok {
+					a = &acc{}
+					calls[ev.OutputIndex] = a
+					order = append(order, ev.OutputIndex)
+				}
+				a.id, a.name = id, ev.Item.Name
+				anyCall = true
+				sendEvent(ctx, out, Event{Kind: EventToolCallStart, ToolCallID: a.id, ToolName: a.name})
+			}
+		case "response.function_call_arguments.delta":
+			a := calls[ev.OutputIndex]
+			if a == nil {
+				a = &acc{id: ev.ItemID}
+				calls[ev.OutputIndex] = a
+				order = append(order, ev.OutputIndex)
+			}
+			if ev.Delta != "" {
+				a.args.WriteString(ev.Delta)
+				sendEvent(ctx, out, Event{Kind: EventToolCallDelta, ToolCallID: a.id, ToolName: a.name, InputDelta: ev.Delta})
+			}
+		case "response.output_item.done":
+			if ev.Item.Type == "function_call" {
+				a := calls[ev.OutputIndex]
+				if a == nil {
+					a = &acc{}
+					calls[ev.OutputIndex] = a
+					order = append(order, ev.OutputIndex)
+				}
+				if a.id == "" {
+					a.id = ev.Item.CallID
+					if a.id == "" {
+						a.id = ev.Item.ID
+					}
+				}
+				if a.name == "" {
+					a.name = ev.Item.Name
+				}
+				if a.args.Len() == 0 && ev.Item.Arguments != "" {
+					a.args.WriteString(ev.Item.Arguments)
+				}
+				anyCall = true
+			}
+		case "response.completed":
+			if u := ev.Response.Usage; u != nil && (u.InputTokens > 0 || u.OutputTokens > 0) {
+				sendEvent(ctx, out, Event{Kind: EventUsage, InputTokens: u.InputTokens, OutputTokens: u.OutputTokens})
+			}
+		case "response.failed", "error":
+			msg := data
+			if ev.Error != nil && ev.Error.Message != "" {
+				msg = []byte(ev.Error.Message)
+			} else if ev.Response.Error != nil && ev.Response.Error.Message != "" {
+				msg = []byte(ev.Response.Error.Message)
+			}
+			// StreamTools reports the returned error as the one EventError.
+			failed = toolsRefusal(400, msg)
+			return false
+		}
+		return true
+	})
+	if err != nil {
+		return "", err
+	}
+	if failed != nil {
+		return "", failed
+	}
+	for _, i := range order {
+		a := calls[i]
+		in := json.RawMessage(a.args.String())
+		if !json.Valid(in) {
+			in = json.RawMessage(`{}`)
+		}
+		sendEvent(ctx, out, Event{Kind: EventToolCall, ToolCallID: a.id, ToolName: a.name, Input: in})
+	}
+	if anyCall {
+		return "tool-calls", nil
+	}
+	return "stop", nil
+}
+
 // --- Anthropic Messages ---
 
 func (c *Client) streamAnthropic(ctx context.Context, base string, cfg config.LLM, req ToolRequest, out chan<- Event) error {
@@ -531,6 +775,13 @@ func (c *Client) streamAnthropic(ctx context.Context, base string, cfg config.LL
 	}
 	if len(tools) > 0 {
 		body["tools"] = tools
+	}
+	if req.ToolChoice != "" {
+		choice := map[string]any{"type": "any"}
+		if req.ToolChoice != "required" {
+			choice = map[string]any{"type": "tool", "name": req.ToolChoice}
+		}
+		body["tool_choice"] = choice
 	}
 	rc, err := c.openStream(ctx, base+"/messages", anthropicHeaders(cfg.APIKey), body)
 	if err != nil {
@@ -653,6 +904,9 @@ func (c *Client) streamGemini(ctx context.Context, base string, cfg config.LLM, 
 		Text             string `json:"text,omitempty"`
 		FunctionCall     any    `json:"functionCall,omitempty"`
 		FunctionResponse any    `json:"functionResponse,omitempty"`
+		// Gemini 3 rejects a replayed function call without the signature it
+		// was issued with ("Function call is missing a thought_signature").
+		ThoughtSignature string `json:"thoughtSignature,omitempty"`
 	}
 	type content struct {
 		Role  string `json:"role"`
@@ -682,7 +936,7 @@ func (c *Client) streamGemini(ctx context.Context, base string, cfg config.LLM, 
 			for _, tc := range m.ToolCalls {
 				var args any
 				_ = json.Unmarshal(schemaOrEmptyInput(tc.Input), &args)
-				parts = append(parts, part{FunctionCall: map[string]any{"name": tc.Name, "args": args}})
+				parts = append(parts, part{FunctionCall: map[string]any{"name": tc.Name, "args": args}, ThoughtSignature: tc.Signature})
 			}
 			contents = append(contents, content{Role: "model", Parts: parts})
 		case "system":
@@ -700,6 +954,13 @@ func (c *Client) streamGemini(ctx context.Context, base string, cfg config.LLM, 
 	}
 	if len(decls) > 0 {
 		body["tools"] = []map[string]any{{"functionDeclarations": decls}}
+	}
+	if req.ToolChoice != "" {
+		choice := map[string]any{"mode": "ANY"}
+		if req.ToolChoice != "required" {
+			choice["allowedFunctionNames"] = []string{req.ToolChoice}
+		}
+		body["toolConfig"] = map[string]any{"functionCallingConfig": choice}
 	}
 	if req.Temperature != 0 {
 		body["generationConfig"] = map[string]any{"temperature": req.Temperature}
@@ -723,6 +984,7 @@ func (c *Client) streamGemini(ctx context.Context, base string, cfg config.LLM, 
 							Name string          `json:"name"`
 							Args json.RawMessage `json:"args"`
 						} `json:"functionCall"`
+						ThoughtSignature string `json:"thoughtSignature"`
 					} `json:"parts"`
 				} `json:"content"`
 			} `json:"candidates"`
@@ -758,7 +1020,7 @@ func (c *Client) streamGemini(ctx context.Context, base string, cfg config.LLM, 
 					}
 					sendEvent(ctx, out, Event{Kind: EventToolCallStart, ToolCallID: id, ToolName: p.FunctionCall.Name})
 					sendEvent(ctx, out, Event{Kind: EventToolCallDelta, ToolCallID: id, ToolName: p.FunctionCall.Name, InputDelta: string(args)})
-					sendEvent(ctx, out, Event{Kind: EventToolCall, ToolCallID: id, ToolName: p.FunctionCall.Name, Input: args})
+					sendEvent(ctx, out, Event{Kind: EventToolCall, ToolCallID: id, ToolName: p.FunctionCall.Name, Input: args, Signature: p.ThoughtSignature})
 				}
 			}
 		}

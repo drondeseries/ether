@@ -25,7 +25,7 @@ func TestSourceOffersSharedExpiryRevocationAndNoABA(t *testing.T) {
 		}
 		return &core.Viewer{ID: id}, nil
 	}
-	broker := &Broker{deps: BrokerDeps{DB: db, Now: func() time.Time { return now }, ActiveViewer: active, Lookup: func(_ context.Context, _ *core.Viewer, _ core.Device, key core.RatingKey) (*core.Title, error) {
+	broker := &Broker{deps: BrokerDeps{SurfacePolicy: testSessionPolicy, DB: db, Now: func() time.Time { return now }, ActiveViewer: active, Lookup: func(_ context.Context, _ *core.Viewer, _ core.Device, key core.RatingKey) (*core.Title, error) {
 		return &core.Title{Key: key}, nil
 	}, CanPlay: func(*core.Viewer, bool, time.Time) bool { return true }, BitrateLimit: func(*core.Viewer) int { return 0 }, Variants: func(context.Context, *core.Viewer, *core.Title, core.ClientCaps) ([]core.ReleaseVariant, error) {
 		return []core.ReleaseVariant{{ID: "private-release"}}, nil
@@ -140,12 +140,12 @@ func TestSourceOffersBatchQuotaRollbackAndConcurrentIdentity(t *testing.T) {
 	ctx := context.Background()
 	db := store.OpenTest(t)
 	now := time.Now().UTC()
-	b := &Broker{deps: BrokerDeps{DB: db, Now: func() time.Time { return now }, ActiveViewer: func(_ context.Context, id int64) (*core.Viewer, error) { return &core.Viewer{ID: id}, nil }, Lookup: func(_ context.Context, _ *core.Viewer, _ core.Device, key core.RatingKey) (*core.Title, error) {
+	b := &Broker{deps: BrokerDeps{SurfacePolicy: testSessionPolicy, DB: db, Now: func() time.Time { return now }, ActiveViewer: func(_ context.Context, id int64) (*core.Viewer, error) { return &core.Viewer{ID: id}, nil }, Lookup: func(_ context.Context, _ *core.Viewer, _ core.Device, key core.RatingKey) (*core.Title, error) {
 		return &core.Title{Key: key}, nil
 	}, CanPlay: func(*core.Viewer, bool, time.Time) bool { return true }, BitrateLimit: func(*core.Viewer) int { return 0 }, Variants: func(context.Context, *core.Viewer, *core.Title, core.ClientCaps) ([]core.ReleaseVariant, error) {
 		return []core.ReleaseVariant{{ID: "one"}, {ID: "two"}}, nil
 	}}}
-	versionAPI, err := NewVersionHandles(db, b, "silo")
+	versionAPI, err := NewVersionHandles(db, b, "silo", testVersionKey)
 	if err != nil {
 		t.Fatal(err)
 	}

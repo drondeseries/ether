@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,11 +21,16 @@ type WorkerOptions struct {
 	Capabilities    Capabilities    // Explicit backend contract; zero retains fixed HLS.
 	ValidateRenewal ValidateRenewal // Nil explicitly disables renewal.
 	Boot            string
-	Capacity        int // Includes all retained tombstones; never evicts unresolved work.
+	Capacity        int // Live records plus retired ones not yet forgotten; never evicts unresolved work.
 	MaxLease        time.Duration
 	Security        Security
 	Resolve         ResolveSource
 	Encoder         core.OwnedTranscoder
+	// Terminal reports durable proof that an identity's generation can never
+	// run or need retirement proof again (for example placement retired or
+	// superseded it and nothing is displaced). Nil disables Forget, keeping
+	// every record for the worker's lifetime.
+	Terminal func(context.Context, Identity) bool
 }
 type execution struct {
 	acceptedStart             *AcceptedStartHandle
@@ -49,6 +55,7 @@ type execution struct {
 	stopDiagnosticJoins       stopJoinObservation
 	stopDiagnosticAt          time.Time // Local log limiter, not retirement authority.
 	monotonicDeadline         time.Time // Local elapsed-time cap; never serialized.
+	retiredAt                 time.Time // First local observation of "retired"; starts the Forget grace.
 }
 type Worker struct {
 	denialMu      sync.Mutex
@@ -59,6 +66,7 @@ type Worker struct {
 	records       map[Identity]*execution
 	highest       map[string]uint64
 	closed        bool
+	forgetGrace   time.Duration
 }
 
 func NewWorker(o WorkerOptions) (*Worker, error) {
@@ -70,7 +78,7 @@ func NewWorker(o WorkerOptions) (*Worker, error) {
 	if !token(o.Boot) || o.Capacity < 1 || o.MaxLease <= 0 || o.MaxLease > 10*time.Minute || o.Security.Authenticate == nil || o.Security.Authorize == nil || o.Resolve == nil || o.Encoder == nil {
 		return nil, errors.New("remotetranscode: explicit worker dependencies required")
 	}
-	return &Worker{opts: o, records: make(map[Identity]*execution), highest: make(map[string]uint64)}, nil
+	return &Worker{opts: o, records: make(map[Identity]*execution), highest: make(map[string]uint64), forgetGrace: o.MaxLease + 2*time.Minute}, nil
 }
 
 // Close stops admission and requests retirement of every exact execution. It does
@@ -170,7 +178,7 @@ func (w *Worker) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if m.Op == "start" {
-		if m.Start == nil || len(m.Start.ReleaseID) > 512 || m.Start.Identity != m.Identity || len(m.Start.Grant) == 0 || len(m.Start.Grant) > 4096 || !SupportsRequest(core.HLSRequest{Ramp: m.Start.Ramp, Resume: cloneResume(m.Start.Resume), RecoveryStart: core.CloneRecoveryStart(m.Start.RecoveryStart), SoftSubtitleStream: m.Start.SoftSubtitleStream, Protocol: m.Start.Protocol, ReleaseID: m.Start.ReleaseID, Info: startInfo(*m.Start), Decision: m.Start.Decision, StartOffset: m.Start.Offset, SegmentDuration: m.Start.SegmentDuration}, w.opts.Capabilities) {
+		if m.Start == nil || len(m.Start.ReleaseID) > 512 || m.Start.Identity != m.Identity || len(m.Start.Grant) == 0 || len(m.Start.Grant) > 4096 || !SupportsRequest(core.HLSRequest{MediaGeneration: m.Start.MediaGeneration, Ramp: m.Start.Ramp, Resume: cloneResume(m.Start.Resume), RecoveryStart: core.CloneRecoveryStart(m.Start.RecoveryStart), SoftSubtitleStream: m.Start.SoftSubtitleStream, Protocol: m.Start.Protocol, ReleaseID: m.Start.ReleaseID, Info: startInfo(*m.Start), Decision: m.Start.Decision, StartOffset: m.Start.Offset, SegmentDuration: m.Start.SegmentDuration, PMSDASH: m.Start.PMSDASH}, w.opts.Capabilities) {
 			http.Error(out, "unsupported start", 422)
 			return
 		}
@@ -212,6 +220,18 @@ func (w *Worker) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 	}
 	w.mu.Lock()
 	e := w.records[m.Identity]
+	if e == nil && (m.Op == "stop" || m.Op == "status") && w.opts.Terminal != nil {
+		// A forgotten record's generation is durably terminal: report it
+		// retired rather than minting a stop-before-start tombstone, which
+		// would claim the generation never started.
+		w.mu.Unlock()
+		if w.opts.Terminal(r.Context(), m.Identity) {
+			replyStatus(out, status{State: "retired", Identity: m.Identity, Stopped: true})
+			return
+		}
+		w.mu.Lock()
+		e = w.records[m.Identity]
+	}
 	if e == nil && m.Op == "stop" && len(w.records) < w.opts.Capacity && !w.closed {
 		// Stop-before-start is a permanent tombstone for this generation.
 		e = &execution{id: m.Identity, stopped: true, origin: EvidenceStopBeforeStart, negativeBarrierGeneration: m.Identity.Generation}
@@ -257,7 +277,17 @@ func (w *Worker) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Only these request headers reach the local session, never caller credentials.
+	if len(m.MediaName) > 128 || strings.ContainsAny(m.MediaName, "/\\?#\r\n") {
+		http.Error(out, "invalid media name", 400)
+		return
+	}
 	request := r.Clone(r.Context())
+	if m.MediaName != "" {
+		u := *request.URL
+		u.Path = "/" + m.MediaName
+		u.RawPath = ""
+		request.URL = &u
+	}
 	request.Method = "GET"
 	if m.Head {
 		request.Method = "HEAD"
@@ -342,7 +372,7 @@ func (w *Worker) start(out http.ResponseWriter, r *http.Request, peer string, s 
 	if backend, ok := w.opts.Encoder.(interface{ SupportsDistributedRequest(core.HLSRequest) bool }); ok {
 		var planStart Start
 		_ = json.Unmarshal(encoded, &planStart)
-		plan := core.HLSRequest{Ramp: planStart.Ramp, Resume: cloneResume(planStart.Resume), RecoveryStart: core.CloneRecoveryStart(planStart.RecoveryStart), ReleaseID: planStart.ReleaseID, Info: startInfo(planStart), Decision: planStart.Decision, StartOffset: planStart.Offset, SegmentDuration: planStart.SegmentDuration, Protocol: planStart.Protocol, SoftSubtitleStream: planStart.SoftSubtitleStream, RequireIndependentProof: planStart.IndependentProof}
+		plan := core.HLSRequest{MediaGeneration: planStart.MediaGeneration, Ramp: planStart.Ramp, Resume: cloneResume(planStart.Resume), RecoveryStart: core.CloneRecoveryStart(planStart.RecoveryStart), ReleaseID: planStart.ReleaseID, Info: startInfo(planStart), Decision: planStart.Decision, StartOffset: planStart.Offset, SegmentDuration: planStart.SegmentDuration, PMSDASH: planStart.PMSDASH, Protocol: planStart.Protocol, SoftSubtitleStream: planStart.SoftSubtitleStream, RequireIndependentProof: planStart.IndependentProof}
 		if !backend.SupportsDistributedRequest(plan) {
 			http.Error(out, "backend plan unsupported", 422)
 			return
@@ -423,7 +453,7 @@ func (w *Worker) start(out http.ResponseWriter, r *http.Request, peer string, s 
 		// Backend receives separate nested slices/pointers; source renewal and duplicate
 		// starts continue comparing the original immutable payload.
 		backendInfo, backendDecision, backendSoft := startInfo(backendStart), backendStart.Decision, backendStart.SoftSubtitleStream
-		session, retirement, err = w.opts.Encoder.StartHLSOwned(ctx, core.HLSRequest{Ramp: backendRamp(backendStart.Ramp), Resume: cloneResume(backendStart.Resume), RecoveryStart: core.CloneRecoveryStart(backendStart.RecoveryStart), ReleaseID: s.ReleaseID, SessionID: executionID(s.Identity), ManifestSessionID: s.Identity.Session, InputURL: source.URL, InputLease: input, Info: backendInfo, Decision: backendDecision, StartOffset: s.Offset, SegmentDuration: s.SegmentDuration, RequireIndependentProof: s.IndependentProof, SoftSubtitleStream: backendSoft, Protocol: s.Protocol})
+		session, retirement, err = w.opts.Encoder.StartHLSOwned(ctx, core.HLSRequest{MediaGeneration: backendStart.MediaGeneration, Ramp: backendRamp(backendStart.Ramp), Resume: cloneResume(backendStart.Resume), RecoveryStart: core.CloneRecoveryStart(backendStart.RecoveryStart), ReleaseID: s.ReleaseID, SessionID: executionID(s.Identity), ManifestSessionID: s.Identity.Session, InputURL: source.URL, InputLease: input, Info: backendInfo, Decision: backendDecision, StartOffset: s.Offset, SegmentDuration: s.SegmentDuration, PMSDASH: s.PMSDASH, RequireIndependentProof: s.IndependentProof, SoftSubtitleStream: backendSoft, Protocol: s.Protocol})
 	}
 	if err == nil && session != nil {
 		if w.opts.Capabilities.Controls {
@@ -680,4 +710,76 @@ func backendRamp(r core.HLSRamp) core.HLSRamp {
 		return core.HLSRamp{Version: 1}
 	}
 	return r
+}
+
+// Forget drops retired records whose generation is durably terminal, so
+// Capacity bounds live work rather than every start this boot has accepted.
+// A record goes only after it has been locally "retired" for the grace period
+// (MaxLease plus two minutes) and Terminal confirms it. The per-session
+// generation floor in highest stays while any record of that controller and
+// session remains; it goes with the last one, when every Start that could
+// still be in flight for those generations has expired (Starts carry an
+// absolute expiry of at most MaxLease) and Authorize refuses them anyway.
+// Terminal runs without the worker mutex; at most limit records are examined.
+func (w *Worker) Forget(ctx context.Context, limit int) int {
+	if w.opts.Terminal == nil || limit < 1 {
+		return 0
+	}
+	now := time.Now()
+	w.mu.Lock()
+	var candidates []*execution
+	for _, e := range w.records {
+		if result(e) != "retired" {
+			e.retiredAt = time.Time{}
+			continue
+		}
+		if e.retiredAt.IsZero() {
+			e.retiredAt = now
+			continue
+		}
+		if now.Sub(e.retiredAt) >= w.forgetGrace && len(candidates) < limit {
+			candidates = append(candidates, e)
+		}
+	}
+	w.mu.Unlock()
+	forgotten := 0
+	for _, e := range candidates {
+		if ctx.Err() != nil {
+			break
+		}
+		if !w.opts.Terminal(ctx, e.id) {
+			w.mu.Lock()
+			e.retiredAt = time.Now() // re-check after another grace period
+			w.mu.Unlock()
+			continue
+		}
+		w.mu.Lock()
+		if w.records[e.id] == e && result(e) == "retired" {
+			if e.timer != nil {
+				e.timer.Stop()
+			}
+			delete(w.records, e.id)
+			forgotten++
+			key := e.id.Controller + "/" + e.id.Session
+			shared := false
+			for id := range w.records {
+				if id.Controller == e.id.Controller && id.Session == e.id.Session {
+					shared = true
+					break
+				}
+			}
+			if !shared {
+				delete(w.highest, key)
+			}
+		}
+		w.mu.Unlock()
+	}
+	return forgotten
+}
+
+// Records reports how many execution records (live and retired) are retained.
+func (w *Worker) Records() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return len(w.records)
 }

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/braedonsaunders/ether/internal/core"
+	"github.com/braedonsaunders/ether/internal/events"
 	"github.com/braedonsaunders/ether/internal/identity"
 )
 
@@ -58,6 +59,7 @@ func (h *Handler) localLogin(w http.ResponseWriter, r *http.Request, surface str
 	}
 	viewerID, identityID, err := h.deps.LocalIdentity.Authenticate(r.Context(), body.Username, body.Password)
 	if err != nil {
+		h.emitLoginFailed(body.Username, "password", "invalid_credentials", "Ether browser", "Web", ip.String())
 		writeError(w, 401, "unauthorized", "invalid credentials")
 		return
 	}
@@ -67,6 +69,7 @@ func (h *Handler) localLogin(w http.ResponseWriter, r *http.Request, surface str
 	}
 	token, err := issue(r.Context(), viewerID, &identityID, surface, core.Device{Client: "Ether browser"})
 	if err != nil {
+		h.emitLoginFailed(body.Username, "password", "grant_refused", "Ether browser", "Web", ip.String())
 		writeError(w, 401, "unauthorized", "invalid credentials")
 		return
 	}
@@ -75,12 +78,42 @@ func (h *Handler) localLogin(w http.ResponseWriter, r *http.Request, surface str
 		if e != nil || !u.IsOwner {
 			sum := sha256.Sum256([]byte(token))
 			_ = h.deps.IdentityGrants.RevokeGrant(r.Context(), viewerID, hex.EncodeToString(sum[:]))
+			h.emitLoginFailed(body.Username, "password", "not_owner", "Ether browser", "Web", ip.String())
 			writeError(w, 401, "unauthorized", "invalid credentials")
 			return
 		}
 		h.ownerCredentialChanged(r)
 	}
+	h.emitLoginSucceeded(viewerID, body.Username, "password", "Ether browser", "Web", ip.String())
 	writeJSON(w, 200, map[string]any{"token": token})
+}
+
+func (h *Handler) emitLoginSucceeded(viewerID int64, username, method, client, platform, remoteIP string) {
+	if h == nil || h.deps.EventBus == nil {
+		return
+	}
+	_ = h.deps.EventBus.PublishTyped(events.EventAuthLoginSucceeded, events.AuthLoginSucceededPayload{
+		ViewerID: viewerID,
+		Username: username,
+		Method:   method,
+		Client:   client,
+		Platform: platform,
+		RemoteIP: remoteIP,
+	}, events.WithSource("admin.auth"), events.WithCorrelation(events.Correlation{ViewerID: viewerID}))
+}
+
+func (h *Handler) emitLoginFailed(username, method, reason, client, platform, remoteIP string) {
+	if h == nil || h.deps.EventBus == nil {
+		return
+	}
+	_ = h.deps.EventBus.PublishTyped(events.EventAuthLoginFailed, events.AuthLoginFailedPayload{
+		Username: username,
+		Method:   method,
+		Reason:   reason,
+		Client:   client,
+		Platform: platform,
+		RemoteIP: remoteIP,
+	}, events.WithSource("admin.auth"))
 }
 
 // ownerCredentialChanged tells the app an owner credential may have changed.
@@ -247,16 +280,24 @@ func (h *Handler) handlePortalPINPoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.portalPins.remove(r.PathValue("handle"))
+	ip, _ := identity.ClientNet(r, h.proxyPrefixes()...)
 	u, err := h.deps.AuthenticatePlex(r.Context(), token)
 	if err != nil {
+		h.emitLoginFailed("", "plex", "unauthorized", "Ether browser", "Web", ip.String())
 		writeError(w, 401, "unauthorized", "sign in rejected")
 		return
 	}
 	grant, err := h.deps.IdentityGrants.IssueLogin(r.Context(), u.ID, nil, "viewer-portal", core.Device{Client: "Ether browser"})
 	if err != nil {
+		h.emitLoginFailed(u.Username, "plex", "grant_refused", "Ether browser", "Web", ip.String())
 		writeError(w, 401, "unauthorized", "sign in rejected")
 		return
 	}
+	name := u.Username
+	if name == "" {
+		name = u.Title
+	}
+	h.emitLoginSucceeded(u.ID, name, "plex", "Ether browser", "Web", ip.String())
 	writeJSON(w, 200, map[string]any{"done": true, "token": grant})
 }
 
@@ -435,7 +476,7 @@ func (h *Handler) ownerIdentityManagement(w http.ResponseWriter, r *http.Request
 			writeError(w, 500, "unavailable", "unavailable")
 			return
 		}
-		writeJSON(w, 200, map[string]any{"devices": items})
+		writeJSON(w, 200, map[string]any{"devices": items, "xtreamUrl": h.xtreamServerURL(r)})
 	case strings.HasSuffix(r.URL.Path, "/password"):
 		var body localLogin
 		if decodeJSON(r, &body) != nil {

@@ -1,4 +1,4 @@
-import { Bell, Blocks, FolderOpen, Globe, Network, Plug, Puzzle, Tv } from "lucide-react";
+import { Bell, Blocks, FolderOpen, Globe, Library, Network, Plug, Puzzle, Tv } from "lucide-react";
 import { createElement, type ReactNode } from "react";
 import { getLocale, t } from "../../i18n";
 import type { Viewer } from "../../lib/contract";
@@ -23,6 +23,8 @@ export interface PluginSummary {
   health: string;
   /** The plain-language reason behind a non-ok health. */
   healthReason?: string;
+  /** "waiting" while a plugin that runs as its own program has no sidecar connected. */
+  healthSidecar?: string;
   capabilities?: string[];
   sourceKind?: string;
   stremioOnly?: boolean;
@@ -45,6 +47,8 @@ export interface PluginHealth {
   egressBytes: number;
   /** Resolves since its last complete ranking that left its ranking step out for running out of time. */
   rankingSkipped?: number;
+  /** "waiting" while a plugin that runs as its own program has no sidecar connected. */
+  sidecar?: string;
   rankingSkippedAt?: string;
 }
 
@@ -53,6 +57,8 @@ export interface PluginGrants {
   folders?: string[];
   revoked?: string[];
   lan?: boolean;
+  localHosts?: string[];
+  operatorHosts?: string[];
 }
 
 export interface DeclaredPermissions {
@@ -65,6 +71,7 @@ export interface DeclaredPermissions {
   };
   collections?: string;
   folders?: string;
+  sources?: string;
   secrets?: string[];
 }
 
@@ -86,9 +93,18 @@ export interface PluginManifest {
     license?: string;
     repo?: string;
     icon?: string;
-    runtime?: { kind?: string; entry?: string; module?: string };
+    runtime?: { kind?: string; entry?: string; module?: string; limits?: Partial<RuntimeLimits> };
+    /** How to run a remote plugin's program (sidecars). */
+    sidecar?: {
+      docker?: string;
+      download?: string;
+      command?: string;
+      docs?: string;
+    };
     permissions?: DeclaredPermissions;
     contributes?: {
+      mediaKinds?: { key: string; label: string; library: { name: string } }[];
+      setup?: { steps: { key: string; label: string; required: boolean }[] };
       events?: { subscribe?: string[] };
       pages?: { key: string; label: string; route: string }[];
       slots?: { slot: string; key: string; label: string; route: string }[];
@@ -96,7 +112,20 @@ export interface PluginManifest {
   };
 }
 
+export interface RuntimeLimits {
+  fetchBytes?: number;
+  archiveMemberBytes?: number;
+  archiveExpandedBytes?: number;
+  archiveMembers?: number;
+  maxItems?: number;
+  memoryBytes: number;
+  deadline: string;
+  unitBudget: number;
+  poolSize?: number;
+}
+
 export interface PluginDetail extends PluginSummary {
+  runtimeLimits?: RuntimeLimits;
   manifest: PluginManifest;
   permissions: {
     lines: string[];
@@ -104,7 +133,10 @@ export interface PluginDetail extends PluginSummary {
     grants: PluginGrants;
     needsViewers: boolean;
     needsFolders: boolean;
+    needsOperatorHosts?: boolean;
   };
+  blockedLocalHosts?: string[];
+  pendingOperatorHosts?: string[];
   healthDetail: PluginHealth;
   privacy: {
     declaredHosts: string[];
@@ -118,6 +150,8 @@ export interface PluginDetail extends PluginSummary {
     p95Ms: number;
     egressBytes: number;
     kvBytes: number;
+    items?: number;
+    maxItems?: number;
     slow: number;
     eventDrops: number;
     restarts: number;
@@ -127,10 +161,18 @@ export interface PluginDetail extends PluginSummary {
 }
 
 export interface InstallPreview {
+  runtimeLimits?: RuntimeLimits;
   manifest: PluginManifest;
+  /** Manifest summary with any "$t:" reference resolved by the server. */
+  summary?: string;
+  /** Resolved preview icon URL or data URI (packaged SVGs are rasterized). */
+  icon?: string;
   permissions: string[];
   needsViewers: boolean;
   needsFolders: boolean;
+  needsOperatorHosts?: boolean;
+  localHosts?: string[];
+  pendingOperatorHosts?: string[];
   verified: boolean;
   stremioOnly: boolean;
   alreadyInstalled?: boolean;
@@ -148,26 +190,40 @@ export interface JournalEntry {
   created: string;
 }
 
+export interface CatalogueVersion {
+  version: string;
+  url: string;
+  sha256: string;
+  releasedAt?: string;
+  minEther?: string;
+  permissions?: DeclaredPermissions;
+}
+
 export interface CatalogueEntry {
   id: string;
   name: string;
-  version: string;
-  kind: string;
-  category?: string;
   summary: string;
   description?: string;
-  author?: { name?: string; url?: string };
-  repo?: string;
+  kind: string;
+  category?: string;
   icon?: string;
-  verified: boolean;
+  repo?: string;
+  homepage?: string;
+  author?: string;
+  license?: string;
   capabilities?: string[];
-  permissions: string[];
-  needsViewers?: boolean;
-  needsFolders?: boolean;
+  permissions?: DeclaredPermissions;
   screenshots?: string[];
-  limits?: string[];
-  url: string;
-  manifest?: PluginManifest;
+  versions: CatalogueVersion[];
+  revoked?: boolean;
+  reason?: string;
+  latestVersion?: string;
+  artifactUrl?: string;
+  sha256?: string;
+  permissionLines?: string[];
+  installed: boolean;
+  installedVersion?: string;
+  updateAvailable?: boolean;
 }
 
 /** A plugin that answers as a Stremio add-on, edited in Studio or not. */
@@ -188,6 +244,8 @@ export function kindLabel(kind?: string, addon?: boolean): string {
       return t("Live TV");
     case "extension":
       return t("Extension");
+    case "content":
+      return t("Content");
     default:
       return t("Plugin");
   }
@@ -224,6 +282,8 @@ export function kindIcon(kind?: string, size = 18): ReactNode {
       return createElement(Tv, { size });
     case "extension":
       return createElement(Blocks, { size });
+    case "content":
+      return createElement(Library, { size });
     default:
       return createElement(Puzzle, { size });
   }
@@ -262,6 +322,29 @@ export function isPrivateUrl(raw: string): boolean {
   }
 }
 
+const LOCAL_REACH_PREFIX = "May reach on your network: ";
+const CONNECTS_PREFIX = "Connects to ";
+
+export function translatePermissionLine(line: string): string {
+  if (line.startsWith(LOCAL_REACH_PREFIX)) {
+    return t("May reach on your network: {hosts}", {
+      hosts: line.slice(LOCAL_REACH_PREFIX.length),
+    });
+  }
+  if (
+    line.startsWith(CONNECTS_PREFIX) &&
+    line !== "Connects to the add-on address you gave" &&
+    line !== "Connects to the add-on it was made from" &&
+    line !== "Connects to addresses you approve"
+  ) {
+    const rest = line.slice(CONNECTS_PREFIX.length);
+    return rest.includes(", ")
+      ? t("Connects to {hosts}", { hosts: rest })
+      : t("Connects to {host}", { host: rest });
+  }
+  return t(line);
+}
+
 export interface GrantItem {
   key: string;
   label: string;
@@ -277,12 +360,21 @@ export function buildGrantItems(detail: PluginDetail): GrantItem[] {
   const items: GrantItem[] = [];
 
   if (d.network && d.network.length > 0) {
+    const fixed = d.network.filter((h) => h !== "operator");
+    const hasOperator = d.network.includes("operator");
+    let label: string;
+    if (hasOperator && fixed.length === 0) {
+      label = t("Connects to addresses you approve");
+    } else {
+      const parts = hasOperator ? [...fixed, t("addresses you approve")] : fixed;
+      label =
+        parts.length === 1
+          ? t("Connects to {host}", { host: parts[0]! })
+          : t("Connects to {hosts}", { hosts: parts.join(", ") });
+    }
     items.push({
       key: "network",
-      label:
-        d.network.length === 1
-          ? t("Connects to {host}", { host: d.network[0]! })
-          : t("Connects to {hosts}", { hosts: d.network.join(", ") }),
+      label,
       revocable: true,
     });
   }
@@ -354,7 +446,7 @@ export function buildGrantItems(detail: PluginDetail): GrantItem[] {
     for (const [idx, line] of fallbackLines.entries()) {
       items.push({
         key: `line-${idx}`,
-        label: line,
+        label: translatePermissionLine(line),
         revocable: false,
       });
     }
@@ -434,7 +526,8 @@ export function buildPlacements(descriptors: Descriptor[], pluginId: string): Pl
         const meta = (isPlainObject(d.meta) ? d.meta : {}) as { slot?: string };
         area = t("Console slot");
         if (meta.slot === "dashboard.panel") href = "/";
-        else if (meta.slot === "title.panel" || meta.slot === "actionMenu.title") href = "/catalog";
+        else if (meta.slot === "title.panel" || meta.slot === "actionMenu.title")
+          href = "/libraries";
         else if (meta.slot === "viewer.tab" || meta.slot === "actionMenu.viewer") href = "/viewers";
         else if (meta.slot === "actionMenu.collection") href = "/collections";
         else if (meta.slot === "actionMenu.release") href = "/releases";

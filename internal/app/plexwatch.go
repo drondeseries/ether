@@ -28,6 +28,9 @@ func (a *App) buildPlexWatch() error {
 		NodeID:   a.clusterNodeID(),
 		ClientID: plexguid.ClientIdentifier(a.cfg.Get().Plex.ClientIdentifier, a.cfg.Get().Server.MachineIdentifier),
 		Logger:   a.log.With("component", "plexwatch"),
+		OnTokenExpired: func(userID int64, errMsg string) {
+			a.emitTokenExpired("plex", "watch_sync", "", userID, errMsg)
+		},
 		Watchlist: func(ctx context.Context, userID int64) ([]core.RatingKey, error) {
 			return watchlist.ExportKeys(ctx, a.db, userID)
 		},
@@ -174,12 +177,12 @@ func (a *App) buildPlexServers() error {
 	return nil
 }
 
-// lazyPlexGUID reads the Plex front end's GUID resolver when it exists.
+// lazyPlexGUID reads the Plex GUID resolver when it exists.
 type lazyPlexGUID struct{ a *App }
 
 func (g lazyPlexGUID) service() *plexguid.Service {
-	g.a.plexBuildMu.Lock()
-	defer g.a.plexBuildMu.Unlock()
+	g.a.plexMetaMu.Lock()
+	defer g.a.plexMetaMu.Unlock()
 	return g.a.plexGUID
 }
 

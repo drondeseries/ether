@@ -25,6 +25,13 @@ func mirroredTitles(ctx context.Context, cat core.Catalog, keys []core.RatingKey
 			}
 		}
 	}
+	var missing []core.RatingKey
+	for _, k := range keys {
+		if _, ok := out[k]; !ok {
+			missing = append(missing, k)
+		}
+	}
+	preloadTitles(ctx, cat, missing)
 	return out
 }
 func historyTitle(ctx context.Context, cat core.Catalog, cached map[core.RatingKey]core.Title, key core.RatingKey) (*core.Title, error) {
@@ -32,4 +39,20 @@ func historyTitle(ctx context.Context, cat core.Catalog, cached map[core.RatingK
 		return &t, nil
 	}
 	return cat.Get(ctx, key)
+}
+
+// preloadTitles reads keys' catalogue titles in batches before a loop that
+// Gets them one at a time: a few statements for the whole set instead of
+// several per title. Each Get then answers from the catalogue's cache and
+// keeps its own freshness and visibility rules. Catalogues without a
+// batched read (test fakes) are left to Get.
+func preloadTitles(ctx context.Context, cat core.Catalog, keys []core.RatingKey) {
+	if len(keys) < 2 {
+		return
+	}
+	if p, ok := cat.(interface {
+		PreloadStored(context.Context, []core.RatingKey)
+	}); ok {
+		p.PreloadStored(ctx, keys)
+	}
 }

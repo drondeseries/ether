@@ -60,14 +60,15 @@ type KindDescribe struct {
 
 // Gather is the context one source gather runs with. Kinds append to Res.
 type Gather struct {
-	Ctx   context.Context
-	Svc   *Service
-	Spec  *core.CollectionSpec
-	Src   core.CollectionSource
-	Rules []*rule
-	Want  int
-	Kinds []string
-	Res   sourceResult
+	Strict bool // on-demand catalogue refreshes preserve old membership on upstream errors
+	Ctx    context.Context
+	Svc    *Service
+	Spec   *core.CollectionSpec
+	Src    core.CollectionSource
+	Rules  []*rule
+	Want   int
+	Kinds  []string
+	Res    sourceResult
 }
 
 // Fail ends a preview when a source cannot be evaluated.
@@ -301,6 +302,7 @@ func builtinSourceKinds() []SourceKind {
 		tmdbListKind{},
 		tmdbUserListKind{},
 		titlesKind{},
+		friendsWatchlistKind{},
 		personKind{},
 		lookupKind{id: "tmdbCollection", order: 50, label: extend.T("TMDB collection"), hint: extend.T("A franchise such as “The Lord of the Rings”"), icon: "layers", lookup: "collection", entity: "collection"},
 		lookupKind{id: "tmdbKeyword", order: 60, label: extend.T("Keyword"), hint: extend.T("Titles tagged with a TMDB keyword"), icon: "tag", lookup: "keyword", entity: "keyword", param: "with_keywords"},
@@ -369,6 +371,31 @@ func (catalogKind) Describe() KindDescribe {
 }
 func (catalogKind) Validate(*ValidationError, string, core.CollectionSource) {}
 func (catalogKind) Gather(g *Gather) {
+	if topic := g.Src.Params["topic"]; topic != "" {
+		// A saved descriptive collection keeps its topic as a bounded local
+		// catalogue source rather than widening into the whole library.
+		f := core.Filter{Topic: topic, LocalOnly: true}
+		switch g.Spec.MediaType {
+		case MediaMovie:
+			f.Type = core.TypeMovie
+		case MediaShow:
+			f.Type = core.TypeShow
+		}
+		for offset := 0; offset < 3072; offset += 500 {
+			page, err := g.Svc.cat.Browse(g.Ctx, core.BrowseQuery{Filter: f, Sort: core.SortPopularity, Desc: true, Offset: offset, Limit: 500, NoTotal: true})
+			if err != nil {
+				g.Fail(err)
+				return
+			}
+			for _, title := range page.Items {
+				g.Res.keys = append(g.Res.keys, title.Key)
+			}
+			if len(page.Items) < 500 {
+				break
+			}
+		}
+		return
+	}
 	g.Res.all = true
 	if g.Spec.ReleaseMode != "upcoming" && g.Spec.ReleaseMode != "mixed" {
 		return

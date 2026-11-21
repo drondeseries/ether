@@ -21,7 +21,12 @@ import (
 	"github.com/braedonsaunders/ether/internal/core"
 )
 
+type Vela struct {
+	ChannelURL string `json:"channelURL,omitempty"`
+}
+
 type Config struct {
+	Vela Vela `json:"vela,omitempty"`
 	// Frontends selects protocol listeners by their registered ID.
 	Frontends map[string]Frontend `json:"frontends,omitempty"`
 	// FrontendPorts are node-local listener port overrides.
@@ -47,8 +52,10 @@ type Config struct {
 	Transcode     Transcode     `json:"transcode"`
 	Trakt         Trakt         `json:"trakt"`
 	Simkl         Simkl         `json:"simkl"`
+	MDBList       MDBList       `json:"mdblist"`
 	PlexServers   PlexServers   `json:"plexServers"`
 	OpenSubtitles OpenSubtitles `json:"openSubtitles"`
+	SubDL         SubDL         `json:"subdl"`
 	// Subtitles is the ordered subtitle provider list (OpenSubtitles and
 	// Stremio subtitle add-ons). Empty means OpenSubtitles alone, as before.
 	Subtitles Subtitles `json:"subtitles,omitempty"`
@@ -75,8 +82,18 @@ type Config struct {
 
 // Frontend holds the enabled state of a protocol front end.
 type Frontend struct {
-	Enabled  bool           `json:"enabled"`
-	Settings map[string]any `json:"settings,omitempty"`
+	// AppearanceRevision survives restarts so Vela clients can reject stale looks.
+	AppearanceRevision uint64 `json:"appearanceRevision,omitempty"`
+	// CapabilitiesRevision survives restarts so Vela clients can observe sign-in method changes.
+	CapabilitiesRevision uint64 `json:"capabilitiesRevision,omitempty"`
+	Enabled              bool   `json:"enabled"`
+	// PublicURL is the optional address viewers use to reach this one app
+	// from outside the home network (e.g. https://jelly.example.com), for
+	// owners who route each app through its own host name. Empty keeps the
+	// server-wide address. Plex ignores it: Plex apps use Plex.CustomURLs,
+	// which is also what plex.tv receives.
+	PublicURL string         `json:"publicUrl,omitempty"`
+	Settings  map[string]any `json:"settings,omitempty"`
 }
 
 type Server struct {
@@ -93,16 +110,15 @@ type Server struct {
 	// outside the home network (through a domain or reverse proxy). Off by
 	// default; sign-in still admits only the owner's Plex account.
 	AllowRemoteConsole bool `json:"allowRemoteConsole,omitempty"`
+	// PortExplicit preserves an owner-selected 32400 when PMS is installed.
+	PortExplicit bool `json:"portExplicit,omitempty"`
 	// Port for the Plex API and web UI. PMS uses 32400.
 	Port         int    `json:"port"`
 	BindAddress  string `json:"bindAddress"`
 	FriendlyName string `json:"friendlyName"`
-	// MoviesLibraryName is the Movies section title shown in Plex apps.
-	// Empty falls back to "Movies".
-	MoviesLibraryName string `json:"moviesLibraryName"`
-	// TVShowsLibraryName is the TV Shows section title shown in Plex apps.
-	// Empty falls back to "TV Shows".
-	TVShowsLibraryName string `json:"tvShowsLibraryName"`
+	// The Movies / TV Shows library names live on libraries 1/2 in
+	// internal/libraries (v0.3.8); the old moviesLibraryName /
+	// tvShowsLibraryName keys were migrated there and deleted here.
 	// MachineIdentifier is generated on first run and never changes.
 	MachineIdentifier string `json:"machineIdentifier"`
 	LogLevel          string `json:"logLevel"`
@@ -120,8 +136,11 @@ type Server struct {
 }
 
 type Plex struct {
-	CompatibilityVersion       string `json:"compatibilityVersion,omitempty"`
-	LatestCompatibilityVersion string `json:"latestCompatibilityVersion,omitempty"`
+	// FileCheckTimeout bounds background availability checks requested by Plex.
+	// Zero uses 2s. This does not change playback preparation deadlines.
+	FileCheckTimeout           Duration `json:"fileCheckTimeout,omitempty"`
+	CompatibilityVersion       string   `json:"compatibilityVersion,omitempty"`
+	LatestCompatibilityVersion string   `json:"latestCompatibilityVersion,omitempty"`
 	// TrackLatestVersion advertises the newest public PMS release instead of
 	// the version Ether's responses were verified against. Plex apps enable
 	// features by server version, so tracking can reach endpoints Ether lacks.
@@ -139,6 +158,11 @@ type Plex struct {
 	// apps still display Plex's own rating. Date-added stays the catalogue
 	// release/air date.
 	UsePlexMetadata bool `json:"usePlexMetadata,omitempty"`
+	// Delivery is how a direct-play media route reaches the client: "relay"
+	// (default) streams the bytes through Ether; "redirect" answers an
+	// eligible TorBox part read with a temporary file URL after admission.
+	// The player fetches the bytes directly. Unrecognised values relay.
+	Delivery string `json:"delivery,omitempty"`
 	// Remote access
 	RemoteAccess bool     `json:"remoteAccess"`
 	UseUPnP      bool     `json:"useUpnp"`
@@ -217,6 +241,12 @@ type Indexer struct {
 	// is the site address and Protocol follows the definition; for an
 	// add-on URL is its install link and results are torrents.
 	Kind string `json:"kind,omitempty"`
+	// UseAddonOrder keeps a Stremio add-on's own result order among its
+	// releases instead of re-ranking them with the quality profile. Hard
+	// compatibility, language, reject and health rules still apply; indexer
+	// priority orders this source relative to other sources. Valid only when
+	// Kind is IndexerKindStremio.
+	UseAddonOrder bool `json:"useAddonOrder,omitempty"`
 	// Plugin is the installed plugin an IndexerKindAddon row searches. Such
 	// rows exist only in the running search manager, never in config.
 	Plugin string `json:"plugin,omitempty"`
@@ -224,12 +254,24 @@ type Indexer struct {
 	Definition string `json:"definition,omitempty"`
 	// Settings are the definition's setting values by name.
 	Settings map[string]string `json:"settings,omitempty"`
+	// Language is the owner's Release language for this indexer: the audio
+	// language of the releases it returns, as a BCP 47 tag ("pt-BR"). It is
+	// evidence for a bare DUAL/MULTI whose name names no dub; an explicit
+	// language in a release name always wins. For a built-in site it
+	// overrides the definition's own `language` when set; for
+	// Newznab/Torznab/Prowlarr/Zilean, which declare none, it is the only
+	// source. Empty leaves the definition's language in force (additive).
+	Language string `json:"language,omitempty"`
 	// SecretSettings are the definition's password-type settings. They are
 	// sealed at rest and redacted in API responses like API keys.
 	SecretSettings map[string]string `json:"secretSettings,omitempty"`
-	// ClientIdentity overrides the global client identity for this indexer's
-	// searches and grabs. Empty inherits the policy.
-	ClientIdentity string `json:"clientIdentity,omitempty"`
+	// UserAgent overrides the global client identity user agent for this
+	// indexer's searches and grabs. Empty inherits the policy. Kept as a
+	// mirror of RequestIdentity's user agent for older configs.
+	UserAgent string `json:"userAgent,omitempty"`
+	// RequestIdentity is how this indexer's requests look (client profile,
+	// header and parameter overrides). Nil uses the shared identity above.
+	RequestIdentity *IndexerRequestIdentity `json:"requestIdentity,omitempty"`
 	// ProwlarrImport is what the last Prowlarr sync wrote into the fields
 	// the owner may also edit. A later sync updates a field only while it
 	// still holds that value, so owner edits survive syncs. Nil for
@@ -250,18 +292,27 @@ const (
 	IndexerKindNewznab   = "newznab"
 	IndexerKindCardigann = "cardigann"
 	IndexerKindStremio   = "stremio"
+	// IndexerKindZilean is a self-hosted Zilean (DMM hash index) whose
+	// Torznab API is searched like any other torrent indexer; URL is the
+	// Zilean base URL, not its Torznab endpoint.
+	IndexerKindZilean = "zilean"
 	// IndexerKindAddon is an installed plugin's streams (an Ether source
 	// plugin or a Stremio add-on installed from Plugins), searched like an
 	// indexer. Rows of this kind are made at run time, never saved.
 	IndexerKindAddon = "addon"
 )
 
-// IsTorrent reports whether the indexer's results are torrents (Torznab or
-// a Stremio add-on).
-func (ix Indexer) IsTorrent() bool { return ix.Protocol == "torrent" || ix.IsStremio() || ix.IsAddon() }
+// IsTorrent reports whether the indexer's results are torrents (Torznab,
+// a Stremio add-on or a Zilean hash index).
+func (ix Indexer) IsTorrent() bool {
+	return ix.Protocol == "torrent" || ix.IsStremio() || ix.IsZilean() || ix.IsAddon()
+}
 
 // IsStremio reports whether the indexer is a Stremio stream add-on.
 func (ix Indexer) IsStremio() bool { return ix.Kind == IndexerKindStremio }
+
+// IsZilean reports whether the indexer is a self-hosted Zilean instance.
+func (ix Indexer) IsZilean() bool { return ix.Kind == IndexerKindZilean }
 
 // IsBuiltin reports whether the indexer is a built-in site.
 func (ix Indexer) IsBuiltin() bool { return ix.Kind == IndexerKindCardigann }
@@ -296,8 +347,11 @@ type Cache struct {
 	RetentionDays      int    `json:"retentionDays,omitempty"`
 	ReplayBoostHours   int    `json:"replayBoostHours,omitempty"`
 	DisableSpeculation bool   `json:"disableSpeculation,omitempty"`
-	DetailWarmup       string `json:"detailWarmup,omitempty"` // empty/on or off
-	DetailBytes        int64  `json:"detailBytes,omitempty"`  // zero warms 40s of source media, capped at 256 MiB
+	// SpeculativeWarming off limits automatic warming to recent viewing, watchlist events and owner pins.
+	SpeculativeWarming string           `json:"speculativeWarming,omitempty"`
+	KeepWarmTitles     []core.RatingKey `json:"keepWarmTitles,omitempty"`
+	DetailWarmup       string           `json:"detailWarmup,omitempty"` // empty/on or off
+	DetailBytes        int64            `json:"detailBytes,omitempty"`  // zero warms 40s of source media, capped at 256 MiB
 	// PlaybackReadAheadMinutes is how many minutes of the title being played
 	// Usenet streaming keeps downloaded to the cache ahead of the viewer:
 	// 0 is off, nil is DefaultPlaybackReadAheadMinutes.
@@ -305,6 +359,10 @@ type Cache struct {
 
 	Dir         string `json:"dir"`
 	BudgetBytes int64  `json:"budgetBytes"`
+	// LibraryBudgetBytes bounds the release library (kept NZBs and torrent
+	// records, internal/vault). Zero means no limit; when set, releases
+	// never replayed leave first.
+	LibraryBudgetBytes int64 `json:"libraryBudgetBytes,omitempty"`
 	// Prefetch
 	PrefetchNextEpisode bool    `json:"prefetchNextEpisode"`
 	PrefetchBytes       int64   `json:"prefetchBytes"` // opening bytes pulled ahead
@@ -323,8 +381,9 @@ type Catalog struct {
 	// ShowUpcomingEpisodes adds metadata-only scheduled episodes to airing seasons.
 	ShowUpcomingEpisodes bool `json:"showUpcomingEpisodes"`
 	ShowUpcomingMovies   bool `json:"showUpcomingMovies"`
-	// ReleaseMode is derived from availability, never an independent persisted setting.
-	ReleaseMode string `json:"-"`
+	// ReleaseMode and HomeReleaseOffsetDays are derived from availability, never independent persisted settings.
+	ReleaseMode           string `json:"-"`
+	HomeReleaseOffsetDays int    `json:"-"`
 	// HideFranchiseCollections hides automatic TMDB groups from Plex's
 	// Collections tab. The zero value preserves existing libraries.
 	HideFranchiseCollections bool `json:"hideFranchiseCollections"`
@@ -342,22 +401,47 @@ type Catalog struct {
 	RefreshInterval   Duration                `json:"refreshInterval"`
 }
 
+// The library's floor when the owner turns "Hide obscure titles" off
+// (0/0): every title with a real audience is listed, and every other
+// TMDB title is still found by search (the long-tail index).
+const (
+	OffFloorPopularity = 2.5
+	OffFloorVotes      = 10
+)
+
+// Bars is the browse bar the catalogue applies: the owner's own, or the
+// Off floor for a saved 0/0. No setting lists every TMDB title.
+func (c Catalog) Bars() (minPopularity float64, minVotes int) {
+	if c.MinPopularity <= 0 && c.MinVotes <= 0 {
+		return OffFloorPopularity, OffFloorVotes
+	}
+	return c.MinPopularity, c.MinVotes
+}
+
 type Resolver struct {
 	// HardSubtitles is empty (prefer clean), exclude, or allow.
-	HardSubtitles        string              `json:"hardSubtitles,omitempty"`
-	HealthRace           int                 `json:"healthRace"`      // 0 = ranked checks; >0 = first healthy of bounded concurrent candidates
-	OptimisticStart      bool                `json:"optimisticStart"` // return top NZB before background health check
-	CustomFormats        []core.CustomFormat `json:"customFormats,omitempty"`
-	CustomFormatScores   map[string]int      `json:"customFormatScores,omitempty"`
-	MinCustomFormatScore *int                `json:"minCustomFormatScore,omitempty"`
-	HealthSamples        int                 `json:"healthSamples"`
-	SearchCacheTTL       Duration            `json:"searchCacheTtl"`
-	UnavailableCooloff   Duration            `json:"unavailableCooloff"` // hide titles with no release this long
-	MaxCandidates        int                 `json:"maxCandidates"`
+	HardSubtitles   string `json:"hardSubtitles,omitempty"`
+	HealthRace      int    `json:"healthRace"`      // 0 = ranked checks; >0 = first healthy of bounded concurrent candidates
+	OptimisticStart bool   `json:"optimisticStart"` // return top NZB before background health check
+	// CustomFormats are the custom format definitions profiles score
+	// (QualityProfile.CustomFormatScores).
+	CustomFormats      []core.CustomFormat `json:"customFormats,omitempty"`
+	HealthSamples      int                 `json:"healthSamples"`
+	SearchCacheTTL     Duration            `json:"searchCacheTtl"`
+	UnavailableCooloff Duration            `json:"unavailableCooloff"` // hide titles with no release this long
+	MaxCandidates      int                 `json:"maxCandidates"`
 	// SameQualityAlternatives is how many other releases of the same cut,
 	// resolution and HDR type a detail page lists after Auto as Play
 	// Versions (0 = none, at most 3; default 1).
 	SameQualityAlternatives int `json:"sameQualityAlternatives"`
+	// AlternativesPerResolution distributes the alternative count across
+	// available resolutions while retaining Auto and the shared menu cap.
+	AlternativesPerResolution bool `json:"alternativesPerResolution,omitempty"`
+	// AlternativesPerSource reserves at least one Play Version slot per
+	// source class (Remux, Blu-ray encode, WEB, or other when nothing else)
+	// within each resolution tier that appears, so a lighter WEB-DL still
+	// shows beside a tier full of remuxes. Auto is unchanged.
+	AlternativesPerSource bool `json:"alternativesPerSource,omitempty"`
 	// OfferHigherVersions lets Play Version list releases taller than the
 	// profile ceiling (a 4K copy on a 1080p profile). Off, the default,
 	// keeps that ceiling: height, HDR policy and size limits.
@@ -379,6 +463,14 @@ type Resolver struct {
 	// the same quality tier may be and still be moved first for its
 	// source (0 = 25).
 	SourceScoreMargin float64 `json:"sourceScoreMargin,omitempty"`
+	// OpenOnDemandAddonStreams lets a client's file-availability check on a
+	// detail page open on-demand add-on stream links within its existing
+	// timeout and concurrency limits. Opening such a link can make the
+	// add-on fetch, import or download the release. It applies only to that
+	// one check: warm-ups, prefetch, discovery and idle background work keep
+	// refusing. Off by default, which leaves behaviour unchanged; when off,
+	// an undecided check never hides Play.
+	OpenOnDemandAddonStreams bool `json:"openOnDemandAddonStreams,omitempty"`
 }
 
 type Quality struct {
@@ -427,7 +519,8 @@ type ClientCompatibility struct {
 type Transcode struct {
 	RTXVideo RTXVideo `json:"rtxVideo"`
 
-	FFmpegPath           string `json:"ffmpegPath"` // empty = bundled, then PATH
+	VideoTranscoding     string `json:"videoTranscoding"` // "on" (default) or "off" (movies and shows only; Live TV is unaffected)
+	FFmpegPath           string `json:"ffmpegPath"`       // empty = bundled, then PATH
 	FFprobePath          string `json:"ffprobePath"`
 	HWAccel              string `json:"hwAccel"` // "auto", "none", "videotoolbox", "nvenc", "qsv", "vaapi"
 	VAAPIDevice          string `json:"vaapiDevice"`
@@ -447,6 +540,12 @@ type Transcode struct {
 	VBVBufferSeconds   int      `json:"vbvBufferSeconds"`   // VBV buffer depth in seconds of maxrate (default 8)
 	SpikeGovernor      bool     `json:"spikeGovernor"`      // clamp VBR spikes in copy streams to measured goodput
 	SpikeMarginPercent int      `json:"spikeMarginPercent"` // spike threshold over goodput, percent (default 125)
+}
+
+// VideoTranscodingOff reports whether video re-encoding is disabled for movies
+// and shows. Empty or "on" leaves video transcoding enabled.
+func (t Transcode) VideoTranscodingOff() bool {
+	return t.VideoTranscoding == "off"
 }
 
 // Downloads controls Plex offline downloads (allowSync + the Download
@@ -487,6 +586,13 @@ type Simkl struct {
 	ClientSecret string `json:"clientSecret"`
 }
 
+// MDBList syncs watch history per viewer. Unlike Trakt/Simkl there is no app
+// registration: each viewer pastes a personal API key from MDBList
+// Preferences, so the section only carries the on/off switch.
+type MDBList struct {
+	Enabled bool `json:"enabled"`
+}
+
 type Trakt struct {
 	Enabled      bool   `json:"enabled"`
 	ClientID     string `json:"clientId"`
@@ -494,16 +600,28 @@ type Trakt struct {
 }
 
 type OpenSubtitles struct {
-	Enabled  bool   `json:"enabled"`
-	APIKey   string `json:"apiKey"`
-	Username string `json:"username"`
-	Password string `json:"password"`
+	// AutomaticPreferred is opt-in; only authenticated actual playing may fetch.
+	AutomaticPreferred bool   `json:"automaticPreferred"`
+	Enabled            bool   `json:"enabled"`
+	APIKey             string `json:"apiKey"`
+	Username           string `json:"username"`
+	Password           string `json:"password"`
+}
+
+// SubDL is the owner's SubDL subtitle account. Its free API key is enough
+// to search and download; the download quota is per key (paid) or per IP
+// (anonymous, 300/day).
+type SubDL struct {
+	Enabled bool   `json:"enabled"`
+	APIKey  string `json:"apiKey"`
 }
 
 // Subtitle provider kinds (SubtitleProvider.Kind). An installed add-on's
 // subtitles are kind "plugin:<id>/subtitles".
 const (
 	SubtitleProviderOpenSubtitles = "opensubtitles"
+	// SubtitleProviderSubDL is the SubDL (subdl.com) subtitle provider.
+	SubtitleProviderSubDL = "subdl"
 	// SubtitleProviderStremio is the retired kind of a subtitle add-on
 	// entered with its link (URL, sealed at rest and redacted). Such
 	// entries are migrated once into installed add-ons and never written.
@@ -537,6 +655,9 @@ type LiveTVScreens struct {
 }
 
 type LiveTV struct {
+	// LatencyProfile is the owner preference for every Live TV client.
+	LatencyProfile string `json:"latencyProfile,omitempty"`
+
 	// Extra act-break scan bandwidth. Zero selects defaults (1 GiB/day,
 	// 256 MiB/release including conservative read overhead, 1 GiB large-file
 	// threshold). Negative daily/release limits disable pre-air full scans.
@@ -551,6 +672,28 @@ type LiveTV struct {
 	// HealthSweepMinutes is the channel health sweep interval: 0 uses
 	// the default (15), negative disables the sweep.
 	HealthSweepMinutes int `json:"healthSweepMinutes,omitempty"`
+	// Stability is the server-wide Live TV stability preset: how much
+	// provider stream Ether holds in reserve so blips never reach the
+	// viewer. "fastest", "balanced" or "rocksolid"; empty means balanced.
+	// A channel may override it.
+	Stability string `json:"stability,omitempty"`
+}
+
+// Live TV stability presets (LiveTV.Stability and the per-channel override).
+const (
+	LiveTVStabilityFastest   = "fastest"
+	LiveTVStabilityBalanced  = "balanced"
+	LiveTVStabilityRockSolid = "rocksolid"
+)
+
+// ValidLiveTVStability reports whether v names a stability preset. Empty is
+// valid and means "inherit" (the server default, itself balanced).
+func ValidLiveTVStability(v string) bool {
+	switch v {
+	case "", LiveTVStabilityFastest, LiveTVStabilityBalanced, LiveTVStabilityRockSolid:
+		return true
+	}
+	return false
 }
 
 type LLM struct {
@@ -573,8 +716,11 @@ type LLM struct {
 
 type Updates struct {
 	// Enabled controls automatic release-feed checks (default true).
-	Enabled    bool   `json:"enabled"`
-	Channel    string `json:"channel"` // "stable", "beta"
+	Enabled bool   `json:"enabled"`
+	Channel string `json:"channel"` // "stable", "beta"
+	// AutoUpdate installs updates on their own, at night once nobody is
+	// watching (default true for new installs; existing settings without
+	// the key keep updates manual).
 	AutoUpdate bool   `json:"autoUpdate"`
 	FeedURL    string `json:"feedUrl"`
 	// MaintenanceStart/End bound the local-time window ("HH:MM") in which
@@ -677,6 +823,13 @@ type Store struct {
 	// sealed elsewhere (the database) cannot have been sealed with it.
 	keyCreated bool
 
+	// legacyLibraryNames holds the pre-v0.3.8 server.moviesLibraryName /
+	// tvShowsLibraryName values Open read, captured before any rewrite
+	// of config.json can drop them. internal/libraries migrates them
+	// onto libraries 1/2 once (LegacyLibraryNames).
+	legacyMoviesLibraryName  string
+	legacyTVShowsLibraryName string
+
 	// Cluster mode (see shared.go). shared is nil on a standalone server,
 	// where config.json is the only source. writeMu sequences cluster-mode
 	// writers (Update, refresh) so mu is never held across database calls.
@@ -748,13 +901,26 @@ func Open(dataDir string) (*Store, error) {
 		if err != nil {
 			return nil, err
 		}
+		// Capture the retired library-name keys before decode/save can
+		// drop them; a malformed extra read never blocks startup.
+		var legacyDoc struct {
+			Server struct {
+				MoviesLibraryName  string `json:"moviesLibraryName"`
+				TVShowsLibraryName string `json:"tvShowsLibraryName"`
+			} `json:"server"`
+		}
+		if json.Unmarshal(plain, &legacyDoc) == nil {
+			s.legacyMoviesLibraryName = strings.TrimSpace(legacyDoc.Server.MoviesLibraryName)
+			s.legacyTVShowsLibraryName = strings.TrimSpace(legacyDoc.Server.TVShowsLibraryName)
+		}
 		var dropped bool
 		if s.cfg, dropped, err = decodeStartupConfig(s.cfg, plain); err != nil {
 			return nil, fmt.Errorf("parse %s: %w", s.path, err)
 		}
 		upgraded := upgradeShippedQuality(&s.cfg)
-		if splitSharedProfiles(&s.cfg.Quality) {
+		if notes := normalizeQuality(&s.cfg.Quality); len(notes) > 0 {
 			upgraded = true
+			slog.Info("config: settled quality profiles", "changes", notes)
 		}
 		// Seal secrets written in plaintext (by hand, or by a release that
 		// predates sealing). Also rewrite a file that still names a server
@@ -776,6 +942,18 @@ func Open(dataDir string) (*Store, error) {
 		return nil, err
 	}
 	return s, nil
+}
+
+// LegacyLibraryNames returns the pre-v0.3.8 Movies / TV Shows library
+// names this store's config document carried at Open (empty when it
+// carried none). App wiring feeds them to
+// libraries.Service.MigrateConfigNames exactly once; the config
+// fields themselves are deleted.
+func (s *Store) LegacyLibraryNames() (movies, shows string) {
+	if s == nil {
+		return "", ""
+	}
+	return s.legacyMoviesLibraryName, s.legacyTVShowsLibraryName
 }
 
 // Read loads dataDir's settings without creating or rewriting anything:
@@ -822,10 +1000,28 @@ func decodeOverDefaults(defaults Config, b []byte) (Config, bool, error) {
 		delete(plex, "disableVersionTracking")
 	}
 	stripRetiredLiveTV(file)
+	upgradeClientIdentity(file)
+	keepStoredAutoUpdate(file)
 	doc := toDoc(defaults)
 	mergeDoc(doc, file)
 	cfg, err := fromDoc(doc)
 	return cfg, false, err
+}
+
+// keepStoredAutoUpdate keeps automatic installs off for stored settings
+// that do not say: they predate the on-by-default switch (v0.3.5 and
+// earlier defaulted to off), so the new default must not reach an existing
+// install through a missing key. Only a brand-new install (no stored
+// settings at all) starts with automatic installs on.
+func keepStoredAutoUpdate(file map[string]any) {
+	updates, ok := file["updates"].(map[string]any)
+	if !ok {
+		updates = map[string]any{}
+		file["updates"] = updates
+	}
+	if _, set := updates["autoUpdate"]; !set {
+		updates["autoUpdate"] = false
+	}
 }
 
 // decodeStartupConfig decodes the stored config over defaults. The
@@ -853,11 +1049,18 @@ func decodeStartupConfig(defaults Config, b []byte) (Config, bool, error) {
 	if stripRetiredLiveTV(file) {
 		dropped = true
 	}
+	keepStoredAutoUpdate(file)
 	if server, ok := file["plex"].(map[string]any); ok {
 		if _, exists := server["disableVersionTracking"]; exists {
 			delete(server, "disableVersionTracking")
 			dropped = true
 		}
+	}
+	if resetPreStandardQuality(file) {
+		dropped = true
+	}
+	if upgradeClientIdentity(file) {
+		dropped = true
 	}
 	doc := toDoc(defaults)
 	if av, ok := file["availability"].(map[string]any); ok {
@@ -885,14 +1088,6 @@ func decodeStartupConfig(defaults Config, b []byte) (Config, bool, error) {
 		}
 	}
 	cfg, err := fromDoc(doc)
-	if err == nil {
-		for i := range cfg.Quality.Profiles {
-			if len(cfg.Quality.Profiles[i].Ranking) == 0 {
-				cfg.Quality.Profiles[i].Ranking = core.DefaultRanking(cfg.Quality.Profiles[i].ReleaseRules)
-				dropped = true
-			}
-		}
-	}
 	return cfg, dropped, err
 }
 
@@ -1018,6 +1213,7 @@ func (s *Store) update(fn func(*Config) error) error {
 		return err
 	}
 	DropFrontendServerNames(&next)
+	syncDerived(&next)
 	prev := s.cfg
 	s.cfg = next
 	if err := s.save(); err != nil {

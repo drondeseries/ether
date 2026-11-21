@@ -1,6 +1,6 @@
 import { render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
-import { UpdatesStatus } from "../pages/settings/sections";
+import { describeUpdaterMessage, UpdatesStatus } from "../pages/settings/sections";
 import type { UpdateStatus } from "../lib/types";
 
 const base: UpdateStatus = {
@@ -60,12 +60,91 @@ describe("update availability confidence", () => {
     expect(screen.getByText("No update feed configured")).toBeInTheDocument();
     expect(screen.queryByText("Ether is up to date")).not.toBeInTheDocument();
   });
+
+  it("maps internal Go updater errors to plain owner language and disables manual check", async () => {
+    await show({
+      enabled: false,
+      capability: "disabled",
+      disabledReason: "updater: no release public key configured",
+    });
+    expect(screen.getByText("This build can't check for signed updates.")).toBeInTheDocument();
+    expect(screen.queryByText(/updater:/i)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Check for updates" })).toBeDisabled();
+  });
+
+  it("never leaks raw updater: prefixes from Go error messages", () => {
+    expect(describeUpdaterMessage("updater: no release public key configured")).toBe(
+      "This build can't check for signed updates.",
+    );
+    expect(
+      describeUpdaterMessage(
+        "updater: updates are disabled in this build: updater: no release public key configured",
+      ),
+    ).toBe("This build can't check for signed updates.");
+    expect(describeUpdaterMessage("check: updater: manifest signature verification failed")).toBe(
+      "The update feed's signature couldn't be verified.",
+    );
+    expect(describeUpdaterMessage("updater: stat target: permission denied")).not.toMatch(
+      /updater:/i,
+    );
+  });
+
   it("preserves the skipped rollback explanation", async () => {
     await show({ state: "rolled-back", failedVersion: "0.2.44" });
     expect(
       screen.getByText("Version 0.2.44 was rolled back and will be skipped"),
     ).toBeInTheDocument();
     expect(screen.queryByText("Ether is up to date")).not.toBeInTheDocument();
+  });
+});
+
+describe("automatic update schedule", () => {
+  const staged = { version: "0.3.6", kind: "binary", staged: true };
+
+  it("says when a staged update installs", async () => {
+    await show({ autoUpdate: true, state: "waiting-for-window", available: staged });
+    expect(
+      screen.getByText("Installs tonight between 03:00 and 05:00, once nobody is watching."),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Ether installs updates by itself at night, once nobody is watching."),
+    ).toBeInTheDocument();
+  });
+
+  it("explains a staged rollout wait", async () => {
+    await show({
+      autoUpdate: true,
+      state: "waiting-for-rollout",
+      available: { ...staged, staged: false, installAfter: "2026-11-09T10:00:00Z" },
+    });
+    expect(screen.getByText(/New releases reach servers a few at a time/)).toBeInTheDocument();
+  });
+
+  it("quietly suggests automatic updates when they are off", async () => {
+    await show({ autoUpdate: false });
+    expect(
+      screen.getByText(/Off\. Turn on “Install updates automatically” below/),
+    ).toBeInTheDocument();
+  });
+
+  it("shows a finished update until dismissed", async () => {
+    await show({ installed: { from: "0.3.5", to: "0.2.32", at: "2026-11-08T03:12:00Z" } });
+    expect(screen.getByText("Updated to 0.2.32")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Dismiss" })).toBeInTheDocument();
+  });
+
+  it("gives a container the exact pull commands", async () => {
+    await show({
+      capability: "notify-only",
+      notifyKind: "container",
+      channel: "stable",
+      available: { version: "0.3.6", kind: "binary", staged: false },
+    });
+    expect(screen.getByText("docker compose pull && docker compose up -d")).toBeInTheDocument();
+    expect(
+      screen.getByText("docker pull ghcr.io/braedonsaunders/ether:latest"),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/Watchtower/)).toBeInTheDocument();
   });
 });
 

@@ -3,6 +3,7 @@ package playback
 import (
 	"context"
 	"errors"
+	"github.com/braedonsaunders/ether/internal/config"
 	"github.com/braedonsaunders/ether/internal/core"
 	"testing"
 	"time"
@@ -100,5 +101,37 @@ func TestSharedBroadcastViewerAndRolloverBudget(t *testing.T) {
 	}
 	if err := h.m.JoinChannel(friend, defaultCaps("friend-c"), "viewer-cccccccccccc", c); err != nil {
 		t.Fatal("retired output did not release budget", err)
+	}
+}
+
+// The automatic limit (no MaxStreams) protects Usenet connections, so it
+// counts only streams that resolve a release: passthrough IPTV neither
+// takes one of those slots nor is refused by them.
+func TestUsenetDerivedLimitLeavesPassthroughIPTV(t *testing.T) {
+	h := newHarness(t, []*fakeRelease{mkv("A", 10000, time.Minute)}, []string{"A"}, func(h *harness, o *Options) {
+		h.cfg.Server.MaxStreams = 0
+		h.cfg.Server.DefaultStreamLimit = 10
+		h.cfg.Usenet.Providers = []config.UsenetProvider{{Enabled: true, Connections: 16}}
+	})
+	ctx := context.Background()
+	if _, err := h.m.Prepare(ctx, owner, movieKey, defaultCaps("vod-1")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.m.Prepare(ctx, friend, movieKey, defaultCaps("vod-2")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.m.BeginChannel(owner, defaultCaps("iptv"), "abcdef0123456789abcdef0123456789"); err != nil {
+		t.Fatalf("IPTV refused by the Usenet-derived limit: %v", err)
+	}
+	if _, err := h.m.Prepare(ctx, friend, movieKey, defaultCaps("vod-3")); !errors.Is(err, core.ErrStreamLimit) {
+		t.Fatalf("third release-backed stream passed a 2-stream Usenet limit: %v", err)
+	}
+	for _, s := range h.m.Sessions() {
+		if s.ClientID == "vod-2" {
+			h.m.Stop(s.ID)
+		}
+	}
+	if _, err := h.m.Prepare(ctx, friend, movieKey, defaultCaps("vod-3")); err != nil {
+		t.Fatalf("an active IPTV channel took a Usenet slot: %v", err)
 	}
 }

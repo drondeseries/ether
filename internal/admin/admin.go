@@ -25,19 +25,27 @@ package admin
 import (
 	"context"
 	"embed"
+	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/braedonsaunders/ether/internal/artwork"
 	"github.com/braedonsaunders/ether/internal/config"
 	"github.com/braedonsaunders/ether/internal/core"
 	"github.com/braedonsaunders/ether/internal/diagnostics"
+	"github.com/braedonsaunders/ether/internal/events"
 	"github.com/braedonsaunders/ether/internal/identity"
+	"github.com/braedonsaunders/ether/internal/veladist"
 )
 
 //go:embed all:dist
 var distFS embed.FS
+
+//go:embed placeholder.html
+var placeholderHTML []byte
 
 // RedactedSecret is the placeholder shown in place of a stored secret.
 // A PUT that sends it back unchanged preserves the stored value.
@@ -56,6 +64,12 @@ type PlexAuth interface {
 	Claim(ctx context.Context) error
 	// Status returns a JSON-able snapshot (claimed, owner, connections...).
 	Status() any
+}
+
+// PlexFriendSyncer is an optional capability on PlexAuth for refreshing shared
+// Plex users and their server access tokens on demand.
+type PlexFriendSyncer interface {
+	SyncFriends(ctx context.Context) error
 }
 
 // SignIn is a plex.tv PIN sign-in that, unlike PlexAuth, changes nothing on
@@ -98,9 +112,13 @@ type StatusFuncE func(ctx context.Context) (any, error)
 // dependencies (Plex sign-in, testers, traces, users, personalization,
 // collections, catalogue helper, image proxy) are required. Only the
 // tuning knobs, Logger/Logs, the dashboard status providers, Extensions,
-// ValidateExtra and DiskUsage have defaults or may be left empty.
+// ValidateExtra, DiskUsage and UI have defaults or may be left empty.
 type Deps struct {
 	ViewerCatalogRules ViewerCatalogRules
+	Vela               *veladist.Manager
+	VelaSkins          VelaSkinAdmin
+	UploadVelaWordmark func(context.Context, io.Reader) (VelaWordmark, error)
+	UploadVelaIcon     func(context.Context, io.Reader) (VelaAppIcon, error)
 	Frontends          FrontendAdmin
 	FavoritesMirror    FavoritesMirror
 	NotInterested      NotInterestedPortal
@@ -138,6 +156,8 @@ type Deps struct {
 	Config *config.Store
 	// Logger defaults to slog.Default().
 	Logger *slog.Logger
+	// EventBus receives structured auth events (sign-in success/failure).
+	EventBus *events.Bus
 	// Logs is the in-memory log ring served at /ether/api/logs. A fresh
 	// 2000-entry buffer is created when nil (retrieve it via
 	// Handler.Logs()); pass a shared one to tail server logs.
@@ -150,6 +170,9 @@ type Deps struct {
 	Support *diagnostics.Recorder
 	// Version is reported by /ether/api/bootstrap ("dev" when empty).
 	Version string
+	// UI overrides the embedded console bundle (tests). Nil serves the
+	// embedded internal/admin/dist directory.
+	UI fs.FS
 
 	// PlexAuth drives wizard step 1 (plex.tv PIN sign-in and claim).
 	PlexAuth PlexAuth
@@ -165,11 +188,14 @@ type Deps struct {
 	Sessions Sessions
 
 	// Provider/integration testers used by the wizard and settings pages.
-	TestUsenet        func(ctx context.Context, p config.UsenetProvider) error
-	TestIndexer       func(ctx context.Context, ix config.Indexer) error
+	TestUsenet  func(ctx context.Context, p config.UsenetProvider) error
+	TestIndexer func(ctx context.Context, ix config.Indexer) error
+	// IndexerPreview renders the masked sample requests for an indexer draft.
+	IndexerPreview    func(ix config.Indexer) (any, error)
 	TestDebrid        func(ctx context.Context, p config.DebridProvider) error
 	TestTMDB          func(ctx context.Context, key string) error
 	TestOpenSubtitles func(ctx context.Context, cfg config.OpenSubtitles) error
+	TestSubDL         func(ctx context.Context, cfg config.SubDL) error
 	TestLLM           func(ctx context.Context, cfg config.LLM) error
 	// LLMModels lists the models the provider in cfg offers.
 	LLMModels func(ctx context.Context, cfg config.LLM) ([]LLMModel, error)
@@ -177,6 +203,10 @@ type Deps struct {
 	// TestIntroDB probes TheIntroDB with the posted key, or the stored key
 	// when the post is empty or still redacted.
 	TestIntroDB func(ctx context.Context, apiKey string) error
+	// TestSkipDB probes SkipDB with the posted key, or the stored key when
+	// the post is empty or still redacted. Reading is open, so an empty key
+	// probes the public API.
+	TestSkipDB func(ctx context.Context, apiKey string) error
 
 	// Dashboard status providers. Each non-nil provider appears on the
 	// dashboard and at /ether/api/status/{name}.
@@ -185,8 +215,11 @@ type Deps struct {
 	ProvidersStatus StatusFunc // "providers" — Usenet provider health
 	IndexersStatus  StatusFunc // "indexers" — budgets remaining
 	CatalogStatus   StatusFunc // "catalog" — catalogue sync/stats
-	RemoteStatus    StatusFunc // "remote" — remote access
-	HWAccelStatus   StatusFunc // "hwaccel" — transcoding hardware
+	// PauseTierMigration pauses (true) or resumes the one-off library-tier
+	// migration shown in the catalogue status.
+	PauseTierMigration func(ctx context.Context, paused bool) error
+	RemoteStatus       StatusFunc // "remote" — remote access
+	HWAccelStatus      StatusFunc // "hwaccel" — transcoding hardware
 
 	// CacheRestartRequired reports whether the saved folder/storage differs
 	// from the running cache, including changes made during initial setup.
@@ -200,6 +233,10 @@ type Deps struct {
 
 	// DatabaseCheck runs an owner-requested integrity check. Optional for offline consoles.
 	DatabaseCheck StatusFuncE
+	// DatabaseCompactStatus reports what compacting the database would take
+	// and any compaction running; DatabaseCompact starts one. Both optional.
+	DatabaseCompactStatus StatusFuncE
+	DatabaseCompact       StatusFuncE
 
 	// ResolverTraces backs GET /ether/api/traces.
 	ResolverTraces StatusFuncE
@@ -226,6 +263,12 @@ type Deps struct {
 	// /api/insights/* (internal/personalize.Engine). Viewers are listed
 	// from Users.
 	Personalization Personalization
+	// LayoutLibraries lists libraries that have Recommended layouts
+	// ("library:<id>"). Optional.
+	LayoutLibraries func(context.Context) ([]LayoutLibrary, error)
+	// PluginLibraryRows lists candidate row descriptors and live shelves for a
+	// plugin library's Recommended tab. Optional.
+	PluginLibraryRows func(ctx context.Context, viewer *core.User, libraryID int) ([]core.RowDescriptor, []core.HomeRow, error)
 
 	// Collections backs /api/collections* (Collection Studio).
 	Collections CollectionStudio
@@ -233,17 +276,31 @@ type Deps struct {
 	CatalogHelper CatalogHelper
 	// TitleSchedules backs the catalogue drawer's episode and release tabs;
 	// nil disables them.
-	TitleSchedules    TitleSchedules
-	CatalogVisibility func(context.Context, []core.LibraryExclusion, string) (any, error)
+	TitleSchedules      TitleSchedules
+	CatalogVisibility   func(context.Context, []core.LibraryExclusion, string, core.LibraryID) (any, error)
+	LibraryBrowseFilter func(context.Context, core.LibraryID, core.Filter) (core.Filter, error)
 	// WaitingReleaseKeys are in-window movies still hidden from viewers.
 	// Nil leaves the waiting catalog filter empty.
 	WaitingReleaseKeys func(context.Context) []core.RatingKey
 	// Images backs the TMDB image proxy at /api/image.
 	Images ImageProxy
+	// OwnerArtwork manages uploads independently of the catalog.
+	OwnerArtwork interface {
+		OwnerStatus() (int, time.Time, bool, error)
+		ClearOwner() (bool, error)
+	}
+	// TitlePosters draws a poster for a title with no artwork.
+	TitlePosters interface {
+		Title(context.Context, artwork.TitlePoster) ([]byte, string, error)
+	}
 
 	// PlexWatch is the per-viewer Plex account watch-state integration.
 	// Nil hides the routes.
 	PlexWatch PlexWatch
+
+	// Trakt is the per-viewer Trakt OAuth device-code integration.
+	// Nil answers 503.
+	Trakt Trakt
 
 	// Prerolls backs /api/admin/prerolls*. Nil hides the routes.
 	Prerolls Prerolls
@@ -251,6 +308,15 @@ type Deps struct {
 	// PlexServers is watch sync with owner-run Plex Media Servers. Nil
 	// hides the routes.
 	PlexServers PlexServers
+
+	// SharePlexViewer grants library access on plex.tv to the given username,
+	// email or user ID for this server. Nil ignores cloud library sharing.
+	SharePlexViewer func(ctx context.Context, usernameOrEmail string, userID int64) error
+
+	// Flows backs /api/flows/* (owner-authenticated) and /api/flows/hooks/{token}
+	// (incoming webhook ingress outside console auth). Nil hides the routes
+	// unless mounted explicitly via Extensions / PublicExtensions.
+	Flows *FlowsDeps
 }
 
 // Handler is the admin HTTP handler. Use NewHandler when you need access
@@ -261,6 +327,8 @@ type Handler struct {
 	logs           *LogBuffer
 	mux            *http.ServeMux
 	version        string
+	ui             fs.FS
+	scriptCSP      string
 	pins           *pinHandles
 	portalPins     *pinHandles
 	linkPins       *pinHandles
@@ -289,7 +357,12 @@ func NewHandler(deps Deps) *Handler {
 	if version == "" {
 		version = "dev"
 	}
-	h := &Handler{deps: deps, log: deps.Logger, logs: deps.Logs, version: version, pins: newPINHandles(), portalPins: newPINHandles(), linkPins: newPINHandles(), authLimit: newAuthLimiter(), loginBodySlots: make(chan struct{}, 32)}
+	scriptCSP := consoleScriptPolicy()
+	if deps.UI != nil {
+		index, _ := fs.ReadFile(deps.UI, "index.html")
+		scriptCSP = scriptPolicy(index)
+	}
+	h := &Handler{deps: deps, log: deps.Logger, logs: deps.Logs, version: version, ui: deps.UI, scriptCSP: scriptCSP, pins: newPINHandles(), portalPins: newPINHandles(), linkPins: newPINHandles(), authLimit: newAuthLimiter(), loginBodySlots: make(chan struct{}, 32)}
 	h.mux = h.routes()
 	return h
 }
@@ -327,6 +400,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) routes() *http.ServeMux {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/web-player", h.webPlayer)
+	mux.HandleFunc("POST /api/web-player", h.webPlayer)
 	api := func(pattern string, fn http.HandlerFunc) {
 		mux.HandleFunc(pattern, h.requireAuth(fn))
 	}
@@ -343,6 +418,10 @@ func (h *Handler) routes() *http.ServeMux {
 	mux.HandleFunc("POST /api/me/favorites-mirror", h.portalFavoritesMirror)
 	mux.HandleFunc("GET /api/me/apps", h.portalConnectApps)
 	mux.HandleFunc("POST /api/me/apps/{surface}", h.portalConnectApps)
+	mux.HandleFunc("GET /api/me/trakt", h.portalTraktStatus)
+	mux.HandleFunc("POST /api/me/trakt/device", h.portalTraktStart)
+	mux.HandleFunc("POST /api/me/trakt/poll", h.portalTraktPoll)
+	mux.HandleFunc("POST /api/me/trakt/disconnect", h.portalTraktDisconnect)
 	mux.HandleFunc("POST /api/me/link/plex", h.limitIdentityAuth(h.handlePlexLinkStart))
 	mux.HandleFunc("GET /api/me/link/plex/{handle}", h.limitIdentityPoll(h.handlePlexLinkPoll))
 	mux.HandleFunc("POST /api/me/invite", h.handleInviteCreate)
@@ -377,6 +456,9 @@ func (h *Handler) routes() *http.ServeMux {
 	api("GET /api/frontends/{id}/settings", h.frontendSettings)
 	api("PUT /api/frontends/{id}/settings", h.frontendSettings)
 	api("PUT /api/frontends/{id}/enabled", h.frontendToggle)
+	api("GET /api/poster-folders", h.posterFolders)
+	api("GET /api/posters/status", h.posterStatus)
+	api("POST /api/posters/clear", h.clearPosters)
 	api("GET /api/config", h.handleGetConfig)
 	api("PUT /api/config", h.handlePutConfig)
 	api("GET /api/config/{section}", h.handleGetSection)
@@ -390,18 +472,22 @@ func (h *Handler) routes() *http.ServeMux {
 	api("POST /api/plex/pin", h.handlePINStart)
 	api("GET /api/plex/pin/{id}", h.handlePINPoll)
 	api("POST /api/plex/claim", h.handleClaim)
+	api("POST /api/plex/friends/sync", h.handleSyncPlexFriends)
 	api("GET /api/plex/status", h.handlePlexStatus)
 
 	api("POST /api/test/usenet", h.handleTestUsenet)
 	api("POST /api/test/indexer", h.handleTestIndexer)
+	api("POST /api/indexer/preview", h.handleIndexerPreview)
 	api("POST /api/test/debrid", h.handleTestDebrid)
 	api("POST /api/test/tmdb", h.handleTestTMDB)
 	api("POST /api/test/opensubtitles", h.handleTestOpenSubtitles)
+	api("POST /api/test/subdl", h.handleTestSubDL)
 	api("POST /api/test/llm", h.handleTestLLM)
 	api("GET /api/llm/providers", h.handleLLMProviders)
 	api("POST /api/llm/models", h.handleLLMModels)
 	api("POST /api/test/trakt", h.handleTestTrakt)
 	api("POST /api/test/introdb", h.handleTestIntroDB)
+	api("POST /api/test/skipdb", h.handleTestSkipDB)
 	api("POST /api/outbound/check", h.handleOutboundCheck)
 
 	api("GET /api/dashboard", h.handleDashboard)
@@ -409,6 +495,8 @@ func (h *Handler) routes() *http.ServeMux {
 	api("GET /api/status", h.handleWidget)
 	api("GET /api/status/{name}", h.handleStatus)
 	api("POST /api/status/database/check", h.handleDatabaseCheck)
+	api("GET /api/status/database/compact", h.handleDatabaseCompact)
+	api("POST /api/status/database/compact", h.handleDatabaseCompact)
 	api("GET /api/traces", h.handleTraces)
 	api("GET /api/disk", h.handleDisk)
 
@@ -416,6 +504,8 @@ func (h *Handler) routes() *http.ServeMux {
 	api("POST /api/users/{id}/password", h.ownerIdentityManagement)
 	api("GET /api/users/{id}/devices", h.ownerIdentityManagement)
 	api("POST /api/users/{id}/devices/revoke", h.ownerIdentityManagement)
+	api("POST /api/users/{id}/devices/xtream/reveal", h.ownerXtreamLogin)
+	api("POST /api/users/{id}/devices/xtream/limit", h.ownerXtreamLogin)
 	api("POST /api/users/{id}/invite", h.ownerIdentityManagement)
 	api("POST /api/users/local", h.handleCreateLocalViewer)
 	api("POST /api/users/invite", h.handleCreateInviteViewer)
@@ -430,6 +520,7 @@ func (h *Handler) routes() *http.ServeMux {
 	api("PATCH /api/users/{id}", h.handleUpdateUser)
 
 	api("GET /api/logs", h.handleLogs)
+	api("GET /api/logs/stream", h.handleLogsStream)
 	api("GET /api/logs/download", h.handleLogsDownload)
 	api("DELETE /api/logs", h.handleClearLogs)
 
@@ -459,10 +550,14 @@ func (h *Handler) routes() *http.ServeMux {
 		prefix := "/api/" + path
 		mux.Handle(prefix+"/", http.StripPrefix(prefix, handler))
 	}
+	h.velaRoutes(api)
+	h.velaSkinRoutes(api)
 	h.personalizationRoutes(api)
 	h.collectionRoutes(mux, api)
 	h.prerollRoutes(api)
 	h.plexServerRoutes(api)
+	h.viewersPlexImportRoutes(api)
+	h.flowsRoutes(mux)
 
 	mux.HandleFunc("/api/", h.requireAuth(func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "no such API endpoint")

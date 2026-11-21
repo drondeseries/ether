@@ -42,9 +42,12 @@ LDFLAGS="-s -w \
   -X github.com/braedonsaunders/ether/internal/updater.PublicKeyB64=${ETHER_UPDATE_PUBLIC_KEY:-} \
   -X github.com/braedonsaunders/ether/internal/tmdb.BundledKey=${ETHER_TMDB_BUNDLED_KEY:-}"
 
+echo "==> building web console (embedded by go:embed)"
+"$ROOT/scripts/build-web.sh"
+
 echo "==> building server (universal, CGO_ENABLED=0)"
 for arch in amd64 arm64; do
-  CGO_ENABLED=0 GOOS=darwin GOARCH=$arch go build -trimpath -ldflags "$LDFLAGS" \
+  CGO_ENABLED=0 GOEXPERIMENT=simd GOOS=darwin GOARCH=$arch go build -trimpath -ldflags "$LDFLAGS" \
     -o "dist/tmp-mac/ether-$arch" ./cmd/ether
 done
 lipo -create -output "$RES/ether" dist/tmp-mac/ether-amd64 dist/tmp-mac/ether-arm64

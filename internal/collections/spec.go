@@ -48,7 +48,7 @@ const (
 	classTags   fieldClass = iota + 1 // multi-valued names: genre, country, language, contentRating
 	classRefs                         // TMDB entities by id or name: keyword, person, studio, network, collection, watchProvider
 	classNumber                       // year, decade, rating, votes, popularity, runtime
-	classDate                         // released, addedAt
+	classDate                         // released, addedAt, latestEpisode, latestSeasonPremiere
 	classBool                         // watched, inProgress (per user)
 )
 
@@ -58,7 +58,7 @@ var ruleFields = map[string]fieldClass{
 	"collection": classRefs, "watchProvider": classRefs,
 	"year": classNumber, "decade": classNumber, "rating": classNumber, "votes": classNumber,
 	"popularity": classNumber, "runtime": classNumber,
-	"released": classDate, "addedAt": classDate,
+	"released": classDate, "addedAt": classDate, "latestEpisode": classDate, "latestSeasonPremiere": classDate,
 	"watched": classBool, "inProgress": classBool,
 }
 
@@ -107,6 +107,20 @@ var accentRe = regexp.MustCompile(`^#[0-9a-fA-F]{6}$`)
 // Normalize fills defaults in place: an empty source list means the whole
 // catalogue, empty match means "all", and so on. It never fails.
 func Normalize(s *core.CollectionSpec) {
+	// Normalize only the rule lists. Round-tripping the whole spec would
+	// rewrite unrelated fields: zero-value targets marshal as an explicit
+	// empty list, which means "nobody".
+	for _, rules := range []*[]core.CollectionRule{&s.Rules, &s.Exclude} {
+		if raw, err := json.Marshal(*rules); err == nil {
+			if fixed, changed := core.NormalizeRuleDocument(raw); changed {
+				var out []core.CollectionRule
+				if json.Unmarshal(fixed, &out) == nil {
+					*rules = out
+				}
+			}
+		}
+	}
+	s.MediaType = core.NormalizeRuleMediaType(s.MediaType)
 	s.Name = strings.TrimSpace(s.Name)
 	s.Description = strings.TrimSpace(s.Description)
 	if s.MediaType == "" {
@@ -120,6 +134,7 @@ func Normalize(s *core.CollectionSpec) {
 	}
 	for i := range s.Sources {
 		src := &s.Sources[i]
+		src.MediaType = core.NormalizeRuleMediaType(src.MediaType)
 		src.URL = strings.TrimSpace(src.URL)
 		src.List = strings.TrimSpace(src.List)
 		src.Label = strings.TrimSpace(src.Label)

@@ -3,6 +3,7 @@ package livetv
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -12,6 +13,7 @@ import (
 	"io"
 	"log"
 	"log/slog"
+	"math"
 	"mime"
 	"net"
 	"net/http"
@@ -49,7 +51,6 @@ const (
 var relayIOTimeout = 30 * time.Second
 
 var (
-	errRelayDowngrade   = errors.New("livetv input relay: HTTPS downgrade")
 	errRelayUnsupported = errors.New("livetv input relay: unsupported manifest")
 	relayExt            = regexp.MustCompile(`^\.[a-z0-9]{1,8}$`)
 )
@@ -60,9 +61,27 @@ type inputRelay struct {
 	host   string // 127.0.0.1:port; "" until first use
 	grants map[[sha256.Size]byte]*inputGrant
 	bySess map[*session]*inputGrant
+	// health mirrors bySess for inputHealth, which must never wait on mu:
+	// grant changes hold it across a synchronous provider close.
+	health sync.Map // *session -> *inputGrant
+}
+
+// cachedManifest holds the bytes of a manifest fetched during input sniff so
+// subsequent readers (ffprobe, passthrough open, or ffmpeg relay failover) can
+// consume it without issuing a second GET against single-use token master URLs.
+type cachedManifest struct {
+	raw      string
+	body     []byte
+	base     *url.URL
+	hls      bool
+	isMaster bool
 }
 
 type inputGrant struct {
+	variantCaps   core.ClientCaps // immutable input quality ceilings
+	variantLogged sync.Once
+
+	login        *loginLease
 	log          *slog.Logger // immutable, credential-free session correlation
 	token        string
 	origin       string      // the only origin that receives authentication
@@ -72,8 +91,29 @@ type inputGrant struct {
 	cancel       context.CancelFunc
 	slots        chan struct{}
 	source       string // the capped provider account behind this input; "" none
+	// reserve is how far behind the live edge this input's reader plays
+	// (stabilityReserve for a Steady input, else zero); immutable.
+	reserve time.Duration
+	lead    time.Duration // extra join depth for a start window (grantSteadyInputLead); immutable
+	steady  bool          // feeds a real-time consumer (grantSteadyInput); immutable
+	// histChannel/histSrc name the source in its history (the session's
+	// original source entry, not the resolved URL); immutable.
+	histChannel string
+	histSrc     StreamSource
+	admitting   atomic.Bool // cold admission tries another input after one refusal
+	paced       atomic.Bool // initial provider tune-gap slot booked once per grant
+	reported    atomic.Bool // the grant's session has been counted in history
+	service     *Service
+	direct      *directStreamState // shared reuse/re-resolve state for direct live streams
 
 	mu               sync.Mutex
+	directGen        uint64
+	tap              *upstreamTap    // the shared connection the root input reads through
+	manifest         *cachedManifest // cached root manifest (master kept for grant lifetime; media consumed once)
+	hls              *hlsInput       // provider playlist state when the root input is HLS
+	watchers         map[*func(UpstreamEvent)]struct{}
+	stalledAt        time.Time                  // guarded by mu; tracks stall onset for downtimeMs
+	snap             atomic.Pointer[healthSnap] // published health; see inputHealth
 	resources        map[string]*relayResource
 	byKey            map[string]string
 	order            []string
@@ -108,15 +148,102 @@ func relayName(stem, p string) string {
 	return stem
 }
 
+// relaySegmentExt are the media extensions a provider may carry in a query
+// value (a redirect target) for an extensionless segment URL.
+var relaySegmentExt = map[string]bool{".ts": true, ".m4s": true, ".mp4": true, ".m4a": true, ".m4v": true, ".aac": true, ".ac3": true, ".ec3": true, ".mp3": true, ".vtt": true, ".webvtt": true, ".cmfv": true, ".cmfa": true, ".m3u8": true}
+
+// relayMediaName names a resource a playlist refers to. ffmpeg refuses an HLS
+// segment whose URL has no media extension (allowed_segment_extensions), and
+// FAST providers (Amagi, ad-insertion beacons) name segments without one, so
+// such a resource takes the extension its URL carries elsewhere (a
+// redirect_url query value), else ".ts". ffmpeg still probes the bytes.
+func relayMediaName(u *url.URL) string {
+	if ext := strings.ToLower(path.Ext(u.Path)); relayExt.MatchString(ext) {
+		return "media" + ext
+	}
+	for _, vals := range u.Query() {
+		for _, v := range vals {
+			if inner, err := url.Parse(v); err == nil && inner.Host != "" {
+				if ext := strings.ToLower(path.Ext(inner.Path)); relaySegmentExt[ext] {
+					return "media" + ext
+				}
+			}
+		}
+	}
+	return "media.ts"
+}
+
 func tokenKey(token string) [sha256.Size]byte { return sha256.Sum256([]byte(token)) }
 
 // grantInput replaces the session's grant with one for src. The token is
 // the only credential; it reaches ffmpeg as a path component.
 func (s *Service) grantInput(ss *session, src StreamSource, headers http.Header) error {
+	return s.grantInputFor(ss, src, headers, false, 0)
+}
+
+// grantSteadyInput is grantInput for a consumer that reads its input at
+// real time: Steady's frame clock, or an owned relay whose timeline paces
+// its output. A reader started behind the live edge then stays there, and
+// that distance is the channel's stability reserve. A consumer that reads
+// as fast as bytes arrive (an unpaced relay) would only turn a reserve into
+// a burst of segments; it uses grantInput.
+func (s *Service) grantSteadyInput(ss *session, src StreamSource, headers http.Header) error {
+	return s.grantInputFor(ss, src, headers, true, 0)
+}
+
+// grantSteadyInputLead is grantSteadyInput for a consumer that publishes a
+// start window ahead of real time as soon as it starts (an owned relay's
+// first segments): its reader joins lead deeper than the reserve, so the
+// reserve is still whole once that window is out. No lead is added when the
+// channel's preset holds no reserve (Fastest).
+func (s *Service) grantSteadyInputLead(ss *session, src StreamSource, headers http.Header, lead time.Duration) error {
+	return s.grantInputFor(ss, src, headers, true, max(lead, 0))
+}
+
+func (s *Service) grantInputFor(ss *session, src StreamSource, headers http.Header, steady bool, lead time.Duration) error {
 	c := ss.info.Channel
 	source := src.AuthSourceID
 	if source == "" && c.SourceID != "" && (src.ID == stableID(c.ID, "playlist") || len(c.StreamSources) <= 1) {
 		source = c.SourceID
+	}
+	lease, err := s.leaseLogin(ss.ctx, source, src.URL, headers)
+	if err != nil {
+		return err
+	}
+	accepted := false
+	defer func() {
+		if !accepted {
+			s.releaseLogin(lease)
+		}
+	}()
+	if lease != nil {
+		src.URL = lease.raw
+		headers = lease.headers
+	}
+	ss.mu.Lock()
+	direct := ss.direct
+	ephemeral := ss.ephemeral
+	ss.mu.Unlock()
+	var directGen uint64
+	manifest := ss.sniffedManifestFor(src.URL)
+	if direct != nil {
+		dURL, dRawHdrs, dHdrs, dCM, dGen, _, _ := direct.current()
+		if dURL != "" && (dURL == src.URL || ephemeral) {
+			src.URL = dURL
+			src.Headers = dRawHdrs
+			headers = dHdrs
+			manifest = dCM
+			directGen = dGen
+		}
+	} else if manifest == nil {
+		s.inputRelay.mu.Lock()
+		old := s.inputRelay.bySess[ss]
+		s.inputRelay.mu.Unlock()
+		if old != nil {
+			if cm := old.peekManifest(src.URL); cm != nil && cm.isMaster {
+				manifest = cm
+			}
+		}
 	}
 	u, err := url.Parse(src.URL)
 	if err != nil || !validHTTP(src.URL) {
@@ -126,11 +253,23 @@ func (s *Service) grantInput(ss *session, src StreamSource, headers http.Header)
 	if _, err := rand.Read(b[:]); err != nil {
 		return err
 	}
-	ctx, cancel := context.WithCancel(s.ctx)
-	g := &inputGrant{
+	var reserve time.Duration
+	if steady {
+		reserve = s.stabilityReserve(c)
+	}
+	if reserve == 0 {
+		lead = 0
+	}
+	ctx, cancel := context.WithCancel(s.serviceContext())
+	histSrc := src
+	if ss.inputSource.ID != "" {
+		histSrc = ss.inputSource
+	}
+	g := &inputGrant{variantCaps: core.ClientCaps{MaxHeight: ss.caps.MaxHeight, MaxBitrateKbps: ss.caps.MaxBitrateKbps}, login: lease, reserve: reserve, lead: lead, steady: steady, service: s, direct: direct, directGen: directGen, histChannel: c.ID, histSrc: histSrc,
 		log:   s.sessionLog(ss).With("input", src.ID),
 		token: base64.RawURLEncoding.EncodeToString(b[:]), origin: relayOrigin(u), headers: headers.Clone(), mediaHeaders: redirectMediaHeaders(src.Headers),
 		ctx: ctx, cancel: cancel, slots: make(chan struct{}, relayConcurrency), source: source,
+		manifest:  manifest,
 		resources: map[string]*relayResource{"0": {name: relayName("stream", u.Path), url: src.URL}},
 		byKey:     map[string]string{},
 	}
@@ -148,8 +287,20 @@ func (s *Service) grantInput(ss *session, src StreamSource, headers http.Header)
 		cancel()
 		return core.ErrNotAvailable
 	}
+	if lease != nil {
+		s.loginPool.mu.Lock()
+		if lease.lost {
+			s.loginPool.mu.Unlock()
+			cancel()
+			return ErrProviderBusy
+		}
+		lease.grants[g] = struct{}{}
+		s.loginPool.mu.Unlock()
+	}
+	accepted = true
 	r.grants[tokenKey(g.token)] = g
 	r.bySess[ss] = g
+	r.health.Store(ss, g)
 	return nil
 }
 
@@ -169,6 +320,8 @@ func (s *Service) transferInput(from, to *session) {
 		r.dropLocked(to, old)
 	}
 	r.bySess[to] = g
+	r.health.Delete(from)
+	r.health.Store(to, g)
 }
 
 // revokeInput ends the session's grant and any relay request using it.
@@ -181,12 +334,92 @@ func (s *Service) revokeInput(ss *session) {
 	r.mu.Unlock()
 }
 
+// markInputPaced records that ss shares a tune open whose provider gap has
+// already been booked (for example, Steady's companion probe grant).
+func (s *Service) markInputPaced(ss *session) {
+	s.inputRelay.mu.Lock()
+	g := s.inputRelay.bySess[ss]
+	s.inputRelay.mu.Unlock()
+	if g != nil {
+		g.paced.Store(true)
+	}
+}
+
+// paceSessionInput waits out the provider's minimum inter-tune gap before a
+// tune starts its probe timer, so provider pacing never consumes the tune's
+// own probe or stream-start budget. Joining an already-open tap does not book
+// a new provider stream.
+func (s *Service) paceSessionInput(ctx context.Context, ss *session) (time.Duration, error) {
+	r := &s.inputRelay
+	r.mu.Lock()
+	g := r.bySess[ss]
+	r.mu.Unlock()
+	if g == nil || g.ctx.Err() != nil {
+		return 0, core.ErrNotAvailable
+	}
+	if g.source == "" || g.paced.Load() {
+		return 0, nil
+	}
+	g.mu.Lock()
+	raw := g.resources["0"].url
+	headers := g.headers.Clone()
+	mediaHeaders := g.mediaHeaders.Clone()
+	g.mu.Unlock()
+	source, limit := s.tapSource(g)
+	joined, err := r.taps.canJoinOrOpen(tapKey(raw+"\x00"+tapKey("", mediaHeaders), headers), source, limit)
+	if err != nil {
+		return 0, err
+	}
+	if joined {
+		g.paced.Store(true)
+		return 0, nil
+	}
+	return s.paceGrant(ctx, g)
+}
+
+// paceGrant books and waits the provider's tune gap at most once for g.
+// Subsequent HLS manifest reloads on the same grant reuse that initial open
+// instead of pacing the stream against itself.
+func (s *Service) paceGrant(ctx context.Context, g *inputGrant) (time.Duration, error) {
+	if g == nil || g.source == "" || !g.paced.CompareAndSwap(false, true) {
+		return 0, nil
+	}
+	e, _ := s.sourceEntry(ctx, g.source)
+	wait, err := s.inputRelay.taps.reserveOpen(g.source, e.gap, e.perHour, time.Now())
+	if err != nil || wait <= 0 {
+		return 0, err
+	}
+	if g.log != nil {
+		g.log.Info("live provider tune gap", "wait", wait)
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return wait, nil
+	case <-ctx.Done():
+		return 0, context.Cause(ctx)
+	case <-g.ctx.Done():
+		return 0, context.Cause(g.ctx)
+	}
+}
+
 func (r *inputRelay) dropLocked(ss *session, g *inputGrant) {
+	r.health.CompareAndDelete(ss, g)
+	if h := g.hlsIfAny(); h != nil {
+		h.flushEvidence()
+	}
 	g.cancel()
 	delete(r.grants, tokenKey(g.token))
 	delete(r.bySess, ss)
 	// Synchronous: a retune that follows finds the old connection closed.
 	r.taps.release(g)
+	if g.login != nil {
+		g.service.loginPool.mu.Lock()
+		delete(g.login.grants, g)
+		g.service.loginPool.mu.Unlock()
+		g.service.releaseLogin(g.login)
+	}
 }
 
 // relayInput is the URL ffmpeg and ffprobe read the session's input from.
@@ -203,7 +436,7 @@ func (s *Service) relayInput(ss *session) (string, error) {
 
 func (s *Service) startRelayLocked() error {
 	r := &s.inputRelay
-	if s.ctx.Err() != nil {
+	if s.serviceContext().Err() != nil {
 		return core.ErrNotAvailable
 	}
 	if r.host != "" {
@@ -225,16 +458,113 @@ func (s *Service) startRelayLocked() error {
 	r.grants, r.bySess = map[[sha256.Size]byte]*inputGrant{}, map[*session]*inputGrant{}
 	go srv.Serve(ln)
 	go func() {
-		<-s.ctx.Done()
+		<-s.serviceContext().Done()
 		srv.Close()
 	}()
 	return nil
 }
 
+func (g *inputGrant) requestScope() (origin string, headers, mediaHeaders http.Header) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.origin, g.headers.Clone(), g.mediaHeaders.Clone()
+}
+
+func (g *inputGrant) rootURL() string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if res := g.resources["0"]; res != nil {
+		return res.url
+	}
+	return ""
+}
+
+// syncDirect aligns this grant with the latest resolved direct-stream URL and
+// headers. Replacing resource "0" with a fresh struct keeps lookupResource
+// lock-free on the resource value while preserving the loopback path name so
+// existing ffmpeg/client URLs stay valid across a re-resolve.
+func (g *inputGrant) syncDirect() (raw string, cm *cachedManifest, gen uint64, invalidated bool, expStatus int) {
+	g.mu.Lock()
+	direct := g.direct
+	if res := g.resources["0"]; res != nil {
+		raw = res.url
+	}
+	cm = g.manifest
+	gen = g.directGen
+	if direct == nil {
+		g.mu.Unlock()
+		return raw, cm, gen, false, 0
+	}
+	g.mu.Unlock()
+
+	dURL, dRawHdrs, dHdrs, dCM, dGen, dInvalid, dStatus := direct.current()
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if dGen > g.directGen && dURL != "" {
+		if u, err := url.Parse(dURL); err == nil && validHTTP(dURL) {
+			name := relayName("stream", u.Path)
+			if old := g.resources["0"]; old != nil {
+				name = old.name
+			}
+			g.resources["0"] = &relayResource{name: name, url: dURL}
+			g.origin = relayOrigin(u)
+			g.headers = dHdrs.Clone()
+			g.mediaHeaders = redirectMediaHeaders(dRawHdrs)
+			g.directGen = dGen
+			g.manifest = dCM
+			g.upstreamFailures = 0
+			g.upstreamRetryAt = time.Time{}
+		}
+	} else if dInvalid {
+		g.manifest = nil
+	} else if g.manifest == nil && dCM != nil {
+		if res := g.resources["0"]; res != nil && dCM.raw == res.url {
+			g.manifest = dCM
+		}
+	}
+	if res := g.resources["0"]; res != nil {
+		raw = res.url
+	}
+	return raw, g.manifest, g.directGen, dInvalid, dStatus
+}
+
+// refreshDirect asks the direct-stream resolver for a fresh URL after expiry
+// and syncs this grant to it.
+func (g *inputGrant) refreshDirect(ctx context.Context, failedGen uint64) (string, error) {
+	if g.direct == nil {
+		return g.rootURL(), providerResponseError(http.StatusForbidden)
+	}
+	if _, _, _, _, err := g.direct.refresh(ctx, failedGen); err != nil {
+		return g.rootURL(), err
+	}
+	raw, _, _, _, _ := g.syncDirect()
+	return raw, nil
+}
+
+// noteExpiredManifest drops any cached master manifest on this grant and marks
+// its direct-stream state as expired so the next root open re-resolves instead
+// of reusing stale variant URLs or re-fetching a dead single-use master.
+func (g *inputGrant) noteExpiredManifest(status int) {
+	if g == nil || !isExpiredStatus(status) {
+		return
+	}
+	g.mu.Lock()
+	g.manifest = nil
+	gen := g.directGen
+	direct := g.direct
+	g.mu.Unlock()
+	if direct != nil {
+		direct.invalidate(gen, status)
+	}
+}
+
 // relayURL registers an exact upstream URL with the grant.
 func (g *inputGrant) relayURL(host, raw string) string {
-	u, _ := url.Parse(raw)
-	return g.register(host, "e\x00"+raw, &relayResource{name: relayName("media", u.Path), url: raw})
+	u, err := url.Parse(raw)
+	if err != nil {
+		u = &url.URL{}
+	}
+	return g.register(host, "e\x00"+raw, &relayResource{name: relayMediaName(u), url: raw})
 }
 
 func (g *inputGrant) register(host, key string, res *relayResource) string {
@@ -326,6 +656,15 @@ func (s *Service) serveInputRelay(w http.ResponseWriter, r *http.Request) {
 	if root && s.serveTapped(w, r, g, raw) {
 		return
 	}
+	// A Steady grant's segments may already be in memory.
+	if !root && s.servePrefetched(w, r, g, raw) {
+		return
+	}
+	// Separate video/audio playlists of a demuxed HLS master align their
+	// starting windows on open before ffmpeg begins demuxing.
+	if !root && s.serveAlignedDemuxedPlaylist(w, r, g, raw) {
+		return
+	}
 	select {
 	case g.slots <- struct{}{}:
 		defer func() { <-g.slots }()
@@ -336,7 +675,22 @@ func (s *Service) serveInputRelay(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	defer context.AfterFunc(g.ctx, cancel)()
-	res, err := s.relayFetch(ctx, cancel, g, raw, r)
+	segment := false
+	if h := g.hlsIfAny(); h != nil {
+		segment = h.isSegment(raw)
+	}
+	res, err := s.relayFetchAs(ctx, cancel, g, raw, r, segment)
+	if err == nil && res.StatusCode >= 400 || err != nil && r.Context().Err() == nil {
+		if err == nil && ((!segment && isExpiredStatus(res.StatusCode)) || (segment && res.StatusCode == http.StatusForbidden)) {
+			g.noteExpiredManifest(res.StatusCode)
+		}
+		if h := g.hlsIfAny(); h != nil {
+			h.deliver(h.failedFetch(raw))
+			if segment {
+				h.segmentFailed()
+			}
+		}
+	}
 	if err != nil {
 		code := http.StatusBadGateway
 		if errors.Is(err, context.DeadlineExceeded) {
@@ -357,14 +711,37 @@ func (s *Service) serveInputRelay(w http.ResponseWriter, r *http.Request) {
 	idle := time.AfterFunc(relayIOTimeout, cancel)
 	defer idle.Stop()
 	body := bufio.NewReaderSize(&idleReader{r: res.Body, t: idle}, 32<<10)
+	// Some providers gzip a playlist without saying so (no Content-Encoding),
+	// and Go's transport only decodes declared gzip. Decode it here, or ffmpeg
+	// reads compressed bytes as a playlist ("Invalid data").
+	if magic, _ := body.Peek(2); len(magic) == 2 && magic[0] == 0x1f && magic[1] == 0x8b {
+		packed, _ := io.ReadAll(io.LimitReader(body, relayManifestLimit+1))
+		if len(packed) <= relayManifestLimit {
+			if zr, err := gzip.NewReader(bytes.NewReader(packed)); err == nil {
+				plain, err := io.ReadAll(io.LimitReader(zr, relayManifestLimit+1))
+				zr.Close()
+				if err == nil && len(plain) <= relayManifestLimit {
+					if t := bytes.TrimLeft(bytes.TrimPrefix(plain, []byte("\xef\xbb\xbf")), " \t\r\n"); bytes.HasPrefix(t, []byte("#EXTM3U")) {
+						s.serveRelayManifest(w, g, raw, res.Request.URL, bytes.NewReader(plain), true)
+						return
+					}
+				}
+			}
+		}
+		// Not a compressed playlist: relay the bytes untouched.
+		body = bufio.NewReaderSize(io.MultiReader(bytes.NewReader(packed), body), 32<<10)
+	}
 	head := sniffHead(body)
 	ctype := strings.ToLower(res.Header.Get("Content-Type"))
 	hls := bytes.HasPrefix(head, []byte("#EXTM3U"))
 	mpd := bytes.HasPrefix(head, []byte("<?xml")) || bytes.HasPrefix(head, []byte("<MPD")) ||
 		(bytes.HasPrefix(head, []byte("<")) && strings.Contains(ctype, "xml"))
 	if hls || mpd {
-		s.serveRelayManifest(w, g, res.Request.URL, body, hls)
+		s.serveRelayManifest(w, g, raw, res.Request.URL, body, hls)
 		return
+	}
+	if h := g.hlsIfAny(); h != nil {
+		h.servedSegment(raw)
 	}
 	for _, name := range []string{"Content-Length", "Content-Range", "Accept-Ranges"} {
 		if v := res.Header.Get(name); v != "" {
@@ -392,26 +769,57 @@ func (s *Service) serveInputRelay(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Service) serveRelayManifest(w http.ResponseWriter, g *inputGrant, base *url.URL, body io.Reader, hls bool) {
+func (s *Service) serveRelayManifest(w http.ResponseWriter, g *inputGrant, raw string, base *url.URL, body io.Reader, hls bool) {
 	b, err := io.ReadAll(io.LimitReader(body, relayManifestLimit+1))
 	if err != nil || len(b) > relayManifestLimit {
 		http.Error(w, "upstream manifest unavailable", http.StatusBadGateway)
 		return
 	}
+	if hls {
+		if isMasterPlaylist(b) {
+			if raw == g.rootURL() && g.peekManifest(raw) == nil {
+				g.setManifest(newCachedManifest(raw, b, base, true))
+			}
+			b = selectedHLSMaster(b, base, g.variantCaps)
+			m := parseMasterPlaylist(b, base)
+			v, picked := pickVariant(m, g.variantCaps)
+			g.variantLogged.Do(func() {
+				if picked && g.log != nil {
+					g.log.Info("live HLS input variant selected", "height", v.height, "bandwidth", v.bandwidth, "audio", variantHasAudio(v), "separate_audio", m.demuxedAudio[v.audio], "max_height", g.variantCaps.MaxHeight, "max_bitrate_kbps", g.variantCaps.MaxBitrateKbps)
+				}
+			})
+			if picked && v.audio != "" && m.demuxedAudio[v.audio] {
+				if audioURLs := m.audioGroupURIs(v.audio, v.uri); len(audioURLs) > 0 {
+					g.hlsState().noteDemuxedMaster(v.uri, audioURLs)
+				}
+			}
+		}
+		// Health, and for Steady the reserve window (reserve_hls.go).
+		var events []UpstreamEvent
+		h := g.hlsState()
+		b, events = h.media(raw, b, base)
+		h.deliver(events)
+	}
+	s.writeRelayManifest(w, g, base, b, hls)
+}
+
+func (s *Service) writeRelayManifest(w http.ResponseWriter, g *inputGrant, base *url.URL, b []byte, hls bool) {
 	s.inputRelay.mu.Lock()
 	host := s.inputRelay.host
 	s.inputRelay.mu.Unlock()
 	exact := func(raw string) (string, error) {
-		u, err := url.Parse(raw)
-		if err != nil || !validHTTP(raw) {
+		// A playlist fetched over TLS may name plain-HTTP segment hosts (an
+		// https origin serving http://<ip>:80 segments). The provider chose
+		// them, and every IPTV player fetches them, exactly as with an http
+		// redirect hop (scopeInputRedirects). The source's credentials stay
+		// on its own origin: relayFetchAs sends them only there.
+		if _, err := url.Parse(raw); err != nil || !validHTTP(raw) {
 			return "", errRelayUnsupported
-		}
-		if base.Scheme == "https" && u.Scheme != "https" {
-			return "", errRelayDowngrade
 		}
 		return g.relayURL(host, raw), nil
 	}
 	var out []byte
+	var err error
 	ctype := "application/dash+xml"
 	if hls {
 		ctype = "application/vnd.apple.mpegurl"
@@ -432,9 +840,6 @@ func (s *Service) serveRelayManifest(w http.ResponseWriter, g *inputGrant, base 
 			if err != nil || !validHTTP(tmpl) {
 				return "", errRelayUnsupported
 			}
-			if base.Scheme == "https" && u.Scheme != "https" {
-				return "", errRelayDowngrade
-			}
 			return g.register(host, "t\x00"+tmpl, &relayResource{name: relayName("media", u.Path), url: tmpl, vars: vars, scope: scope}), nil
 		})
 	}
@@ -446,6 +851,367 @@ func (s *Service) serveRelayManifest(w http.ResponseWriter, g *inputGrant, base 
 	w.Header().Set("Content-Length", fmt.Sprint(len(out)))
 	w.Header().Set("Cache-Control", "no-store")
 	_, _ = w.Write(out)
+}
+
+type relayPlaylistFetch struct {
+	body   []byte
+	base   *url.URL
+	status int
+	ctype  string
+	hls    bool
+	err    error
+}
+
+func (s *Service) fetchRelayPlaylist(ctx context.Context, g *inputGrant, raw string) relayPlaylistFetch {
+	select {
+	case g.slots <- struct{}{}:
+		defer func() { <-g.slots }()
+	case <-ctx.Done():
+		return relayPlaylistFetch{err: ctx.Err()}
+	}
+	fctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	defer context.AfterFunc(g.ctx, cancel)()
+	res, err := s.relayFetchAs(fctx, cancel, g, raw, &http.Request{Header: http.Header{}}, false)
+	if err != nil {
+		return relayPlaylistFetch{err: err}
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK && res.StatusCode != http.StatusPartialContent {
+		return relayPlaylistFetch{status: res.StatusCode}
+	}
+	idle := time.AfterFunc(relayIOTimeout, cancel)
+	defer idle.Stop()
+	br := bufio.NewReaderSize(&idleReader{r: res.Body, t: idle}, 32<<10)
+	if magic, _ := br.Peek(2); len(magic) == 2 && magic[0] == 0x1f && magic[1] == 0x8b {
+		packed, rerr := io.ReadAll(io.LimitReader(br, relayManifestLimit+1))
+		if rerr != nil || len(packed) > relayManifestLimit {
+			return relayPlaylistFetch{err: errors.New("upstream manifest unavailable")}
+		}
+		if zr, zerr := gzip.NewReader(bytes.NewReader(packed)); zerr == nil {
+			plain, perr := io.ReadAll(io.LimitReader(zr, relayManifestLimit+1))
+			zr.Close()
+			if perr == nil && len(plain) <= relayManifestLimit {
+				if t := bytes.TrimLeft(bytes.TrimPrefix(plain, []byte("\xef\xbb\xbf")), " \t\r\n"); bytes.HasPrefix(t, []byte("#EXTM3U")) {
+					return relayPlaylistFetch{body: plain, base: res.Request.URL, status: res.StatusCode, ctype: res.Header.Get("Content-Type"), hls: true}
+				}
+			}
+		}
+		br = bufio.NewReaderSize(io.MultiReader(bytes.NewReader(packed), br), 32<<10)
+	}
+	// Decide HLS from the body itself: a slice from sniffHead aliases the
+	// bufio buffer, which io.ReadAll overwrites once the playlist spans more
+	// than one read, so a large playlist read back as "not HLS" and was
+	// relayed without its URIs rewritten.
+	b, rerr := io.ReadAll(io.LimitReader(br, relayManifestLimit+1))
+	if rerr != nil || len(b) > relayManifestLimit {
+		return relayPlaylistFetch{err: errors.New("upstream manifest unavailable")}
+	}
+	head := bytes.TrimLeft(bytes.TrimPrefix(b, []byte("\xef\xbb\xbf")), " \t\r\n")
+	return relayPlaylistFetch{
+		body:   b,
+		base:   res.Request.URL,
+		status: res.StatusCode,
+		ctype:  res.Header.Get("Content-Type"),
+		hls:    bytes.HasPrefix(head, []byte("#EXTM3U")),
+	}
+}
+
+// serveAlignedDemuxedPlaylist intercepts the first video/audio playlist opens
+// following a demuxed HLS master so both playlists are fetched together and
+// trimmed to start at the same media time before ffmpeg starts demuxing.
+func (s *Service) serveAlignedDemuxedPlaylist(w http.ResponseWriter, r *http.Request, g *inputGrant, raw string) bool {
+	h := g.hlsIfAny()
+	if h == nil {
+		return false
+	}
+	var (
+		gen                  uint64
+		pairVideo, pairAudio string
+		call                 *hlsAlignCall
+	)
+	for {
+		h.mu.Lock()
+		if !h.isDemuxedMemberLocked(raw) {
+			h.mu.Unlock()
+			return false
+		}
+		if snap, ok := h.demux.snap[raw]; ok {
+			delete(h.demux.snap, raw)
+			h.mu.Unlock()
+			if time.Since(snap.at) < 5*time.Second {
+				s.writeRelayManifest(w, g, snap.base, snap.body, true)
+				return true
+			}
+			return false
+		}
+		if wait := h.demux.inFlight; wait != nil {
+			h.mu.Unlock()
+			select {
+			case <-wait.done:
+				continue
+			case <-r.Context().Done():
+				return true
+			case <-g.ctx.Done():
+				http.Error(w, "input revoked", http.StatusGone)
+				return true
+			}
+		}
+		if !h.demux.pending {
+			h.mu.Unlock()
+			return false
+		}
+		gen = h.demux.gen
+		pairVideo = h.demux.videoURL
+		pairAudio = h.demux.audioURLs[0]
+		if raw != pairVideo {
+			pairAudio = raw
+		}
+		call = &hlsAlignCall{done: make(chan struct{})}
+		h.demux.inFlight = call
+		h.demux.pending = false
+		h.mu.Unlock()
+		break
+	}
+	defer func() {
+		h.mu.Lock()
+		if h.demux.inFlight == call {
+			h.demux.inFlight = nil
+		}
+		h.mu.Unlock()
+		close(call.done)
+	}()
+
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	defer context.AfterFunc(g.ctx, cancel)()
+
+	sequential := g.source != "" && s.sourceConnectionLimit(g.source) == 1
+	var vRes, aRes relayPlaylistFetch
+	if sequential {
+		vRes = s.fetchRelayPlaylist(ctx, g, pairVideo)
+		aRes = s.fetchRelayPlaylist(ctx, g, pairAudio)
+	} else {
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			vRes = s.fetchRelayPlaylist(ctx, g, pairVideo)
+		}()
+		go func() {
+			defer wg.Done()
+			aRes = s.fetchRelayPlaylist(ctx, g, pairAudio)
+		}()
+		wg.Wait()
+	}
+
+	reqRes, peerURL, peerRes := vRes, pairAudio, aRes
+	if raw == pairAudio {
+		reqRes, peerURL, peerRes = aRes, pairVideo, vRes
+	}
+	if reqRes.err != nil || (reqRes.status != http.StatusOK && reqRes.status != http.StatusPartialContent) {
+		if reqRes.err == nil && isExpiredStatus(reqRes.status) {
+			g.noteExpiredManifest(reqRes.status)
+		}
+		if reqRes.err == nil && reqRes.status >= 400 || reqRes.err != nil && r.Context().Err() == nil {
+			h.deliver(h.failedFetch(raw))
+		}
+		if reqRes.err != nil {
+			code := http.StatusBadGateway
+			if errors.Is(reqRes.err, context.DeadlineExceeded) {
+				code = http.StatusGatewayTimeout
+			}
+			http.Error(w, "upstream unavailable", code)
+			return true
+		}
+		code := reqRes.status
+		if code < 400 || code > 599 {
+			code = http.StatusBadGateway
+		}
+		http.Error(w, "upstream unavailable", code)
+		return true
+	}
+
+	if reqRes.hls && peerRes.err == nil && (peerRes.status == http.StatusOK || peerRes.status == http.StatusPartialContent) && peerRes.hls {
+		vm := parseHLSMedia(vRes.body, vRes.base)
+		am := parseHLSMedia(aRes.body, aRes.base)
+		if vm.live() && am.live() {
+			vTimes, vHas, aTimes, aHas, haveTimes := hlsMediaPDTTimes(vm, am)
+			method := "pdt"
+			if !haveTimes && (len(vm.segs) > 1 || len(am.segs) > 1) {
+				vTimes, vHas, aTimes, aHas, haveTimes = s.probeDemuxedSegmentTimes(ctx, g, h, vm, am, sequential)
+				method = "segment_ts"
+			}
+			vOut, aOut, events := h.applyDemuxedPair(pairVideo, vRes.body, vm, pairAudio, aRes.body, am, vTimes, vHas, aTimes, aHas, haveTimes, method)
+			h.deliver(events)
+			reqOut, peerOut := vOut, aOut
+			if raw == pairAudio {
+				reqOut, peerOut = aOut, vOut
+			}
+			h.mu.Lock()
+			if h.demux.gen == gen {
+				if h.demux.snap == nil {
+					h.demux.snap = map[string]hlsAlignedSnap{}
+				}
+				h.demux.snap[peerURL] = hlsAlignedSnap{body: peerOut, base: peerRes.base, at: time.Now()}
+			}
+			h.mu.Unlock()
+			s.writeRelayManifest(w, g, reqRes.base, reqOut, true)
+			return true
+		}
+	}
+
+	if reqRes.hls {
+		s.serveRelayManifest(w, g, raw, reqRes.base, bytes.NewReader(reqRes.body), true)
+		return true
+	}
+	if mt, params, err := mime.ParseMediaType(reqRes.ctype); err == nil {
+		w.Header().Set("Content-Type", mime.FormatMediaType(mt, params))
+	}
+	w.Header().Set("Content-Length", fmt.Sprint(len(reqRes.body)))
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(reqRes.status)
+	_, _ = w.Write(reqRes.body)
+	return true
+}
+
+// probeDemuxedSegmentTimes falls back to media timestamps (CMAF tfdt or
+// MPEG-TS PTS) when separate video and audio playlists lack usable
+// EXT-X-PROGRAM-DATE-TIME tags. Fetched init maps and segments are kept in
+// h's startup cache so the reader reuses them without downloading twice.
+func (s *Service) probeDemuxedSegmentTimes(ctx context.Context, g *inputGrant, h *hlsInput, vm, am *hlsMedia, sequential bool) ([]time.Duration, []bool, []time.Duration, []bool, bool) {
+	depth := g.joinDepth()
+	if g.reserve <= 0 {
+		fallback := max(vm.target, am.target)
+		if fallback <= 0 {
+			fallback = 2 * time.Second
+		}
+		depth = sumLastSegments(vm.segs, 3, fallback)
+	}
+	vAnchor := vm.startFor(depth)
+	aAnchor := am.startFor(depth)
+	vSeg, aSeg := vm.segs[vAnchor], am.segs[aAnchor]
+	if vSeg.encrypted || aSeg.encrypted || !validHTTP(vSeg.url) || !validHTTP(aSeg.url) {
+		return nil, nil, nil, nil, false
+	}
+	pctx, pcancel := context.WithTimeout(ctx, 2*time.Second)
+	defer pcancel()
+
+	fetchBytes := func(raw string, reusable bool) ([]byte, bool) {
+		if raw == "" || !validHTTP(raw) {
+			return nil, false
+		}
+		if cached, ok := h.getStartupCache(raw, false); ok {
+			return cached.body, true
+		}
+		select {
+		case g.slots <- struct{}{}:
+			defer func() { <-g.slots }()
+		case <-pctx.Done():
+			return nil, false
+		}
+		fctx, fcancel := context.WithCancel(pctx)
+		defer fcancel()
+		res, err := s.relayFetchAs(fctx, fcancel, g, raw, &http.Request{Header: http.Header{}}, true)
+		if err != nil {
+			return nil, false
+		}
+		defer res.Body.Close()
+		if res.StatusCode != http.StatusOK {
+			return nil, false
+		}
+		b, err := io.ReadAll(io.LimitReader(res.Body, hlsSegmentLimit+1))
+		if err != nil || len(b) == 0 || len(b) > hlsSegmentLimit {
+			return nil, false
+		}
+		h.putStartupCache(raw, b, res.Header.Get("Content-Type"), reusable)
+		return b, true
+	}
+
+	var vInit, aInit, vData, aData []byte
+	var vInitOK, aInitOK, vOK, aOK bool
+	needMaps := vSeg.mapURI != "" && aSeg.mapURI != ""
+	sameMap := needMaps && vSeg.mapURI == aSeg.mapURI
+
+	if sequential {
+		if needMaps {
+			vInit, vInitOK = fetchBytes(vSeg.mapURI, true)
+			if sameMap {
+				aInit, aInitOK = vInit, vInitOK
+			} else {
+				aInit, aInitOK = fetchBytes(aSeg.mapURI, true)
+			}
+		}
+		vData, vOK = fetchBytes(vSeg.url, false)
+		aData, aOK = fetchBytes(aSeg.url, false)
+	} else {
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			vData, vOK = fetchBytes(vSeg.url, false)
+		}()
+		go func() {
+			defer wg.Done()
+			aData, aOK = fetchBytes(aSeg.url, false)
+		}()
+		if needMaps {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				vInit, vInitOK = fetchBytes(vSeg.mapURI, true)
+			}()
+			if !sameMap {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					aInit, aInitOK = fetchBytes(aSeg.mapURI, true)
+				}()
+			}
+		}
+		wg.Wait()
+		if sameMap {
+			aInit, aInitOK = vInit, vInitOK
+		}
+	}
+	if !vOK || !aOK {
+		return nil, nil, nil, nil, false
+	}
+
+	var aRel time.Duration
+	haveRel := false
+	if needMaps && vInitOK && aInitOK {
+		if vSec, ok1 := mp4SegmentStartSeconds(vInit, vData); ok1 {
+			if aSec, ok2 := mp4SegmentStartSeconds(aInit, aData); ok2 {
+				deltaSec := aSec - vSec
+				if math.Abs(deltaSec) <= 3600 {
+					aRel = time.Duration(math.Round(deltaSec * float64(time.Second)))
+					haveRel = true
+				}
+			}
+		}
+	}
+	if !haveRel && isTS(vData) && isTS(aData) {
+		if vPTS, ok1 := tsSegmentFirstPTS(vData); ok1 {
+			if aPTS, ok2 := tsSegmentFirstPTS(aData); ok2 {
+				diff := ptsDiff(aPTS, vPTS)
+				if absInt64(diff) <= 90000*3600 {
+					aRel = time.Duration(diff) * time.Second / 90000
+					haveRel = true
+				}
+			}
+		}
+	}
+	if !haveRel {
+		return nil, nil, nil, nil, false
+	}
+
+	vTimes, vHas := buildAnchorTimeline(vm, vAnchor, 0)
+	aTimes, aHas := buildAnchorTimeline(am, aAnchor, aRel)
+	if !timelinesOverlap(vm, vTimes, vHas, am, aTimes, aHas) {
+		return nil, nil, nil, nil, false
+	}
+	return vTimes, vHas, aTimes, aHas, true
 }
 
 // scopeInputRedirects confines authentication to the source origin while
@@ -488,10 +1254,21 @@ func scopeInputRedirects(client *http.Client, origin string, headers http.Header
 // relayIOTimeout; the body is then bounded by the caller's idle reader.
 // Errors never carry the upstream URL to the caller's response.
 func (s *Service) relayFetch(ctx context.Context, cancel context.CancelFunc, g *inputGrant, raw string, in *http.Request) (*http.Response, error) {
+	return s.relayFetchAs(ctx, cancel, g, raw, in, false)
+}
+
+// relayFetchAs fetches one upstream object. segment marks a media segment
+// named by a live HLS playlist: it is a short request that holds no provider
+// connection, so it is outside the grant's refusal accounting (whose 1 s
+// spacing exists for refused stream opens). One quick retry, then the error
+// goes straight back to ffmpeg, whose HLS demuxer skips the segment while
+// the reserve plays on; a slow answer would stall the decoder instead.
+func (s *Service) relayFetchAs(ctx context.Context, cancel context.CancelFunc, g *inputGrant, raw string, in *http.Request, segment bool) (*http.Response, error) {
 	client := *s.o.HTTPClient
 	client.Timeout = 0 // a live input is endless; idle time is bounded instead
 	ua := defaultUserAgent()
-	scopeInputRedirects(&client, g.origin, g.headers, ua, g.mediaHeaders)
+	origin, headers, mediaHeaders := g.requestScope()
+	scopeInputRedirects(&client, origin, headers, ua, mediaHeaders)
 	u, err := url.Parse(raw)
 	if err != nil {
 		return nil, errRelayUnsupported
@@ -499,7 +1276,11 @@ func (s *Service) relayFetch(ctx context.Context, cancel context.CancelFunc, g *
 	// A provider that sells connections counts every attempt; it gets one,
 	// not a burst of retries.
 	attempts := 3
-	if g.source != "" && s.sourceConnectionLimit(g.source) > 0 {
+	if g.admitting.Load() && !segment {
+		attempts = 1
+	} else if segment {
+		attempts = 2
+	} else if g.source != "" && s.sourceConnectionLimit(g.source) > 0 {
 		attempts = 1
 	}
 	// Headers wait at most relayIOTimeout, and never past the opener's
@@ -516,10 +1297,10 @@ func (s *Service) relayFetch(ctx context.Context, cancel context.CancelFunc, g *
 		if err != nil {
 			return nil, errRelayUnsupported
 		}
-		if relayOrigin(u) == g.origin {
-			req.Header = g.headers.Clone()
+		if relayOrigin(u) == origin {
+			req.Header = headers.Clone()
 		}
-		applyMediaHeaders(req, g.mediaHeaders)
+		applyMediaHeaders(req, mediaHeaders)
 		if req.Header.Get("User-Agent") == "" && ua != "" {
 			req.Header.Set("User-Agent", ua)
 		}
@@ -528,7 +1309,7 @@ func (s *Service) relayFetch(ctx context.Context, cancel context.CancelFunc, g *
 				req.Header.Set(name, v)
 			}
 		}
-		if !g.reserveUpstreamAttempt(ctx) {
+		if !segment && !g.reserveUpstreamAttempt(ctx) {
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
@@ -539,7 +1320,9 @@ func (s *Service) relayFetch(ctx context.Context, cancel context.CancelFunc, g *
 		var timedOut atomic.Bool
 		t := time.AfterFunc(budget(), func() { timedOut.Store(true); cancel() })
 		res, err := client.Do(req)
-		g.finishUpstreamAttempt(err != nil || res.StatusCode >= 400)
+		if !segment {
+			g.finishUpstreamAttempt(err != nil || res.StatusCode >= 400)
+		}
 		t.Stop()
 		if timedOut.Load() || errors.Is(err, context.DeadlineExceeded) {
 			if res != nil {
@@ -555,9 +1338,6 @@ func (s *Service) relayFetch(ctx context.Context, cancel context.CancelFunc, g *
 		}
 		if ctx.Err() != nil {
 			return nil, Diagnose("upstream_headers", ctx.Err())
-		}
-		if errors.Is(err, errRelayDowngrade) {
-			return nil, Diagnose("upstream_headers", err)
 		}
 		if err != nil {
 			last = Diagnose("upstream_headers", err)
@@ -653,4 +1433,20 @@ func (g *inputGrant) finishUpstreamAttempt(failed bool) {
 		g.upstreamFailures = 0
 		g.upstreamRetryAt = time.Time{}
 	}
+}
+
+// joinDepth is how far behind the live edge a new reader of this grant
+// starts: the reserve plus any start window.
+func (g *inputGrant) joinDepth() time.Duration { return g.reserve + g.lead }
+
+// noteEvidence adds evidence to the history of the grant's source, counting
+// the grant's session once it has received media.
+func (g *inputGrant) noteEvidence(ev SourceEvidence) {
+	if g.service == nil || g.histSrc.ID == "" || ev.empty() {
+		return
+	}
+	if ev.Media > 0 && g.reported.CompareAndSwap(false, true) {
+		ev.newSession = true
+	}
+	g.service.noteSourceEvidence(g.histChannel, g.histSrc, ev)
 }

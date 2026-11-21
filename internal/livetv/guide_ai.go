@@ -182,9 +182,6 @@ func aiWords(s string) map[string]bool {
 	}
 	return out
 }
-func aiSimilarity(a, b string) float64 {
-	return aiNameOf(a).similarity(aiNameOf(b))
-}
 
 // aiName is a guide or channel name folded once for repeated comparison.
 type aiName struct {
@@ -548,7 +545,7 @@ func (s *Service) aiGuideMatches(ctx context.Context, req GuideMatchRequest, cha
 			}
 			d.Reason = aiText(d.Reason)
 			b, _ := json.Marshal(d)
-			if _, err = s.o.DB.ExecContext(ctx, `INSERT INTO livetv_guide_ai(fingerprint,decision) VALUES(?,?) ON CONFLICT(fingerprint) DO NOTHING`, item.key, string(b)); err != nil {
+			if _, err = s.o.DB.ExecContext(ctx, `INSERT INTO livetv_guide_ai(fingerprint,decision,updated_ms) VALUES(?,?,?) ON CONFLICT(fingerprint) DO UPDATE SET updated_ms=excluded.updated_ms`, item.key, string(b), s.o.Now().UnixMilli()); err != nil {
 				return nil, err
 			}
 			if err = accept(item, d); err != nil {

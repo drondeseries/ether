@@ -65,6 +65,16 @@ func TestCacheTTLKeysAndRedaction(t *testing.T) {
 	if calls != 1 {
 		t.Fatal("cache did not suppress duplicate lookup")
 	}
+	// A home-sized page reads the local badges within a library-scale-invariant ceiling.
+	titles := make([]core.Title, 1600)
+	for n := range titles {
+		titles[n] = core.Title{Key: core.MovieKey(int64(n + 1))}
+	}
+	measured, stats := store.WithQueryStats(ctx)
+	page, e := s.CachedMany(measured, titles)
+	if e != nil || len(page[title.Key]) != 1 || stats.Queries() > 10 || calls != 1 {
+		t.Fatalf("page cache: badges=%v queries=%d provider=%d err=%v", page[title.Key], stats.Queries(), calls, e)
+	}
 	now = now.Add(2 * time.Hour)
 	cached, e := s.Cached(ctx, title)
 	if e != nil || cached != nil {

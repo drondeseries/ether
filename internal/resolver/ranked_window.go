@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/braedonsaunders/ether/internal/core"
@@ -30,6 +31,11 @@ import (
 func (s *Service) validateRanked(ctx context.Context, cands []candidate, tr *Trace) (int, []byte, error) {
 	ctx, cancelBudget := context.WithTimeout(ctx, validationBudget)
 	defer cancelBudget()
+	attempts := &atomic.Int64{}
+	ctx = context.WithValue(ctx, healthAttemptsKey{}, attempts)
+	if len(cands) == 1 && len(cands[0].fallbacks) > 0 && !cands[0].verified && !cands[0].rel.OpensOnDemand() {
+		ctx = context.WithValue(ctx, singleGroupHedgeKey{}, true)
+	}
 	workCtx, cancelWork := context.WithCancel(ctx)
 	var wg sync.WaitGroup
 	var results chan validation
@@ -49,6 +55,7 @@ func (s *Service) validateRanked(ctx context.Context, cands []candidate, tr *Tra
 	startedAt := make([]time.Time, limit)
 	done := make([]*validation, limit)
 	next, inflight, confirmed, failed := 0, 0, 0, 0
+	budgetHit := false
 	launch := func() {
 		i := next
 		next++
@@ -109,8 +116,32 @@ func (s *Service) validateRanked(ctx context.Context, cands []candidate, tr *Tra
 		}
 		return true
 	}
-	// fill keeps width checks running, but a verified lead runs alone:
-	// reusing a known working release must not start speculative downloads.
+	var transient error
+	// An unattended search stops at the first on-demand candidate.
+	foregroundOnly := false
+	// addonHedge reports whether cands[next] may start beside a lead
+	// add-on stream still being checked: Play is waiting, the lead is the
+	// only check running and its add-on marks it debrid-cached, it has run
+	// onDemandHedgeDelay, and next is native or another cached add-on
+	// stream. The lead still wins when healthy; the hedge only makes its
+	// failure seamless.
+	addonHedge := func(lead int) bool {
+		if lead >= next || done[lead] != nil || inflight != 1 || !core.OnDemandStreamsAllowed(ctx) || !core.OnDemandCached(cands[lead].rel) {
+			return false
+		}
+		if c := cands[next].rel; c.OpensOnDemand() && !core.OnDemandCached(c) {
+			return false
+		}
+		if at := startedAt[lead].Add(onDemandHedgeDelay); time.Now().Before(at) {
+			hedgeAt = at
+			return false
+		}
+		return true
+	}
+	// fill keeps width checks running, but a verified or on-demand lead
+	// runs alone: reusing a known working release must not start
+	// speculative downloads, and each on-demand open makes an add-on fetch
+	// a release.
 	fill := func(lead int) {
 		hedgeAt = time.Time{}
 		// Once a healthy backup is ready, wait for the preferred source or
@@ -121,10 +152,24 @@ func (s *Service) validateRanked(ctx context.Context, cands []candidate, tr *Tra
 			}
 		}
 		for next < limit {
-			if next > lead && lead < limit && cands[lead].verified && done[lead] == nil {
+			if next > lead && lead < limit && (cands[lead].verified || cands[lead].rel.OpensOnDemand()) && done[lead] == nil && !addonHedge(lead) {
 				return
 			}
+			if cands[next].rel.OpensOnDemand() {
+				if !core.OnDemandAllowedAt(ctx, cands[next].rel, next) {
+					foregroundOnly = true
+					return
+				}
+				if inflight > 0 && !addonHedge(lead) {
+					return // starts once everything ranked above it settled
+				}
+			}
 			if core.IsSpeculative(ctx) && next >= speculativeHealthAttempts {
+				budgetHit = true
+				return
+			}
+			if attempts.Load() >= int64(maxHealthAttempts) {
+				budgetHit = true
 				return
 			}
 			// A candidate that cannot overtake the lead waits for a free
@@ -138,11 +183,36 @@ func (s *Service) validateRanked(ctx context.Context, cands []candidate, tr *Tra
 			launch()
 		}
 	}
-	var transient error
 	record := func(v validation) {
-		noteValidation(ctx, cands[v.index].rel, v)
+		if v.budgetExhausted {
+			budgetHit = true
+		}
+		origLeader := cands[v.index]
+		if len(v.fallbacks) > 0 {
+			if fterr := s.applyFallbackValidations(ctx, tr, v.fallbacks); fterr != nil && v.promoted == nil {
+				transient = errors.Join(transient, fterr)
+			}
+		}
+		if v.promoted != nil {
+			lct := &tr.Candidates[origLeader.trace]
+			lct.Attempted = true
+			lct.Rejected = true
+			if lct.Reason == "" {
+				lct.Reason = "health: unhealthy"
+			}
+			cands[v.index] = *v.promoted
+		} else if v.rel.ID != "" {
+			cands[v.index].rel = v.rel
+		}
+		if v.promoted == nil {
+			noteValidation(ctx, cands[v.index].rel, v)
+		}
 		inflight--
 		done[v.index] = &v
+		if errors.Is(v.err, errHealthBudget) && !v.healthChecked && len(v.nzb) == 0 && v.promoted == nil && len(v.fallbacks) == 0 {
+			budgetHit = true
+			return
+		}
 		ct := &tr.Candidates[cands[v.index].trace]
 		ct.Attempted = true
 		ct.FetchDuration = v.fetchDuration
@@ -156,16 +226,18 @@ func (s *Service) validateRanked(ctx context.Context, cands []candidate, tr *Tra
 		ct.Rejected = true
 		ct.err = v.err
 		if v.err != nil {
-			ct.Reason = v.err.Error()
+			ct.Reason = candidateErrorReason(v.err)
 		} else {
 			ct.Reason = "health: unhealthy"
 		}
 		if v.err != nil && !permanentFailure(v.err) {
-			transient = errors.Join(transient, v.err)
+			if !errors.Is(v.err, errHealthBudget) {
+				transient = errors.Join(transient, v.err)
+			}
 		} else {
 			confirmed++
-			s.noteFailedHealth(cands[v.index].rel.ID)
-			s.recordReputation(ctx, cands[v.index].rel.Indexer, false)
+			s.recordFailedValidation(ctx, origLeader.rel, v)
+			s.recordReputation(ctx, origLeader.rel.Indexer, false)
 		}
 	}
 	win := func(v validation, lead int) (int, []byte, error) {
@@ -175,7 +247,7 @@ func (s *Service) validateRanked(ctx context.Context, cands []candidate, tr *Tra
 			tr.Candidates[cands[lead].trace].Attempted = true
 		}
 		if v.healthChecked && !v.healthCached {
-			s.markVerified(ctx, cands[v.index].rel.ID)
+			s.markVerifiedKeys(ctx, s.allVerificationKeys(cands[v.index].rel, v.extraContentKeys...))
 			s.noteStartup(cands[v.index].rel, max(v.fetchDuration+v.healthDuration, time.Microsecond))
 		}
 		s.recordReputation(ctx, cands[v.index].rel.Indexer, true)
@@ -193,7 +265,12 @@ func (s *Service) validateRanked(ctx context.Context, cands []candidate, tr *Tra
 			select {
 			case v := <-results:
 				if ctx.Err() != nil {
-					noteValidation(ctx, cands[v.index].rel, v)
+					for _, fv := range v.fallbacks {
+						noteValidation(ctx, fv.rel, fv.val)
+					}
+					if v.promoted == nil {
+						noteValidation(ctx, cands[v.index].rel, v)
+					}
 					return -1, nil, ctx.Err()
 				}
 				record(v)
@@ -221,14 +298,14 @@ func (s *Service) validateRanked(ctx context.Context, cands []candidate, tr *Tra
 		// A healthy later candidate may overtake a lead still checking.
 		age := time.Since(startedAt[lead])
 		var wait time.Duration = -1
-		leadUncachedTorrent := protocolOf(cands[lead].rel) == core.ProtocolTorrent && !s.knownCached(cands[lead].rel)
+		leadUncachedTorrent := cands[lead].keys.addonOrder == 0 && protocolOf(cands[lead].rel) == core.ProtocolTorrent && !s.knownCached(cands[lead].rel)
 		for k := lead + 1; k < limit; k++ {
 			v := done[k]
 			if v == nil || !v.healthy || v.err != nil {
 				continue
 			}
 			switch {
-			case leadUncachedTorrent && s.knownCached(cands[k].rel) && cands[k].policy.Fallback <= cands[lead].policy.Fallback:
+			case leadUncachedTorrent && cands[k].keys.sourceBand == cands[lead].keys.sourceBand && s.knownCached(cands[k].rel) && cands[k].policy.Fallback <= cands[lead].policy.Fallback:
 				return win(*v, lead)
 			case equivalentHedge(cands[lead], cands[k], margin):
 				if age >= rankedSourceGrace {
@@ -259,7 +336,12 @@ func (s *Service) validateRanked(ctx context.Context, cands []candidate, tr *Tra
 		select {
 		case v := <-results:
 			if ctx.Err() != nil {
-				noteValidation(ctx, cands[v.index].rel, v)
+				for _, fv := range v.fallbacks {
+					noteValidation(ctx, fv.rel, fv.val)
+				}
+				if v.promoted == nil {
+					noteValidation(ctx, cands[v.index].rel, v)
+				}
 				return -1, nil, ctx.Err()
 			}
 			record(v)
@@ -274,7 +356,10 @@ func (s *Service) validateRanked(ctx context.Context, cands []candidate, tr *Tra
 			}
 		}
 	}
-	if transient == nil && (len(cands) > limit || (core.IsSpeculative(ctx) && len(cands) > speculativeHealthAttempts)) {
+	if foregroundOnly {
+		return -1, nil, errors.Join(transient, errOnDemandForeground)
+	}
+	if transient == nil && (budgetHit || len(cands) > limit || (core.IsSpeculative(ctx) && len(cands) > speculativeHealthAttempts)) {
 		return -1, nil, errHealthBudget
 	}
 	return -1, nil, transient

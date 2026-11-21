@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -24,6 +25,13 @@ type StreamSource struct {
 	// AuthSourceID names the source whose provider credentials this input
 	// uses; empty means the channel's own source.
 	AuthSourceID string `json:"authSourceId,omitempty"`
+	// MergedFrom names the imported channel ID whose stream was attached by
+	// channel input merge rules; empty on the channel's own or manual inputs.
+	MergedFrom string `json:"mergedFrom,omitempty"`
+	// AutoFrom names the duplicate channel ID whose primary stream was
+	// attached automatically as a backup; AutoNumber records its channel number.
+	AutoFrom   string `json:"autoFrom,omitempty"`
+	AutoNumber string `json:"autoNumber,omitempty"`
 	// Headers are request headers this input needs (a Stremio stream's
 	// proxy headers), sent after the source's own.
 	Headers map[string]string `json:"headers,omitempty"`
@@ -66,6 +74,8 @@ type StreamSourceStatus struct {
 	LastPlayed  time.Time `json:"lastPlayed,omitempty"`
 	RetryAfter  time.Time `json:"retryAfter,omitempty"`
 	LastError   string    `json:"lastError,omitempty"`
+	// Learned is what the source's history says about its media.
+	Learned *LearnedSourceHealth `json:"learned,omitempty"`
 }
 
 type streamSourceHealth struct {
@@ -182,19 +192,80 @@ func (s *Service) sourceStatus(channelID string, src StreamSource) StreamSourceS
 	return h.StreamSourceStatus
 }
 
-func (s *Service) recordStreamFailure(ss *session, rctx context.Context, err error) {
-	if rctx.Err() == nil {
-		s.recordSourceHealth(ss.info.Channel.ID, ss.inputSource, err, false)
-		ss.mu.Lock()
-		warn := ss.lastMediaWarning.IsZero() || time.Since(ss.lastMediaWarning) >= 5*time.Second
-		if warn {
-			ss.lastMediaWarning = time.Now()
-		}
-		ss.mu.Unlock()
-		if warn {
-			s.sessionLog(ss).Warn("live upstream media failed", Diagnose("media_fetch", err).LogAttrs()...)
-		}
+func (s *Service) autoDonorActive(donorID string) bool {
+	if donorID == "" || s == nil {
+		return true
 	}
+	if donor, ok := s.cachedChannelByID(donorID); ok {
+		return donor.Enabled && donor.MergedInto == ""
+	}
+	return true
+}
+
+// orderedSourceCandidates lists a channel's enabled inputs, best first. Health
+// only orders them: a cooling-down source still appears, after every source
+// that is not, so recovery never waits out a cooldown while any input remains.
+// Unless the owner manually ordered streamSources, the channel's own healthy or
+// unchecked primary inputs always precede automatic duplicate backups, and
+// automatic backups rank by measured stall history, resolution closeness and
+// source affinity. exclude skips source IDs (typically the one that just failed).
+func (s *Service) orderedSourceCandidates(c Channel, exclude ...string) []StreamSource {
+	if err := normalizeStreamSources(&c); err != nil {
+		return nil
+	}
+	type ranked struct {
+		src    StreamSource
+		band   int
+		retry  time.Time
+		played time.Time
+	}
+	var out []ranked
+	for _, src := range c.StreamSources {
+		if !src.Enabled || slices.Contains(exclude, src.ID) || !s.autoDonorActive(src.AutoFrom) {
+			continue
+		}
+		st := s.sourceStatus(c.ID, src)
+		band := 1
+		switch st.State {
+		case "available":
+			band = 0
+			if !c.OwnerStreamSources && src.AutoFrom != "" {
+				band = 2
+			}
+		case "unchecked":
+			band = 1
+			if !c.OwnerStreamSources && src.AutoFrom != "" {
+				band = 2
+			}
+		case "retry_ready":
+			band = 3
+		case "cooling_down":
+			band = 4
+		}
+		out = append(out, ranked{src: src, band: band, retry: st.RetryAfter, played: st.LastPlayed})
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].band != out[j].band {
+			return out[i].band < out[j].band
+		}
+		if !c.OwnerStreamSources && out[i].band == 3 && (out[i].src.AutoFrom == "") != (out[j].src.AutoFrom == "") {
+			return out[i].src.AutoFrom == ""
+		}
+		if !c.OwnerStreamSources && out[i].band < 4 && out[i].src.AutoFrom != "" && out[j].src.AutoFrom != "" {
+			if cmp := s.compareRuntimeAutoBackups(c, out[i].src, out[j].src); cmp != 0 {
+				return cmp < 0
+			}
+		}
+		if out[i].band == 0 && !out[i].played.Equal(out[j].played) {
+			return out[i].played.After(out[j].played)
+		}
+		return out[i].band == 4 && out[i].retry.Before(out[j].retry)
+	})
+	list := make([]StreamSource, len(out))
+	for i, r := range out {
+		list[i] = r.src
+	}
+	return list
 }
 
 // StreamSourceStatuses is owner-only health, without source URLs or upstream
@@ -212,17 +283,18 @@ func (s *Service) StreamSourceStatuses(ctx context.Context, channelID string) ([
 	}
 	out := make([]StreamSourceStatus, 0, len(c.StreamSources))
 	for _, src := range c.StreamSources {
-		out = append(out, s.sourceStatus(c.ID, src))
+		st := s.sourceStatus(c.ID, src)
+		st.Learned = s.learnedHealth(c.ID, src)
+		out = append(out, st)
 	}
 	return out, nil
 }
 
 func (s *Service) recordSourceHealth(channelID string, src StreamSource, err error, played bool) {
-	if src.ID == "" || errors.Is(err, context.Canceled) {
+	if src.ID == "" || strings.HasPrefix(channelID, directChannelPrefix) || errors.Is(err, context.Canceled) {
 		return
 	}
 	s.sourceMu.Lock()
-	defer s.sourceMu.Unlock()
 	if s.sourceHealth == nil {
 		s.sourceHealth = map[string]streamSourceHealth{}
 	}
@@ -268,12 +340,25 @@ func (s *Service) recordSourceHealth(channelID string, src StreamSource, err err
 		}
 	}
 	s.sourceHealth[key] = h
+	s.noteSourceOpen(channelID, src, err, played, h.RetryAfter)
+	failures, retryAfter := h.Failures, h.RetryAfter
+	s.sourceMu.Unlock()
+	if err != nil {
+		s.emitSourceCooldown(channelID, src.ID, failures, historyErrorClass(err), retryAfter)
+	}
 }
 
 // ResolveStreamSource resolves a channel's stream input at tune time. HTTP(S)
 // URLs return directly; plugin:// inputs delegate to the installed stream
 // opener under its Open deadline.
 func (s *Service) ResolveStreamSource(ctx context.Context, c Channel, src StreamSource) (string, http.Header, error) {
+	effSourceID := src.AuthSourceID
+	if effSourceID == "" {
+		effSourceID = c.SourceID
+	}
+	if !s.channelSourceEnabled(ctx, effSourceID) {
+		return "", nil, core.ErrNotAvailable
+	}
 	headers, err := s.upstreamHeaders(ctx, c, src)
 	if err != nil {
 		return "", nil, err
@@ -303,9 +388,24 @@ func (s *Service) ResolveStreamSource(ctx context.Context, c Channel, src Stream
 	return resolved, headers, nil
 }
 
-// startIPTV selects one input per viewing session, under the caller's existing
-// ten-second startup deadline. It never substitutes another provider's bytes,
-// keys or media sequence into the active HLS resource map.
+var errSilentInput = errors.New("live input has no audio")
+
+func liveInputHasAudio(info *core.MediaInfo) bool {
+	if info != nil {
+		for _, st := range info.Streams {
+			if st.Type == "audio" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// startIPTV selects one input per viewing session. Probing stays bounded so a
+// dead primary fails fast enough to leave budget for backups; once an input
+// answers its probe, post-probe stream startup receives its own bounded
+// budget. It never substitutes another provider's bytes, keys or media
+// sequence into the active HLS resource map.
 func (s *Service) startIPTV(ctx context.Context, ss *session) error {
 	c := ss.info.Channel
 	if err := normalizeStreamSources(&c); err != nil {
@@ -314,7 +414,7 @@ func (s *Service) startIPTV(ctx context.Context, ss *session) error {
 	var candidates []StreamSource
 	var earliestRetry time.Time
 	for _, src := range c.StreamSources {
-		if !src.Enabled {
+		if !src.Enabled || !s.autoDonorActive(src.AutoFrom) {
 			continue
 		}
 		retry := s.sourceStatus(c.ID, src).RetryAfter
@@ -327,63 +427,118 @@ func (s *Service) startIPTV(ctx context.Context, ss *session) error {
 		}
 		candidates = append(candidates, src)
 	}
+	if !c.OwnerStreamSources && len(candidates) > 1 {
+		var manuals, autos []StreamSource
+		for _, src := range candidates {
+			if src.AutoFrom == "" {
+				manuals = append(manuals, src)
+			} else {
+				autos = append(autos, src)
+			}
+		}
+		if len(autos) > 1 {
+			sort.SliceStable(autos, func(i, j int) bool {
+				return s.compareRuntimeAutoBackups(c, autos[i], autos[j]) < 0
+			})
+		}
+		candidates = append(manuals, autos...)
+	}
 	var last error = core.ErrNotAvailable
+	var failures []TuneInputFailure
 	if len(candidates) == 0 && !earliestRetry.IsZero() {
 		return &TuneError{Code: "source_cooldown", Stage: "source_selection", RetryAfter: earliestRetry.Sub(s.o.Now()), cause: core.ErrNotAvailable}
 	}
-	for index, src := range candidates {
+	remaining := iptvProbeBudget
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining = min(remaining, max(time.Until(deadline), 0))
+	}
+	primaryCount := len(candidates)
+	for index := 0; index < len(candidates); index++ {
+		src := candidates[index]
 		started := time.Now()
 		log := s.sessionLog(ss).With("input", src.ID, "attempt", index+1, "candidates", len(candidates))
 		log.Debug("live source attempt started")
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		attemptCtx := ctx
-		cancel := func() {}
-		if len(candidates) > 1 {
-			// Leave a stalled primary only half the total tune budget, so a
-			// backup can still be tried. Fast failures advance immediately.
-			attemptCtx, cancel = context.WithTimeout(ctx, 5*time.Second)
-		}
-		resolvedURL, headers, err := s.ResolveStreamSource(attemptCtx, c, src)
+		// Share the remaining connect/sniff budget among untried inputs. Fast
+		// failures leave their unused time for the next candidate.
+		connectBudget := remaining / time.Duration(len(candidates)-index)
+		resolveCtx, stopResolve := context.WithTimeout(ctx, connectBudget)
+		resolveStarted := time.Now()
+		resolvedURL, resolvedRawHdrs, headers, err := s.resolveSessionSource(resolveCtx, ss, c, src)
+		resolveElapsed := time.Since(resolveStarted)
+		stopResolve()
 		if err != nil {
-			cancel()
+			remaining = max(remaining-min(resolveElapsed, connectBudget), 0)
 			last = Diagnose("source_resolve", err)
+			failures = append(failures, inputFailure(src.ID, last))
 			log.Warn("live source resolve failed", append(Diagnose("source_resolve", err).LogAttrs(), "elapsed", time.Since(started))...)
 			if !errors.Is(ctx.Err(), context.Canceled) {
 				s.recordSourceHealth(c.ID, src, err, false)
 			}
 			continue
 		}
+		sniffBudget := max(connectBudget-resolveElapsed, 0)
+		probeBudget := max(remaining-resolveElapsed, 0)
+		if len(candidates) > 1 {
+			probeBudget = min(max(sniffBudget, steadyProbeBudget-resolveElapsed), max(iptvProbeBudget-resolveElapsed, 0))
+			if deadline, ok := ctx.Deadline(); ok {
+				probeBudget = min(probeBudget, max(time.Until(deadline), 0))
+			}
+		}
 		grantSrc := src
 		grantSrc.URL = resolvedURL
-		ss.inputURL, ss.inputSource = resolvedURL, src
+		grantSrc.Headers = resolvedRawHdrs
+		ss.inputURL, ss.inputSource = resolvedURL, grantSrc
 		ss.inputHeaders = headers.Clone()
+		ss.setSniffedManifest(nil)
 		ss.info.MediaInfo, ss.relayInfo = nil, nil
-		ss.resources = map[string]string{}
+		ss.startDeadline = time.Time{}
 		// ffmpeg and ffprobe read this input through a loopback grant, never
 		// with the provider URL or headers on their command line.
-		err = s.grantInput(ss, grantSrc, headers)
-		if err == nil {
-			err = s.startIPTVSource(attemptCtx, ss)
-		}
-		cancel()
+		var spent time.Duration
+		err = s.withProviderCapacity(ctx, c, src, func() error {
+			ss.owned.close()
+			ss.owned = nil
+			s.revokeInput(ss)
+			if err := s.grantDirectInput(ss, grantSrc, headers); err != nil {
+				return err
+			}
+			// Wait out any inter-tune gap on this provider before starting the
+			// candidate's probe deadline.
+			if _, err := s.paceSessionInput(ctx, ss); err != nil {
+				return err
+			}
+			probeStarted := time.Now()
+			err := s.startIPTVSource(ctx, ss, sniffBudget, probeBudget, primaryCount > 1 && index < primaryCount)
+			spent = time.Since(probeStarted)
+			return err
+		})
+		remaining = max(remaining-min(resolveElapsed+spent, connectBudget), 0)
 		if err == nil {
 			ss.info.ActiveSourceID = src.ID
 			s.recordSourceHealth(c.ID, src, nil, false)
-			log.Info("live source ready", "elapsed", time.Since(started))
+			readyAttrs := []any{"elapsed", time.Since(started)}
+			if index > 0 {
+				readyAttrs = append(readyAttrs, "from", candidates[0].ID, "to", src.ID)
+				readyAttrs = append(readyAttrs, s.duplicateFailoverLogAttrs(c, candidates[0], src)...)
+			}
+			log.Info("live source ready", readyAttrs...)
 			return nil
 		}
-		if ss.relay != nil {
-			ss.relay.Close()
-			ss.relay = nil
-		}
-		if ss.relayCancel != nil {
-			ss.relayCancel()
-			ss.relayCancel = nil
-		}
+		ss.owned.close()
+		ss.owned = nil
 		s.revokeInput(ss)
+		if errors.Is(err, errSilentInput) {
+			// Retry silent inputs only after every original candidate. No health
+			// penalty: they remain usable when all audible inputs are down.
+			candidates = append(candidates, src)
+			log.Info("live silent source deferred", "reason", "trying other candidates before silent fallback")
+			continue
+		}
 		last = Diagnose("source_start", err)
+		failures = append(failures, inputFailure(src.ID, last))
 		if !errors.Is(ctx.Err(), context.Canceled) {
 			s.recordSourceHealth(c.ID, src, err, false)
 		}
@@ -395,5 +550,15 @@ func (s *Service) startIPTV(ctx context.Context, ss *session) error {
 			log.Warn("live source attempt failed", attrs...)
 		}
 	}
-	return last
+	detail := *Diagnose("source_start", last)
+	detail.Inputs = failures
+	return &detail
+}
+
+func (s *Service) channelSourceEnabled(ctx context.Context, id string) bool {
+	if id == "" {
+		return true
+	}
+	src, err := s.storedSourceByID(ctx, id)
+	return err == nil && !src.Disabled
 }

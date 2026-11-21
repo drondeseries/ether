@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +15,8 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/braedonsaunders/ether/internal/artwork"
+	"github.com/braedonsaunders/ether/internal/events"
 	"github.com/braedonsaunders/ether/internal/safefetch"
 )
 
@@ -40,20 +43,29 @@ type Source struct {
 
 // Preview is what the install sheet shows before the owner confirms.
 type Preview struct {
-	Manifest         Manifest `json:"manifest"`
-	PermissionLines  []string `json:"permissions"`
-	NeedsViewers     bool     `json:"needsViewers"`
-	NeedsFolders     bool     `json:"needsFolders"`
-	Verified         bool     `json:"verified"`
-	StremioOnly      bool     `json:"stremioOnly"`
-	AlreadyInstalled bool     `json:"alreadyInstalled,omitempty"`
-	InstalledVersion string   `json:"installedVersion,omitempty"`
-	AddedPermissions []string `json:"addedPermissions,omitempty"`
-	source           Source
-	files            map[string][]byte
-	manifestRaw      json.RawMessage
-	resolvedSettings json.RawMessage
-	resolvedStrings  map[string]map[string]string
+	Manifest      Manifest       `json:"manifest"`
+	RuntimeLimits *RuntimeLimits `json:"runtimeLimits,omitempty"`
+	// Summary is the manifest summary with any "$t:" reference resolved
+	// from the package's own strings.
+	Summary string `json:"summary,omitempty"`
+	// Icon is a browser-loadable URL or rasterized PNG data URI for preview.
+	Icon                 string   `json:"icon,omitempty"`
+	PermissionLines      []string `json:"permissions"`
+	NeedsViewers         bool     `json:"needsViewers"`
+	NeedsFolders         bool     `json:"needsFolders"`
+	NeedsOperatorHosts   bool     `json:"needsOperatorHosts,omitempty"`
+	LocalHosts           []string `json:"localHosts,omitempty"`
+	PendingOperatorHosts []string `json:"pendingOperatorHosts,omitempty"`
+	Verified             bool     `json:"verified"`
+	StremioOnly          bool     `json:"stremioOnly"`
+	AlreadyInstalled     bool     `json:"alreadyInstalled,omitempty"`
+	InstalledVersion     string   `json:"installedVersion,omitempty"`
+	AddedPermissions     []string `json:"addedPermissions,omitempty"`
+	source               Source
+	files                map[string][]byte
+	manifestRaw          json.RawMessage
+	resolvedSettings     json.RawMessage
+	resolvedStrings      map[string]map[string]string
 }
 
 // IsGitHubURL classifies a github.com repo URL.
@@ -409,6 +421,9 @@ func (p *Preview) resolve() error {
 			}
 		}
 	}
+	if man := p.Manifest; man.Ether != nil {
+		p.Summary = pluginText(p.resolvedStrings, man.Ether.Summary)
+	}
 	return nil
 }
 
@@ -458,11 +473,25 @@ func (m *Manager) PreviewInstall(ctx context.Context, src Source) (*Preview, err
 	if src.Version != "" && man.Version != src.Version {
 		return nil, fmt.Errorf("plugins: manifest version %q does not match catalogue version %q", man.Version, src.Version)
 	}
-	p := &Preview{Manifest: man, source: src, files: files, manifestRaw: raw, Verified: src.Verified, StremioOnly: man.IsStremioOnly()}
+	p := &Preview{Manifest: man, RuntimeLimits: m.grantedRuntimeLimits(man), source: src, files: files, manifestRaw: raw, Verified: src.Verified, StremioOnly: man.IsStremioOnly()}
 	p.PermissionLines, p.NeedsViewers, p.NeedsFolders = PermissionSheet(man)
+	p.LocalHosts = DeclaredLocalHosts(man)
 	if err := p.resolve(); err != nil {
 		return nil, err
 	}
+	p.NeedsOperatorHosts = DeclaresOperatorHosts(man)
+	if p.NeedsOperatorHosts {
+		var existingGrants Grants
+		var existingSettings map[string]any
+		if cur, err := m.store.record(ctx, man.ID); err == nil {
+			existingGrants, _ = m.store.grants(ctx, cur.ID)
+			if row, sErr := m.store.settings(ctx, cur.ID); sErr == nil {
+				existingSettings = row.Settings
+			}
+		}
+		p.PendingOperatorHosts = PendingOperatorHosts(man, existingGrants, existingSettings, p.resolvedSettings, m.BlockedOperatorHosts(man.ID), true)
+	}
+	p.Icon = m.previewIcon(ctx, man, files, src)
 	// The conformance kit checks packages Ether runs; a plain Stremio add-on
 	// is a remote service whose manifest was validated above.
 	if m.deps.CheckPackage != nil && !man.IsStremioOnly() {
@@ -478,6 +507,33 @@ func (m *Manager) PreviewInstall(ctx context.Context, src Source) (*Preview, err
 	return p, nil
 }
 
+func (m *Manager) previewIcon(ctx context.Context, man Manifest, files map[string][]byte, src Source) string {
+	if man.Ether != nil {
+		icon := strings.TrimSpace(man.Ether.Icon)
+		if isHTTPURL(icon) {
+			return icon
+		}
+		if icon != "" && !unsafePath(icon) && m.iconRaster != nil {
+			if raw, ok := files[icon]; ok && len(raw) > 0 {
+				if data, ct, err := m.iconRaster.Rasterize(
+					ctx,
+					"preview-icon:"+man.ID+":"+digestOf(raw),
+					raw,
+					artwork.RasterOptions{Width: 128, Height: 128, Format: "png"},
+				); err == nil && len(data) > 0 {
+					return "data:" + ct + ";base64," + base64.StdEncoding.EncodeToString(data)
+				}
+			}
+		}
+	} else if logo := strings.TrimSpace(man.Logo); isHTTPURL(logo) {
+		return logo
+	}
+	if src.reviewed != nil && isHTTPURL(strings.TrimSpace(src.reviewed.Icon)) {
+		return strings.TrimSpace(src.reviewed.Icon)
+	}
+	return ""
+}
+
 // InstallOptions carries the owner's install-time picks.
 type InstallOptions struct {
 	Grants     Grants
@@ -486,6 +542,16 @@ type InstallOptions struct {
 	Shadow     bool
 	// AcceptAddedPermissions confirms an update that asks for more.
 	AcceptAddedPermissions bool
+	// ReplaceLibraries confirms a non-additive media-kind upgrade that
+	// replaces the plugin's library contents (spec §2.5).
+	ReplaceLibraries bool
+}
+
+func mediaKindsOf(m Manifest) []MediaKindMeta {
+	if m.Ether == nil {
+		return nil
+	}
+	return m.Ether.Contributes.MediaKinds
 }
 
 // Install installs (or updates to) a previewed source.
@@ -517,6 +583,11 @@ func (m *Manager) Install(ctx context.Context, p *Preview, opts InstallOptions) 
 			// Same-version reinstall is allowed (Studio); older is not.
 			if CompareSemVer(man.Version, cur.Version) < 0 {
 				return Record{}, fmt.Errorf("plugins: version %s is older than the installed %s; use rollback", man.Version, cur.Version)
+			}
+		}
+		if !opts.ReplaceLibraries {
+			if err := ValidateMediaKindsUpgrade(mediaKindsOf(cur.Manifest), mediaKindsOf(man)); err != nil {
+				return Record{}, err
 			}
 		}
 		added := PermissionDiff(cur.Manifest, man)
@@ -555,12 +626,36 @@ func (m *Manager) Install(ctx context.Context, p *Preview, opts InstallOptions) 
 	if err := m.store.upsert(ctx, r); err != nil {
 		return Record{}, err
 	}
-	// Grants: keep existing picks on update unless new ones were given.
+	if existing {
+		// Only the current and previous bundles are ever read again
+		// (runtime, rollback); older ones are dead blobs.
+		if err := m.store.dropOtherVersions(ctx, man.ID, r.Version, r.PrevVersion); err != nil {
+			m.log.Warn("plugin install: dropping old artifacts failed", "plugin", man.ID, "err", err)
+		}
+	}
+	// Grants: keep existing picks on update unless new ones were given;
+	// on fresh install, pre-grant any local-network hosts declared in the manifest.
 	g := opts.Grants
-	if existing && g.Viewers == nil && g.Folders == nil && g.Revoked == nil {
+	if existing && g.Viewers == nil && g.Folders == nil && g.LocalHosts == nil && g.OperatorHosts == nil && g.Revoked == nil {
 		if old, err := m.store.grants(ctx, man.ID); err == nil {
 			g = old
 		}
+	} else if !existing && g.LocalHosts == nil {
+		g.LocalHosts = DeclaredLocalHosts(man)
+	}
+	if g.LocalHosts != nil {
+		normalized, err := normalizeLocalHosts(g.LocalHosts)
+		if err != nil {
+			return Record{}, &ValidationError{Fields: []FieldError{{Field: "localHosts", Message: err.Error()}}}
+		}
+		g.LocalHosts = normalized
+	}
+	if g.OperatorHosts != nil {
+		normalized, err := normalizeOperatorHosts(g.OperatorHosts)
+		if err != nil {
+			return Record{}, &ValidationError{Fields: []FieldError{{Field: "operatorHosts", Message: err.Error()}}}
+		}
+		g.OperatorHosts = normalized
 	}
 	if p.source.LAN {
 		g.LAN = true
@@ -568,9 +663,20 @@ func (m *Manager) Install(ctx context.Context, p *Preview, opts InstallOptions) 
 	if err := m.store.putGrants(ctx, man.ID, g); err != nil {
 		return Record{}, err
 	}
+	m.pruneBlockedOperatorHosts(man.ID, g.OperatorHosts)
 	row, _ := m.store.settings(ctx, man.ID)
 	if opts.Settings != nil {
 		row.Settings = opts.Settings
+	}
+	if !existing && len(g.Folders) > 0 {
+		if fields := folderFieldNames(p.resolvedSettings); len(fields) == 1 {
+			if row.Settings == nil {
+				row.Settings = map[string]any{}
+			}
+			if cur, _ := row.Settings[fields[0]].(string); strings.TrimSpace(cur) == "" {
+				row.Settings[fields[0]] = g.Folders[0]
+			}
+		}
 	}
 	row.Strings = p.resolvedStrings
 	row.Schema = p.resolvedSettings
@@ -587,6 +693,32 @@ func (m *Manager) Install(ctx context.Context, p *Preview, opts InstallOptions) 
 	}
 	m.syncDescriptors(ctx, saved)
 	m.broadcast(ctx)
+	if !existing && saved.Enabled {
+		m.mu.Lock()
+		hooks := append([]func(context.Context, Record){}, m.installHooks...)
+		m.mu.Unlock()
+		for _, fn := range hooks {
+			fn(ctx, saved)
+		}
+	}
+	if !existing {
+		m.emitBusEvent(events.EventPluginPackageInstalled, saved.ID, events.PluginPackageInstalledPayload{
+			PluginID:    saved.ID,
+			Name:        saved.Name,
+			Version:     saved.Version,
+			Kind:        saved.Kind,
+			RuntimeKind: saved.Manifest.RuntimeKind(),
+			Verified:    saved.Verified,
+		}, false)
+	} else if cur.Version != saved.Version {
+		m.emitBusEvent(events.EventPluginPackageUpdated, saved.ID, events.PluginPackageUpdatedPayload{
+			PluginID:    saved.ID,
+			Name:        saved.Name,
+			FromVersion: cur.Version,
+			ToVersion:   saved.Version,
+			Auto:        saved.AutoUpdate,
+		}, false)
+	}
 	return saved, nil
 }
 
@@ -689,7 +821,7 @@ func (m *Manager) ApplyUpdate(ctx context.Context, id string, acceptAdded bool) 
 	if err := json.Unmarshal([]byte(r.updateFiles), &files); err != nil {
 		return Record{}, err
 	}
-	p := &Preview{Manifest: man, files: files, manifestRaw: json.RawMessage(r.updateManifest),
+	p := &Preview{Manifest: man, RuntimeLimits: m.grantedRuntimeLimits(man), files: files, manifestRaw: json.RawMessage(r.updateManifest),
 		source: Source{Kind: r.SourceKind, URL: r.SourceURL, Verified: r.Verified}}
 	if err := p.resolve(); err != nil {
 		return Record{}, err
@@ -732,7 +864,7 @@ func (m *Manager) Rollback(ctx context.Context, id string) (Record, error) {
 		return Record{}, err
 	}
 	// Strings and schema come from the rolled-back package files.
-	p := &Preview{Manifest: man, files: map[string][]byte{}, source: Source{Kind: r.SourceKind}}
+	p := &Preview{Manifest: man, RuntimeLimits: m.grantedRuntimeLimits(man), files: map[string][]byte{}, source: Source{Kind: r.SourceKind}}
 	// Reload known files for the target version so resolution works.
 	for _, name := range artifactPaths(man) {
 		if b, ok := m.store.file(ctx, id, prev, name); ok {
@@ -745,6 +877,11 @@ func (m *Manager) Rollback(ctx context.Context, id string) (Record, error) {
 		_ = m.store.putSettings(ctx, id, row)
 	}
 	m.closeRuntime(id)
+	// Rollback is one step: the version rolled back from is no longer
+	// reachable, so its bundle goes.
+	if err := m.store.dropOtherVersions(ctx, id, prev, ""); err != nil {
+		m.log.Warn("plugin rollback: dropping old artifacts failed", "plugin", id, "err", err)
+	}
 	saved, err := m.store.record(ctx, id)
 	if err != nil {
 		return Record{}, err
@@ -794,6 +931,36 @@ func (m *Manager) SettingsSchema(ctx context.Context, id string) (json.RawMessag
 		return json.RawMessage("{}"), nil
 	}
 	return row.Schema, nil
+}
+
+// folderFieldNames walks a settings schema for folder-kind field names.
+func folderFieldNames(schema json.RawMessage) []string {
+	var out []string
+	seen := map[string]bool{}
+	var walk func(any)
+	walk = func(n any) {
+		switch t := n.(type) {
+		case map[string]any:
+			if t["kind"] == "folder" {
+				if name, ok := firstString(t, "key", "name", "id", "field"); ok && !seen[name] {
+					seen[name] = true
+					out = append(out, name)
+				}
+			}
+			for _, v := range t {
+				walk(v)
+			}
+		case []any:
+			for _, v := range t {
+				walk(v)
+			}
+		}
+	}
+	var doc any
+	if json.Unmarshal(schema, &doc) == nil {
+		walk(doc)
+	}
+	return out
 }
 
 // secretFieldNames walks a settings schema for secret-kind field names.
@@ -1009,8 +1176,42 @@ type TestResult struct {
 	Details []string `json:"details,omitempty"`
 }
 
-// Test calls the plugin's /ether/test.
+// stremioProbe checks a plain Stremio add-on the Stremio way: its manifest
+// answers 200 with a JSON object naming an id. A plain add-on has no
+// /ether/test or /ether/health (those are Ether plugin routes), so asking
+// for them reads the add-on's 404 page.
+func (m *Manager) stremioProbe(ctx context.Context, id string) error {
+	resp, err := m.Call(ctx, id, Request{Method: http.MethodGet, Path: "/manifest.json"})
+	if err != nil {
+		return err
+	}
+	if resp.Status != http.StatusOK {
+		return fmt.Errorf("plugins: add-on %s manifest answered HTTP %d", id, resp.Status)
+	}
+	var man struct {
+		ID string `json:"id"`
+	}
+	if json.Unmarshal(resp.Body, &man) != nil || man.ID == "" {
+		return fmt.Errorf("plugins: add-on %s manifest was not understood", id)
+	}
+	return nil
+}
+
+func (m *Manager) stremioOnly(ctx context.Context, id string) bool {
+	rec, err := m.store.record(ctx, id)
+	return err == nil && rec.Manifest.IsStremioOnly()
+}
+
+// Test calls the plugin's /ether/test; a plain Stremio add-on is tested by
+// reading its manifest.
 func (m *Manager) Test(ctx context.Context, id string) (TestResult, error) {
+	if m.stremioOnly(ctx, id) {
+		if err := m.stremioProbe(ctx, id); err != nil {
+			return TestResult{OK: false, Message: "The add-on did not answer."}, nil
+		}
+		m.recordOK(ctx, id)
+		return TestResult{OK: true, Message: "The add-on answered."}, nil
+	}
 	resp, err := m.Call(ctx, id, Request{Method: "POST", Path: "/ether/test"})
 	if err != nil {
 		return TestResult{}, err
@@ -1044,6 +1245,19 @@ func (m *Manager) Options(ctx context.Context, id, field string, query ...map[st
 // A failing call feeds the failure policy through Call already; a plugin
 // reporting attention or error is recorded without counting as a crash.
 func (m *Manager) CheckHealth(ctx context.Context, id string) (Health, error) {
+	if m.stremioOnly(ctx, id) {
+		if err := m.stremioProbe(ctx, id); err == nil {
+			m.recordOK(ctx, id)
+		}
+		return m.store.health(ctx, id)
+	}
+	if rec, err := m.store.record(ctx, id); err == nil && m.sidecarWaiting(rec) {
+		h, herr := m.store.health(ctx, id)
+		if herr != nil {
+			return Health{}, herr
+		}
+		return m.liveHealth(rec, h), nil
+	}
 	resp, err := m.Call(ctx, id, Request{Method: "GET", Path: "/ether/health"})
 	if err != nil {
 		h, herr := m.store.health(ctx, id)

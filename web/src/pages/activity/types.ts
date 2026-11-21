@@ -194,3 +194,25 @@ export type PlayDetail = Play &
     uhd?: boolean;
     hdr?: boolean;
   };
+
+export type TimelineLevel = "debug" | "info" | "warn" | "error";
+
+export type TimelineEntry = {
+  seq: number;
+  atMs: number;
+  offsetMs: number;
+  type: "event" | "log";
+  kind?: string;
+  level: TimelineLevel;
+  message: string;
+  detail?: string;
+};
+
+export type PlayTimeline = {
+  playId: string;
+  startedMs: number;
+  failed: boolean;
+  error: string;
+  capped?: boolean;
+  entries: TimelineEntry[];
+};

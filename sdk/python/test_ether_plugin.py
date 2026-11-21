@@ -402,6 +402,8 @@ class EtherPluginSDKTest(unittest.TestCase):
                     self.wfile.write(json.dumps({"key": "greeting", "value": "hello"}).encode("utf-8"))
                 elif self.path.startswith("/ether/plugin-host/kv") and self.command == "GET":
                     self.wfile.write(json.dumps({"keys": ["greeting"]}).encode("utf-8"))
+                elif self.path == "/ether/plugin-host/badges-usage" and self.command == "GET":
+                    self.wfile.write(json.dumps({"titles": 2, "quotaTitles": 200000}).encode("utf-8"))
                 else:
                     self.wfile.write(json.dumps({"ok": True}).encode("utf-8"))
 
@@ -412,6 +414,9 @@ class EtherPluginSDKTest(unittest.TestCase):
                 self._handle()
 
             def do_POST(self) -> None:  # noqa: N802
+                self._handle()
+
+            def do_DELETE(self) -> None:  # noqa: N802
                 self._handle()
 
             def log_message(self, format: str, *args: object) -> None:  # noqa: A002
@@ -431,6 +436,9 @@ class EtherPluginSDKTest(unittest.TestCase):
             self.assertEqual(client.kv.list(""), ["greeting"])
             client.collections.upsert({"name": "Top picks", "itemIds": ["tt0133093"]})
             client.notify.owner("Sync complete.")
+            client.badges.set("dub_languages", [{"title": {"type": "show", "tmdb": 1429}, "labels": ["EN DUB"]}])
+            self.assertEqual(client.badges.usage(), {"titles": 2, "quotaTitles": 200000})
+            client.badges.clear("dub_languages")
             self.assertTrue(all(r["cred"] == "cred-py-test" for r in received))
         finally:
             server.shutdown()
@@ -473,6 +481,58 @@ class EtherPluginSDKTest(unittest.TestCase):
         )
         self.assertTrue(cond_h.cond_match(fixtures.candidate(cached=True), "eq", True))
         self.assertFalse(cond_h.cond_match(fixtures.candidate(cached=False), "eq", True))
+
+
+    def test_mock_host_badges_bounds(self) -> None:
+        from ether_plugin import MockHostClient
+
+        host = MockHostClient()
+        host.badges.set(
+            "dub_languages",
+            [
+                {"title": {"type": "show", "tmdb": 1429}, "labels": ["en dub", "ja"]},
+                {"title": {"type": "movie", "imdb": "tt0133093"}, "labels": ["Director's Cut"]},
+            ],
+        )
+        self.assertEqual(host.badges.usage(), {"titles": 2, "quotaTitles": 200000})
+        self.assertEqual(host.badges_store["dub_languages"]["tmdb:show:1429"], ["EN DUB", "JA"])
+        self.assertEqual(
+            host.badges_store["dub_languages"]["imdb:movie:tt0133093"],
+            ["DIRECTOR'S CUT"],
+        )
+
+        # Empty labels deletes title's badges
+        host.badges.set("dub_languages", [{"title": {"type": "show", "tmdb": 1429}, "labels": []}])
+        self.assertEqual(host.badges.usage()["titles"], 1)
+
+        # Bounds checks
+        with self.assertRaises(ValueError):
+            host.badges.set("BadKey", [])
+        with self.assertRaises(ValueError):
+            host.badges.set(
+                "dub_languages",
+                [{"title": {"type": "movie", "tmdb": 1}, "labels": ["A", "B", "C", "D"]}],
+            )
+        with self.assertRaises(ValueError):
+            host.badges.set(
+                "dub_languages",
+                [{"title": {"type": "movie", "tmdb": 1}, "labels": ["BAD!"]}],
+            )
+        with self.assertRaises(ValueError):
+            host.badges.set(
+                "dub_languages",
+                [{"title": {"type": "movie", "tmdb": 1}, "labels": ["ABCDEFGHIJKLMNOPQ"]}],
+            )
+
+        host.badge_quota_titles = 1
+        with self.assertRaises(RuntimeError):
+            host.badges.set(
+                "editions",
+                [{"title": {"type": "movie", "tmdb": 603}, "labels": ["IMAX"]}],
+            )
+
+        host.badges.clear("dub_languages")
+        self.assertEqual(host.badges.usage()["titles"], 0)
 
 
 if __name__ == "__main__":

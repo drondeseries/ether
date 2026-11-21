@@ -2,6 +2,7 @@ package transcode
 
 import (
 	"bytes"
+	"encoding/binary"
 	"io"
 	"net/http"
 	"os"
@@ -12,6 +13,9 @@ import (
 // ServeSegment implements core.HLSSession. n == InitSegment serves the fMP4
 // init segment. For DASH sessions it serves the first representation.
 func (s *Session) ServeSegment(w http.ResponseWriter, r *http.Request, n int) {
+	if !s.acceptMediaGeneration(w, r) {
+		return
+	}
 	if n == InitSegment {
 		s.serveInit(w, r, 0)
 		return
@@ -23,10 +27,26 @@ func (s *Session) ServeSegment(w http.ResponseWriter, r *http.Request, n int) {
 // restarting it when n is behind or far ahead of the encoder.
 func (s *Session) serveSegment(w http.ResponseWriter, r *http.Request, t, n int) {
 	s.Touch()
+	if warm := s.resumeSession(n); warm != nil {
+		warm.serveSegment(w, r, t, n)
+		return
+	}
 	if t < 0 || t >= len(s.done) || n < 0 || (s.total > 0 && n >= s.total) {
 		http.NotFound(w, r)
 		return
 	}
+	// A long wait keeps bytes flowing to the player (segment_padding.go).
+	var pw *paddedSegmentWriter
+	var padC <-chan time.Time
+	if unit := segmentPadding(s.container); unit != nil && !s.isDASH() && r.Method == http.MethodGet && r.Header.Get("Range") == "" {
+		pw = &paddedSegmentWriter{ResponseWriter: w, unit: unit}
+		w = pw
+		defer pw.finish()
+		tick := time.NewTicker(segmentPadEvery)
+		defer tick.Stop()
+		padC = tick.C
+	}
+	waitStart := time.Now()
 	timeout := time.NewTimer(s.m.opts.segmentTimeout)
 	defer timeout.Stop()
 	restarts := 0
@@ -74,12 +94,14 @@ func (s *Session) serveSegment(w http.ResponseWriter, r *http.Request, t, n int)
 			continue
 		}
 		if availability == segmentReady {
+			s.log.Debug("segment ready to send", "segment", n, "track", t, "ready_after", time.Since(waitStart), "restarts", restarts)
 			// The segment is already on disk. A throttle stop still resumes
 			// here so the encoder continues ahead of this playhead.
 			s.throttleLocked()
 			s.pruneLocked()
 			s.mu.Unlock()
 			if s.serveFiles(w, r, paths, t, n) {
+				pw.delivered(paths)
 				return
 			}
 			s.mu.Lock()
@@ -105,7 +127,8 @@ func (s *Session) serveSegment(w http.ResponseWriter, r *http.Request, t, n int)
 		// old representation must not switch the current video encoder.
 		// Audio shares the active video run and never chooses its rung.
 		previousTrack := s.wantTrack
-		if !waitTail && !stale && r.Context().Err() == nil && r.Method == http.MethodGet {
+		handoffFetch := s.handoff != nil && s.handoff.track == t
+		if !handoffFetch && !waitTail && !stale && r.Context().Err() == nil && r.Method == http.MethodGet {
 			if !s.isDASH() || t != s.audioTrackLocked() {
 				s.wantTrack = t
 				if s.isDASH() {
@@ -123,14 +146,14 @@ func (s *Session) serveSegment(w http.ResponseWriter, r *http.Request, t, n int)
 		// Only the oldest outstanding fetch may move the encoder. A request
 		// for a segment the encoder has already raced to is a buffer fill,
 		// not a seek, and must not abandon the segment the client is on.
-		if !waitTail && !s.mayMoveEncoderLocked(t, n, tracked) && s.needsRestartLocked(n) {
+		if !handoffFetch && !waitTail && !s.mayMoveEncoderLocked(t, n, tracked) && s.needsRestartLocked(n) {
 			s.throttleLocked()
 			s.mu.Unlock()
 			w.Header().Set("Retry-After", "1")
 			http.Error(w, "segment is ahead of the playhead", http.StatusServiceUnavailable)
 			return
 		}
-		if !waitTail && s.mayMoveEncoderLocked(t, n, tracked) && s.needsRestartLocked(n) {
+		if !handoffFetch && !waitTail && s.mayMoveEncoderLocked(t, n, tracked) && s.needsRestartLocked(n) {
 			// The cap covers the empty position and what follows it, never
 			// a segment before it: a seek back there still has media.
 			if s.emptyRuns >= emptyRestartCap && n >= s.emptyAt && (s.lastReal < 0 || n > s.lastReal) && !s.segmentPublishedLocked(t, n) {
@@ -188,42 +211,146 @@ func (s *Session) serveSegment(w http.ResponseWriter, r *http.Request, t, n int)
 		if dwell != nil {
 			dwellC = dwell.C
 		}
-		select {
-		case <-ch:
-		case <-dwellC:
-		case <-r.Context().Done():
-			stopTimer(dwell)
-			return
-		case <-timeout.C:
-			stopTimer(dwell)
-			s.log.Warn("timed out waiting for segment", "segment", n)
-			http.Error(w, "timed out waiting for segment", http.StatusGatewayTimeout)
-			return
+		for padded := true; padded; {
+			padded = false
+			select {
+			case <-ch:
+			case <-dwellC:
+			case <-padC:
+				// Padding is not progress: keep waiting for the same change.
+				waited := time.Since(waitStart)
+				if pw.committed && waited >= s.m.opts.segmentPadLimit {
+					stopTimer(dwell)
+					s.log.Warn("segment still not ready after padding; aborting the request", "segment", n, "waited", waited)
+					return // finish aborts the committed response
+				}
+				if pw.committed || waited >= segmentPadAfter {
+					pw.pad(s)
+				}
+				padded = true
+			case <-r.Context().Done():
+				stopTimer(dwell)
+				return
+			case <-timeout.C:
+				stopTimer(dwell)
+				s.log.Warn("timed out waiting for segment", "segment", n)
+				http.Error(w, "timed out waiting for segment", http.StatusGatewayTimeout)
+				return
+			}
 		}
 		stopTimer(dwell)
 	}
 }
 
+// emptyAliasSize reports whether an in-GOP placeholder segment is written
+// for HLS containers whose players join fragments into a single stream: a
+// positive size when placeholders exist, 0 when aliases duplicate the
+// covering segment directly (MPEG-TS, DASH). The fMP4 placeholder's exact
+// size varies with the track, so it is matched structurally (isEmptyFMP4),
+// not by size.
+func (s *Session) emptyAliasSize() int64 {
+	if s.isDASH() {
+		return 0
+	}
+	switch s.container {
+	case ContainerMatroska:
+		return emptyClusterSize
+	case ContainerFMP4:
+		return 1
+	default:
+		return 0
+	}
+}
+
+// emptyFragmentLocked is the placeholder bytes for in-GOP segment n of the
+// primary track: an empty fMP4 fragment (with a valid traf/tfdt at n's start)
+// or an empty Matroska Cluster. Callers write it in place of repeating the
+// covering GOP.
+func (s *Session) emptyFragmentLocked(n int) []byte {
+	if s.container == ContainerMatroska {
+		return emptyCluster(s.segStart(n) + matroskaOrigin)
+	}
+	track := s.fmp4VideoTrack
+	base := emptyFMP4DecodeTime(s.segStart(n), track.Timescale)
+	return emptyFMP4(uint32(n+1), track, base)
+}
+
+func isEmptyFMP4(b []byte) bool {
+	top, err := readBoxes(b, 0, len(b))
+	if err != nil || len(top) != 3 || top[0].typ != "styp" || top[1].typ != "moof" || top[2].typ != "mdat" {
+		return false
+	}
+	if top[2].end-top[2].start > 8 {
+		return false // mdat with samples is not an empty placeholder
+	}
+	kids, err := readBoxes(b, top[1].start+top[1].hdr, top[1].end)
+	if err != nil {
+		return false
+	}
+	sawTfdt := false
+	for _, k := range kids {
+		if k.typ != "traf" {
+			continue
+		}
+		grandkids, err := readBoxes(b, k.start+k.hdr, k.end)
+		if err != nil {
+			return false
+		}
+		samples := 0
+		for _, g := range grandkids {
+			switch g.typ {
+			case "tfdt":
+				sawTfdt = true
+			case "trun":
+				p := g.payload(b)
+				if len(p) >= 8 {
+					samples += int(binary.BigEndian.Uint32(p[4:]))
+				}
+			}
+		}
+		if samples != 0 {
+			return false
+		}
+	}
+	return sawTfdt
+}
+
 // coveringSegLocked is the latest segment at or before n that holds a
-// real Matroska GOP, or -1 if none is still on disk.
+// real GOP (not an empty alias placeholder), or -1 if none is still on disk.
 func (s *Session) coveringSegLocked(t, n int) int {
 	if t < 0 || t >= len(s.done) {
 		return -1
 	}
 	for k := n; k >= 0 && s.done[t][k]; k-- {
-		st, err := os.Stat(s.trackSegPath(t, k))
+		path := s.trackSegPath(t, k)
+		st, err := os.Stat(path)
 		if err != nil {
 			return -1
 		}
-		if st.Size() > emptyClusterSize {
-			return k
+		switch s.container {
+		case ContainerMatroska:
+			if st.Size() > emptyClusterSize {
+				return k
+			}
+		case ContainerFMP4:
+			b, err := os.ReadFile(path)
+			if err != nil {
+				return -1
+			}
+			if !isEmptyFMP4(b) {
+				return k
+			}
+		default:
+			if st.Size() > 0 {
+				return k
+			}
 		}
 	}
 	return -1
 }
 
-// decodableMKVLocked is the file to serve for Matroska segment n of track
-// t to a fresh decoder: n itself, or for an empty Cluster (a segment
+// decodableMKVLocked is the file to serve for segment n of track t to a
+// fresh decoder: n itself, or for an empty alias placeholder (a segment
 // inside a GOP longer than a segment, chunks.go) the earlier segment
 // holding that GOP; false when it is no longer on disk.
 func (s *Session) decodableMKVLocked(t, n int) (string, bool) {
@@ -264,12 +391,33 @@ func (s *Session) endFetchLocked(n int) {
 		delete(s.inflight, n)
 	}
 	prev := s.lastReq
-	if oldest := s.oldestFetchLocked(); oldest >= 0 && !s.encoderHeadLocked(oldest) {
+	if oldest := s.oldestFetchLocked(); oldest >= 0 && (!s.encoderHeadLocked(oldest) || s.blockedSeekLocked(oldest)) {
 		s.lastReq = oldest
 	}
 	if s.lastReq != prev {
 		s.broadcastLocked()
 	}
+}
+
+// blockedSeekLocked reports that fetch n is where the player now is,
+// although the encoder-head rule would hold the playhead: no track has
+// published n, nothing older is open, and n is past the playhead's restart
+// window. A seek that lands inside a copy's lead is served from disk and
+// leaves the playhead behind; the first segment the paused run has not
+// written is then the one the player waits on. Holding the playhead there
+// keeps the throttle pausing the run that must write it, and the fetch
+// never completes. A published head fetch (the client still on an earlier
+// segment) does not qualify, so it still cannot evict the playhead.
+func (s *Session) blockedSeekLocked(n int) bool {
+	if n <= s.lastReq+s.restartLimit() || n != s.oldestFetchLocked() {
+		return false
+	}
+	for t := range s.done {
+		if s.segmentPublishedLocked(t, n) {
+			return false
+		}
+	}
+	return true
 }
 
 // notePlayheadLocked follows the oldest fetch still open. A segment the
@@ -287,6 +435,9 @@ func (s *Session) notePlayheadLocked(t, n int) {
 	if !published && restart && !head {
 		s.lastReq = n
 		decision = "seek"
+	} else if s.blockedSeekLocked(n) {
+		s.lastReq = n
+		decision = "blocked"
 	} else if oldest := s.oldestFetchLocked(); oldest >= 0 && !s.encoderHeadLocked(oldest) {
 		s.lastReq = oldest
 		decision = "oldest"
@@ -392,7 +543,7 @@ func (s *Session) restartLimit() int {
 // restarting it at n: wait when n is at or a little ahead of the encoder,
 // restart when n is behind the run's start, far ahead, or nothing runs.
 func (s *Session) needsRestartLocked(n int) bool {
-	if s.liveRecovering {
+	if s.liveRecovering || s.headerRecovering {
 		return false
 	}
 	if s.pendingStart && s.pendingSegment == n && s.pendingTrack == s.wantTrack {
@@ -428,7 +579,7 @@ func (s *Session) rungDwellLocked(media bool, n int) time.Duration {
 		return 0
 	}
 	if s.deliveredTrack == r.track && s.deliveredCount > 0 {
-		if media && n == s.deliveredSeg+1 {
+		if media && n > s.deliveredSeg && n <= s.deliveredSeg+s.aheadLimit() {
 			return 0
 		}
 		// fMP4/DASH players load initialization before the next media GET.
@@ -471,7 +622,7 @@ func (s *Session) serveInit(w http.ResponseWriter, r *http.Request, t int) {
 			// delete) this one as soon as the lock is released, and the
 			// open handle keeps serving the bytes the lookup chose.
 			f, err := os.Open(filepath.Join(s.dir, name))
-			if err == nil && s.container == ContainerMatroska && r.Method != http.MethodHead {
+			if err == nil && s.emptyAliasSize() > 0 && r.Method != http.MethodHead {
 				// An init GET starts a decoder. Its first media GET needs
 				// a GOP even when it follows the previous decoder's last
 				// segment; metadata-only HEAD probes do not reset it.
@@ -508,7 +659,7 @@ func (s *Session) serveInit(w http.ResponseWriter, r *http.Request, t int) {
 		// a probe deadlocked every lazy rung: the player asks for no media
 		// segment until the init succeeds. Only DASH keeps the ranged-probe
 		// guard; non-GET requests stay probes on both protocols.
-		probe := r.Method != http.MethodGet || (s.isDASH() && r.Header.Get("Range") != "")
+		probe := r.Method != http.MethodGet || (s.isDASH() && r.Header.Get("Range") != "" && (s.cur != nil || s.runSeq > 0))
 		selectTrack := !s.isDASH() || t != s.audioTrackLocked()
 		if probe && (s.cur == nil || s.cur.finished || s.cur.stopped || (selectTrack && s.cur.track != t)) {
 			s.mu.Unlock()
@@ -520,7 +671,7 @@ func (s *Session) serveInit(w http.ResponseWriter, r *http.Request, t int) {
 			s.wantTrack = t
 		}
 		var dwell *time.Timer
-		if (s.cur == nil || s.cur.finished || s.cur.stopped || (selectTrack && s.cur.track != t)) && !restarted && !probe {
+		if (s.cur == nil || s.cur.finished || s.cur.stopped || (selectTrack && s.cur.track != t)) && !restarted && !probe && !s.pendingStart && !s.headerRecovering {
 			left := s.rungDwellLocked(false, s.lastReq)
 			if s.isDASH() && selectTrack && !s.videoRequested && s.runSeq <= 1 {
 				// No video was requested yet: the initial quality choice
@@ -602,13 +753,20 @@ func (s *Session) serveFiles(w http.ResponseWriter, r *http.Request, paths []str
 	}
 	s.setSegmentHeaders(w)
 	armSegmentDeadline(w)
-	s.serveCounted(w, r, filepath.Base(paths[0]), mod, bytes.NewReader(buf.Bytes()), t, n)
+	content := io.ReadSeeker(bytes.NewReader(buf.Bytes()))
+	s.serveCounted(w, r, filepath.Base(paths[0]), mod, content, t, n)
 	return true
 }
 
 // serveCounted is http.ServeContent with delivery goodput measured over
 // the write phase only (the wait for ffmpeg already happened).
 func (s *Session) serveCounted(w http.ResponseWriter, r *http.Request, name string, mod time.Time, content io.ReadSeeker, t, n int) {
+	if s.diagnosticsEnabled {
+		dw := &diagnosticWriter{ResponseWriter: w, session: s, track: t, segment: n, resource: name}
+		defer dw.finish()
+		w = dw
+	}
+
 	if r.Method != http.MethodGet || n == InitSegment {
 		http.ServeContent(w, r, name, mod, content)
 		return
@@ -702,6 +860,9 @@ func (s *Session) setSegmentHeaders(w http.ResponseWriter) {
 		ct = "video/mp4"
 	case s.container == ContainerMatroska:
 		ct = "video/x-matroska"
+		if s.androidMatroskaHLS {
+			ct = "video/MP2T"
+		}
 	}
 	w.Header().Set("Content-Type", ct)
 	w.Header().Set("Cache-Control", "no-cache")
@@ -727,9 +888,13 @@ func (s *Session) serveOpened(w http.ResponseWriter, r *http.Request, f *os.File
 	name := filepath.Base(f.Name())
 	if n == InitSegment {
 		name = initSegmentName(s.container)
+		if s.androidMatroskaHLS && s.container == ContainerMatroska {
+			w.Header().Set("Content-Type", "application/octet-stream")
+		}
 	}
 	armSegmentDeadline(w)
-	s.serveCounted(w, r, name, st.ModTime(), f, t, n)
+	var content io.ReadSeeker = f
+	s.serveCounted(w, r, name, st.ModTime(), content, t, n)
 	return true
 }
 

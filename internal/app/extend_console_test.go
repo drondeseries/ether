@@ -16,20 +16,21 @@ func TestConsoleDescriptorsRegister(t *testing.T) {
 		t.Fatal(err)
 	}
 	pages := r.List(extend.KindPage)
-	if len(pages) != 24 {
-		t.Fatalf("pages = %d, want 24", len(pages))
+	if len(pages) != 25 {
+		t.Fatalf("pages = %d, want 25", len(pages))
 	}
 	// Sidebar order and grouping, exactly as the old navigation() list.
 	wantNav := []struct{ id, group, route string }{
 		{"overview", "", "/"}, {"activity", "", "/activity"}, {"viewers", "", "/viewers"},
-		{"catalog", "library", "/catalog"}, {"collections", "library", "/collections"},
+		{"libraries", "library", "/libraries"}, {"collections", "library", "/collections"},
 		{"home", "library", "/home"}, {"livetv", "library", "/livetv"},
 		{"calendar", "library", "/calendar"}, {"metadata", "library", "/metadata"},
 		{"sources", "streaming", "/sources"}, {"releases", "streaming", "/quality"},
 		{"cache", "streaming", "/cache"}, {"playback", "streaming", "/playback"},
 		{"general", "server", "/server"}, {"apps", "server", "/apps"},
 		{"integrations", "server", "/services"}, {"plugins", "server", "/plugins"},
-		{"notifications", "server", "/notifications"}, {"cluster", "server", "/cluster"},
+		{"notifications", "server", "/notifications"}, {"flows", "server", "/flows"},
+		{"cluster", "server", "/cluster"},
 		{"maintenance", "server", "/maintenance"},
 	}
 	// Registry order is group, then order: "" < "library" < "server" <
@@ -44,9 +45,9 @@ func TestConsoleDescriptorsRegister(t *testing.T) {
 	}
 	for group, ids := range map[string][]string{
 		"":          {"overview", "activity", "viewers"},
-		"library":   {"catalog", "collections", "home", "livetv", "calendar", "metadata"},
+		"library":   {"libraries", "collections", "home", "livetv", "calendar", "metadata"},
 		"streaming": {"sources", "playback", "releases", "cache"},
-		"server":    {"general", "apps", "integrations", "plugins", "notifications", "cluster", "maintenance"},
+		"server":    {"general", "apps", "integrations", "plugins", "notifications", "flows", "cluster", "maintenance"},
 	} {
 		var got []string
 		for _, d := range nav {
@@ -114,12 +115,12 @@ func TestConsoleDescriptorsRegister(t *testing.T) {
 			}
 		}
 	}
-	if actions != 7 || suggestions != 4 {
-		t.Errorf("commands: actions=%d suggestions=%d, want 7 and 4", actions, suggestions)
+	if actions != 8 || suggestions != 4 {
+		t.Errorf("commands: actions=%d suggestions=%d, want 8 and 4", actions, suggestions)
 	}
 	integrations := r.List(extend.KindIntegration)
-	if len(integrations) != 7 {
-		t.Fatalf("integrations = %d, want 7", len(integrations))
+	if len(integrations) != 9 {
+		t.Fatalf("integrations = %d, want 9", len(integrations))
 	}
 	for _, d := range integrations {
 		meta, err := extend.MetaOf[extend.IntegrationMeta](d)

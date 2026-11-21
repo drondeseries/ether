@@ -17,23 +17,26 @@ import (
 const failoverRaceWidth = 3
 
 type raceResult struct {
-	alt core.Release
-	g   *generation
-	err error
+	alt   core.Release
+	g     *generation
+	err   error
+	fetch bool
 }
 
 // raceAlternates opens untried alternates concurrently, keeping width in
 // flight, and returns the first that opens. Releases that failed are
 // returned so the caller does not try them again. Late successes are
-// dropped in the background.
+// dropped in the background. Add-on stream links that open on demand
+// (core.Release.OpensOnDemand) never race: each open makes the add-on fetch
+// a release, so the sequential failover tries them one after another.
 func (m *Manager) raceAlternates(ctx context.Context, s *session, tried []string, alternates []core.Release, fallback func(int64) core.MediaInfo, width int, accept func(*generation) error, prefer func(*generation) bool) (*generation, []string, error) {
 	var cands []core.Release
 	for _, alt := range alternates {
-		if alt.ID != "" && !slices.Contains(tried, alt.ID) && releaseMatchesTitle(alt, s.title) {
+		if alt.ID != "" && m.ownerPinAllows(s, alt.ID) && !alt.OpensOnDemand() && !slices.Contains(tried, alt.ID) && !m.titleReleaseRejected(ctx, s.ident.key, alt) && releaseMatchesTitle(alt, s.title) {
 			cands = append(cands, alt)
 		}
 	}
-	if m.deps.FetchNZB == nil || len(cands) < 2 {
+	if m.deps.FetchNZB == nil || len(cands) == 0 {
 		return nil, nil, nil
 	}
 	rctx, cancel := context.WithCancel(ctx)
@@ -46,7 +49,7 @@ func (m *Manager) raceAlternates(ctx context.Context, s *session, tried []string
 		go func() {
 			nzb, err := m.deps.FetchNZB(rctx, alt)
 			if err != nil {
-				results <- raceResult{alt: alt, err: err}
+				results <- raceResult{alt: alt, err: err, fetch: true}
 				return
 			}
 			res := &core.Resolution{Title: s.ident.key, Release: alt, NZB: nzb, ResolvedAt: m.now()}
@@ -131,6 +134,15 @@ func (m *Manager) raceAlternates(ctx context.Context, s *session, tried []string
 		}
 		failed = append(failed, r.alt.ID)
 		lastErr = r.err
+		if r.fetch {
+			m.recordTimeline(s, TimelineEvent{
+				Kind:    "candidate",
+				Level:   "warn",
+				Failing: true,
+				Message: "Candidate failed: " + releaseLabel(r.alt),
+				Detail:  OwnerError(r.err),
+			})
+		}
 		m.log.Warn("failover candidate failed", "session", s.id, "release", r.alt.Name, "err", r.err)
 		if next < len(cands) && (held == nil || next < m.opts.MaxAttempts) {
 			launch()

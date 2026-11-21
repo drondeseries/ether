@@ -9,15 +9,20 @@ import type { Descriptor } from "./extend";
 const pages = descriptors.filter((d) => d.kind === "page") as Descriptor<PageMeta>[];
 
 describe("sitemap", () => {
-  it("indexes Rules and upcoming content without the retired gate", () => {
+  it("indexes per-library Rules and Settings without global library settings", () => {
     const hrefs = destinations().map((d) => d.href);
-    expect(hrefs).toContain("/catalog/rules");
-    expect(hrefs).not.toContain("/catalog/visibility");
+    expect(hrefs.filter((h) => h.startsWith("/libraries/"))).toEqual([
+      "/libraries/1/rules",
+      "/libraries/1/settings",
+      "/libraries/2/rules",
+      "/libraries/2/settings",
+    ]);
+    expect(hrefs.some((h) => h.startsWith("/catalog"))).toBe(false);
     expect(settingsIndex().some((s) => s.title === "Wait for digital or physical release")).toBe(
       false,
     );
     expect(settingsIndex().find((s) => s.title === "Show upcoming movies")?.href).toBe(
-      "/catalog/settings",
+      "/libraries/1/settings",
     );
   });
 
@@ -25,6 +30,16 @@ describe("sitemap", () => {
     const hrefs = destinationsFrom(pages).map((d) => d.href);
     expect(new Set(hrefs).size).toBe(hrefs.length);
     expect(pagesFrom(pages).map((p) => p.title)).toContain("Overview");
+  });
+
+  it("homes IPTV and guide sources under Streaming › Sources rather than Live TV", () => {
+    const staticHrefs = destinations().map((d) => d.href);
+    expect(staticHrefs).toContain("/sources/iptv");
+    expect(staticHrefs).not.toContain("/livetv/sources");
+
+    const descriptorHrefs = destinationsFrom(pages).map((d) => d.href);
+    expect(descriptorHrefs).toContain("/sources/iptv");
+    expect(descriptorHrefs).not.toContain("/livetv/sources");
   });
 
   it("points Plex sections at the Plex tab, never at dead Apps tabs", () => {
@@ -72,7 +87,7 @@ describe("settings index", () => {
     expect(at("Trailers and Cinema Trailers")[0]).toMatchObject({ href: "/playback/prerolls" });
     expect(at("Custom server URLs")[0]).toMatchObject({ href: "/apps/overview" });
     expect(at("Bitrate limit")[0]).toMatchObject({ href: "/quality/profiles" });
-    expect(at("Watchlist monitoring")[0]).toMatchObject({ href: "/catalog/settings" });
+    expect(at("Watchlist monitoring")[0]).toMatchObject({ href: "/viewers" });
     expect(at("Adapt Home to tonight's browsing")[0]).toMatchObject({ href: "/home" });
   });
 

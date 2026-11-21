@@ -4,12 +4,13 @@ import (
 	"fmt"
 	"net/url"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/braedonsaunders/ether/internal/config"
 	"github.com/braedonsaunders/ether/internal/core"
-	"github.com/braedonsaunders/ether/internal/libraryfilter"
+	"github.com/braedonsaunders/ether/internal/identity"
 	"github.com/braedonsaunders/ether/internal/releasepolicy"
 	"github.com/braedonsaunders/ether/internal/remote"
 )
@@ -70,10 +71,20 @@ func (v *validator) clock(field, s string) {
 // fix in the UI. It is intentionally permissive about empty optional
 // sections (an unconfigured install must remain saveable mid-wizard) and
 // strict about structurally broken values.
+func sortedFrontendIDs(cfg config.Config) []string {
+	ids := make([]string, 0, len(cfg.Frontends))
+	for id := range cfg.Frontends {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
 func ValidateConfig(cfg config.Config) []FieldError {
 	v := &validator{}
 	ids := map[string]bool{}
 	openSubtitles := false
+	subdl := false
 	for i, provider := range cfg.Subtitles.Providers {
 		field := fmt.Sprintf("subtitles.providers[%d]", i)
 		if strings.TrimSpace(provider.ID) == "" || ids[provider.ID] {
@@ -86,6 +97,11 @@ func ValidateConfig(cfg config.Config) []FieldError {
 				v.add(field+".kind", "OpenSubtitles can only appear once")
 			}
 			openSubtitles = true
+		case config.SubtitleProviderSubDL:
+			if subdl {
+				v.add(field+".kind", "SubDL can only appear once")
+			}
+			subdl = true
 		default:
 			if !strings.HasPrefix(provider.Kind, "plugin:") || !strings.HasSuffix(provider.Kind, "/subtitles") || provider.ID != provider.Kind {
 				v.add(field+".kind", "unknown subtitle provider")
@@ -96,12 +112,21 @@ func ValidateConfig(cfg config.Config) []FieldError {
 		v.add("liveTV.healthSweepMinutes", "must be between -1 and 1440")
 	}
 	v.httpURL("liveTV.logoIndexUrl", cfg.LiveTV.LogoIndexURL, false)
+	if !config.ValidLiveLatencyProfile(cfg.LiveTV.LatencyProfile) {
+		v.add("liveTV.latencyProfile", "must be auto, low or stable")
+	}
+	if !config.ValidLiveTVStability(cfg.LiveTV.Stability) {
+		v.add("liveTV.stability", "must be fastest, balanced or rocksolid")
+	}
 	if err := cfg.Posters.Validate(); err != nil {
 		v.add("posters", "%s", err.Error())
 	}
 	a := cfg.Availability
 	if a.MovieEvidenceDays < 0 || a.MovieEvidenceDays > 366 {
 		v.add("availability.movieEvidenceDays", "must be between 1 and 366 days (0 uses the default)")
+	}
+	if a.HomeReleaseOffsetDays < -366 || a.HomeReleaseOffsetDays > 366 {
+		v.add("availability.homeReleaseOffsetDays", "must be between -366 and 366 days")
 	}
 	if a.PollMinutes < 5 || a.PollMinutes > 1440 {
 		v.add("availability.pollMinutes", "must be between 5 and 1440 minutes")
@@ -125,10 +150,16 @@ func ValidateConfig(cfg config.Config) []FieldError {
 	default:
 		v.add("availability.effort", "must be gentle, normal, unlimited, or custom")
 	}
-	switch a.Mode {
-	case "", config.ModePlayable, config.ModeDigital, config.ModeImmediate:
-	default:
-		v.add("availability.mode", "must be playable, digital, or immediate")
+	for _, m := range []struct{ field, val string }{
+		{"availability.mode", a.Mode},
+		{"availability.movieMode", a.MovieMode},
+		{"availability.showMode", a.ShowMode},
+	} {
+		switch m.val {
+		case "", config.ModePlayable, config.ModeDigital, config.ModeImmediate:
+		default:
+			v.add(m.field, "must be playable, digital, or immediate")
+		}
 	}
 
 	if cfg.SharedCache != nil {
@@ -153,14 +184,17 @@ func ValidateConfig(cfg config.Config) []FieldError {
 	if _, err := frameOrigins(cfg.Server.WebFrameOrigins); err != nil {
 		v.add("server.webFrameOrigins", "%s", err)
 	}
+	for _, raw := range cfg.Server.TrustedProxyCIDRs {
+		if strings.TrimSpace(raw) == "" {
+			continue
+		}
+		if _, err := identity.ParseProxyEntry(raw); err != nil {
+			v.add("server.trustedProxyCIDRs", "%s", err)
+			break
+		}
+	}
 	if strings.TrimSpace(cfg.Server.FriendlyName) == "" {
 		v.add("server.friendlyName", "is required")
-	}
-	if strings.TrimSpace(cfg.Server.MoviesLibraryName) == "" {
-		v.add("server.moviesLibraryName", "is required")
-	}
-	if strings.TrimSpace(cfg.Server.TVShowsLibraryName) == "" {
-		v.add("server.tvShowsLibraryName", "is required")
 	}
 	if cfg.Server.LogLevel != "" {
 		v.oneOf("server.logLevel", cfg.Server.LogLevel, "debug", "info", "warn", "error")
@@ -191,6 +225,15 @@ func ValidateConfig(cfg config.Config) []FieldError {
 			break
 		}
 	}
+	for _, id := range sortedFrontendIDs(cfg) {
+		raw := cfg.Frontends[id].PublicURL
+		if strings.TrimSpace(raw) == "" {
+			continue
+		}
+		if _, err := remote.ParseCustomURL(raw); err != nil {
+			v.add("frontends."+id+".publicUrl", "Enter a full http:// or https:// address, or leave it blank.")
+		}
+	}
 
 	seenProv := map[string]bool{}
 	for i, p := range cfg.Usenet.Providers {
@@ -218,14 +261,23 @@ func ValidateConfig(cfg config.Config) []FieldError {
 	for i, ix := range cfg.Indexers {
 		f := fmt.Sprintf("indexers[%d]", i)
 		v.httpURL(f+".url", ix.URL, true)
-		if ix.ClientIdentity != "" && !config.ValidSearchIdentity(ix.ClientIdentity) {
-			v.add(f+".clientIdentity", "must be a client that searches or empty to inherit")
+		if msg := config.ValidateUserAgent(ix.UserAgent); msg != "" {
+			v.add(f+".userAgent", "%s", msg)
+		}
+		for _, e := range ix.RequestIdentity.Validate() {
+			v.add(f+"."+e.Field, "%s", e.Message)
 		}
 		if ix.Kind != "" {
-			v.oneOf(f+".kind", ix.Kind, config.IndexerKindNewznab, config.IndexerKindCardigann, config.IndexerKindStremio)
+			v.oneOf(f+".kind", ix.Kind, config.IndexerKindNewznab, config.IndexerKindCardigann, config.IndexerKindStremio, config.IndexerKindZilean)
 		}
 		if ix.IsStremio() && ix.Protocol != "" && ix.Protocol != "torrent" {
 			v.add(f+".protocol", "must be torrent for a Stremio addon")
+		}
+		if ix.UseAddonOrder && !ix.IsStremio() {
+			v.add(f+".useAddonOrder", "is only supported for a Stremio addon")
+		}
+		if ix.IsZilean() && ix.Protocol != "" && ix.Protocol != "torrent" {
+			v.add(f+".protocol", "must be torrent for a Zilean instance")
 		}
 		if ix.IsBuiltin() && strings.TrimSpace(ix.Definition) == "" {
 			v.add(f+".definition", "is required for a built-in site")
@@ -321,6 +373,18 @@ func ValidateConfig(cfg config.Config) []FieldError {
 	if cfg.Cache.ReplayBoostHours < 0 || cfg.Cache.ReplayBoostHours > 720 {
 		v.add("cache.replayBoostHours", "must be between 0 and 720")
 	}
+	if cfg.Cache.SpeculativeWarming != "" && cfg.Cache.SpeculativeWarming != "on" && cfg.Cache.SpeculativeWarming != "off" {
+		v.add("cache.speculativeWarming", "must be on or off")
+	}
+	if len(cfg.Cache.KeepWarmTitles) > 200 {
+		v.add("cache.keepWarmTitles", "must contain at most 200 titles")
+	}
+	for _, key := range cfg.Cache.KeepWarmTitles {
+		if key.Kind() != core.KindMovie && key.Kind() != core.KindShow {
+			v.add("cache.keepWarmTitles", "must contain movie or show keys")
+			break
+		}
+	}
 	if cfg.Cache.DetailWarmup != "" && cfg.Cache.DetailWarmup != "on" && cfg.Cache.DetailWarmup != "off" {
 		v.add("cache.detailWarmup", "must be on or off")
 	}
@@ -348,9 +412,6 @@ func ValidateConfig(cfg config.Config) []FieldError {
 
 	if cfg.Catalog.MinPopularity < 0 {
 		v.add("catalog.minPopularity", "must be >= 0")
-	}
-	if _, err := libraryfilter.CompilePolicy(cfg.Catalog.Exclusions, cfg.Catalog.VisibilityDefault); err != nil {
-		v.add("catalog.exclusions", "%s", err.Error())
 	}
 	if cfg.Catalog.MinVotes < 0 {
 		v.add("catalog.minVotes", "must be >= 0")
@@ -398,8 +459,29 @@ func ValidateConfig(cfg config.Config) []FieldError {
 		} else if msg := releasepolicy.Conflict(p.ReleaseRules); msg != "" {
 			v.add(f+".releaseRules", "%s", msg)
 		}
-		if err := core.ValidateRanking(p.Ranking, p.ReleaseRules); err != nil {
-			v.add(f+".ranking", "%s", err)
+		if msg := core.QualityOrderError(p.QualityOrder); msg != "" {
+			v.add(f+".qualityOrder", "%s", msg)
+		}
+		prefer := map[string]bool{}
+		for _, r := range p.ReleaseRules {
+			if r.Action == "prefer" {
+				prefer[core.RuleFormatPrefix+r.ID] = true
+			}
+		}
+		for id, score := range p.CustomFormatScores {
+			switch {
+			case score < -1e9 || score > 1e9:
+				v.add(f+".customFormatScores", "%s: score must be between -1000000000 and 1000000000", id)
+			case strings.HasPrefix(id, core.BuiltinFormatPrefix) && !core.IsBuiltinFormat(id):
+				v.add(f+".customFormatScores", "%s is not one of Ether's formats", id)
+			case strings.HasPrefix(id, core.RuleFormatPrefix) && !prefer[id]:
+				v.add(f+".customFormatScores", "%s does not name a Prefer rule of this profile", id)
+			}
+		}
+		for id := range p.PluginScores {
+			if !core.IsPluginRankingStep(id) {
+				v.add(f+".pluginScores", "%s is not a plugin ranking step", id)
+			}
 		}
 		if p.MinHeight < 0 || p.MaxHeight < 0 || (p.MaxHeight > 0 && p.MinHeight > p.MaxHeight) {
 			v.add(f+".minHeight", "must be <= maxHeight")
@@ -463,6 +545,9 @@ func ValidateConfig(cfg config.Config) []FieldError {
 		v.add("quality.sync.interval", "must be positive when sync is enabled")
 	}
 
+	if cfg.Transcode.VideoTranscoding != "" {
+		v.oneOf("transcode.videoTranscoding", cfg.Transcode.VideoTranscoding, "on", "off")
+	}
 	if cfg.Transcode.HWAccel != "" {
 		v.oneOf("transcode.hwAccel", cfg.Transcode.HWAccel, "auto", "none", "videotoolbox", "nvenc", "qsv", "vaapi")
 	}

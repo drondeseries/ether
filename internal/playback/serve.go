@@ -37,13 +37,33 @@ func (m *Manager) ServeRange(w http.ResponseWriter, r *http.Request, sessionID s
 		http.Error(w, "unknown playback session", http.StatusNotFound)
 		return
 	}
+	if measurement := core.MediaCapWaitFrom(r.Context()); measurement != nil {
+		if g := s.current(); g != nil {
+			if source, ok := g.src.(core.MediaCapWaitSource); ok && source.MediaCapWaitKnown() {
+				measurement.MarkKnown()
+			}
+		}
+	}
 	s.activeReads.Add(1)
 	defer func() {
 		s.activeReads.Add(-1)
-		s.touch(m.now())
+		s.touchMedia(m.now())
 	}()
-	s.touch(m.now())
-	s.markDirectPlay()
+	s.touchMedia(m.now())
+	if s.markDirectPlay() {
+		m.recordTimeline(s, TimelineEvent{
+			Kind:    "decision",
+			Level:   "info",
+			Message: "Delivery: Direct play",
+			Detail:  "Serving original container byte ranges",
+		})
+		m.emitStreamDecision(s, "", core.Decision{
+			Kind:      core.DecisionDirectPlay,
+			VideoCopy: true,
+			AudioCopy: true,
+			Reason:    "Serving original container byte ranges",
+		})
+	}
 	if !s.directRangeCompatible() {
 		// The client still holds the original file's container headers and
 		// byte coordinates. A remux handoff needs a new playback decision;
@@ -61,9 +81,9 @@ func (m *Manager) ServeRange(w http.ResponseWriter, r *http.Request, sessionID s
 		contentType:           s.contentType,
 		deferStatusOnZeroRead: true,
 	}
-	plexPart, _ := r.Context().Value(plexPartKey{}).(bool)
-	if plexPart {
-		rep.contentType = plexPartMIME(s.name)
+	policy, customResponse := core.RangeResponseFrom(r.Context())
+	if customResponse && policy.MIME != nil {
+		rep.contentType = policy.MIME(s.name)
 	}
 	s.mu.Unlock()
 	rep.body = func(w io.Writer, start, length int64) error {
@@ -76,8 +96,12 @@ func (m *Manager) ServeRange(w http.ResponseWriter, r *http.Request, sessionID s
 		return err
 	}
 	serve := serveRepresentation
-	if plexPart {
-		serve = servePlexPart
+	if customResponse && policy.Serve != nil {
+		serve = func(w http.ResponseWriter, r *http.Request, rep representation) error {
+			return policy.Serve(w, r, core.RangeRepresentation{Size: rep.size, ETag: rep.etag, ContentType: rep.contentType, ModTime: rep.modTime, ServeBody: func(status int, start, length int64) error {
+				return serveSingleRangeBody(w, r, status, start, length, rep.deferStatusOnZeroRead, rep.body)
+			}})
+		}
 	}
 	if err := serve(w, r, rep); err != nil && r.Context().Err() == nil {
 		m.log.Debug("direct play response ended early", "session", s.id, "err", err)
@@ -121,7 +145,7 @@ func (m *Manager) streamClient(ctx context.Context, w io.Writer, s *session, vst
 			g.retryEpoch++
 			g.retryPending = false
 			g.mu.Unlock()
-			s.touch(now)
+			s.touchMedia(now)
 		}
 	}
 	for vpos < vend {
@@ -159,9 +183,25 @@ func (m *Manager) streamClient(ctx context.Context, w io.Writer, s *session, vst
 		case errors.Is(rerr, errDirectReadDeadline) && ctx.Err() == nil:
 			// The backend has not returned a chunk in the entire budget;
 			// do not wait for its internal retries before replacing it.
+			m.log.Warn("direct-play source read stalled", "session", s.id, "release", g.releaseID(), "offset", srcpos)
+			m.recordTimeline(s, TimelineEvent{
+				Kind:    "stall",
+				Level:   "warn",
+				Failing: true,
+				Message: "Source read stalled during direct play",
+				Detail:  releaseLabel(g.res.Release),
+			})
 			g.noteReadFailure(core.ErrSourceUnavailable)
 			at = g.timeMapSnapshot().TimeAt(srcpos)
-			_, err := m.failoverWith(ctx, s, g, at, failoverOpts{reason: "media source stalled", strictDirect: true})
+			res, err := m.failoverWith(ctx, s, g, at, failoverOpts{reason: "media source stalled", strictDirect: true, stallRecovery: true})
+			if err == nil && res == g {
+				// The stall grace continued this release on a read the
+				// client may never repeat. This path does not return a
+				// retryable error, so arm the same bounded recovery the
+				// recoverable path uses: a client that stops requesting
+				// still ends or restarts within two windows (issue #169).
+				m.limitDirectRetry(s, g, at)
+			}
 			if err != nil && !errors.Is(err, errRequireRemux) && ctx.Err() == nil {
 				m.emitEvent("error", s, err)
 				m.Stop(s.id)
@@ -235,29 +275,46 @@ func (m *Manager) limitDirectRetryAfter(s *session, g *generation, at, delay tim
 	g.retryPending = true
 	epoch := g.retryEpoch
 	g.mu.Unlock()
+	pending := func() bool {
+		s.mu.Lock()
+		inactive := s.closed || s.viewerState == "paused" || s.viewerState == "stopped" || !s.stopAt.IsZero() || s.stoppedBySurface
+		s.mu.Unlock()
+		if inactive {
+			return false
+		}
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		return g.retryPending && g.retryEpoch == epoch && !g.retired
+	}
 	go func() {
-		timer := time.NewTimer(delay)
-		defer timer.Stop()
-		select {
-		case <-timer.C:
-		case <-g.ctx.Done():
-			return
-		}
-		pending := func() bool {
-			g.mu.Lock()
-			defer g.mu.Unlock()
-			return g.retryPending && g.retryEpoch == epoch && !g.retired
-		}
-		if !pending() {
-			return
-		}
-		g.noteReadFailure(core.ErrSourceUnavailable)
-		ctx, cancel := context.WithTimeout(g.ctx, 25*time.Second)
-		defer cancel()
-		_, err := m.failoverWith(ctx, s, g, at, failoverOpts{reason: "media source unavailable", stillNeeded: pending, strictDirect: true})
-		if err != nil && !errors.Is(err, errRequireRemux) && pending() {
-			m.emitEvent("error", s, err)
-			m.Stop(s.id)
+		// One spent stall grace re-waits in this goroutine rather than
+		// re-arming through limitDirectRetryAfter: capturing one epoch at
+		// arm time keeps the epoch guarantee, so a read that progresses
+		// between windows disarms the watchdog instead of letting a stale
+		// timer re-arm over recovered progress and escalate later.
+		for {
+			timer := time.NewTimer(delay)
+			select {
+			case <-timer.C:
+			case <-g.ctx.Done():
+				timer.Stop()
+				return
+			}
+			if !pending() {
+				return
+			}
+			g.noteReadFailure(core.ErrSourceUnavailable)
+			ctx, cancel := context.WithTimeout(g.ctx, 25*time.Second)
+			res, err := m.failoverWith(ctx, s, g, at, failoverOpts{reason: "media source unavailable", stillNeeded: pending, strictDirect: true, stallRecovery: true})
+			continued := err == nil && res == g && pending()
+			if err != nil && !errors.Is(err, errRequireRemux) && pending() {
+				m.emitEvent("error", s, err)
+				m.Stop(s.id)
+			}
+			cancel()
+			if !continued {
+				return
+			}
 		}
 	}()
 }
@@ -288,6 +345,11 @@ type chunk struct {
 const maxReadProducers = 128
 
 var readProducers = make(chan struct{}, maxReadProducers)
+
+// firstReadAlign bounds a response's first read: it ends at the next
+// multiple of the debrid engine's block (its cache and publish unit), so the
+// first bytes go out once one block has arrived rather than two or three.
+const firstReadAlign = 512 << 10
 
 // copyFrom copies up to length bytes of g's source starting at off into w,
 // reading ahead of the writer in ChunkSize pieces. It returns the bytes
@@ -349,6 +411,14 @@ func (m *Manager) copyFrom(ctx context.Context, w io.Writer, g *generation, off,
 		}
 		return 0, errRetired, nil
 	}
+	// A tiny header or tail request is container discovery, not a playhead.
+	if g.warmReads != nil && !background && off >= firstReadAlign && off < g.src.Size()-(32<<20) {
+		g.warmReads.Observe(off)
+		if g.prewarmReads != nil {
+			g.prewarmReads.Observe(off)
+		}
+	}
+	ctx = core.WithReadOrigin(ctx, "playback.loopback", "client Range")
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	g.sess.mu.Lock()
@@ -378,12 +448,21 @@ func (m *Manager) copyFrom(ctx context.Context, w io.Writer, g *generation, off,
 		}()
 		defer close(ch)
 		pos, rem := off, length
+		first := !background
 		for rem > 0 {
 			if ctx.Err() != nil {
 				return
 			}
 			bp := pool.Get().(*[]byte)
 			want := int64(len(*bp))
+			if first {
+				// The client is waiting for its first byte: read only up
+				// to the next firstReadAlign boundary (one debrid block)
+				// and write that at once instead of waiting for a whole
+				// chunk. Later reads start aligned and use full chunks.
+				first = false
+				want = min(want, firstReadAlign-pos%firstReadAlign)
+			}
 			if rem < want {
 				want = rem
 			}
@@ -430,8 +509,13 @@ func (m *Manager) copyFrom(ctx context.Context, w io.Writer, g *generation, off,
 			}
 			if n > 0 && g.sess.isRegistered() && g.sess.current() == g && !background {
 				now := m.now()
-				g.sess.noteFetch(n, time.Since(readAt), now)
-				g.sess.noteReadPos(pos, n, now, m.opts.SpeedGrace)
+				warmup := g.sess.noteReadPos(pos, n, now, m.opts.SpeedGrace)
+				if !warmup {
+					g.sess.noteFetch(n, time.Since(readAt), now)
+				}
+				if rep, ok := g.src.(core.SourceDeliveryReporter); ok {
+					g.sess.recordDelivery(rep.SourceDelivery(), now)
+				}
 			}
 			if int64(n) == want && errors.Is(err, io.EOF) {
 				err = nil
@@ -462,6 +546,7 @@ func (m *Manager) copyFrom(ctx context.Context, w io.Writer, g *generation, off,
 			rem -= int64(n)
 		}
 	}()
+	flushFirst := !background
 	for c := range ch {
 		if c.n > 0 {
 			k, err := w.Write((*c.buf)[:c.n])
@@ -469,6 +554,12 @@ func (m *Manager) copyFrom(ctx context.Context, w io.Writer, g *generation, off,
 			onWrite(k)
 			if err == nil && k < c.n {
 				err = io.ErrShortWrite
+			}
+			if err == nil && flushFirst {
+				flushFirst = false
+				if f, ok := w.(http.Flusher); ok {
+					f.Flush()
+				}
 			}
 			if err != nil {
 				pool.Put(c.buf)
@@ -575,6 +666,12 @@ func (m *Manager) serveLoopback(w http.ResponseWriter, r *http.Request) {
 // backgroundFailover fails a session over outside any request, for errors
 // seen by ffmpeg on the loopback server.
 func (m *Manager) backgroundFailover(s *session, g *generation, at time.Duration) {
+	// A channel clock owns decoder recovery and its programme offset. ffmpeg
+	// also reads the file tail for metadata: mapping that byte to time seeks
+	// to EOF, not to the airing position. It has no HLS session to swap here.
+	if s.caps.BroadcastBitrateKbps > 0 {
+		return
+	}
 	if s.isClosed() || !g.backgroundFailover.CompareAndSwap(false, true) {
 		return
 	}

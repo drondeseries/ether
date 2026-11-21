@@ -61,7 +61,7 @@ func TestSiloWatchPlaybackResume(t *testing.T) {
 		}
 		return &core.Title{Key: item, Type: core.TypeMovie, Title: "Abzurdah"}, nil
 	}
-	broker, err := NewBroker(BrokerDeps{
+	broker, err := NewBroker(BrokerDeps{SurfacePolicy: testSessionPolicy,
 		DB: db, Events: events, Playback: playback, Lookup: lookup, MediaLookup: lookup,
 		ActiveViewer: active, CanPlay: func(*core.Viewer, bool, time.Time) bool { return true },
 		BitrateLimit: func(*core.Viewer) int { return 0 }, Progress: progress,
@@ -288,7 +288,7 @@ func TestSiloTranscodePlanURL(t *testing.T) {
 		}
 		return &core.Title{Key: item, Type: core.TypeMovie, Title: "Abzurdah"}, nil
 	}
-	broker, err := NewBroker(BrokerDeps{
+	broker, err := NewBroker(BrokerDeps{SurfacePolicy: testSessionPolicy,
 		DB: db, Events: events, Playback: playback, Transcoder: &siloTranscoder{}, Lookup: lookup, MediaLookup: lookup,
 		ActiveViewer: active, CanPlay: func(*core.Viewer, bool, time.Time) bool { return true },
 		BitrateLimit: func(*core.Viewer) int { return 0 }, Progress: state.New(db, state.Options{}),
@@ -363,10 +363,10 @@ func TestSiloTranscodePlanURL(t *testing.T) {
 		t.Fatalf("transcode plan %s", started.Body.String())
 	}
 	master := call(http.MethodGet, streamURL, "")
-	if master.Code != 200 || !strings.Contains(master.Body.String(), "base/index.m3u8") {
+	if master.Code != 200 || !strings.Contains(master.Body.String(), "segment/base~index.m3u8") {
 		t.Fatalf("master %d %s", master.Code, master.Body.String())
 	}
-	variant := call(http.MethodGet, "/api/v2/playback/transcode/"+sessionID+"/base/index.m3u8", "")
+	variant := call(http.MethodGet, "/api/v2/playback/transcode/"+sessionID+"/segment/base~index.m3u8", "")
 	if variant.Code != 200 || !strings.Contains(variant.Body.String(), "variant playlist") {
 		t.Fatalf("variant %d %s", variant.Code, variant.Body.String())
 	}

@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="https://github.com/braedonsaunders/ether/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/braedonsaunders/ether?label=release&color=1f6feb" /></a>
-  <a href="https://discord.gg/t8ewTZ7gpa"><img alt="Discord" src="https://img.shields.io/discord/1567272301672796331?label=discord&logo=discord&logoColor=white&color=5865F2" /></a>
+  <a href="https://discord.gg/kAhN4QxM"><img alt="Discord" src="https://img.shields.io/discord/1567272301672796331?label=discord&logo=discord&logoColor=white&color=5865F2" /></a>
   <img alt="Platforms" src="https://img.shields.io/badge/runs%20on-macOS%20%7C%20Windows%20%7C%20Linux%20%7C%20Docker-555" />
   <img alt="Pure Go" src="https://img.shields.io/badge/Go-CGO__ENABLED%3D0-00ADD8" />
   <a href="LICENSE"><img alt="GPL-3.0" src="https://img.shields.io/badge/license-GPL--3.0-555" /></a>
@@ -147,7 +147,7 @@ The sidebar groups everything by what you are doing:
 - **Overview, Activity & Viewers** at the top for live sessions, 30-day playback history, and household accounts.
 - **Library:** **Catalog** (browser, three New releases modes, and ordered show/hide **Rules**), **Collections**, **Home** (Home Designer), **Live TV**, **Calendar**, and **Metadata** (Ratings, Artwork, Episode order).
 - **Streaming:** **Sources** (Debrid, Usenet, Indexers, Stats on one level), **Quality** (Profiles, Rules, Check quality, Searching, Blocklist, Pinned, History), **Cache**, and **Playback**.
-- **Server:** **General** (every app's port and address under **How apps connect**, plus an optional outbound HTTP/SOCKS5 proxy for source traffic), **Apps**, **Integrations**, **Notifications**, **Cluster**, and **Maintenance** (Backups & import, Updates, Health, Logs). Press ⌘K (Ctrl+K elsewhere) to search pages and individual settings; choosing a setting opens its page, expands **More options** if needed, and highlights the row.
+- **Server:** **General** (every app's port and address under **How apps connect**, plus an optional outbound HTTP/SOCKS5 proxy for source traffic, including Live TV/IPTV), **Apps**, **Integrations**, **Notifications**, **Cluster**, and **Maintenance** (Backups & import, Updates, Health, Logs). Press ⌘K (Ctrl+K elsewhere) to search pages and individual settings; choosing a setting opens its page, expands **More options** if needed, and highlights the row.
 
 ### Release profiles, sources, and new-release modes
 Quality profiles are scoped to a media type, the way Radarr and Sonarr work: every profile is for **Movies** or for **Shows**, and each media has its own **At home** and **Away** default. **Quality › Profiles** has a **Movies | Shows** picker; the profile table, its default badges, new profiles and imported presets follow the selected media. Import presets from **TRaSH Guides**, **Profilarr** or pasted Radarr/Sonarr JSON (a Radarr profile becomes a movie profile, a Sonarr one a show profile), and turn on **Keep imported profiles in sync** to pick up guide changes on a schedule or with **Sync now**. Upgrading from 0.3.4 splits each existing profile into a movie and a show copy with the same name, so every rule and default keeps choosing exactly what it did before.
@@ -235,6 +235,8 @@ Dial your storage footprint from **Pass-through (0 GiB)** to **Everyday (32 GiB)
 | **Linux** | [`.deb` / `.rpm`](https://github.com/braedonsaunders/ether/releases/latest) (`amd64`, `arm64`) | Dedicated `ether` systemd service, hardware transcoding group setup (`render`/`video`), bundled FFmpeg. |
 | **Docker** | `ghcr.io/braedonsaunders/ether:latest` | Multi-arch (`amd64`, `arm64`). Ready-made templates for **Unraid, TrueNAS SCALE, and Proxmox**, plus Synology instructions, in [`packaging/community`](packaging/community/README.md). |
 
+PR previews (`linux/amd64` only) are published for PRs whose author has write access to this repository, from a branch here or in the author's own fork, as `ghcr.io/braedonsaunders/ether:pr-<number>`. **Previews are unreviewed PR code: only run one if you trust its author, and never in place of a release.** The `pr-<number>` tag moves with each new head. A second tag, `pr-<number>-<branch>-<12-char head SHA>`, is never replaced; for a strictly immutable reference, pull by the digest shown in the publish run. Eligibility is checked again before every publication, previews remain after a PR closes, and preview tags never collide with release tags.
+
 ```yaml
 services:
   ether:
@@ -268,7 +270,7 @@ Open **`http://localhost:32400/ether/`** and complete the setup wizard. If Plex 
 4. **Choose a cache preset** (an SSD with 32–50 GiB is plenty to start).
 5. **Catalogue:** official builds include a TMDB key; custom builds without a bundled key need a free [TMDB API key](https://www.themoviedb.org/settings/api). Add Trakt, Simkl, OpenSubtitles, or a local language model (Ollama/LM Studio) later under **Integrations**.
 
-**Documentation:** [**Installation & Clustering Guide**](docs/install.md) · [**Owner & User Guide**](docs/user-guide.md) · [**Multi-App Architecture & Watch Party**](docs/apps.md) · [**Performance Architecture**](docs/performance.md) · [**NAS & Homelab Templates**](packaging/community/README.md)
+**Documentation:** [**Installation & Clustering Guide**](docs/install.md) · [**Owner & User Guide**](docs/user-guide.md) · [**Multi-App Architecture & Watch Party**](docs/apps.md) · [**Performance Architecture**](docs/performance.md) · [**NAS & Homelab Templates**](packaging/community/README.md) · [**Building from Source & Contributing**](CONTRIBUTING.md)
 
 ---
 
@@ -283,7 +285,7 @@ Open **`http://localhost:32400/ether/`** and complete the setup wizard. If Plex 
 - **System requirements:**
   - **CPU and RAM:** 2 CPU cores and 1 GiB of RAM are enough for direct play, container remuxing, and audio transcoding. Video transcoding requires a supported GPU (NVIDIA NVENC, Intel QuickSync, VAAPI, or Apple VideoToolbox) or 4+ CPU cores for software encoding.
   - **Disk space:** Configurable from **0 GiB** (pass-through mode) to **32+ GiB** on an SSD for the default segment cache, or multiple terabytes if you enable household preloading.
-- **Outbound network activity:** Ether sends no analytics or usage telemetry. By default it checks GitHub's signed release feed once a day for updates and queries TheIntroDB (`api.theintrodb.org`) for intro and credits skip timestamps during playback; both can be turned off in the console. When Plex is claimed and enabled, it communicates with `plex.tv`; turning the Plex app off stops Plex sign-in, publishing, sharing, and metadata traffic. See [What outbound connections does Ether make?](#what-outbound-connections-does-ether-make) for the full list.
+- **Outbound network activity:** Ether sends no analytics or usage telemetry. By default it checks GitHub's signed release feed every few hours for updates and queries TheIntroDB (`api.theintrodb.org`) for intro and credits skip timestamps during playback; both can be turned off in the console. When Plex is claimed and enabled, it communicates with `plex.tv`; turning the Plex app off stops Plex sign-in, publishing, sharing, and metadata traffic. See [What outbound connections does Ether make?](#what-outbound-connections-does-ether-make) for the full list.
 - **Legal responsibility:** You supply your own accounts, providers, and indexers, and you are responsible for complying with applicable laws and service terms. Read [**LEGAL.md**](LEGAL.md).
 
 ---
@@ -380,12 +382,28 @@ Yes, and if you have local media files on disk, that is the recommended setup. O
 
 Ether sends **no usage analytics, crash reports, or behavioural telemetry**. Every outbound connection has a specific purpose, and all but cluster address detection can be configured or turned off:
 
-1. **Update check (on by default):** Ether checks the signed release feed on GitHub once a day (first check 5 minutes after startup). Turn this off under **Maintenance › Updates** (*Check for updates*).
+1. **Update check (on by default):** Ether checks the signed release feed on GitHub about every 6 hours (first check 5 minutes after startup). The feed is a static file; nothing about your server is sent. Turn this off under **Maintenance › Updates** (*Check for updates*).
 2. **TheIntroDB skip markers (on by default):** When a title plays, Ether queries `api.theintrodb.org` by TMDB ID, season/episode number, and duration for intro, recap, and credits timestamps. Turn this off with the lookup switch under **Playback › Extras** or the TheIntroDB switch on **Integrations**.
 3. **TMDB and your configured sources:** Ether queries `api.themoviedb.org` and `image.tmdb.org` with your key or the one built into official builds, plus the Usenet providers, debrid services, indexers, Stremio addons, and optional integrations (OpenSubtitles, Trakt, Simkl, ratings, artwork, notifications, language model) that you configure.
 4. **`plex.tv` (only when Plex is claimed and enabled):** When the Plex app is enabled and claimed, Ether contacts `plex.tv` for PIN sign-in, server and connection registration, friend/share sync, `plex.direct` TLS certificate renewal, and public IP detection when **Remote access** is on (**Apps › Plex › Remote access**). Ether also matches titles to Plex IDs through `metadata.provider.plex.tv`. Full Plex metadata (**Apps › Plex › Account**), per-viewer Plex account watch sync, and Plex watchlist sync (both `discover.provider.plex.tv`) are off until you enable them. Turning the **Plex** app off under **Server › Apps** stops all of this `plex.tv` traffic.
 5. **Features you turn on:** collection sources (StevenLu, AniList), quality-profile imports (TRaSH Guides and Dictionarry, from GitHub), indexer site definitions, the anime ID map (GitHub), the NVEncC runtime download for RTX Video Super Resolution, and trailers (YouTube) contact their own services only when you use them.
 6. **Cluster address detection (clustered nodes only):** each node checks its public IP every 10 minutes (`v4.plex.tv` first, then `api.ipify.org`, `icanhazip.com`, `ifconfig.me`). This has no switch.
+</details>
+
+<details>
+<summary><b>How do I build Ether from source?</b></summary>
+
+Use a blobless partial clone so Git skips historical asset blobs:
+
+```sh
+git clone --filter=blob:none https://github.com/braedonsaunders/ether.git
+cd ether
+```
+
+- **Full server with the `/ether/` web console (Go + Node 22+ + `pnpm` 10):** run `make build` (or `scripts/build-web.sh && CGO_ENABLED=0 go build ./cmd/ether`), and `make ffmpeg` to stage the pinned FFmpeg/FFprobe binaries. Multi-stage `docker build .` compiles the web console automatically.
+- **Go-only builds and tests (no Node required):** `CGO_ENABLED=0 go build ./...`, `CGO_ENABLED=0 go vet ./...`, and `go test ./internal/...` work directly on a clean checkout; `/ether/api/` and all client protocols run normally while `/ether/` serves a short build-instructions placeholder until `make web` is run.
+
+See [**CONTRIBUTING.md**](CONTRIBUTING.md) for full developer and pull-request instructions.
 </details>
 
 ---
@@ -423,6 +441,10 @@ Ether is backed by 5,700+ offline unit, fault-injection, and fuzz tests, a 540k-
 
 ---
 
+## Supporting Ether
+
+Ether is free and always will be: no paid tier, no locked features. If it's made your setup better and you'd like to say thanks, you can leave a one-time tip through [GitHub Sponsors](https://github.com/sponsors/braedonsaunders). It helps pay for the test hardware, code signing and services that keep releases coming.
+
 ## Credits
 
 Thank you to the community contributors and reporters who shaped 0.3.0:
@@ -441,4 +463,13 @@ Ether is an independent, clean-room implementation of the HTTP protocols used by
 
 "Plex" is a trademark of Plex, Inc. "Jellyfin" is a trademark of the Jellyfin project. "Emby" is a trademark of Emby LLC. "Silo" and "Stremio" are trademarks of their respective owners. Ether is **not affiliated with, sponsored by, or endorsed by Plex, Inc., the Jellyfin project, Emby LLC, Silo, or Stremio.** This product uses the TMDB API but is not endorsed or certified by TMDB.
 
-[**GPL-3.0 License**](LICENSE) · [**Legal**](LEGAL.md) · [**Third-Party Notices**](THIRD_PARTY_NOTICES.md)
+[**GPL-3.0 License**](LICENSE) · [**Contributing**](CONTRIBUTING.md) · [**Legal**](LEGAL.md) · [**Third-Party Notices**](THIRD_PARTY_NOTICES.md)
+
+## Build a plugin
+
+Start with [the plugin author and coding-agent guide](sdk/AGENTS.md): ten recipes,
+manifest decisions, local live reload, conformance, and packaging. Ether reads the
+signed community marketplace at [`braedonsaunders/ether-plugins`](https://github.com/braedonsaunders/ether-plugins)
+by default; run `ether plugin publish --url <release-asset-url> <dir>` to pack a
+release archive and generate `plugins/<id>.yaml` for a pull request. The console
+also includes a searchable reference under Plugins → Reference.

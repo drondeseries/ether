@@ -64,6 +64,7 @@ func (a *App) buildServerRole(ctx context.Context, cfg config.Config) error {
 		return err
 	}
 	a.closers = append(a.closers, a.frontends.close)
+	a.buildFlows()
 	mux := http.NewServeMux()
 	mux.Handle("/ether/", a.perf.wrap("console", lanOnly(a.buildAdmin(), a.cfg.TrustedProxyCIDRs, a.cfg.AllowRemoteConsole)))
 	mux.Handle("/", a.frontends.plexHandler())

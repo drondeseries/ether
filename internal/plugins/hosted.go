@@ -1,16 +1,20 @@
 package plugins
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"path"
 	"strings"
 	"time"
 	"unicode/utf8"
 
+	"github.com/braedonsaunders/ether/internal/core"
+	"github.com/braedonsaunders/ether/internal/events"
 	"github.com/braedonsaunders/ether/internal/plugins/wasm"
 )
 
@@ -68,7 +72,7 @@ type rankingBudget struct {
 // above its defaults, so a manifest can lower budgets but never raise them.
 // Studio replay uses it to run a plugin under its installed budgets.
 func HotLimits(m Manifest) wasm.Limits {
-	var lim wasm.Limits
+	lim := RuntimeLimitsFor(m)
 	if m.Ether == nil {
 		return lim
 	}
@@ -112,6 +116,15 @@ func HostedRuntimeFactory(eng *wasm.Engine) RuntimeFactory {
 		decl := inst.Manifest.Ether.Runtime
 		host := hostBridge{h: inst.Host}
 		lim := HotLimits(inst.Manifest)
+		lim.Stremio = inst.Manifest.SpeaksStremio()
+		if inst.RuntimeLimits != nil {
+			l := inst.RuntimeLimits
+			lim.MemoryBytes = l.MemoryBytes
+			lim.Deadline, _ = time.ParseDuration(l.Deadline)
+			lim.UnitBudget = l.UnitBudget
+			lim.PoolSize = l.PoolSize
+		}
+		lim.Busy = inst.Busy
 		switch {
 		case decl.Module != "":
 			module, ok := inst.Files(decl.Module)
@@ -195,11 +208,17 @@ func (r *hostedRuntime) Call(ctx context.Context, req Request) (Response, error)
 		headers = cloneHeaders(headers)
 		headers["X-Ether-Locale"] = req.Locale
 	}
-	resp, err := r.p.Call(ctx, wasm.Request{Op: req.Op, ID: req.ID, Method: req.Method, Path: req.Path, Query: q, Headers: headers, Body: req.Body})
+	resp, err := r.p.Call(ctx, wasm.Request{Op: req.Op, ID: req.ID, Method: req.Method, Path: req.Path, Query: q, Headers: headers, Body: req.Body, BodyBase64: req.BodyBase64, ContentType: req.ContentType})
 	if err != nil {
 		return Response{}, err
 	}
-	return Response{Status: resp.Status, Headers: resp.Headers, Body: resp.Body}, nil
+	var blob *FrontendBlob
+	if len(resp.Blob) > 0 {
+		if err := json.Unmarshal(resp.Blob, &blob); err != nil {
+			return Response{}, fmt.Errorf("invalid frontend blob response: %w", err)
+		}
+	}
+	return Response{Status: resp.Status, Headers: resp.Headers, Body: resp.Body, Blob: blob}, nil
 }
 
 func (r *hostedRuntime) Close() error       { return r.p.Close() }
@@ -307,12 +326,20 @@ func (m *Manager) warmAsync(pluginID string) {
 		}()
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		r, err := m.Get(ctx, pluginID)
-		if err != nil || !r.Enabled {
-			return
-		}
-		if _, err := m.runtimeFor(ctx, r); err != nil {
+		for attempt := 0; attempt < 3; attempt++ {
+			r, err := m.Get(ctx, pluginID)
+			if err != nil || !r.Enabled {
+				return
+			}
+			_, err = m.runtimeFor(ctx, r)
+			if err == nil {
+				return
+			}
+			if errors.Is(err, ErrUnavailable) && attempt < 2 {
+				continue
+			}
 			m.log.Warn("plugins: warm hot runtime", "plugin", pluginID, "err", err)
+			return
 		}
 	}()
 }
@@ -360,6 +387,12 @@ func (b hostBridge) CallHost(ctx context.Context, name string, raw json.RawMessa
 		return out, err
 	}
 	switch name {
+	case "runtime.limits", "http.hash", "http.fetchToCache", "cache.read", "cache.rasterize", "archive.list", "archive.open", "archive.read", "archive.extract":
+		out, err := CallDataHost(ctx, b.h, name, raw)
+		if err != nil {
+			return nil, mapHostError(err)
+		}
+		return out, nil
 	case "kv.get":
 		v, ok, err := b.h.KVGet(ctx, str(0))
 		if err != nil || !ok {
@@ -379,6 +412,22 @@ func (b hostBridge) CallHost(ctx context.Context, name string, raw json.RawMessa
 	case "kv.list":
 		keys, err := b.h.KVList(ctx, str(0))
 		return result(keys, err)
+	case "kv.usage":
+		usage, err := b.h.KVUsage(ctx)
+		return result(usage, err)
+	case "badges.set":
+		var entries []BadgeEntry
+		if len(args) > 1 && len(args[1]) > 0 && string(args[1]) != "null" {
+			if err := json.Unmarshal(args[1], &entries); err != nil {
+				return nil, &wasm.Fault{Code: "bad_arguments", Message: "badges.set takes (setKey, entries[])"}
+			}
+		}
+		return result(nil, b.h.BadgesSet(ctx, str(0), entries))
+	case "badges.clear":
+		return result(nil, b.h.BadgesClear(ctx, str(0)))
+	case "badges.usage":
+		usage, err := b.h.BadgesUsage(ctx)
+		return result(usage, err)
 	case "settings.get":
 		v, err := b.h.Settings(ctx)
 		return result(v, err)
@@ -393,6 +442,7 @@ func (b hostBridge) CallHost(ctx context.Context, name string, raw json.RawMessa
 			Body    string            `json:"body"`
 			// BodyBase64 carries a binary request body; it wins over Body.
 			BodyBase64 string `json:"bodyBase64"`
+			TimeoutMS  int64  `json:"timeoutMs"`
 		}
 		if len(args) > 0 {
 			if err := json.Unmarshal(args[0], &req); err != nil {
@@ -410,7 +460,7 @@ func (b hostBridge) CallHost(ctx context.Context, name string, raw json.RawMessa
 			}
 			body = decoded
 		}
-		resp, err := b.h.HTTPFetch(ctx, FetchRequest{Method: req.Method, URL: req.URL, Headers: req.Headers, Body: body})
+		resp, err := b.h.HTTPFetch(ctx, FetchRequest{Method: req.Method, URL: req.URL, Headers: req.Headers, Body: body, TimeoutMS: req.TimeoutMS})
 		if err != nil {
 			return nil, mapHostError(err)
 		}
@@ -448,12 +498,178 @@ func (b hostBridge) CallHost(ctx context.Context, name string, raw json.RawMessa
 			col = args[0]
 		}
 		return result(nil, b.h.CollectionsUpsert(ctx, col))
+	case "kinds.upsert":
+		var items []core.KindItem
+		if len(args) > 1 {
+			if err := json.Unmarshal(args[1], &items); err != nil {
+				return nil, &wasm.Fault{Code: "bad_arguments", Message: "kinds.upsert takes (kind, items[])"}
+			}
+		}
+		var upserted KindUpsertResult
+		var err error
+		if wh, ok := b.h.(interface {
+			KindUpsertWithResult(context.Context, string, []core.KindItem) (KindUpsertResult, error)
+		}); ok {
+			upserted, err = wh.KindUpsertWithResult(ctx, str(0), items)
+		} else {
+			var accepted int
+			accepted, err = b.h.KindUpsert(ctx, str(0), items)
+			upserted.Accepted = accepted
+		}
+		if err != nil {
+			return nil, mapHostError(err)
+		}
+		return result(map[string]any{
+			"accepted": upserted.Accepted, "added": upserted.Added,
+			"updated": upserted.Updated, "unchanged": upserted.Unchanged,
+		}, nil)
+	case "kinds.delete":
+		var ids []string
+		if len(args) > 1 {
+			if err := json.Unmarshal(args[1], &ids); err != nil {
+				return nil, &wasm.Fault{Code: "bad_arguments", Message: "kinds.delete takes (kind, ids[])"}
+			}
+		}
+		return result(nil, b.h.KindDelete(ctx, str(0), ids))
+	case "kinds.items":
+		page, err := b.h.KindItems(ctx, str(0), str(1), int(num(2)))
+		return result(page, err)
+	case "kinds.visible":
+		var ids []string
+		if len(args) > 1 && string(args[1]) != "null" {
+			if err := json.Unmarshal(args[1], &ids); err != nil {
+				return nil, &wasm.Fault{Code: "bad_arguments", Message: "kinds.visible takes (kind, ids[])"}
+			}
+		}
+		visible, err := b.h.KindVisible(ctx, str(0), ids)
+		return result(visible, err)
+	case "kinds.browse":
+		var q core.KindBrowseRequest
+		if len(args) > 1 && string(args[1]) != "null" {
+			if err := json.Unmarshal(args[1], &q); err != nil {
+				return nil, &wasm.Fault{Code: "bad_arguments", Message: "kinds.browse takes (kind, query?)"}
+			}
+		}
+		page, err := b.h.KindBrowse(ctx, str(0), q)
+		return result(page, err)
+	case "frontend.streamURL":
+		var partIdx *int
+		if len(args) > 1 && string(args[1]) != "null" {
+			var n int
+			if err := json.Unmarshal(args[1], &n); err != nil || n < 0 {
+				return nil, &wasm.Fault{Code: "bad_arguments", Message: "frontend.streamURL partIndex must be a non-negative integer"}
+			}
+			partIdx = &n
+		}
+		u, err := b.h.StreamPartURL(ctx, str(0), partIdx)
+		if err != nil {
+			return nil, mapHostError(err)
+		}
+		return result(map[string]any{"url": u}, nil)
+	case "sources.resolve":
+		var q core.SourceQuery
+		if len(args) > 0 {
+			if err := json.Unmarshal(args[0], &q); err != nil {
+				return nil, &wasm.Fault{Code: "bad_arguments", Message: "sources.resolve takes a query object"}
+			}
+		}
+		cands, err := b.h.ResolveSources(ctx, q)
+		if err != nil {
+			return nil, mapHostError(err)
+		}
+		if cands == nil {
+			cands = []core.SourceCandidate{}
+		}
+		return result(map[string]any{"candidates": cands}, nil)
+	case "cache.put":
+		var body []byte
+		if len(args) > 2 {
+			var s string
+			if err := json.Unmarshal(args[2], &s); err == nil {
+				body = []byte(s)
+			} else {
+				var wrapped struct {
+					Body       string `json:"body"`
+					BodyBase64 string `json:"bodyBase64"`
+				}
+				if err := json.Unmarshal(args[2], &wrapped); err != nil {
+					return nil, &wasm.Fault{Code: "bad_arguments", Message: "cache.put takes (libraryKey, name, data)"}
+				}
+				body = []byte(wrapped.Body)
+				if wrapped.BodyBase64 != "" {
+					decoded, err := base64.StdEncoding.DecodeString(wrapped.BodyBase64)
+					if err != nil {
+						return nil, &wasm.Fault{Code: "bad_arguments", Message: "bodyBase64 is not valid base64"}
+					}
+					body = decoded
+				}
+			}
+		}
+		ref, err := b.h.CachePut(ctx, str(0), str(1), bytes.NewReader(body))
+		if err != nil {
+			return nil, mapHostError(err)
+		}
+		return result(map[string]any{"blob": ref}, nil)
+	case "cache.open":
+		readCap := int64(MinDataReadBytes)
+		if provider, ok := b.h.(interface {
+			DataLimits(context.Context) RuntimeLimits
+		}); ok {
+			readCap = dataReadLimit(provider.DataLimits(ctx))
+		}
+		rc, err := b.h.CacheOpen(ctx, str(0))
+		if err != nil {
+			return nil, mapHostError(err)
+		}
+		defer rc.Close()
+		data, err := io.ReadAll(io.LimitReader(rc, readCap+1))
+		if err != nil {
+			return nil, mapHostError(err)
+		}
+		if int64(len(data)) > readCap {
+			return nil, &wasm.Fault{Code: "host_error", Message: "cached blob exceeds per-call readBytes limit"}
+		}
+		out := map[string]any{}
+		if utf8.Valid(data) {
+			out["body"] = string(data)
+		} else {
+			out["body"] = ""
+			out["bodyBase64"] = base64.StdEncoding.EncodeToString(data)
+		}
+		return result(out, nil)
+	case "cache.delete":
+		return result(nil, b.h.CacheDelete(ctx, str(0)))
 	case "folders.list":
 		v, err := b.h.FoldersList(ctx, str(0), str(1))
+		return result(v, err)
+	case "folders.hashStart":
+		v, err := b.h.FoldersHashStart(ctx, str(0), str(1))
+		return result(v, err)
+	case "folders.hashPoll":
+		v, err := b.h.FoldersHashPoll(ctx, str(0))
+		return result(v, err)
+	case "folders.hashCancel":
+		v, err := b.h.FoldersHashCancel(ctx, str(0))
+		return result(v, err)
+	case "folders.hash":
+		v, err := b.h.FoldersHash(ctx, str(0), str(1))
 		return result(v, err)
 	case "folders.stat":
 		v, err := b.h.FoldersStat(ctx, str(0), str(1))
 		return result(v, err)
+	case "events.publish":
+		key := str(0)
+		payload := json.RawMessage(`{}`)
+		if len(args) > 1 && len(bytes.TrimSpace(args[1])) > 0 && string(bytes.TrimSpace(args[1])) != "null" {
+			payload = args[1]
+		}
+		var corr events.Correlation
+		if len(args) > 2 && len(bytes.TrimSpace(args[2])) > 0 && string(bytes.TrimSpace(args[2])) != "null" {
+			if err := json.Unmarshal(args[2], &corr); err != nil {
+				return nil, &wasm.Fault{Code: "bad_arguments", Message: "events.publish correlation must be an object"}
+			}
+		}
+		return result(nil, b.h.PublishEvent(ctx, key, payload, corr))
 	case "notify.owner":
 		return result(nil, b.h.NotifyOwner(ctx, str(0)))
 	case "log":
@@ -472,12 +688,28 @@ func (b hostBridge) CallHost(ctx context.Context, name string, raw json.RawMessa
 }
 
 func mapHostError(err error) error {
+	var fault *wasm.Fault
 	var input *CollectionInputError
+	var valid *ValidationError
+	var blocked *BlockedLocalHostError
+	var blockedOp *BlockedOperatorHostError
 	switch {
+	case errors.As(err, &blocked):
+		return &wasm.Fault{Code: "host_error", Message: blocked.PluginMessage()}
+	case errors.As(err, &blockedOp):
+		return wasm.Forbidden(blockedOp.PluginMessage())
+	case errors.As(err, &fault):
+		return fault
 	case errors.As(err, &input):
 		return &wasm.Fault{Code: string(wasm.StatusInvalidInput), Message: input.Message}
+	case errors.As(err, &valid):
+		return &wasm.Fault{Code: string(wasm.StatusInvalidInput), Message: valid.Error()}
 	case errors.Is(err, ErrPermissionDenied):
 		return wasm.Forbidden(err.Error())
+	case errors.Is(err, ErrQuotaExceeded):
+		return &wasm.Fault{Code: "quota_exceeded", Message: err.Error()}
+	case errors.Is(err, ErrRateLimited):
+		return &wasm.Fault{Code: "rate_limited", Message: err.Error()}
 	case errors.Is(err, context.DeadlineExceeded):
 		return &wasm.Fault{Code: string(wasm.StatusTimeout), Message: "host call timed out"}
 	default:
@@ -488,7 +720,7 @@ func mapHostError(err error) error {
 // FetchResult is the guest-facing http.fetch answer. body is the response
 // as text (JSON, HTML, playlists); bodyBase64 carries the exact bytes only
 // for responses that are not valid UTF-8 (archives, images), so a large
-// text response is not sent twice into the 4 MiB host-result cap.
+// text response is not sent twice into guest memory.
 func FetchResult(resp FetchResponse) map[string]any {
 	out := map[string]any{"status": resp.Status, "headers": resp.Headers}
 	if utf8.Valid(resp.Body) {
@@ -499,3 +731,11 @@ func FetchResult(resp FetchResponse) map[string]any {
 	}
 	return out
 }
+
+// RuntimeLimitsFor returns the granted hosted resources, also used by Studio.
+func RuntimeLimitsFor(m Manifest) wasm.Limits {
+	return runtimeLimitsWithCeilings(m, defaultRuntimeCeilings())
+}
+
+// GrantedRuntimeLimits reports the default-policy grant for standalone tools.
+func GrantedRuntimeLimits(m Manifest) *RuntimeLimits { return (&Manager{}).grantedRuntimeLimits(m) }

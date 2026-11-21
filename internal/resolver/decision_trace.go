@@ -127,9 +127,42 @@ func decisionRank(winner string, c CandidateTrace) int {
 
 func ceilingRejection(reason string) bool {
 	switch reason {
-	case "above profile max height", "above client max height", "dolby vision not allowed for client", "size too large for runtime":
+	case ReasonAboveProfileMaxResolution, ReasonAboveClientMaxResolution, ReasonNeedsVideoTranscode, "dolby vision not allowed for client", "size too large for runtime":
 		return true
 	default:
 		return false
 	}
+}
+
+// logPlayDecision emits one structured decision record, without payload URLs.
+func (s *Service) logPlayDecision(tr Trace) {
+	type readiness struct {
+		ID     string `json:"id"`
+		State  string `json:"readiness"`
+		Reason string `json:"reason,omitempty"`
+	}
+	candidates := make([]readiness, 0, len(tr.Candidates))
+	why := tr.Err
+	for _, c := range tr.Candidates {
+		state := "not_checked"
+		switch {
+		case c.Healthy:
+			state = "ready"
+		case c.Rejected:
+			state = "rejected"
+		case c.Attempted:
+			state = "checking"
+		}
+		candidates = append(candidates, readiness{c.ReleaseID, state, c.Reason})
+		if c.ReleaseID == tr.Winner {
+			why = c.Route
+			if why == "" {
+				why = c.Reason
+			}
+			if why == "" {
+				why = "highest ranked ready source"
+			}
+		}
+	}
+	s.log.Info("resolver: play decision", "key", tr.TitleKey, "considered", len(candidates), "candidates", candidates, "chosen", tr.Winner, "why", why, "time_to_decision", tr.TotalDuration, "failover", tr.Failover)
 }

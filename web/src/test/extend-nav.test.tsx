@@ -33,11 +33,11 @@ describe("registry navigation", () => {
 
   it("builds the sidebar in the same order as before", () => {
     const groups = buildNavigation(descriptors);
-    expect(groups.map((g) => g.label)).toEqual(["", "Library", "Streaming", "Server"]);
+    expect(groups.map((g) => g.label)).toEqual(["", "Content", "Streaming", "Server"]);
     expect(groups[0]!.items.map((i) => i.href)).toEqual(["/", "/activity", "/viewers"]);
     expect(groups[0]!.items.map((i) => i.label)).toEqual(["Overview", "Activity", "Viewers"]);
     expect(groups[1]!.items.map((i) => i.href)).toEqual([
-      "/catalog",
+      "/libraries",
       "/collections",
       "/home",
       "/livetv",
@@ -56,6 +56,7 @@ describe("registry navigation", () => {
       "/services",
       "/plugins",
       "/notifications",
+      "/flows",
       "/cluster",
       "/maintenance",
     ]);

@@ -26,13 +26,17 @@ type PeopleQuery struct {
 
 type PersonReadOptions struct{ Prefetch bool }
 
-// PersonDetail contains only facts from currently visible credits. Artwork is
-// optional and remains bound to the authorized title that owns the image.
+// PersonDetail contains only facts from currently visible credits, plus optional
+// cached person metadata. Artwork remains bound to the authorized title that owns it.
 type PersonDetail struct {
 	ID, Name, IMDB string
 	TMDB           int64
 	ArtworkItem    RatingKey
 	Images         []Image
+	KnownFor       string
+	Biography      string
+	Birthday       string
+	Roles          []string
 }
 
 // PeopleReader resolves existing person facet IDs through current visible
@@ -58,4 +62,47 @@ type PeopleImageReader interface {
 // metadata lookup, refresh, scheduling, or independent title-cache read.
 type PersonArtwork interface {
 	PersonImages(context.Context, ArtworkRequest, Title) ([]Image, error)
+}
+
+// PersonImageTarget binds a portrait to its current credited title.
+type PersonImageTarget struct {
+	Item  RatingKey
+	Image Image
+}
+
+// PeopleImageBatchReader validates exact descriptors and current credits in
+// one host policy proof. Output is usable only on success; false entries deny.
+type PeopleImageBatchReader interface {
+	AuthorizePersonImages(context.Context, *Viewer, Device, []PersonImageTarget) ([]bool, error)
+}
+
+// PersonImageGrantBatch issues independently revocable portrait capabilities.
+// Results align with input, with empty secrets for denied portraits.
+type PersonImageGrantBatch interface {
+	IssuePersonImages(context.Context, string, Device, []PersonImageTarget) ([]string, error)
+}
+
+// FacetPager pages a facet list (Jellyfin and Emby /Studios, /Genres):
+// Facets' values [offset, offset+limit) in its order, and how many it
+// lists, without listing every value of the library.
+type FacetPager interface {
+	FacetPage(ctx context.Context, viewer *Viewer, device Device, viewID, kind string, offset, limit int) ([]FacetValue, int, error)
+}
+
+// FacetPerson is one person entry in a plugin library's people tab.
+type FacetPerson struct {
+	Person    PersonDetail
+	ItemCount int
+}
+
+// FacetPersonPage is one page of people in a plugin library's people tab.
+type FacetPersonPage struct {
+	Items []FacetPerson
+	More  bool
+}
+
+// LibraryFacetPeople is an optional Experience capability returning a single
+// page of people for a plugin library's declared people-type facet field.
+type LibraryFacetPeople interface {
+	LibraryFacetPeople(ctx context.Context, viewer *Viewer, device Device, viewID, field, order string, page PageQuery) (FacetPersonPage, error)
 }

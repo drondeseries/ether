@@ -2,24 +2,41 @@ import { t } from "../../i18n";
 
 /** Frontend status fields the owner-console summary actually reads. */
 export type ReachabilityStatus = {
+  mounted?: boolean;
   addresses?: string[] | null;
   connectUrls?: string[];
   lan?: string;
   lanReason?: string;
   lanCheckedAt?: string;
   wan?: string;
+  /** outside_client, plex_tv, self_check, self_check_failed, wrong_identity or not_checked. */
+  wanReason?: string;
+  /** The published outside route the away verdict is about. */
+  wanAddress?: string;
+  wanCheckedAt?: string;
+  busyPort?: number;
+  actualPort?: number;
+  busyPortHolder?: string;
+  error?: string;
+  warnings?: string[];
 };
 
 const UNUSABLE_HOSTS = new Set(["", "localhost", "127.0.0.1", "::1", "0.0.0.0", "::"]);
 
-function hostOf(value: string): string {
+function parseCandidateURL(value: string): URL | null {
   const trimmed = value.trim();
+  if (!trimmed) return null;
   try {
-    const url = trimmed.includes("://") ? new URL(trimmed) : new URL(`http://${trimmed}`);
-    return url.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    return trimmed.includes("://") ? new URL(trimmed) : new URL(`http://${trimmed}`);
   } catch {
-    return trimmed.toLowerCase();
+    return null;
   }
+}
+
+function hostOf(value: string): string {
+  const parsed = parseCandidateURL(value);
+  if (parsed) return parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  return value.trim().toLowerCase();
 }
 
 /** Loopback and unspecified binds are not addresses another device can use. */
@@ -27,11 +44,37 @@ export function isLoopbackAddress(value: string): boolean {
   return UNUSABLE_HOSTS.has(hostOf(value));
 }
 
-/** Prefer published connect URLs. Fall back to listener addresses that are not loopback. */
+/**
+ * True when an address uses Ether's shared-port path for an app that normally
+ * has its own dedicated listener port (Jellyfin, Emby, Silo).
+ */
+export function isSharedPortFallbackPath(value: string): boolean {
+  const parsed = parseCandidateURL(value);
+  if (!parsed) return false;
+  return /^\/(jellyfin|emby|silo)(\/|$)/i.test(parsed.pathname || "/");
+}
+
+function orderDedicatedFirst(addresses: string[]): string[] {
+  const dedicated: string[] = [];
+  const shared: string[] = [];
+  for (const item of addresses) {
+    if (isSharedPortFallbackPath(item)) shared.push(item);
+    else dedicated.push(item);
+  }
+  return dedicated.length > 0 ? [...dedicated, ...shared] : addresses;
+}
+
+/**
+ * Prefer published connect URLs, always ranking a protocol's own dedicated
+ * listener port ahead of shared-port fallback paths (/jellyfin, /emby, /silo).
+ * Fall back to listener addresses that are not loopback.
+ */
 export function usableAddresses(status: ReachabilityStatus | null | undefined): string[] {
   const urls = (status?.connectUrls ?? []).filter((item) => item && !isLoopbackAddress(item));
-  if (urls.length) return urls;
-  return (status?.addresses ?? []).filter((item) => item && !isLoopbackAddress(item));
+  if (urls.length) return orderDedicatedFirst(urls);
+  return orderDedicatedFirst(
+    (status?.addresses ?? []).filter((item) => item && !isLoopbackAddress(item)),
+  );
 }
 
 /** The address the connect control selects until the owner picks another. */
@@ -89,13 +132,53 @@ export function homeSummary(
 export function awaySummary(
   status: ReachabilityStatus | null | undefined,
   options?: { remoteAccess?: boolean; homeNetwork?: boolean },
-): { title: string; detail: string } {
+): { title: string; detail: string; address?: string; label?: string } {
   const wan = status?.wan || "unknown";
+  const reason = status?.wanReason;
+  const address = status?.wanAddress || undefined;
+  if (address && reason === "self_check" && wan === "reachable") {
+    return {
+      title: t("Away from home"),
+      address,
+      detail: t(
+        "Reachable at {address}. Checked from this server, so devices away from home may differ.",
+        { address },
+      ),
+    };
+  }
   if (wan === "reachable") {
-    return { title: t("Away from home"), detail: t("Reachable away from home.") };
+    return { title: t("Away from home"), address, detail: t("Reachable away from home.") };
+  }
+  if (address && reason === "wrong_identity") {
+    return {
+      title: t("Away from home"),
+      address,
+      detail: t(
+        "{address} is answered by a different server. Check the public host name and your reverse proxy.",
+        { address },
+      ),
+    };
   }
   if (wan === "unreachable") {
     return { title: t("Away from home"), detail: t("Not reachable away from home.") };
+  }
+  if (address && reason === "self_check_failed") {
+    return {
+      title: t("Away from home"),
+      address,
+      label: t("Not confirmed"),
+      detail: t(
+        "Ether could not reach {address} from this server. Some routers block this check, so devices away from home may still connect.",
+        { address },
+      ),
+    };
+  }
+  if (address && reason === "not_checked") {
+    return {
+      title: t("Away from home"),
+      address,
+      detail: t("Not checked yet. Ether checks {address} shortly.", { address }),
+    };
   }
   if (options?.remoteAccess === false) {
     return { title: t("Away from home"), detail: t("Not checked yet: remote access is off.") };

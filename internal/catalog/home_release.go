@@ -26,23 +26,42 @@ func homeReleaseCutoff(now time.Time) int64 {
 	return cutoff.Unix()
 }
 
+// HomeReleaseAdmission shifts a known digital or physical release date by
+// offsetDays (negative admits earlier, positive later).
+func HomeReleaseAdmission(earliest time.Time, offsetDays int) time.Time {
+	if earliest.IsZero() || offsetDays == 0 {
+		return earliest
+	}
+	return earliest.Add(time.Duration(offsetDays) * 24 * time.Hour)
+}
+
+func homeReleaseDeadline(now time.Time, offsetDays int) int64 {
+	return now.Add(-time.Duration(offsetDays) * 24 * time.Hour).Unix()
+}
+
 // homeReleaseVisible accepts a passed home date. Only when no home date is
 // known does the cinema-age admission stand in for one: a known future
 // digital date is never overridden.
-func homeReleaseVisible(t *core.Title, now time.Time) bool {
+func homeReleaseVisible(t *core.Title, now time.Time, offsetDays int) bool {
 	if t.Type != core.TypeMovie {
 		return true
 	}
 	if t.HomeReleaseChecked && !t.HomeReleased.IsZero() {
-		return !t.HomeReleased.After(now)
+		return !HomeReleaseAdmission(t.HomeReleased, offsetDays).After(now)
 	}
 	return HomeReleaseAgeAdmitted(t, now)
 }
 
-func (c *Catalog) homeVisible(t *core.Title) bool { return homeReleaseVisible(t, c.now()) }
+func (c *Catalog) homeVisible(t *core.Title) bool {
+	return homeReleaseVisible(t, c.now(), c.config().HomeReleaseOffsetDays)
+}
 
+// homeReleaseSQL's EXISTS sit inside an OR; LIMIT 1 OFFSET 0 keeps each a
+// per-row key probe on PostgreSQL, which otherwise hashes it and reads the
+// whole of catalog_home_release per request. SQLite probes by key either
+// way and needs the LIMIT for the OFFSET.
 func homeReleaseSQL(alias string) string {
-	return "(" + alias + ".type<>'movie' OR (" + alias + ".release_known=1 AND " + alias + ".released_ts<? AND NOT EXISTS (SELECT 1 FROM catalog_home_release hk WHERE hk.key=" + alias + ".key AND hk.checked=1 AND hk.earliest_ts<>0)) OR EXISTS (SELECT 1 FROM catalog_home_release hr WHERE hr.key=" + alias + ".key AND hr.checked=1 AND hr.earliest_ts<>0 AND hr.earliest_ts<=?))"
+	return "(" + alias + ".type<>'movie' OR (" + alias + ".release_known=1 AND " + alias + ".released_ts<? AND NOT EXISTS (SELECT 1 FROM catalog_home_release hk WHERE hk.key=" + alias + ".key AND hk.checked=1 AND hk.earliest_ts<>0 LIMIT 1 OFFSET 0)) OR EXISTS (SELECT 1 FROM catalog_home_release hr WHERE hr.key=" + alias + ".key AND hr.checked=1 AND hr.earliest_ts<>0 AND hr.earliest_ts<=? LIMIT 1 OFFSET 0))"
 }
 
 func (c *Catalog) hydrateHomeRelease(ctx context.Context, items []core.Title) error {
@@ -144,8 +163,13 @@ func saveHomeReleases(ctx context.Context, tx *sql.Tx, t core.Title, dates *tmdb
 		if _, err := tx.ExecContext(ctx, `DELETE FROM catalog_home_release_dates WHERE key=?`, int64(t.Key)); err != nil {
 			return err
 		}
+		var args []any
 		for d := range want {
-			if _, err := tx.ExecContext(ctx, `INSERT INTO catalog_home_release_dates(key,country,kind,released_ts) VALUES(?,?,?,?) ON CONFLICT DO NOTHING`, int64(t.Key), d.country, d.kind, d.ts); err != nil {
+			args = append(args, int64(t.Key), d.country, d.kind, d.ts)
+		}
+		for start := 0; start < len(args); start += 800 {
+			part := args[start:min(start+800, len(args))]
+			if _, err := tx.ExecContext(ctx, `INSERT INTO catalog_home_release_dates(key,country,kind,released_ts) VALUES `+valueRows(len(part)/4, 4)+` ON CONFLICT DO NOTHING`, part...); err != nil {
 				return err
 			}
 		}
@@ -176,7 +200,7 @@ func (c *Catalog) HomeReleases(ctx context.Context, keys []core.RatingKey) (map[
 				rows.Close()
 				return nil, err
 			}
-			if ts > 0 {
+			if ts != 0 {
 				out[core.RatingKey(key)] = time.Unix(ts, 0).UTC()
 			} else {
 				out[core.RatingKey(key)] = time.Time{}

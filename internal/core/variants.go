@@ -2,12 +2,42 @@ package core
 
 import "context"
 
+// VersionAvailability classifies how quickly a version can start playback
+// without spending any indexer or provider searches.
+type VersionAvailability string
+
+const (
+	VersionInstant     VersionAvailability = "instant"
+	VersionCached      VersionAvailability = "cached"
+	VersionFetch       VersionAvailability = "fetch"
+	VersionUnavailable VersionAvailability = "unavailable"
+)
+
+// VersionProfile is the quality/source signature stored for a viewer's
+// show-level episode version preference (e.g. "4K DV" or "1080p Remux").
+type VersionProfile struct {
+	Height       int    `json:"height,omitempty"`
+	DynamicRange string `json:"dynamicRange,omitempty"` // "dv", "hdr10", "hdr10+", "hlg", "sdr"
+	SourceClass  string `json:"sourceClass,omitempty"`  // "remux", "disc", "web", "other"
+}
+
+// ViewerChoiceSummary describes a viewer's remembered version choice for a
+// title or its show, projected for frontends.
+type ViewerChoiceSummary struct {
+	Scope     string         `json:"scope"` // "title" or "show"
+	Active    bool           `json:"active"`
+	Label     string         `json:"label"`
+	Profile   VersionProfile `json:"profile,omitempty"`
+	Selector  string         `json:"selector,omitempty"`
+	ReleaseID string         `json:"releaseId,omitempty"`
+}
+
 // ReleaseVariant is one playable version of a title, offered in the Plex
 // "Play Version" picker: a distinct candidate release, by quality tier or
 // edition (cut).
 type ReleaseVariant struct {
-	// ID is stable for the title and release; front ends encode it (or its
-	// position) in Media/Part ids.
+	// ID is the stable menu identity; configured slots keep it while the
+	// concrete Release changes. Frontends encode it in Media/Part ids.
 	ID string `json:"id"`
 	// Label is the viewer-facing name, e.g. "4K Dolby Vision Remux" or
 	// "1080p WEB-DL (High Compatibility)".
@@ -16,16 +46,25 @@ type ReleaseVariant struct {
 	// for the theatrical/unspecified cut.
 	Edition string `json:"edition,omitempty"`
 	// Auto marks the resolver's own pick for this client ("Best for Device").
-	Auto    bool    `json:"auto,omitempty"`
-	Release Release `json:"release"`
+	Auto bool `json:"auto,omitempty"`
+	// Remembered marks a variant backed by the viewer's remembered choice.
+	Remembered bool `json:"remembered,omitempty"`
+	// Pinned marks a variant backed by the owner's pin for this title.
+	Pinned bool `json:"pinned,omitempty"`
+	// Availability reports local/cached/fetch/unavailable readiness without
+	// searching indexers or opening remote sources.
+	Availability VersionAvailability `json:"availability,omitempty"`
+	// AvailabilityNote is an optional human-readable note for Availability.
+	AvailabilityNote string  `json:"availabilityNote,omitempty"`
+	Release          Release `json:"release"`
 	// Info is the expected media info, estimated from the release name until
 	// the release has been probed.
 	Info MediaInfo `json:"info"`
 }
 
-// MaxVariants caps the Play Version picker: Auto, up to three same-quality
-// alternatives (the owner's setting), and up to three tiers and cuts. The
-// resolver and the Plex front end both read it so the two caps move together.
+// MaxVariants caps both version-menu modes, including Auto. The resolver
+// and Plex front end share this bound for tier/cut selection and balanced
+// alternatives across resolutions.
 const MaxVariants = 7
 
 // VariantResolver lists distinct candidate releases of a title for a client,
@@ -84,3 +123,7 @@ type DecisionCandidate struct {
 type DecisionTraceSource interface {
 	LatestDecision(key RatingKey) (DecisionTrace, bool)
 }
+
+// VersionSelectorPrefix identifies a configured menu choice rather than a
+// concrete release. Only the resolver interprets or authorizes its payload.
+const VersionSelectorPrefix = "ether-slot:v1:"

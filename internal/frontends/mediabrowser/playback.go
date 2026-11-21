@@ -33,6 +33,70 @@ type playbackRequest struct {
 	SubtitleStreamIndex *int               `json:"SubtitleStreamIndex"`
 }
 
+// UnmarshalJSON decodes a PlaybackInfo body through the caps Flex types
+// so a client that quotes a number/boolean (or sends MaxAudioChannels as
+// a number inside DeviceProfile) still plays instead of 400ing (#404).
+func (p *playbackRequest) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		MediaSourceId       caps.FlexString    `json:"MediaSourceId"`
+		LiveStreamId        caps.FlexString    `json:"LiveStreamId"`
+		OpenToken           caps.FlexString    `json:"OpenToken"`
+		ItemId              caps.FlexString    `json:"ItemId"`
+		PlaySessionId       caps.FlexString    `json:"PlaySessionId"`
+		DeviceProfile       caps.DeviceProfile `json:"DeviceProfile"`
+		IsPlayback          *caps.FlexBool     `json:"IsPlayback"`
+		AutoOpenLiveStream  *caps.FlexBool     `json:"AutoOpenLiveStream"`
+		EnableDirectPlay    *caps.FlexBool     `json:"EnableDirectPlay"`
+		EnableDirectStream  *caps.FlexBool     `json:"EnableDirectStream"`
+		EnableTranscoding   *caps.FlexBool     `json:"EnableTranscoding"`
+		StartTimeTicks      caps.FlexInt64     `json:"StartTimeTicks"`
+		AudioStreamIndex    json.RawMessage    `json:"AudioStreamIndex"`
+		SubtitleStreamIndex json.RawMessage    `json:"SubtitleStreamIndex"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	flexBool := func(f *caps.FlexBool) *bool {
+		if f == nil {
+			return nil
+		}
+		b := bool(*f)
+		return &b
+	}
+	// Jellyfin Web posts "SubtitleStreamIndex":"" when no subtitle is
+	// chosen; an empty string (or null) is no choice, not stream 0, which
+	// is the video stream and made every plan NoCompatibleStream.
+	flexInt := func(raw json.RawMessage) *int {
+		t := strings.TrimSpace(string(raw))
+		if t == "" || t == "null" || t == `""` {
+			return nil
+		}
+		var f caps.FlexInt
+		if json.Unmarshal(raw, &f) != nil {
+			return nil
+		}
+		n := int(f)
+		return &n
+	}
+	*p = playbackRequest{
+		MediaSourceId:       string(raw.MediaSourceId),
+		LiveStreamId:        string(raw.LiveStreamId),
+		OpenToken:           string(raw.OpenToken),
+		ItemId:              string(raw.ItemId),
+		PlaySessionId:       string(raw.PlaySessionId),
+		DeviceProfile:       raw.DeviceProfile,
+		IsPlayback:          flexBool(raw.IsPlayback),
+		AutoOpenLiveStream:  flexBool(raw.AutoOpenLiveStream),
+		EnableDirectPlay:    flexBool(raw.EnableDirectPlay),
+		EnableDirectStream:  flexBool(raw.EnableDirectStream),
+		EnableTranscoding:   flexBool(raw.EnableTranscoding),
+		StartTimeTicks:      int64(raw.StartTimeTicks),
+		AudioStreamIndex:    flexInt(raw.AudioStreamIndex),
+		SubtitleStreamIndex: flexInt(raw.SubtitleStreamIndex),
+	}
+	return nil
+}
+
 func boolValue(p *bool, def bool) bool {
 	if p == nil {
 		return def
@@ -46,7 +110,7 @@ func jellyfinStaticPlayable(protocol frontend.Protocol, channel string, opts fro
 }
 
 func jellyfinStaticFallback(err error) bool {
-	return err != nil && !errors.Is(err, frontend.ErrSessionBusy) && !errors.Is(err, frontend.ErrTranscodeCapacity)
+	return err != nil && !errors.Is(err, frontend.ErrSessionBusy) && !errors.Is(err, frontend.ErrTranscodeCapacity) && !errors.Is(err, frontend.ErrPreparing) && !errors.Is(err, frontend.ErrJobsBusy)
 }
 
 func offerJellyfinStatic(source map[string]any, opts frontend.DecideOptions) {
@@ -63,7 +127,19 @@ func offerJellyfinStatic(source map[string]any, opts frontend.DecideOptions) {
 	source["Protocol"] = "File"
 }
 
+const msgVideoTranscodingOff = "This title needs a video transcode to play on this device, and video transcoding is turned off."
+
 func streamError(protocol frontend.Protocol, w http.ResponseWriter, err error) {
+	var bedtime *frontend.ErrBedtime
+	if errors.As(err, &bedtime) {
+		http.Error(w, bedtime.Error(), http.StatusForbidden)
+		return
+	}
+	if errors.Is(err, frontend.ErrVideoTranscodingDisabled) {
+		http.Error(w, msgVideoTranscodingOff, http.StatusUnprocessableEntity)
+		return
+	}
+
 	if errors.Is(err, frontend.ErrNotFound) || errors.Is(err, frontend.ErrNotAvailable) || errors.Is(err, frontend.ErrSourceGone) {
 		if protocol == "jellyfin" {
 			w.Header().Set("Content-Type", "text/plain")
@@ -72,6 +148,24 @@ func streamError(protocol frontend.Protocol, w http.ResponseWriter, err error) {
 			return
 		}
 		http.Error(w, "Not Found", http.StatusNotFound)
+		return
+	}
+	if errors.Is(err, frontend.ErrPreparing) {
+		w.Header().Set("Retry-After", strconv.Itoa(frontend.PreparingRetrySeconds(err, 5)))
+		w.Header().Set("X-Ether-Media-Error", "preparing")
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = io.WriteString(w, `{"error":{"code":"preparing","message":"The item is still being prepared. Try again shortly."}}`)
+		return
+	}
+	if errors.Is(err, frontend.ErrJobsBusy) {
+		w.Header().Set("Retry-After", strconv.Itoa(frontend.JobsBusyRetrySeconds(err, 5)))
+		w.Header().Set("X-Ether-Media-Error", "jobs_busy")
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write(frontend.JobsBusyErrorBody(err))
 		return
 	}
 	var capacity *frontend.TranscodeCapacityError
@@ -107,6 +201,10 @@ func (i *instance) playbackInfo(w http.ResponseWriter, r *http.Request) {
 	v, credential, err := i.viewer(r)
 	if err != nil || v == nil {
 		http.Error(w, "Unauthorized", 401)
+		return
+	}
+	if themeParentID(r.PathValue("id")) != "" {
+		i.themePlaybackInfo(w, r)
 		return
 	}
 	if i.host.Sessions == nil || i.host.Capabilities == nil {
@@ -233,6 +331,9 @@ func (i *instance) playbackInfo(w http.ResponseWriter, r *http.Request) {
 	}
 	allowed := queryBool(r, "EnableTranscoding", boolValue(body.EnableTranscoding, true))
 	intent := frontend.PlayIntent{Estimate: !playback, Options: opts, Position: time.Duration(body.StartTimeTicks) * 100 * time.Nanosecond, AllowTranscoding: &allowed, AudioSet: audioSet, SubtitleSet: subtitleSet}
+	// A posted DeviceProfile is this device's real declaration; detail pages
+	// warm with it later (frontend.DetailWarmer).
+	intent.DeclaredCaps = channel == "" && (len(body.DeviceProfile.DirectPlayProfiles) > 0 || len(body.DeviceProfile.TranscodingProfiles) > 0)
 	sourceID := body.MediaSourceId
 	idsQuery := route.Query(r.URL.Query(), "MediaSourceId")
 	if len(idsQuery) > 1 {
@@ -271,38 +372,104 @@ func (i *instance) playbackInfo(w http.ResponseWriter, r *http.Request) {
 			detailSource, expectedETag, version = version, tag, ""
 		} else {
 			intent.ExactVersion = true
+			// Selecting a version is foreground playback preparation, even
+			// when a client omits IsPlayback on its PlaybackInfo request.
+			// Probe this release so its own embedded tracks reach the picker.
+			intent.Estimate = false
 			resolvedRelease = tag
 		}
 	}
 	if i.extraPlayback(w, r, v, key, playback) {
 		return
 	}
-	planRequest := frontend.PlanRequest{Viewer: v, Device: dev, Protocol: i.protocol, Item: key, Channel: channel, Version: version, ResolvedRelease: resolvedRelease, DetailSource: detailSource, ExpectedSourceETag: expectedETag, Caps: capability.Client, Intent: intent}
-	plan, err := i.host.Sessions.Plan(r.Context(), planRequest)
-	if err != nil {
-		if playback && noCompatibleStream(err) {
-			i.writeNoCompatibleStream(w)
-			return
+	versionRequested := version != "" || detailSource != ""
+	// The ranked release variants are listed (and Auto may switch to one) only
+	// when the client did not pick a version and this is a single playable
+	// item, never a live channel or a plugin kind.
+	var variants []frontend.ReleaseVariant
+	if i.host.Editions != nil && !versionRequested && channel == "" && !key.IsPluginKey() {
+		if title, ok := i.playbackTitle(r, v, key); ok {
+			variants = i.releaseVariants(r, scope, title)
 		}
-		http.Error(w, "Playback unavailable", 503)
+	}
+	listVersions := len(variants) > 0
+	autoSwitchedRelease := ""
+	planBase := frontend.PlanRequest{Viewer: v, Device: dev, Protocol: i.protocol, Item: key, Channel: channel, Version: version, ResolvedRelease: resolvedRelease, DetailSource: detailSource, ExpectedSourceETag: expectedETag, Caps: capability.Client, Intent: intent}
+	// Auto skips a video transcode: when the automatic pick would re-encode
+	// video for this device and a ranked alternative would not, play the
+	// first alternative that avoids it (up to maxAutoTranscodeTrials). The
+	// choice is made from estimated plans first so the release about to be
+	// skipped is never opened and probed.
+	var plan frontend.PlayPlan
+	err = nil
+	planned, triedAlternatives := false, false
+	if playback && !versionRequested && len(variants) > 1 {
+		estimate := planBase
+		estimate.Intent.Estimate = true
+		if guess, e := i.host.Sessions.Plan(r.Context(), estimate); e == nil && videoTranscode(guess) {
+			triedAlternatives = true
+			if release := i.avoidVideoTranscode(r.Context(), planBase, variants); release != "" {
+				if alt, p, handle, ok := i.autoSwitchPlan(r, scope, planBase, release); ok {
+					planBase, plan, planned = alt, p, true
+					autoSwitchedRelease, version = release, handle
+				}
+			}
+		}
+	}
+	if !planned {
+		plan, err = i.host.Sessions.Plan(r.Context(), planBase)
+	}
+	if err != nil {
+		if i.protocol == "jellyfin" {
+			i.playbackInfoError(w, "plan", err)
+		} else if playback && noCompatibleStream(err) {
+			i.writeNoCompatibleStream(w)
+		} else if errors.Is(err, frontend.ErrPreparing) || errors.Is(err, frontend.ErrJobsBusy) {
+			streamError(i.protocol, w, err)
+		} else {
+			http.Error(w, "Playback unavailable", 503)
+		}
 		return
 	}
 	if playback && (plan.Estimated || (channel == "" && plan.Media.Estimated)) {
 		i.writeNoCompatibleStream(w)
 		return
 	}
+	// The estimate can miss a transcode the probed media reveals: check the
+	// real plan too.
+	if playback && !versionRequested && !triedAlternatives && videoTranscode(plan) && len(variants) > 1 {
+		if release := i.avoidVideoTranscode(r.Context(), planBase, variants); release != "" {
+			if alt, p, handle, ok := i.autoSwitchPlan(r, scope, planBase, release); ok {
+				planBase, plan = alt, p
+				autoSwitchedRelease, version = release, handle
+			}
+		}
+	}
 	if !allowed && plan.Decision.Kind == "transcode" {
-		http.Error(w, "Playback unavailable", 422)
+		if i.protocol == "jellyfin" {
+			i.playbackInfoError(w, "transcoding disabled", frontend.ErrNotAvailable)
+		} else {
+			http.Error(w, "Playback unavailable", 422)
+		}
 		return
 	}
 	sourceID = ids.RatingKeyGUID(key)
 	if channel != "" {
 		sourceID = wireID
+	} else if autoSwitchedRelease != "" {
+		// Auto played a different release than it would have: identify it by
+		// its scoped handle (the session was planned through it), never the
+		// raw release id.
+		sourceID = version
 	} else if version != "" {
 		sourceID = version
 	} else if detailSource != "" {
 		sourceID = detailSource
 	}
+	// A declared device profile is authoritative. Static-file clients without
+	// one can use the generic static endpoint; Roku must follow the broker
+	// decision instead of being told to direct-play an incompatible source.
+	staticPlayable := jellyfinStaticPlayable(i.protocol, channel, opts) && !intent.DeclaredCaps
 	media := plan.Media
 	media.Estimated = media.Estimated || plan.Estimated
 	source := i.detailMediaSourceDTO(sourceID, media)
@@ -310,7 +477,7 @@ func (i *instance) playbackInfo(w http.ResponseWriter, r *http.Request) {
 		// These streams are produced by Ether, even when their input is remote.
 		source["IsRemote"] = false
 	}
-	if i.protocol == "jellyfin" && channel == "" && (!media.Estimated || jellyfinStaticPlayable(i.protocol, channel, opts)) {
+	if i.protocol == "jellyfin" && channel == "" && (!media.Estimated || staticPlayable) {
 		// Infuse and Swiftfin direct-play a Jellyfin file with
 		// GET /Videos/{id}/stream?Static=true. They do not open Path.
 		// IsRemote true would tell Infuse that Path is an upstream URL to
@@ -322,7 +489,7 @@ func (i *instance) playbackInfo(w http.ResponseWriter, r *http.Request) {
 		source["ETag"] = plan.ETag
 	}
 	source["SupportsDirectPlay"], source["SupportsDirectStream"], source["SupportsTranscoding"] = plan.DirectPlay, plan.DirectStream, plan.Transcoding
-	if jellyfinStaticPlayable(i.protocol, channel, opts) {
+	if staticPlayable {
 		offerJellyfinStatic(source, opts)
 	}
 	source["IsInfiniteStream"] = channel != ""
@@ -341,27 +508,57 @@ func (i *instance) playbackInfo(w http.ResponseWriter, r *http.Request) {
 
 	playID := ""
 	if !playback && channel == "" && (opts.DirectPlay || opts.DirectStream) {
-		if path := i.lazySourceURL(r, credential, planRequest); path != "" {
+		if path := i.lazySourceURL(r, credential, planBase); path != "" {
 			source["Path"] = path
 		}
 	}
 	if playback {
 		session, err := i.host.Sessions.Open(r.Context(), frontend.OpenRequest{Protocol: i.protocol, PlanID: plan.ID, Viewer: v, Device: dev})
 		if err != nil {
-			if !jellyfinStaticFallback(err) || !jellyfinStaticPlayable(i.protocol, channel, opts) {
-				http.Error(w, "Playback unavailable", 503)
+			if channel != "" {
+				i.liveTuneError(w, err)
+				return
+			}
+			if !jellyfinStaticFallback(err) || !staticPlayable {
+				if i.protocol == "jellyfin" {
+					i.playbackInfoError(w, "open", err)
+				} else if errors.Is(err, frontend.ErrPreparing) || errors.Is(err, frontend.ErrJobsBusy) {
+					streamError(i.protocol, w, err)
+				} else {
+					http.Error(w, "Playback unavailable", 503)
+				}
 				return
 			}
 			if i.host.Log != nil {
 				i.host.Log.Warn("jellyfin static PlaybackInfo open", "err", err)
 			}
 		} else {
+			i.rememberAnonymousSession(r, v, session.ID, key, channel, dev, version, detailSource, sourceID)
 			format := frontend.StreamDirect
-			if channel != "" || (plan.Decision.Kind != "directplay" && (plan.Decision.Kind != "copy" || !plan.Decision.AudioCopy)) {
+			if channel != "" || (plan.Decision.Kind != "directplay" && ((i.protocol == "jellyfin" && intent.DeclaredCaps) || plan.Decision.Kind != "copy" || !plan.Decision.AudioCopy)) {
 				format = frontend.StreamHLS
 			}
+			// The progressive client requires an active playback demuxer. A
+			// direct-file plan becomes HLS (copy remux where codecs allow it),
+			// so all embedded text rides the same input read as the picture.
+			if i.protocol == "jellyfin" && channel == "" && format == frontend.StreamDirect && (plan.Media.Size == 0 || plan.Media.Size > 32<<20) {
+				progressive := false
+				for _, p := range body.DeviceProfile.SubtitleProfiles {
+					if p.Format == "ether-progressive-vtt" {
+						progressive = true
+					}
+				}
+				if progressive {
+					for _, track := range plan.Media.Streams {
+						if track.Type == "subtitle" && !track.External && (track.Codec == "subrip" || track.Codec == "srt" || track.Codec == "webvtt") {
+							format = frontend.StreamHLS
+							break
+						}
+					}
+				}
+			}
 			url, err := i.host.Sessions.StartStream(r.Context(), frontend.SessionAccess{Viewer: v, Device: dev, Protocol: i.protocol}, session.ID, frontend.StreamRequest{Format: format, Position: intent.Position})
-			if err != nil && format == frontend.StreamHLS && jellyfinStaticPlayable(i.protocol, channel, opts) {
+			if err != nil && format == frontend.StreamHLS && staticPlayable {
 				url, err = i.host.Sessions.StartStream(r.Context(), frontend.SessionAccess{Viewer: v, Device: dev, Protocol: i.protocol}, session.ID, frontend.StreamRequest{Format: frontend.StreamDirect, Position: intent.Position})
 				if err == nil {
 					format = frontend.StreamDirect
@@ -369,8 +566,8 @@ func (i *instance) playbackInfo(w http.ResponseWriter, r *http.Request) {
 			}
 			if err != nil {
 				_ = i.host.Sessions.Stop(r.Context(), frontend.SessionAccess{Viewer: v, Device: dev, Protocol: i.protocol}, session.ID)
-				if !jellyfinStaticFallback(err) || !jellyfinStaticPlayable(i.protocol, channel, opts) {
-					streamError(i.protocol, w, err)
+				if !jellyfinStaticFallback(err) || !staticPlayable {
+					i.playbackInfoError(w, "start stream", err)
 					return
 				}
 				if i.host.Log != nil {
@@ -390,9 +587,26 @@ func (i *instance) playbackInfo(w http.ResponseWriter, r *http.Request) {
 					i.shapeLiveMediaSource(source, sourceID, channelName, session.ID, url, media, true)
 				} else if subtitleService := i.host.Sessions; subtitleService != nil {
 					streams := i.mediaStreams(plan.Media.Streams)
-					for n, stream := range plan.Media.Streams {
+					n := -1
+					for _, stream := range plan.Media.Streams {
+						if mediaStreamKind(stream.Type) == "" {
+							continue
+						}
+						n++
 						if stream.Type != "subtitle" {
 							continue
+						}
+						// A track the HLS stream carries as a rendition is
+						// delivered there, as Jellyfin does for "Hls" clients.
+						if format == frontend.StreamHLS {
+							if rendition, e := subtitleService.SubtitleURL(r.Context(), frontend.SessionAccess{Viewer: v, Device: dev, Protocol: i.protocol}, session.ID, stream.Index, "hls"); e == nil && rendition != "" {
+								dto := streams[n].(map[string]any)
+								dto["DeliveryMethod"] = "Hls"
+								delete(dto, "DeliveryUrl")
+								dto["IsTextSubtitleStream"] = true
+								dto["SupportsExternalStream"] = true
+								continue
+							}
 						}
 						subtitleURL, e := subtitleService.SubtitleURL(r.Context(), frontend.SessionAccess{Viewer: v, Device: dev, Protocol: i.protocol}, session.ID, stream.Index, "vtt")
 						if e != nil || !strings.HasPrefix(subtitleURL, "/sessions/media/") || strings.ContainsAny(subtitleURL, "\r\n") {
@@ -424,6 +638,12 @@ func (i *instance) playbackInfo(w http.ResponseWriter, r *http.Request) {
 						source["SupportsDirectStream"] = plan.DirectStream
 						delete(source, "Path")
 					}
+					if i.protocol == "jellyfin" && intent.DeclaredCaps {
+						source["SupportsDirectPlay"] = false
+						source["SupportsDirectStream"] = false
+						source["Protocol"] = "Http"
+						delete(source, "Path")
+					}
 					source["TranscodingUrl"] = url
 					source["TranscodingSubProtocol"] = "hls"
 					if channel != "" {
@@ -452,6 +672,15 @@ func (i *instance) playbackInfo(w http.ResponseWriter, r *http.Request) {
 	}
 	if (i.protocol == "emby" || i.protocol == "jellyfin") && channel == "" {
 		applyPlannedStreamIndexes(source, media, plan.Decision)
+	}
+	// With no explicit version pick, list Auto then the ranked release
+	// variants so the app's version picker offers them; a pick resolves to
+	// the exact release through the returned MediaSource Id.
+	if listVersions && !versionRequested && autoSwitchedRelease == "" {
+		if sources := i.releaseVersionSourcesFor(r, scope, key, variants, source); sources != nil {
+			jsonReply(w, map[string]any{"MediaSources": sources, "PlaySessionId": playID})
+			return
+		}
 	}
 	jsonReply(w, map[string]any{"MediaSources": []any{source}, "PlaySessionId": playID})
 }
@@ -524,12 +753,12 @@ func (i *instance) liveStreamsOpen(w http.ResponseWriter, r *http.Request) {
 	intent := frontend.PlayIntent{Options: opts, AllowTranscoding: &allowed}
 	plan, err := i.host.Sessions.Plan(r.Context(), frontend.PlanRequest{Viewer: v, Device: dev, Protocol: i.protocol, Channel: channel, Caps: capability.Client, Intent: intent})
 	if err != nil {
-		http.Error(w, "Playback unavailable", 503)
+		i.liveTuneError(w, err)
 		return
 	}
 	session, err := i.host.Sessions.Open(r.Context(), frontend.OpenRequest{Protocol: i.protocol, PlanID: plan.ID, Viewer: v, Device: dev})
 	if err != nil {
-		http.Error(w, "Playback unavailable", 503)
+		i.liveTuneError(w, err)
 		return
 	}
 	url, err := i.host.Sessions.StartStream(r.Context(), frontend.SessionAccess{Viewer: v, Device: dev, Protocol: i.protocol}, session.ID, frontend.StreamRequest{Format: frontend.StreamHLS})
@@ -559,6 +788,81 @@ func (i *instance) liveStreamsOpen(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	jsonReply(w, map[string]any{"MediaSource": source})
+}
+
+// liveStreamsMediaInfo returns the source of an already open, authorized live
+// stream. Looking up metadata never opens another provider connection.
+func (i *instance) liveStreamsMediaInfo(w http.ResponseWriter, r *http.Request) {
+	v, _, err := i.viewer(r)
+	if err != nil || v == nil {
+		http.Error(w, "Unauthorized", 401)
+		return
+	}
+	if i.host.Sessions == nil {
+		http.Error(w, "Unavailable", 503)
+		return
+	}
+	var body struct {
+		LiveStreamId string `json:"LiveStreamId"`
+	}
+	if r.Body != nil && r.ContentLength != 0 {
+		if err := decode(r, &body); err != nil && !errors.Is(err, io.EOF) {
+			http.Error(w, "Bad Request", 400)
+			return
+		}
+	}
+	streamID := body.LiveStreamId
+	if values := route.Query(r.URL.Query(), "LiveStreamId"); len(values) > 1 {
+		http.Error(w, "Bad Request", 400)
+		return
+	} else if len(values) == 1 && values[0] != "" {
+		streamID = values[0]
+	}
+	if streamID == "" {
+		http.Error(w, "Bad Request", 400)
+		return
+	}
+	access := frontend.SessionAccess{Viewer: v, Device: device(r), Protocol: i.protocol}
+	sessions, err := i.host.Sessions.Sessions(r.Context(), access)
+	if err != nil {
+		http.Error(w, "Unavailable", 503)
+		return
+	}
+	for _, session := range sessions {
+		if session.ID != streamID || session.Channel == "" {
+			continue
+		}
+		url, err := i.host.Sessions.StartStream(r.Context(), access, streamID, frontend.StreamRequest{Format: frontend.StreamHLS})
+		if err != nil {
+			streamError(i.protocol, w, err)
+			return
+		}
+		if prefix, ok := r.Context().Value(prefixKey{}).(string); ok {
+			url = prefix + url
+		}
+		id, err := ids.StringGUID(ids.Channel, session.Channel)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		var media frontend.MediaInfo
+		if session.Media != nil {
+			media = *session.Media
+		}
+		media = defaultLiveMediaInfo(media)
+		source := i.detailMediaSourceDTO(id, media)
+		i.shapeLiveMediaSource(source, id, "", streamID, url, media, true)
+		i.mediaSourceDialect(source)
+		if i.protocol == "jellyfin" {
+			i.jellyfinMediaSourceDTO(source, media, true)
+		}
+		if i.protocol == "emby" {
+			i.embyMediaSourceDTO(source, id, media)
+		}
+		jsonReply(w, source)
+		return
+	}
+	http.NotFound(w, r)
 }
 
 func (i *instance) liveStreamsClose(w http.ResponseWriter, r *http.Request) {
@@ -652,20 +956,37 @@ func (i *instance) mediaSourceDTO(id string, media frontend.MediaInfo) map[strin
 
 func (i *instance) mediaStreams(streams []frontend.StreamInfo) []any {
 	out := mediaStreams(streams)
-	for n, stream := range streams {
+	n := 0
+	for _, stream := range streams {
+		if mediaStreamKind(stream.Type) == "" {
+			continue
+		}
 		if i.protocol == "emby" {
 			i.embyMediaStreamDTO(out[n].(map[string]any), stream)
 		} else if i.protocol == "jellyfin" {
 			i.jellyfinStreamDTO(out[n].(map[string]any), stream)
 		}
+		n++
 	}
 	return out
+}
+
+// mediaStreamKind maps a probe stream type to its MediaBrowser kind, or
+// "" for streams (data, attachments) that have none.
+func mediaStreamKind(t string) string {
+	return map[string]string{"video": "Video", "audio": "Audio", "subtitle": "Subtitle"}[t]
 }
 
 func mediaStreams(streams []frontend.StreamInfo) []any {
 	out := make([]any, 0, len(streams))
 	for _, s := range streams {
-		kind := map[string]string{"video": "Video", "audio": "Audio", "subtitle": "Subtitle"}[s.Type]
+		kind := mediaStreamKind(s.Type)
+		if kind == "" {
+			// MediaStream.Type is a required enum in the Jellyfin SDK;
+			// an empty value fails decoding of the whole item (#614).
+			// Data/attachment streams have no MediaBrowser kind.
+			continue
+		}
 		m := map[string]any{"Index": s.Index, "Type": kind, "Codec": s.Codec, "Language": s.Language, "IsDefault": s.Default, "IsForced": s.Forced, "IsExternal": s.External, "Width": s.Width, "Height": s.Height, "Channels": s.Channels, "IsInterlaced": s.Interlaced, "IsHearingImpaired": false, "IsOriginal": false, "IsTextSubtitleStream": false, "SupportsExternalStream": false}
 		if s.DefaultDisposition != nil {
 			m["IsDefault"] = *s.DefaultDisposition
@@ -714,7 +1035,7 @@ func addChapters(source map[string]any, media frontend.MediaInfo) {
 	}
 	chapters := make([]any, 0, len(media.Chapters))
 	for _, chapter := range media.Chapters {
-		chapters = append(chapters, map[string]any{"Name": chapter.Title, "StartPositionTicks": chapter.Start.Nanoseconds() / 100})
+		chapters = append(chapters, map[string]any{"Name": chapter.Title, "StartPositionTicks": chapter.Start.Nanoseconds() / 100, "ImageDateModified": wireTime(time.Time{})})
 	}
 	source["Chapters"] = chapters
 }
@@ -731,6 +1052,9 @@ func (i *instance) playbackRoutes() error {
 		if err := i.router.Handle(method, "/Videos/{id}/{name}", http.HandlerFunc(i.streamAlias)); err != nil {
 			return err
 		}
+		if err := i.router.Handle(method, "/Audio/{id}/{name}", http.HandlerFunc(i.streamAlias)); err != nil {
+			return err
+		}
 	}
 	if err := i.router.Handle("GET", "/MediaSegments/{itemId}", http.HandlerFunc(i.mediaSegments)); err != nil {
 		return err
@@ -744,7 +1068,7 @@ func (i *instance) playbackRoutes() error {
 	for _, entry := range []struct {
 		path    string
 		stopped bool
-	}{{"/Sessions/Playing", false}, {"/Sessions/Playing/Progress", false}, {"/Sessions/Playing/Stopped", true}} {
+	}{{"/Sessions/Playing", false}, {"/Sessions/Playing/Progress", false}, {"/Sessions/Playing/Ping", false}, {"/Sessions/Playing/Stopped", true}} {
 		stop := entry.stopped
 		started := entry.path == "/Sessions/Playing"
 		if err := i.router.Handle("POST", entry.path, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { i.timeline(w, r, stop, started) })); err != nil {
@@ -767,6 +1091,9 @@ func (i *instance) playbackRoutes() error {
 		return err
 	}
 	if err := i.router.Handle("POST", "/LiveStreams/Open", http.HandlerFunc(i.liveStreamsOpen)); err != nil {
+		return err
+	}
+	if err := i.router.Handle("POST", "/LiveStreams/MediaInfo", http.HandlerFunc(i.liveStreamsMediaInfo)); err != nil {
 		return err
 	}
 	if err := i.router.Handle("POST", "/LiveStreams/Close", http.HandlerFunc(i.liveStreamsClose)); err != nil {
@@ -794,6 +1121,7 @@ func (i *instance) playbackRoutes() error {
 }
 
 type timelineRequest struct {
+	AudioStreamIndex, SubtitleStreamIndex              *int
 	PlaySessionId, LiveStreamId, ItemId, MediaSourceId string
 	PositionTicks, RunTimeTicks                        json.Number
 	IsPaused                                           bool
@@ -841,6 +1169,10 @@ func (i *instance) timeline(w http.ResponseWriter, r *http.Request, stopped, sta
 		state = "stopped"
 	}
 	report := frontend.Timeline{PlaybackID: body.PlaySessionId, Position: time.Duration(ticks) * 100 * time.Nanosecond, Duration: time.Duration(runtime) * 100 * time.Nanosecond, State: state}
+	if !started && !stopped {
+		report.AudioStreamIndex = body.AudioStreamIndex
+		report.SubtitleStreamIndex = body.SubtitleStreamIndex
+	}
 	recorded := false
 	if body.PlaySessionId != "" {
 		err = i.host.Sessions.Report(r.Context(), access, body.PlaySessionId, report)
@@ -936,6 +1268,34 @@ func noCompatibleStream(err error) bool {
 	return errors.Is(err, frontend.ErrNotFound) || errors.Is(err, frontend.ErrNotAvailable) || errors.Is(err, frontend.ErrSourceGone)
 }
 
+// PlaybackInfo errors must be successful protocol responses: jellyfin-web
+// reads ErrorCode only on a resolved request, and otherwise shows its generic
+// network error. Admission failures retain 503 and Retry-After so clients
+// can retry once capacity returns. Keep failure stages in server diagnostics.
+func (i *instance) playbackInfoError(w http.ResponseWriter, stage string, err error) {
+	if i.host.Log != nil {
+		i.host.Log.Warn("PlaybackInfo failed", "protocol", i.protocol, "stage", stage, "err", err)
+	}
+	if i.protocol != "jellyfin" || errors.Is(err, frontend.ErrSessionBusy) || errors.Is(err, frontend.ErrTranscodeCapacity) || errors.Is(err, frontend.ErrPreparing) || errors.Is(err, frontend.ErrJobsBusy) {
+		streamError(i.protocol, w, err)
+		return
+	}
+	code := "NoCompatibleStream"
+	if errors.Is(err, frontend.ErrUnauthorized) {
+		code = "NotAllowed"
+	} else if errors.Is(err, frontend.ErrStreamLimit) {
+		code = "RateLimitExceeded"
+	}
+	body := map[string]any{"MediaSources": []any{}, "PlaySessionId": "", "ErrorCode": code}
+	var bedtime *frontend.ErrBedtime
+	if errors.As(err, &bedtime) {
+		body["Message"] = bedtime.Error()
+	} else if errors.Is(err, frontend.ErrVideoTranscodingDisabled) {
+		body["Message"] = msgVideoTranscodingOff
+	}
+	jsonReply(w, body)
+}
+
 func (i *instance) writeNoCompatibleStream(w http.ResponseWriter) {
 	jsonReply(w, map[string]any{"MediaSources": []any{}, "PlaySessionId": "", "ErrorCode": "NoCompatibleStream"})
 }
@@ -946,6 +1306,16 @@ func directFilePath(path string) bool {
 
 // streamAlias translates client-generated URLs into broker-owned, scoped URLs.
 func (i *instance) streamAlias(w http.ResponseWriter, r *http.Request) {
+	if themeParentID(r.PathValue("id")) != "" {
+		name := strings.ToLower(r.PathValue("name"))
+		if name != "stream" && name != "stream.m4a" {
+			http.NotFound(w, r)
+			return
+		}
+		r.SetPathValue("id", themeParentID(r.PathValue("id")))
+		i.themeStream(w, r)
+		return
+	}
 	mediasafety.SetHeaders(w)
 	name := strings.ToLower(r.PathValue("name"))
 	if i.protocol == "emby" && queryBool(r, "Static", false) && (name == "stream" || strings.HasPrefix(name, "stream.")) {
@@ -953,6 +1323,12 @@ func (i *instance) streamAlias(w http.ResponseWriter, r *http.Request) {
 	}
 	viewer, credential, err := i.viewer(r)
 	if err != nil || viewer == nil {
+		// A stream alias with no credential at all is answered from a
+		// session the viewer just opened from this peer (anonymousStreamKey
+		// is set by the middleware). Anything else stays 401.
+		if _, anonymous := r.Context().Value(anonymousStreamKey{}).(bool); anonymous && i.serveAnonymousStream(w, r, name) {
+			return
+		}
 		http.Error(w, "Unauthorized", 401)
 		return
 	}
@@ -999,8 +1375,8 @@ func (i *instance) streamAlias(w http.ResponseWriter, r *http.Request) {
 	}
 	format := frontend.StreamDirect
 	switch {
-	case name == "stream", strings.HasPrefix(name, "stream."):
-	case name == "master.m3u8":
+	case name == "stream", strings.HasPrefix(name, "stream."), name == "universal":
+	case name == "master.m3u8", name == "main.m3u8":
 		format = frontend.StreamHLS
 	default:
 		http.NotFound(w, r)
@@ -1099,47 +1475,18 @@ func (i *instance) streamAlias(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if version != "" && i.host.VersionHandles.MatchSession(i.identityContext(r), versionScope, version, sessionID) != nil {
-		http.NotFound(w, r)
-		return
+	i.serveAliasSession(w, r, access, sessions, sessionID, versionScope, version, detailSource, format)
+}
+
+// Both MediaBrowser dialects resolve tune failures with a native playback code.
+func (i *instance) liveTuneError(w http.ResponseWriter, err error) {
+	detail := frontend.DiagnoseLiveTV("tune", err)
+	code := "NoCompatibleStream"
+	if errors.Is(err, frontend.ErrUnauthorized) {
+		code = "NotAllowed"
+	} else if errors.Is(err, frontend.ErrStreamLimit) {
+		code = "RateLimitExceeded"
 	}
-	if detailSource != "" {
-		planner, ok := i.host.Sessions.(frontend.DetailPlanner)
-		if !ok || planner.MatchDetailSession(i.identityContext(r), versionScope, detailSource, sessionID) != nil {
-			http.NotFound(w, r)
-			return
-		}
-	}
-	// PlaybackInfo already started this direct file. Serve that URL here so
-	// the client does not pay a second round trip, or a second stream start.
-	if format == frontend.StreamDirect {
-		for _, session := range sessions {
-			if session.ID != sessionID || !directFilePath(session.MediaPath) {
-				continue
-			}
-			req := r.Clone(r.Context())
-			u := *req.URL
-			u.Path = session.MediaPath
-			u.RawPath = ""
-			req.URL = &u
-			if i.protocol == "emby" {
-				i.embyMediaHeaders(w, req)
-			}
-			i.host.Sessions.ServeMedia(w, req)
-			return
-		}
-	}
-	url, err := i.host.Sessions.StartStream(r.Context(), access, sessionID, frontend.StreamRequest{Format: format})
-	if err != nil {
-		streamError(i.protocol, w, err)
-		return
-	}
-	if !strings.HasPrefix(url, "/sessions/media/") || strings.ContainsAny(url, "\r\n") {
-		http.Error(w, "Unavailable", 503)
-		return
-	}
-	if prefix, ok := r.Context().Value(prefixKey{}).(string); ok {
-		url = prefix + url
-	}
-	http.Redirect(w, r, url, http.StatusTemporaryRedirect)
+	w.Header().Set("X-Ether-LiveTV-Error", detail.Code)
+	jsonReply(w, map[string]any{"MediaSources": []any{}, "PlaySessionId": "", "ErrorCode": code, "Message": detail.Message, "LiveTVErrorCode": detail.Code})
 }

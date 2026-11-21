@@ -17,6 +17,14 @@ import (
 // An unrestricted viewer whose epoch has not moved since the last fence is
 // answered from that snapshot, so a play does not take a write lock.
 func (s *Service) ConfirmPlayback(ctx context.Context, u *core.User, remote bool, now time.Time) (*core.User, error) {
+	return s.confirmPlayback(ctx, u, remote, now, false)
+}
+
+// ConfirmAdmission adds bedtime only when starting a new item or tuning a channel.
+func (s *Service) ConfirmAdmission(ctx context.Context, u *core.User, remote bool, now time.Time) (*core.User, error) {
+	return s.confirmPlayback(ctx, u, remote, now, true)
+}
+func (s *Service) confirmPlayback(ctx context.Context, u *core.User, remote bool, now time.Time, admission bool) (*core.User, error) {
 	if s == nil || s.db == nil || u == nil || u.ID <= 0 {
 		return nil, core.ErrUnauthorized
 	}
@@ -28,18 +36,24 @@ func (s *Service) ConfirmPlayback(ctx context.Context, u *core.User, remote bool
 				if !CanPlayWithPolicy(merged, policy, remote, now) {
 					return nil, core.ErrUnauthorized
 				}
+				if admission {
+					if err := CheckBedtime(merged, policy, now); err != nil {
+						return nil, err
+					}
+				}
 				return merged, nil
 			}
 		}
 	}
-	for attempt := 0; attempt < 3; attempt++ {
-		epoch, err := viewerpolicy.Read(ctx, s.db)
-		if err != nil {
-			return confirmFallback(restricted)
-		}
+	for attempt := 0; attempt < 8; attempt++ {
 		tx, err := s.db.BeginTx(ctx, nil)
 		if err != nil {
-			return confirmFallback(restricted)
+			return confirmFallback(ctx, restricted)
+		}
+		var epoch int64
+		if err := tx.QueryRowContext(ctx, `SELECT generation FROM viewer_policy_epoch WHERE id=1`).Scan(&epoch); err != nil {
+			_ = tx.Rollback()
+			return confirmFallback(ctx, restricted)
 		}
 		started := time.Now()
 		err = viewerpolicy.Fence(ctx, s.db, tx, epoch)
@@ -49,7 +63,7 @@ func (s *Service) ConfirmPlayback(ctx context.Context, u *core.User, remote bool
 		}
 		if err != nil {
 			_ = tx.Rollback()
-			return confirmFallback(restricted)
+			return confirmFallback(ctx, restricted)
 		}
 		merged, policy, err := readFreshPlayback(ctx, tx, u)
 		if errors.Is(err, core.ErrUnauthorized) {
@@ -58,10 +72,10 @@ func (s *Service) ConfirmPlayback(ctx context.Context, u *core.User, remote bool
 		}
 		if err != nil {
 			_ = tx.Rollback()
-			return confirmFallback(restricted)
+			return confirmFallback(ctx, restricted)
 		}
 		if err := tx.Commit(); err != nil {
-			return confirmFallback(restricted)
+			return confirmFallback(ctx, restricted)
 		}
 		ended := time.Now()
 		if !CanPlayWithPolicy(merged, policy, remote, started) || !CanPlayWithPolicy(merged, policy, remote, ended) || !CanPlayWithPolicy(merged, policy, remote, now) {
@@ -70,9 +84,14 @@ func (s *Service) ConfirmPlayback(ctx context.Context, u *core.User, remote bool
 		if !s.Restricted(merged) {
 			s.storeConfirm(merged.ID, epoch, merged, policy)
 		}
+		if admission {
+			if err := CheckBedtime(merged, policy, now); err != nil {
+				return nil, err
+			}
+		}
 		return merged, nil
 	}
-	return confirmFallback(restricted)
+	return confirmFallback(ctx, restricted)
 }
 
 func (s *Service) cachedConfirm(id, epoch int64) (*core.User, Policy, bool) {
@@ -83,7 +102,7 @@ func (s *Service) cachedConfirm(id, epoch int64) (*core.User, Policy, bool) {
 		return nil, Policy{}, false
 	}
 	user := hit.user
-	user.AllowedSections = append([]int(nil), hit.user.AllowedSections...)
+	user.AllowedLibraries = append([]core.LibraryID(nil), hit.user.AllowedLibraries...)
 	return &user, hit.policy, true
 }
 
@@ -92,7 +111,7 @@ func (s *Service) storeConfirm(id, epoch int64, user *core.User, policy Policy) 
 		return
 	}
 	stored := *user
-	stored.AllowedSections = append([]int(nil), user.AllowedSections...)
+	stored.AllowedLibraries = append([]core.LibraryID(nil), user.AllowedLibraries...)
 	s.playbackMu.Lock()
 	defer s.playbackMu.Unlock()
 	if s.playbackEpoch == nil {
@@ -101,7 +120,10 @@ func (s *Service) storeConfirm(id, epoch int64, user *core.User, policy Policy) 
 	s.playbackEpoch[id] = playbackConfirm{epoch: epoch, user: stored, policy: policy}
 }
 
-func confirmFallback(restricted bool) (*core.User, error) {
+func confirmFallback(ctx context.Context, restricted bool) (*core.User, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if restricted {
 		return nil, core.ErrUnauthorized
 	}
@@ -111,7 +133,7 @@ func confirmFallback(restricted bool) (*core.User, error) {
 func readFreshPlayback(ctx context.Context, tx *sql.Tx, u *core.User) (*core.User, Policy, error) {
 	var active, owner, streams int
 	var rating, allowed, plexSecs, raw string
-	err := tx.QueryRowContext(ctx, `SELECT active, is_owner, stream_limit, max_content_rating, allowed_sections, plex_sections, COALESCE((SELECT policy FROM safety_policies WHERE user_id=auth_users.id), '') FROM auth_users WHERE id=?`, u.ID).Scan(&active, &owner, &streams, &rating, &allowed, &plexSecs, &raw)
+	err := tx.QueryRowContext(ctx, `SELECT active, is_owner, stream_limit, max_content_rating, allowed_libraries, plex_sections, COALESCE((SELECT policy FROM safety_policies WHERE user_id=auth_users.id), '') FROM auth_users WHERE id=?`, u.ID).Scan(&active, &owner, &streams, &rating, &allowed, &plexSecs, &raw)
 	if errors.Is(err, sql.ErrNoRows) || (err == nil && active != 1) {
 		return nil, Policy{}, core.ErrUnauthorized
 	}
@@ -131,12 +153,16 @@ func readFreshPlayback(ctx context.Context, tx *sql.Tx, u *core.User) (*core.Use
 	out.IsOwner = owner == 1
 	out.StreamLimit = streams
 	out.MaxContentRating = rating
-	var sections, plex []int
+	var sections []core.LibraryID
+	var plex []int
 	_ = json.Unmarshal([]byte(allowed), &sections)
 	_ = json.Unmarshal([]byte(plexSecs), &plex)
 	if len(sections) == 0 && len(plex) > 0 && !out.IsOwner {
-		sections = plex
+		// Plex section id == LibraryID.
+		for _, sec := range plex {
+			sections = append(sections, core.LibraryID(sec))
+		}
 	}
-	out.AllowedSections = append([]int(nil), sections...)
+	out.AllowedLibraries = append([]core.LibraryID(nil), sections...)
 	return &out, policy, nil
 }

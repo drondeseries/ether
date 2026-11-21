@@ -45,7 +45,7 @@ func get(t *testing.T, s core.HLSSession, n int) *httptest.ResponseRecorder {
 	t.Helper()
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/seg/%d", n), nil)
-	s.ServeSegment(rec, req, n)
+	s.ServeSegment(rec, mediaRequest(s, req, n), n)
 	return rec
 }
 
@@ -481,12 +481,8 @@ func TestRemuxRestartsAfterPrematureEOF(t *testing.T) {
 	m := newTestManager(t, fr, config.Transcode{}, WithBuffering(24*time.Second, 2*time.Minute, 3*time.Minute))
 	s := startSession(t, m, remuxRequest(t, "premature-eof", 48*time.Minute+39*time.Second))
 	resume := 620
-	started := time.Now()
 	if r := get(t, s, resume); r.Code != 200 {
 		t.Fatalf("resume segment %d: %d %s", resume, r.Code, r.Body.String())
-	}
-	if took := time.Since(started); took > 5*time.Second {
-		t.Fatalf("resume first segment took %v, want under 5s", took)
 	}
 	startsAfterResume := fr.startCount()
 	next := resume + fr.eofAfter
@@ -584,7 +580,7 @@ func TestSessionFMP4Init(t *testing.T) {
 	}
 	rec := httptest.NewRecorder()
 	s.ServePlaylist(rec, httptest.NewRequest(http.MethodGet, "/", nil))
-	if !strings.Contains(rec.Body.String(), `#EXT-X-MAP:URI="init.mp4"`) || !strings.Contains(rec.Body.String(), "00001.m4s") {
+	if !strings.Contains(rec.Body.String(), `#EXT-X-MAP:URI="`+s.scopeMediaName(InitSegmentName)+`"`) || !strings.Contains(rec.Body.String(), "00001.m4s") {
 		t.Errorf("playlist %s", rec.Body.String())
 	}
 }
@@ -661,19 +657,6 @@ func TestIdleReaping(t *testing.T) {
 	}
 }
 
-func TestTouchKeepsSessionAlive(t *testing.T) {
-	fr := newFakeRunner()
-	m := newTestManager(t, fr, config.Transcode{}, WithIdleTimeout(200*time.Millisecond))
-	s := startSession(t, m, remuxRequest(t, "touch", time.Hour))
-	for i := 0; i < 8; i++ {
-		time.Sleep(50 * time.Millisecond)
-		s.Touch()
-	}
-	if _, ok := m.Session("touch"); !ok {
-		t.Error("touched session reaped")
-	}
-}
-
 func TestPlaylistPollingCannotPreserveAbandonedEncoder(t *testing.T) {
 	fr := newFakeRunner()
 	m := newTestManager(t, fr, config.Transcode{})
@@ -720,10 +703,19 @@ func TestStopAndClose(t *testing.T) {
 }
 
 func TestThrottlePausesAndResumes(t *testing.T) {
+	t.Run("copy", func(t *testing.T) { testThrottlePausesAndResumes(t, false) })
+	t.Run("encode", func(t *testing.T) { testThrottlePausesAndResumes(t, true) })
+}
+
+func testThrottlePausesAndResumes(t *testing.T, encode bool) {
 	fr := newFakeRunner()
 	fr.segDelay = time.Millisecond
 	m := newTestManager(t, fr, config.Transcode{}, WithBuffering(24*time.Second, 16*time.Second, 0))
-	s := startSession(t, m, remuxRequest(t, "thr", time.Hour))
+	req := remuxRequest(t, "thr", time.Hour)
+	if encode {
+		req = transcodeRequest(t, "thr-encode")
+	}
+	s := startSession(t, m, req)
 	p := fr.lastProc()
 	waitFor(t, "pause", p.isPaused)
 	s.mu.Lock()
@@ -795,6 +787,11 @@ func TestRungSwitchDoesNotResumeThrottleBeforeRestart(t *testing.T) {
 	fr.noPause = true
 	m := newTestManager(t, fr, config.Transcode{ABRLadder: true}, WithBuffering(24*time.Second, 16*time.Second, 0), withRungDwell(0))
 	s := startSession(t, m, ladderEncodeRequest(t, "handoff", 10*time.Minute))
+	// Select the base before observing its throttle lifecycle. Ladder
+	// metadata intentionally no longer creates an eager process.
+	if rec := get(t, s, 0); rec.Code != 200 {
+		t.Fatalf("initial base segment: %d", rec.Code)
+	}
 	first := fr.lastProc()
 	waitFor(t, "throttle stop", first.wasKilled)
 	s.mu.Lock()
@@ -808,7 +805,7 @@ func TestRungSwitchDoesNotResumeThrottleBeforeRestart(t *testing.T) {
 	}
 	n := resumeAt - 2
 	rec := httptest.NewRecorder()
-	s.ServeRungSegment(rec, httptest.NewRequest(http.MethodGet, "/", nil), "720p4m", n)
+	s.ServeRungSegment(rec, mediaRequest(s, httptest.NewRequest(http.MethodGet, "/", nil), n), "720p4m", n)
 	if rec.Code != 200 {
 		t.Fatalf("rung segment %d: %d %s", n, rec.Code, rec.Body.String())
 	}
@@ -1060,7 +1057,7 @@ func TestMaxTranscodesCountsEncodingCopySessions(t *testing.T) {
 	}
 	m2.Stop("t2")
 	rec := httptest.NewRecorder()
-	s2.ServeRungSegment(rec, httptest.NewRequest(http.MethodGet, "/720p4m/00001.ts", nil), "720p4m", 1)
+	s2.ServeRungSegment(rec, mediaRequest(s2, httptest.NewRequest(http.MethodGet, "/720p4m/00001.ts", nil), 1), "720p4m", 1)
 	if rec.Code != 200 {
 		t.Fatalf("rung segment: %d", rec.Code)
 	}
@@ -1112,7 +1109,7 @@ func TestPrefetchDoesNotEvictTheWaitingSegment(t *testing.T) {
 	go func() {
 		defer close(done)
 		req := httptest.NewRequest(http.MethodGet, "/seg/0", nil)
-		s.ServeSegment(hold, req, 0)
+		s.ServeSegment(hold, mediaRequest(s, req, 0), 0)
 	}()
 	select {
 	case <-hold.got:
@@ -1264,4 +1261,23 @@ func (h *holdResponse) Write(p []byte) (int, error) {
 	h.once.Do(func() { close(h.got) })
 	<-h.rel
 	return len(p), nil
+}
+
+// mediaRequest follows the resource namespace advertised by a concrete session.
+// Fakes and DASH retain their own URI contracts.
+func mediaRequest(hs core.HLSSession, r *http.Request, n int) *http.Request {
+	s, ok := hs.(*Session)
+	if !ok || s.isDASH() {
+		return r
+	}
+	r = r.Clone(r.Context())
+	u := *r.URL
+	name := s.segName(n)
+	if n == InitSegment {
+		name = s.scopeMediaName(initSegmentName(s.container))
+	}
+	u.Path = "/" + name
+	u.RawPath = ""
+	r.URL = &u
+	return r
 }

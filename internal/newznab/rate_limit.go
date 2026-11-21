@@ -89,5 +89,6 @@ ON CONFLICT(indexer_id) DO UPDATE SET retry_at=CASE WHEN excluded.retry_at > new
 		}
 	}
 	c.log.Info("indexer paused by service; will retry automatically", "indexer", c.Name(), "retryAt", until.UTC())
+	c.emitRateLimited(until, cause)
 	return cause
 }

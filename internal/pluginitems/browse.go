@@ -1,0 +1,2420 @@
+package pluginitems
+
+import (
+	"context"
+	"database/sql"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"math"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/braedonsaunders/ether/internal/contentrating"
+	"github.com/braedonsaunders/ether/internal/core"
+	"github.com/braedonsaunders/ether/internal/libraryfilter"
+)
+
+// BrowseQuery specifies a keyset-paged browse over a plugin library and level
+// (spec §2.3, §3.4).
+type BrowseQuery struct {
+	// NoTotal avoids count queries for clients using cursor continuation.
+	NoTotal   bool
+	Policy    *libraryfilter.Filter
+	TabPolicy *libraryfilter.Filter
+	ViewerID  int64
+	Hidden    bool
+	LibraryID core.LibraryID
+	ParentRef core.ItemRef
+	Level     string
+	Levels    []string
+	AnyLevel  bool
+	PersonID  int64
+	Sort      string              // title (default), added, released, year, rating, index, lastViewed
+	Desc      bool                // false = default direction for Sort; true = reverse
+	Facets    map[string][]string // field key -> values, any of (OR within key, AND across keys)
+	// AllFacets requires every listed value per field; ExcludeFacets
+	// drops items having any listed value. Both combine with Facets
+	// using AND and the same per-type value handling.
+	AllFacets     map[string][]string
+	ExcludeFacets map[string][]string
+	// Watched filters on the viewer's watch state in SQL (ViewerID):
+	// true keeps items with a state_watch view_count > 0, false keeps
+	// items without one. Nil applies no watched predicate.
+	Watched *bool
+	// MaxContentRating caps items at this content-rating enforcement
+	// level in SQL (persisted rating_level). Unrated items never pass a
+	// cap, matching contentrating.EnforceExceeds. Empty is uncapped.
+	MaxContentRating string
+	// ExcludeKeys drops these plugin items by RatingKey. Callers bound
+	// the list; non-plugin keys are ignored.
+	ExcludeKeys []core.RatingKey
+	Cursor      string // opaque keyset cursor
+	Limit       int
+}
+
+// BrowsePage is a keyset page of plugin items.
+type BrowsePage struct {
+	Items      []core.KindItem `json:"items"`
+	Total      int             `json:"total"`
+	NextCursor string          `json:"nextCursor,omitempty"`
+}
+
+// FacetCount is a single facet value and item count.
+type FacetCount struct {
+	Value string `json:"value"`
+	Count int    `json:"count"`
+}
+
+// FacetBucket is one discrete facet bucket (id, label, count) for browse UIs.
+type FacetBucket struct {
+	ID    string `json:"id"`
+	Label string `json:"label"`
+	Count int    `json:"count"`
+}
+
+type browseCursor struct {
+	Sort       string  `json:"s"`
+	Desc       bool    `json:"d,omitempty"`
+	Phase      int     `json:"p,omitempty"`
+	StartPhase bool    `json:"sp,omitempty"`
+	StrVal     string  `json:"sv,omitempty"`
+	IntVal     int64   `json:"iv,omitempty"`
+	FloatVal   float64 `json:"fv,omitempty"`
+	ItemRef    string  `json:"r"`
+}
+
+func encodeBrowseCursor(c browseCursor) string {
+	b, err := json.Marshal(c)
+	if err != nil {
+		return ""
+	}
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+func decodeBrowseCursor(raw string) (browseCursor, error) {
+	var c browseCursor
+	b, err := base64.RawURLEncoding.DecodeString(strings.TrimSpace(raw))
+	if err != nil {
+		return c, fmt.Errorf("pluginitems: invalid cursor: %w", err)
+	}
+	if err := json.Unmarshal(b, &c); err != nil {
+		return c, fmt.Errorf("pluginitems: invalid cursor payload: %w", err)
+	}
+	if c.ItemRef == "" && !c.StartPhase {
+		return c, fmt.Errorf("pluginitems: cursor missing item_ref")
+	}
+	return c, nil
+}
+
+// normalizeSortField returns the canonical column name, value kind ("str", "int", "float", "last_viewed"),
+// and default descending flag for a browse sort name.
+func normalizeSortField(sortName string) (col string, kind string, defaultDesc bool) {
+	switch strings.ToLower(strings.TrimSpace(sortName)) {
+	case "", "title", "sort_title":
+		return "sort_title", "str", false
+	case "added", "added_at", "date_added":
+		return "added_at", "int", true
+	case "released", "originally_available_at", "release_date":
+		return "released", "int", true
+	case "year":
+		return "year", "int", true
+	case "rating":
+		return "rating", "float", true
+	case "index", "idx":
+		return "idx", "int", false
+	case "lastviewed", "last_viewed", "played":
+		return "last_viewed_at", "last_viewed", true
+	default:
+		return "sort_title", "str", false
+	}
+}
+
+// Browse returns a keyset-paged slice of items in a library (spec §2.3, §3.4).
+// Unfiltered totals are read from plugin_item_tally in O(1); filtered or
+// child-scoped totals execute an exact COUNT(*) with the same WHERE clauses,
+// so a filtered total is never a capped count presented as the total.
+func (s *Service) Browse(ctx context.Context, q BrowseQuery) (BrowsePage, error) {
+	if s == nil || s.db == nil {
+		return BrowsePage{}, fmt.Errorf("pluginitems: nil service")
+	}
+	if q.LibraryID <= 0 {
+		return BrowsePage{}, fmt.Errorf("pluginitems: library_id is required")
+	}
+	limit := q.Limit
+	if limit <= 0 {
+		limit = DefaultBrowseLimit
+	}
+	if limit > MaxBrowseLimit {
+		limit = MaxBrowseLimit
+	}
+
+	col, kind, defaultDesc := normalizeSortField(q.Sort)
+	desc := defaultDesc
+	if q.Desc {
+		desc = !defaultDesc
+	}
+	if strings.HasSuffix(strings.ToLower(strings.TrimSpace(q.Sort)), ":desc") {
+		col, kind, _ = normalizeSortField(strings.TrimSuffix(strings.ToLower(strings.TrimSpace(q.Sort)), ":desc"))
+		desc = true
+	} else if strings.HasSuffix(strings.ToLower(strings.TrimSpace(q.Sort)), ":asc") {
+		col, kind, _ = normalizeSortField(strings.TrimSuffix(strings.ToLower(strings.TrimSpace(q.Sort)), ":asc"))
+		desc = false
+	}
+
+	level := strings.TrimSpace(q.Level)
+	parentRef := strings.TrimSpace(string(q.ParentRef))
+	if err := checkFacetValueBound(q.Facets, q.AllFacets, q.ExcludeFacets); err != nil {
+		return BrowsePage{}, err
+	}
+	hasFacets := hasActiveFacets(q.Facets) || hasActiveFacets(q.AllFacets) || hasActiveFacets(q.ExcludeFacets) || !q.Policy.Passive() || !q.TabPolicy.Passive() || q.Hidden || q.PersonID > 0 || len(q.Levels) > 0 || q.AnyLevel || q.Watched != nil || q.MaxContentRating != "" || len(q.ExcludeKeys) > 0
+
+	// Build person + facet predicates first so we know whether to drive the
+	// query from plugin_item_fields_lookup / plugin_item_fields_lookup_int.
+	var filterWhere strings.Builder
+	var filterArgs []any
+	driveFromFields := false
+
+	if q.PersonID > 0 {
+		ok, err := s.appendBrowsePersonFilter(ctx, q.LibraryID, &filterWhere, &filterArgs, q.PersonID)
+		if err != nil {
+			return BrowsePage{}, err
+		}
+		if !ok {
+			return BrowsePage{Items: []core.KindItem{}, Total: 0}, nil
+		}
+		driveFromFields = true
+	}
+	usedFacetIndex, err := s.appendBrowseFacets(ctx, q.LibraryID, &filterWhere, &filterArgs, q.Facets)
+	if err != nil {
+		return BrowsePage{}, err
+	}
+	if usedFacetIndex {
+		driveFromFields = true
+	}
+	usedAllFacetIndex, err := s.appendBrowseFacetsMode(ctx, q.LibraryID, &filterWhere, &filterArgs, q.AllFacets, facetAll)
+	if err != nil {
+		return BrowsePage{}, err
+	}
+	if usedAllFacetIndex {
+		driveFromFields = true
+	}
+	// Exclusion predicates are NOT IN subqueries over the same indexed
+	// field rows; they filter the item scan and never drive it.
+	if _, err := s.appendBrowseFacetsMode(ctx, q.LibraryID, &filterWhere, &filterArgs, q.ExcludeFacets, facetNone); err != nil {
+		return BrowsePage{}, err
+	}
+	if !q.Hidden && (q.TabPolicy.HasPositiveViewerFilter() || q.Policy.HasPositiveViewerFilter()) {
+		driveFromFields = true
+	}
+
+	viewerID := q.ViewerID
+	if viewerID <= 0 {
+		viewerID = core.CatalogViewerID(ctx)
+	}
+
+	// Base filter predicate.
+	var baseWhere strings.Builder
+	baseArgs := []any{int64(q.LibraryID)}
+	if driveFromFields && parentRef == "" {
+		baseWhere.WriteString(`i.library_id + 0 = ?`)
+	} else {
+		baseWhere.WriteString(`i.library_id = ?`)
+	}
+	if parentRef != "" {
+		baseWhere.WriteString(` AND i.parent_ref = ?`)
+		baseArgs = append(baseArgs, parentRef)
+	} else if len(q.Levels) > 0 {
+		placeholders := make([]string, len(q.Levels))
+		for idx, lv := range q.Levels {
+			placeholders[idx] = "?"
+			baseArgs = append(baseArgs, strings.TrimSpace(lv))
+		}
+		baseWhere.WriteString(` AND i.level IN (` + strings.Join(placeholders, ",") + `)`)
+	} else if level != "" {
+		baseWhere.WriteString(` AND i.level = ?`)
+		baseArgs = append(baseArgs, level)
+	} else if !q.AnyLevel && q.PersonID <= 0 {
+		// Default to root items when neither Level nor ParentRef is specified.
+		baseWhere.WriteString(` AND i.parent_ref = ''`)
+	}
+	if filterWhere.Len() > 0 {
+		baseWhere.WriteString(filterWhere.String())
+		baseArgs = append(baseArgs, filterArgs...)
+	}
+	if q.MaxContentRating != "" {
+		if lvl := contentrating.EnforceLevelOf(q.MaxContentRating); lvl == contentrating.Unrated {
+			baseWhere.WriteString(` AND 0=1`)
+		} else {
+			baseWhere.WriteString(` AND i.rating_level > 0 AND i.rating_level <= ?`)
+			baseArgs = append(baseArgs, int(lvl))
+		}
+	}
+	if len(q.ExcludeKeys) > 0 {
+		var placeholders []string
+		for _, k := range q.ExcludeKeys {
+			if !k.IsPluginKey() {
+				continue
+			}
+			placeholders = append(placeholders, "?")
+			baseArgs = append(baseArgs, int64(k)-core.PluginKeyOffset)
+		}
+		if len(placeholders) > 0 {
+			baseWhere.WriteString(` AND i.seq NOT IN (` + strings.Join(placeholders, ",") + `)`)
+		}
+	}
+	if q.Watched != nil {
+		switch {
+		case viewerID <= 0 && *q.Watched:
+			baseWhere.WriteString(` AND 0=1`)
+		case viewerID > 0 && *q.Watched:
+			baseWhere.WriteString(fmt.Sprintf(` AND EXISTS (SELECT 1 FROM state_watch w WHERE w.user_id = ? AND w.rating_key = %d + i.seq AND w.view_count > 0)`, core.PluginKeyOffset))
+			baseArgs = append(baseArgs, viewerID)
+		case viewerID > 0:
+			baseWhere.WriteString(fmt.Sprintf(` AND NOT EXISTS (SELECT 1 FROM state_watch w WHERE w.user_id = ? AND w.rating_key = %d + i.seq AND w.view_count > 0)`, core.PluginKeyOffset))
+			baseArgs = append(baseArgs, viewerID)
+		}
+	}
+	if err := s.appendVisibilityForViewer(ctx, &baseWhere, &baseArgs, q.LibraryID, q.Policy, q.Hidden, viewerID); err != nil {
+		return BrowsePage{}, err
+	}
+	if err := s.appendVisibilityForViewer(ctx, &baseWhere, &baseArgs, q.LibraryID, q.TabPolicy, false, viewerID); err != nil {
+		return BrowsePage{}, err
+	}
+
+	if kind == "last_viewed" {
+		return s.browseLastViewed(ctx, q, viewerID, baseWhere.String(), baseArgs, hasFacets, parentRef, level, desc, limit)
+	}
+
+	// Compute total count.
+	var total int
+	if q.NoTotal {
+		// Count-free request: the page and cursor below are sufficient.
+	} else if !hasFacets && parentRef == "" && level != "" {
+		_ = s.db.QueryRowContext(ctx,
+			`SELECT COALESCE(n, 0) FROM plugin_item_tally WHERE library_id = ? AND level = ?`,
+			int64(q.LibraryID), level).Scan(&total)
+	} else if !hasFacets && parentRef == "" && level == "" {
+		// Root level: look up the kind's root level from plugin_kinds if available,
+		// falling back to COUNT(*).
+		if k, err := s.GetKindByLibrary(ctx, q.LibraryID); err == nil && len(k.Decl.Levels) > 0 {
+			_ = s.db.QueryRowContext(ctx,
+				`SELECT COALESCE(n, 0) FROM plugin_item_tally WHERE library_id = ? AND level = ?`,
+				int64(q.LibraryID), k.Decl.Levels[0].Key).Scan(&total)
+		} else {
+			if err := s.db.QueryRowContext(ctx,
+				`SELECT COUNT(*) FROM plugin_items i WHERE `+baseWhere.String(),
+				baseArgs...).Scan(&total); err != nil {
+				return BrowsePage{}, err
+			}
+		}
+	} else {
+		if err := s.db.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM plugin_items i WHERE `+baseWhere.String(),
+			baseArgs...).Scan(&total); err != nil {
+			return BrowsePage{}, err
+		}
+	}
+
+	pageWhere := baseWhere.String()
+	pageArgs := append([]any(nil), baseArgs...)
+
+	if strings.TrimSpace(q.Cursor) != "" {
+		cur, err := decodeBrowseCursor(q.Cursor)
+		if err != nil {
+			return BrowsePage{}, err
+		}
+		var curVal any
+		switch kind {
+		case "str":
+			curVal = cur.StrVal
+		case "int":
+			curVal = cur.IntVal
+		case "float":
+			curVal = cur.FloatVal
+		}
+		if !desc {
+			// Range-friendly keyset predicate: i.<col> >= ? AND (i.<col> > ? OR i.item_ref > ?)
+			pageWhere += fmt.Sprintf(` AND (i.%s >= ? AND (i.%s > ? OR i.item_ref > ?))`, col, col)
+			pageArgs = append(pageArgs, curVal, curVal, cur.ItemRef)
+		} else {
+			// Range-friendly DESC predicate with ASC item_ref tie-breaker:
+			// i.<col> <= ? AND (i.<col> < ? OR i.item_ref > ?)
+			pageWhere += fmt.Sprintf(` AND (i.%s <= ? AND (i.%s < ? OR i.item_ref > ?))`, col, col)
+			pageArgs = append(pageArgs, curVal, curVal, cur.ItemRef)
+		}
+	}
+
+	dir := "ASC"
+	if desc {
+		dir = "DESC"
+	}
+	orderBy := fmt.Sprintf("i.%s %s, i.item_ref ASC", col, dir)
+	pageArgs = append(pageArgs, limit+1)
+
+	querySQL := `SELECT ` + prefixedItemCols("i.") + `
+FROM plugin_items i
+WHERE ` + pageWhere + `
+ORDER BY ` + orderBy + `
+LIMIT ?`
+
+	items, err := s.queryItems(ctx, querySQL, pageArgs, false)
+	if err != nil {
+		return BrowsePage{}, err
+	}
+
+	var nextCursor string
+	if len(items) > limit {
+		last := items[limit-1]
+		items = items[:limit]
+		cur := browseCursor{
+			Sort:    col,
+			Desc:    desc,
+			ItemRef: string(last.Ref),
+		}
+		switch col {
+		case "sort_title":
+			cur.StrVal = last.SortTitle
+		case "added_at":
+			cur.IntVal = last.AddedAt
+		case "released":
+			cur.IntVal = last.Released
+		case "year":
+			cur.IntVal = int64(last.Year)
+		case "idx":
+			cur.IntVal = int64(last.Index)
+		case "rating":
+			cur.FloatVal = last.Rating
+		}
+		nextCursor = encodeBrowseCursor(cur)
+	}
+
+	if len(items) > 0 {
+		if err := s.hydrateArtSlice(ctx, items); err != nil {
+			return BrowsePage{}, err
+		}
+	}
+
+	if q.NoTotal {
+		total = len(items)
+	}
+	return BrowsePage{
+		Items:      items,
+		Total:      total,
+		NextCursor: nextCursor,
+	}, nil
+}
+
+const smallPluginLibraryMax = 5000
+
+func (s *Service) libraryHasAtMostItems(ctx context.Context, itemWhere string, itemArgs []any, maxItems int) (bool, error) {
+	qArgs := append(append([]any(nil), itemArgs...), maxItems+1)
+	var n int
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM (SELECT 1 FROM plugin_items i WHERE `+itemWhere+` LIMIT ?)`,
+		qArgs...).Scan(&n); err != nil {
+		return false, err
+	}
+	return n <= maxItems, nil
+}
+
+// FacetPage is one field's filter values in display order. Truncated means
+// the field has more distinct values than the limit returned.
+type FacetPage struct {
+	Values    []FacetCount `json:"values"`
+	Truncated bool         `json:"truncated,omitempty"`
+}
+
+// Facets lists a field's values. The query keeps the most common values when
+// a field has more than limit; the page is then ordered for reading: an enum
+// in its declared order, text values alphabetically, numbers by count.
+func (s *Service) Facets(ctx context.Context, libraryID core.LibraryID, level, fieldKey string, limit int) (FacetPage, error) {
+	if s == nil || s.db == nil {
+		return FacetPage{}, fmt.Errorf("pluginitems: nil service")
+	}
+	fieldKey = strings.TrimSpace(fieldKey)
+	if libraryID <= 0 || fieldKey == "" {
+		return FacetPage{}, fmt.Errorf("pluginitems: library_id and field_key are required")
+	}
+	if limit <= 0 || limit > 500 {
+		limit = 200
+	}
+	fetch := limit + 1
+
+	var (
+		query string
+		args  []any
+	)
+	if envelopeFacet(fieldKey) {
+		query = `SELECT CAST(i.` + fieldKey + ` AS TEXT), COUNT(*) AS cnt FROM plugin_items i WHERE i.library_id = ? AND i.` + fieldKey + ` > 0`
+		args = []any{int64(libraryID)}
+		if strings.TrimSpace(level) != "" {
+			query += ` AND i.level = ?`
+			args = append(args, strings.TrimSpace(level))
+		}
+		query += ` GROUP BY i.` + fieldKey + ` ORDER BY cnt DESC, i.` + fieldKey + ` ASC LIMIT ?`
+		args = append(args, fetch)
+	} else {
+		query = `
+			SELECT v_text, cnt
+			FROM plugin_item_field_tally
+			WHERE library_id = ? AND level = ? AND field = ? AND cnt > 0
+			ORDER BY cnt DESC, v_text ASC
+			LIMIT ?`
+		args = []any{int64(libraryID), strings.TrimSpace(level), fieldKey, fetch}
+	}
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return FacetPage{}, err
+	}
+	defer rows.Close()
+
+	var out []FacetCount
+	for rows.Next() {
+		var fc FacetCount
+		if err := rows.Scan(&fc.Value, &fc.Count); err != nil {
+			return FacetPage{}, err
+		}
+		out = append(out, fc)
+	}
+	if err := rows.Err(); err != nil {
+		return FacetPage{}, err
+	}
+	page := FacetPage{Values: out}
+	if len(out) > limit {
+		page.Values, page.Truncated = out[:limit], true
+	}
+	if !envelopeFacet(fieldKey) {
+		if rec, err := s.GetKindByLibrary(ctx, libraryID); err == nil {
+			for _, f := range rec.Decl.Fields {
+				if f.Key == fieldKey {
+					orderFacetValues(page.Values, f.Type, f.Enum)
+					break
+				}
+			}
+		}
+	}
+	return page, nil
+}
+
+// FacetBuckets returns discrete filter buckets for a declared or envelope facet
+// field on libraryID, respecting library visibility policy:
+//   - date (and envelope released): UTC years ("2024"), newest year first
+//   - <date>-decade (and envelope decade): UTC decades ("1990" / "1990s"), newest first
+//   - duration: discrete duration ranges ("Under 10 min", ...), omitting empty
+//   - int (and envelope year): distinct values when <= 50, else clean ranges
+//   - float (and envelope rating): distinct values when <= 50, else clean ranges
+//   - enum: declared order
+//   - string, strings, bool, people: alphabetical order
+func (s *Service) FacetBuckets(ctx context.Context, libraryID core.LibraryID, level string, policy *libraryfilter.Filter, fieldKey string) ([]FacetBucket, error) {
+	if s == nil || s.db == nil {
+		return nil, fmt.Errorf("pluginitems: nil service")
+	}
+	fieldKey = strings.TrimSpace(fieldKey)
+	if libraryID <= 0 || fieldKey == "" {
+		return nil, fmt.Errorf("pluginitems: library_id and field_key are required")
+	}
+	rec, err := s.GetKindByLibrary(ctx, libraryID)
+	if err != nil {
+		return nil, err
+	}
+
+	itemWhere, fieldDrivenWhere, itemArgs, err := s.buildRootItemPredicates(ctx, rec, level, policy)
+	if err != nil {
+		return nil, err
+	}
+	smallLib, err := s.libraryHasAtMostItems(ctx, itemWhere, itemArgs, smallPluginLibraryMax)
+	if err != nil {
+		return nil, err
+	}
+
+	fieldsByKey := make(map[string]struct {
+		typ  string
+		enum []string
+	}, len(rec.Decl.Fields))
+	for _, fd := range rec.Decl.Fields {
+		fieldsByKey[fd.Key] = struct {
+			typ  string
+			enum []string
+		}{typ: fd.Type, enum: fd.Enum}
+	}
+
+	if fieldKey == "decade" {
+		if _, hasDeclared := fieldsByKey["decade"]; !hasDeclared {
+			years, err := s.scanEnvelopeYearCounts(ctx, libraryID, itemWhere, itemArgs, smallLib)
+			if err != nil {
+				return nil, err
+			}
+			return bucketYearDecades(years), nil
+		}
+	}
+
+	if base, ok := libraryfilter.SplitDateDecadeFacet(fieldKey); ok {
+		if fd, exists := fieldsByKey[base]; exists && fd.typ == "date" {
+			return s.scanDateFieldDecadeBuckets(ctx, base, itemWhere, fieldDrivenWhere, itemArgs, smallLib)
+		}
+	}
+
+	switch fieldKey {
+	case "year":
+		vals, err := s.scanEnvelopeYearCounts(ctx, libraryID, itemWhere, itemArgs, smallLib)
+		if err != nil {
+			return nil, err
+		}
+		return bucketIntValues(vals, true), nil
+	case "released":
+		return s.scanEnvelopeReleasedBuckets(ctx, libraryID, itemWhere, itemArgs, smallLib)
+	case "rating":
+		vals, err := s.scanEnvelopeRatingCounts(ctx, libraryID, itemWhere, itemArgs, smallLib)
+		if err != nil {
+			return nil, err
+		}
+		return bucketFloatValues(vals), nil
+	}
+
+	fd, found := fieldsByKey[fieldKey]
+	if !found {
+		return []FacetBucket{}, nil
+	}
+	fieldType := fd.typ
+	enumVals := fd.enum
+
+	args := append(append([]any(nil), itemArgs...), fieldKey)
+	switch fieldType {
+	case "date":
+		return s.scanDateFieldYearBuckets(ctx, fieldKey, itemWhere, fieldDrivenWhere, itemArgs, smallLib)
+	case "duration":
+		if smallLib {
+			vals, err := s.scanIntFacetCounts(ctx, `SELECT f.v_int, COUNT(*) FROM plugin_item_fields f JOIN plugin_items i ON i.item_ref = f.item_ref WHERE `+itemWhere+` AND f.field = ? AND (f.v_text = '' OR f.v_int <> 0) AND f.v_int >= 0 GROUP BY f.v_int`, args)
+			if err != nil {
+				return nil, err
+			}
+			return bucketDurationValues(vals), nil
+		}
+		return s.scanDurationBucketsLarge(ctx, fieldKey, fieldDrivenWhere, itemArgs)
+	case "int":
+		vals, err := s.scanFieldIntCounts(ctx, fieldKey, itemWhere, fieldDrivenWhere, itemArgs, smallLib)
+		if err != nil {
+			return nil, err
+		}
+		return bucketIntValues(vals, false), nil
+	case "float":
+		vals, err := s.scanFieldFloatCounts(ctx, fieldKey, itemWhere, fieldDrivenWhere, itemArgs, smallLib)
+		if err != nil {
+			return nil, err
+		}
+		return bucketFloatValues(vals), nil
+	case "people":
+		if !smallLib {
+			return s.scanPeopleBucketsLarge(ctx, fieldKey, fieldDrivenWhere, itemArgs)
+		}
+		rows, err := s.db.QueryContext(ctx, `SELECT MIN(f.v_text), COUNT(*) FROM plugin_item_fields f JOIN plugin_items i ON i.item_ref = f.item_ref WHERE `+itemWhere+` AND f.field = ? AND f.v_int <> 0 AND f.v_int > 0 AND f.v_text <> '' GROUP BY f.v_int`, args...)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		var out []FacetBucket
+		for rows.Next() {
+			var name string
+			var cnt int
+			if err := rows.Scan(&name, &cnt); err != nil {
+				return nil, err
+			}
+			name = strings.TrimSpace(name)
+			if name != "" && cnt > 0 {
+				out = append(out, FacetBucket{ID: name, Label: name, Count: cnt})
+			}
+		}
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+		sort.SliceStable(out, func(i, j int) bool { return facetNameLess(out[i].Label, out[j].Label) })
+		if out == nil {
+			return []FacetBucket{}, nil
+		}
+		return out, nil
+	default:
+		if !smallLib {
+			raw, err := s.scanFieldTextCountsLarge(ctx, fieldKey, fieldDrivenWhere, itemArgs, 2001)
+			if err != nil {
+				return nil, err
+			}
+			orderFacetValues(raw, fieldType, enumVals)
+			out := make([]FacetBucket, 0, len(raw))
+			for _, fc := range raw {
+				out = append(out, FacetBucket{ID: fc.Value, Label: fc.Value, Count: fc.Count})
+			}
+			return out, nil
+		}
+		rows, err := s.db.QueryContext(ctx, `SELECT f.v_text, COUNT(*) FROM plugin_item_fields f JOIN plugin_items i ON i.item_ref = f.item_ref WHERE `+itemWhere+` AND f.field = ? AND f.v_text <> '' GROUP BY f.v_text`, args...)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		var raw []FacetCount
+		for rows.Next() {
+			var fc FacetCount
+			if err := rows.Scan(&fc.Value, &fc.Count); err != nil {
+				return nil, err
+			}
+			if fc.Value != "" && fc.Count > 0 {
+				raw = append(raw, fc)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+		orderFacetValues(raw, fieldType, enumVals)
+		out := make([]FacetBucket, 0, len(raw))
+		for _, fc := range raw {
+			out = append(out, FacetBucket{ID: fc.Value, Label: fc.Value, Count: fc.Count})
+		}
+		return out, nil
+	}
+}
+
+func (s *Service) scanEnvelopeYearCounts(ctx context.Context, libraryID core.LibraryID, itemWhere string, itemArgs []any, smallLib bool) ([]intFacetPair, error) {
+	if smallLib {
+		return s.scanIntFacetCounts(ctx, `SELECT i.year, COUNT(*) FROM plugin_items i WHERE `+itemWhere+` AND i.year > 0 GROUP BY i.year ORDER BY i.year ASC`, itemArgs)
+	}
+	qArgs := make([]any, 0, 2+len(itemArgs))
+	qArgs = append(qArgs, int64(libraryID), int64(libraryID))
+	qArgs = append(qArgs, itemArgs...)
+	return s.scanIntFacetCounts(ctx, `
+WITH RECURSIVE distinct_years(y) AS (
+	SELECT (SELECT i.year FROM plugin_items i WHERE i.library_id = ? AND i.year > 0 ORDER BY i.year DESC LIMIT 1)
+	UNION ALL
+	SELECT (SELECT i.year FROM plugin_items i WHERE i.library_id = ? AND i.year > 0 AND i.year < distinct_years.y ORDER BY i.year DESC LIMIT 1)
+	FROM distinct_years
+	WHERE distinct_years.y IS NOT NULL
+	LIMIT 300
+)
+SELECT y, (
+	SELECT COUNT(*) FROM (
+		SELECT 1 FROM plugin_items i
+		WHERE `+itemWhere+` AND i.year = distinct_years.y
+		LIMIT 25001
+	) s
+)
+FROM distinct_years
+WHERE y IS NOT NULL
+ORDER BY y ASC`, qArgs)
+}
+
+type intSpanDef struct {
+	id    string
+	label string
+	lo    int64
+	hi    int64
+}
+
+func (s *Service) scanEnvelopeReleasedBuckets(ctx context.Context, libraryID core.LibraryID, itemWhere string, itemArgs []any, smallLib bool) ([]FacetBucket, error) {
+	if smallLib {
+		vals, err := s.scanIntFacetCounts(ctx, `SELECT i.released, COUNT(*) FROM plugin_items i WHERE `+itemWhere+` AND i.released <> 0 GROUP BY i.released`, itemArgs)
+		if err != nil {
+			return nil, err
+		}
+		return bucketDateYears(vals), nil
+	}
+	var minTS, maxTS sql.NullInt64
+	_ = s.db.QueryRowContext(ctx,
+		`SELECT
+			(SELECT i.released FROM plugin_items i WHERE i.library_id = ? AND i.released > 0 ORDER BY i.released ASC LIMIT 1),
+			(SELECT i.released FROM plugin_items i WHERE i.library_id = ? AND i.released > 0 ORDER BY i.released DESC LIMIT 1)`,
+		int64(libraryID), int64(libraryID)).Scan(&minTS, &maxTS)
+	if !minTS.Valid || !maxTS.Valid {
+		return []FacetBucket{}, nil
+	}
+	minY := max(time.Unix(minTS.Int64, 0).UTC().Year(), 1900)
+	maxY := min(time.Unix(maxTS.Int64, 0).UTC().Year(), 2100)
+	if minY > maxY {
+		return []FacetBucket{}, nil
+	}
+	if maxY-minY > 200 {
+		minY = maxY - 200
+	}
+	arms := make([]string, 0, maxY-minY+1)
+	qArgs := make([]any, 0, 3*(maxY-minY+1)+len(itemArgs))
+	for y := maxY; y >= minY; y-- {
+		lo := time.Date(y, 1, 1, 0, 0, 0, 0, time.UTC).Unix()
+		hi := time.Date(y+1, 1, 1, 0, 0, 0, 0, time.UTC).Unix() - 1
+		if len(arms) == 0 {
+			arms = append(arms, `SELECT CAST(? AS INTEGER) AS y, CAST(? AS BIGINT) AS lo, CAST(? AS BIGINT) AS hi`)
+		} else {
+			arms = append(arms, `SELECT ?, ?, ?`)
+		}
+		qArgs = append(qArgs, y, lo, hi)
+	}
+	qArgs = append(qArgs, itemArgs...)
+	rows, err := s.db.QueryContext(ctx, `
+WITH spans(y, lo, hi) AS (
+	`+strings.Join(arms, "\n\tUNION ALL\n\t")+`
+)
+SELECT y, (
+	SELECT COUNT(*) FROM (
+		SELECT 1 FROM plugin_items i
+		WHERE `+itemWhere+` AND i.released BETWEEN spans.lo AND spans.hi
+		LIMIT 25001
+	) s
+)
+FROM spans
+ORDER BY y DESC`, qArgs...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []FacetBucket
+	for rows.Next() {
+		var y, cnt int
+		if err := rows.Scan(&y, &cnt); err != nil {
+			return nil, err
+		}
+		if cnt > 0 {
+			ys := strconv.Itoa(y)
+			out = append(out, FacetBucket{ID: ys, Label: ys, Count: cnt})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if out == nil {
+		return []FacetBucket{}, nil
+	}
+	return out, nil
+}
+
+func (s *Service) scanEnvelopeRatingCounts(ctx context.Context, libraryID core.LibraryID, itemWhere string, itemArgs []any, smallLib bool) ([]floatFacetPair, error) {
+	if smallLib {
+		return s.scanFloatFacetCounts(ctx, `SELECT i.rating, COUNT(*) FROM plugin_items i WHERE `+itemWhere+` AND i.rating > 0 GROUP BY i.rating ORDER BY i.rating ASC`, itemArgs)
+	}
+	qArgs := make([]any, 0, 2+len(itemArgs))
+	qArgs = append(qArgs, int64(libraryID), int64(libraryID))
+	qArgs = append(qArgs, itemArgs...)
+	return s.scanFloatFacetCounts(ctx, `
+WITH RECURSIVE distinct_ratings(r) AS (
+	SELECT (SELECT i.rating FROM plugin_items i WHERE i.library_id = ? AND i.rating > 0 ORDER BY i.rating DESC LIMIT 1)
+	UNION ALL
+	SELECT (SELECT i.rating FROM plugin_items i WHERE i.library_id = ? AND i.rating > 0 AND i.rating < distinct_ratings.r ORDER BY i.rating DESC LIMIT 1)
+	FROM distinct_ratings
+	WHERE distinct_ratings.r IS NOT NULL
+	LIMIT 200
+)
+SELECT r, (
+	SELECT COUNT(*) FROM (
+		SELECT 1 FROM plugin_items i
+		WHERE `+itemWhere+` AND i.rating = distinct_ratings.r
+		LIMIT 2001
+	) s
+)
+FROM distinct_ratings
+WHERE r IS NOT NULL
+ORDER BY r ASC`, qArgs)
+}
+
+func (s *Service) scanFieldIntSpanBuckets(ctx context.Context, fieldKey, fieldDrivenWhere string, itemArgs []any, defs []intSpanDef, includeZero bool) ([]FacetBucket, error) {
+	if len(defs) == 0 {
+		return []FacetBucket{}, nil
+	}
+	arms := make([]string, len(defs))
+	qArgs := make([]any, 0, 3*len(defs)+2+2*len(itemArgs))
+	for i, d := range defs {
+		if i == 0 {
+			arms[i] = `SELECT CAST(? AS INTEGER) AS idx, CAST(? AS BIGINT) AS lo, CAST(? AS BIGINT) AS hi`
+		} else {
+			arms[i] = `SELECT ?, ?, ?`
+		}
+		qArgs = append(qArgs, i, d.lo, d.hi)
+	}
+	qArgs = append(qArgs, fieldKey)
+	qArgs = append(qArgs, itemArgs...)
+
+	// Drive the range scan with f.v_int <> 0 so SQLite treats the partial
+	// plugin_item_fields_lookup_int index as covering across every span arm
+	// instead of falling back to plugin_item_fields_fold. When legitimate zero
+	// values belong to a span (e.g. duration's under-10m bucket), add an exact
+	// v_int = 0 probe carrying the full partial predicate.
+	zeroTerm := ""
+	if includeZero {
+		qArgs = append(qArgs, fieldKey, int64(0))
+		qArgs = append(qArgs, itemArgs...)
+		zeroTerm = ` + CASE WHEN 0 BETWEEN spans.lo AND spans.hi THEN (
+	SELECT COUNT(*) FROM (
+		SELECT 1 FROM plugin_item_fields f
+		JOIN plugin_items i ON i.item_ref = f.item_ref
+		WHERE f.field = ? AND (f.v_text = '' OR f.v_int <> 0) AND f.v_int = ? AND ` + fieldDrivenWhere + `
+		LIMIT 25001
+	) s0
+) ELSE 0 END`
+	}
+
+	rows, err := s.db.QueryContext(ctx, `
+WITH spans(idx, lo, hi) AS (
+	`+strings.Join(arms, "\n\tUNION ALL\n\t")+`
+)
+SELECT idx, (
+	SELECT COUNT(*) FROM (
+		SELECT 1 FROM plugin_item_fields f
+		JOIN plugin_items i ON i.item_ref = f.item_ref
+		WHERE f.field = ? AND f.v_int <> 0 AND f.v_int BETWEEN spans.lo AND spans.hi AND `+fieldDrivenWhere+`
+		LIMIT 25001
+	) s
+)`+zeroTerm+`
+FROM spans
+ORDER BY idx ASC`, qArgs...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []FacetBucket
+	for rows.Next() {
+		var idx, cnt int
+		if err := rows.Scan(&idx, &cnt); err != nil {
+			return nil, err
+		}
+		if cnt > 25001 {
+			cnt = 25001
+		}
+		if cnt > 0 && idx >= 0 && idx < len(defs) {
+			out = append(out, FacetBucket{ID: defs[idx].id, Label: defs[idx].label, Count: cnt})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if out == nil {
+		return []FacetBucket{}, nil
+	}
+	return out, nil
+}
+
+func (s *Service) scanDateFieldYearBuckets(ctx context.Context, fieldKey, itemWhere, fieldDrivenWhere string, itemArgs []any, smallLib bool) ([]FacetBucket, error) {
+	if smallLib {
+		args := append(append([]any(nil), itemArgs...), fieldKey)
+		vals, err := s.scanIntFacetCounts(ctx, `SELECT f.v_int, COUNT(*) FROM plugin_item_fields f JOIN plugin_items i ON i.item_ref = f.item_ref WHERE `+itemWhere+` AND f.field = ? AND f.v_int <> 0 GROUP BY f.v_int`, args)
+		if err != nil {
+			return nil, err
+		}
+		return bucketDateYears(vals), nil
+	}
+	minY, maxY, ok := s.dateFieldYearSpan(ctx, fieldKey)
+	if !ok {
+		return []FacetBucket{}, nil
+	}
+	defs := make([]intSpanDef, 0, maxY-minY+1)
+	for y := maxY; y >= minY; y-- {
+		ys := strconv.Itoa(y)
+		defs = append(defs, intSpanDef{
+			id:    ys,
+			label: ys,
+			lo:    time.Date(y, 1, 1, 0, 0, 0, 0, time.UTC).Unix(),
+			hi:    time.Date(y+1, 1, 1, 0, 0, 0, 0, time.UTC).Unix() - 1,
+		})
+	}
+	return s.scanFieldIntSpanBuckets(ctx, fieldKey, fieldDrivenWhere, itemArgs, defs, false)
+}
+
+func (s *Service) scanDateFieldDecadeBuckets(ctx context.Context, fieldKey, itemWhere, fieldDrivenWhere string, itemArgs []any, smallLib bool) ([]FacetBucket, error) {
+	if smallLib {
+		args := append(append([]any(nil), itemArgs...), fieldKey)
+		vals, err := s.scanIntFacetCounts(ctx, `SELECT f.v_int, COUNT(*) FROM plugin_item_fields f JOIN plugin_items i ON i.item_ref = f.item_ref WHERE `+itemWhere+` AND f.field = ? AND f.v_int <> 0 GROUP BY f.v_int`, args)
+		if err != nil {
+			return nil, err
+		}
+		return bucketDateDecades(vals), nil
+	}
+	minY, maxY, ok := s.dateFieldYearSpan(ctx, fieldKey)
+	if !ok {
+		return []FacetBucket{}, nil
+	}
+	minD := (minY / 10) * 10
+	maxD := (maxY / 10) * 10
+	defs := make([]intSpanDef, 0, (maxD-minD)/10+1)
+	for d := maxD; d >= minD; d -= 10 {
+		ds := strconv.Itoa(d)
+		defs = append(defs, intSpanDef{
+			id:    ds,
+			label: ds + "s",
+			lo:    time.Date(d, 1, 1, 0, 0, 0, 0, time.UTC).Unix(),
+			hi:    time.Date(d+10, 1, 1, 0, 0, 0, 0, time.UTC).Unix() - 1,
+		})
+	}
+	return s.scanFieldIntSpanBuckets(ctx, fieldKey, fieldDrivenWhere, itemArgs, defs, false)
+}
+
+func (s *Service) dateFieldYearSpan(ctx context.Context, fieldKey string) (int, int, bool) {
+	var minTS, maxTS sql.NullInt64
+	_ = s.db.QueryRowContext(ctx,
+		`SELECT
+			(SELECT f.v_int FROM plugin_item_fields f WHERE f.field = ? AND f.v_int <> 0 ORDER BY f.v_int ASC LIMIT 1),
+			(SELECT f.v_int FROM plugin_item_fields f WHERE f.field = ? AND f.v_int <> 0 ORDER BY f.v_int DESC LIMIT 1)`,
+		fieldKey, fieldKey).Scan(&minTS, &maxTS)
+	if !minTS.Valid || !maxTS.Valid {
+		return 0, 0, false
+	}
+	minY := max(time.Unix(minTS.Int64, 0).UTC().Year(), 1900)
+	maxY := min(time.Unix(maxTS.Int64, 0).UTC().Year(), 2100)
+	if minY > maxY {
+		return 0, 0, false
+	}
+	if maxY-minY > 200 {
+		minY = maxY - 200
+	}
+	return minY, maxY, true
+}
+
+func (s *Service) scanDurationBucketsLarge(ctx context.Context, fieldKey, fieldDrivenWhere string, itemArgs []any) ([]FacetBucket, error) {
+	defs := make([]intSpanDef, len(libraryfilter.DurationBucketDefs))
+	for i, d := range libraryfilter.DurationBucketDefs {
+		defs[i] = intSpanDef{id: d.ID, label: d.Label, lo: d.Min, hi: d.Max}
+	}
+	return s.scanFieldIntSpanBuckets(ctx, fieldKey, fieldDrivenWhere, itemArgs, defs, true)
+}
+
+func (s *Service) scanFieldIntCounts(ctx context.Context, fieldKey, itemWhere, fieldDrivenWhere string, itemArgs []any, smallLib bool) ([]intFacetPair, error) {
+	if smallLib {
+		args := append(append([]any(nil), itemArgs...), fieldKey)
+		return s.scanIntFacetCounts(ctx, `SELECT f.v_int, COUNT(*) FROM plugin_item_fields f JOIN plugin_items i ON i.item_ref = f.item_ref WHERE `+itemWhere+` AND f.field = ? AND (f.v_text = '' OR f.v_int <> 0) GROUP BY f.v_int ORDER BY f.v_int ASC`, args)
+	}
+	qArgs := make([]any, 0, 3+len(itemArgs))
+	qArgs = append(qArgs, fieldKey, fieldKey, fieldKey)
+	qArgs = append(qArgs, itemArgs...)
+	return s.scanIntFacetCounts(ctx, `
+WITH RECURSIVE distinct_ints(v) AS (
+	SELECT (SELECT f.v_int FROM plugin_item_fields f WHERE f.field = ? AND (f.v_text = '' OR f.v_int <> 0) ORDER BY f.v_int ASC LIMIT 1)
+	UNION ALL
+	SELECT (SELECT f.v_int FROM plugin_item_fields f WHERE f.field = ? AND (f.v_text = '' OR f.v_int <> 0) AND f.v_int > distinct_ints.v ORDER BY f.v_int ASC LIMIT 1)
+	FROM distinct_ints
+	WHERE distinct_ints.v IS NOT NULL
+	LIMIT 400
+)
+SELECT v, (
+	SELECT COUNT(*) FROM (
+		SELECT 1 FROM plugin_item_fields f
+		JOIN plugin_items i ON i.item_ref = f.item_ref
+		WHERE f.field = ? AND (f.v_text = '' OR f.v_int <> 0) AND f.v_int = distinct_ints.v AND `+fieldDrivenWhere+`
+		LIMIT 2001
+	) s
+)
+FROM distinct_ints
+WHERE v IS NOT NULL
+ORDER BY v ASC`, qArgs)
+}
+
+func (s *Service) scanFieldFloatCounts(ctx context.Context, fieldKey, itemWhere, fieldDrivenWhere string, itemArgs []any, smallLib bool) ([]floatFacetPair, error) {
+	if smallLib {
+		args := append(append([]any(nil), itemArgs...), fieldKey)
+		return s.scanFloatFacetCounts(ctx, `SELECT f.v_real, COUNT(*) FROM plugin_item_fields f JOIN plugin_items i ON i.item_ref = f.item_ref WHERE `+itemWhere+` AND f.field = ? AND f.v_text = '' GROUP BY f.v_real ORDER BY f.v_real ASC`, args)
+	}
+	qArgs := make([]any, 0, 3+len(itemArgs))
+	qArgs = append(qArgs, fieldKey, fieldKey, fieldKey)
+	qArgs = append(qArgs, itemArgs...)
+	return s.scanFloatFacetCounts(ctx, `
+WITH RECURSIVE distinct_reals(v) AS (
+	SELECT (SELECT f.v_real FROM plugin_item_fields f WHERE f.field = ? AND f.v_text = '' ORDER BY f.v_real ASC LIMIT 1)
+	UNION ALL
+	SELECT (SELECT f.v_real FROM plugin_item_fields f WHERE f.field = ? AND f.v_text = '' AND f.v_real > distinct_reals.v ORDER BY f.v_real ASC LIMIT 1)
+	FROM distinct_reals
+	WHERE distinct_reals.v IS NOT NULL
+	LIMIT 400
+)
+SELECT v, (
+	SELECT COUNT(*) FROM (
+		SELECT 1 FROM plugin_item_fields f
+		JOIN plugin_items i ON i.item_ref = f.item_ref
+		WHERE f.field = ? AND f.v_text = '' AND f.v_real = distinct_reals.v AND `+fieldDrivenWhere+`
+		LIMIT 2001
+	) s
+)
+FROM distinct_reals
+WHERE v IS NOT NULL
+ORDER BY v ASC`, qArgs)
+}
+
+func (s *Service) scanFieldTextCountsLarge(ctx context.Context, fieldKey, fieldDrivenWhere string, itemArgs []any, countCap int) ([]FacetCount, error) {
+	qArgs := make([]any, 0, 4+len(itemArgs))
+	qArgs = append(qArgs, fieldKey, fieldKey, fieldKey)
+	qArgs = append(qArgs, itemArgs...)
+	qArgs = append(qArgs, countCap)
+	rows, err := s.db.QueryContext(ctx, `
+WITH RECURSIVE distinct_vals(val) AS (
+	SELECT (SELECT f.v_text FROM plugin_item_fields f WHERE f.field = ? AND f.v_text > '' ORDER BY f.v_text ASC LIMIT 1)
+	UNION ALL
+	SELECT (SELECT f.v_text FROM plugin_item_fields f WHERE f.field = ? AND f.v_text > distinct_vals.val ORDER BY f.v_text ASC LIMIT 1)
+	FROM distinct_vals
+	WHERE distinct_vals.val IS NOT NULL
+	LIMIT 400
+)
+SELECT val, (
+	SELECT COUNT(*) FROM (
+		SELECT 1 FROM plugin_item_fields f
+		JOIN plugin_items i ON i.item_ref = f.item_ref
+		WHERE f.field = ? AND f.v_text = distinct_vals.val AND `+fieldDrivenWhere+`
+		LIMIT ?
+	) s
+)
+FROM distinct_vals
+WHERE val IS NOT NULL`, qArgs...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []FacetCount
+	for rows.Next() {
+		var fc FacetCount
+		if err := rows.Scan(&fc.Value, &fc.Count); err != nil {
+			return nil, err
+		}
+		if fc.Value != "" && fc.Count > 0 {
+			out = append(out, fc)
+		}
+	}
+	return out, rows.Err()
+}
+
+type personBucketCandidate struct {
+	pid   int64
+	label string
+	count int
+}
+
+func (s *Service) scanPeopleCandidatesLarge(ctx context.Context, fieldKey, fieldDrivenWhere string, itemArgs []any, countCap int) ([]personBucketCandidate, error) {
+	minPID := core.PluginPersonIDBase
+	maxPID := core.PluginPersonIDBase + core.PluginPersonIDSpan
+	qArgs := make([]any, 0, 9+2*len(itemArgs))
+	qArgs = append(qArgs, fieldKey, minPID, maxPID, fieldKey, maxPID)
+	qArgs = append(qArgs, fieldKey)
+	qArgs = append(qArgs, itemArgs...)
+	qArgs = append(qArgs, countCap)
+	qArgs = append(qArgs, fieldKey)
+	qArgs = append(qArgs, itemArgs...)
+	qArgs = append(qArgs, countCap)
+	rows, err := s.db.QueryContext(ctx, `
+WITH RECURSIVE distinct_pids(pid) AS (
+	SELECT (SELECT f.v_int FROM plugin_item_fields f WHERE f.field = ? AND f.v_int <> 0 AND f.v_int > ? AND f.v_int < ? ORDER BY f.v_int ASC LIMIT 1)
+	UNION ALL
+	SELECT (SELECT f.v_int FROM plugin_item_fields f WHERE f.field = ? AND f.v_int <> 0 AND f.v_int > distinct_pids.pid AND f.v_int < ? ORDER BY f.v_int ASC LIMIT 1)
+	FROM distinct_pids
+	WHERE distinct_pids.pid IS NOT NULL
+	LIMIT 400
+)
+SELECT pid,
+	COALESCE((
+		SELECT MIN(sub.v_text) FROM (
+			SELECT f.v_text FROM plugin_item_fields f
+			JOIN plugin_items i ON i.item_ref = f.item_ref
+			WHERE f.field = ? AND f.v_int <> 0 AND f.v_int = distinct_pids.pid AND f.v_text <> '' AND `+fieldDrivenWhere+`
+			LIMIT ?
+		) sub
+	), ''),
+	(
+		SELECT COUNT(*) FROM (
+			SELECT 1 FROM plugin_item_fields f
+			JOIN plugin_items i ON i.item_ref = f.item_ref
+			WHERE f.field = ? AND f.v_int <> 0 AND f.v_int = distinct_pids.pid AND f.v_text <> '' AND `+fieldDrivenWhere+`
+			LIMIT ?
+		) sub2
+	)
+FROM distinct_pids
+WHERE pid IS NOT NULL`, qArgs...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []personBucketCandidate
+	for rows.Next() {
+		var pid int64
+		var label string
+		var cnt int
+		if err := rows.Scan(&pid, &label, &cnt); err != nil {
+			return nil, err
+		}
+		clean := strings.TrimSpace(label)
+		if clean != "" && cnt > 0 {
+			out = append(out, personBucketCandidate{pid: pid, label: clean, count: cnt})
+		}
+	}
+	return out, rows.Err()
+}
+
+func (s *Service) scanPeopleBucketsLarge(ctx context.Context, fieldKey, fieldDrivenWhere string, itemArgs []any) ([]FacetBucket, error) {
+	cands, err := s.scanPeopleCandidatesLarge(ctx, fieldKey, fieldDrivenWhere, itemArgs, 2001)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]FacetBucket, 0, len(cands))
+	for _, c := range cands {
+		out = append(out, FacetBucket{ID: c.label, Label: c.label, Count: c.count})
+	}
+	sort.SliceStable(out, func(i, j int) bool { return facetNameLess(out[i].Label, out[j].Label) })
+	return out, nil
+}
+
+type intFacetPair struct {
+	val   int64
+	count int
+}
+
+type floatFacetPair struct {
+	val   float64
+	count int
+}
+
+func (s *Service) scanIntFacetCounts(ctx context.Context, query string, args []any) ([]intFacetPair, error) {
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []intFacetPair
+	for rows.Next() {
+		var p intFacetPair
+		if err := rows.Scan(&p.val, &p.count); err != nil {
+			return nil, err
+		}
+		if p.count > 0 {
+			out = append(out, p)
+		}
+	}
+	return out, rows.Err()
+}
+
+func (s *Service) scanFloatFacetCounts(ctx context.Context, query string, args []any) ([]floatFacetPair, error) {
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []floatFacetPair
+	for rows.Next() {
+		var p floatFacetPair
+		if err := rows.Scan(&p.val, &p.count); err != nil {
+			return nil, err
+		}
+		if p.count > 0 {
+			out = append(out, p)
+		}
+	}
+	return out, rows.Err()
+}
+
+func bucketDateYears(vals []intFacetPair) []FacetBucket {
+	if len(vals) == 0 {
+		return []FacetBucket{}
+	}
+	byYear := make(map[int]int)
+	for _, p := range vals {
+		y := time.Unix(p.val, 0).UTC().Year()
+		if y >= 1000 && y <= 9999 {
+			byYear[y] += p.count
+		}
+	}
+	years := make([]int, 0, len(byYear))
+	for y := range byYear {
+		years = append(years, y)
+	}
+	sort.Sort(sort.Reverse(sort.IntSlice(years)))
+	out := make([]FacetBucket, 0, len(years))
+	for _, y := range years {
+		s := strconv.Itoa(y)
+		out = append(out, FacetBucket{ID: s, Label: s, Count: byYear[y]})
+	}
+	return out
+}
+
+func bucketDateDecades(vals []intFacetPair) []FacetBucket {
+	if len(vals) == 0 {
+		return []FacetBucket{}
+	}
+	byDecade := make(map[int]int)
+	for _, p := range vals {
+		y := time.Unix(p.val, 0).UTC().Year()
+		if y >= 1000 && y <= 9999 {
+			d := (y / 10) * 10
+			byDecade[d] += p.count
+		}
+	}
+	decades := make([]int, 0, len(byDecade))
+	for d := range byDecade {
+		decades = append(decades, d)
+	}
+	sort.Sort(sort.Reverse(sort.IntSlice(decades)))
+	out := make([]FacetBucket, 0, len(decades))
+	for _, d := range decades {
+		ds := strconv.Itoa(d)
+		out = append(out, FacetBucket{ID: ds, Label: ds + "s", Count: byDecade[d]})
+	}
+	return out
+}
+
+func bucketYearDecades(vals []intFacetPair) []FacetBucket {
+	if len(vals) == 0 {
+		return []FacetBucket{}
+	}
+	byDecade := make(map[int]int)
+	for _, p := range vals {
+		y := int(p.val)
+		if y >= 1000 && y <= 9999 {
+			d := (y / 10) * 10
+			byDecade[d] += p.count
+		}
+	}
+	decades := make([]int, 0, len(byDecade))
+	for d := range byDecade {
+		decades = append(decades, d)
+	}
+	sort.Sort(sort.Reverse(sort.IntSlice(decades)))
+	out := make([]FacetBucket, 0, len(decades))
+	for _, d := range decades {
+		ds := strconv.Itoa(d)
+		out = append(out, FacetBucket{ID: ds, Label: ds + "s", Count: byDecade[d]})
+	}
+	return out
+}
+
+func bucketDurationValues(vals []intFacetPair) []FacetBucket {
+	if len(vals) == 0 {
+		return []FacetBucket{}
+	}
+	counts := make([]int, len(libraryfilter.DurationBucketDefs))
+	for _, p := range vals {
+		if p.val < 0 {
+			continue
+		}
+		for i, def := range libraryfilter.DurationBucketDefs {
+			if p.val >= def.Min && p.val <= def.Max {
+				counts[i] += p.count
+				break
+			}
+		}
+	}
+	out := make([]FacetBucket, 0, len(libraryfilter.DurationBucketDefs))
+	for i, def := range libraryfilter.DurationBucketDefs {
+		if counts[i] > 0 {
+			out = append(out, FacetBucket{ID: def.ID, Label: def.Label, Count: counts[i]})
+		}
+	}
+	return out
+}
+
+func bucketIntValues(vals []intFacetPair, descDistinct bool) []FacetBucket {
+	if len(vals) == 0 {
+		return []FacetBucket{}
+	}
+	if len(vals) <= 50 {
+		out := make([]FacetBucket, len(vals))
+		for i, p := range vals {
+			idx := i
+			if descDistinct {
+				idx = len(vals) - 1 - i
+			}
+			s := strconv.FormatInt(p.val, 10)
+			out[idx] = FacetBucket{ID: s, Label: s, Count: p.count}
+		}
+		return out
+	}
+	minVal, maxVal := vals[0].val, vals[len(vals)-1].val
+	step := niceIntBucketStep(minVal, maxVal, 10)
+	firstLo := floorDivInt64(minVal, step) * step
+	type rangeAccum struct {
+		lo, hi int64
+		count  int
+	}
+	byIdx := make(map[int64]*rangeAccum)
+	var order []int64
+	for _, p := range vals {
+		bIdx := floorDivInt64(p.val-firstLo, step)
+		acc := byIdx[bIdx]
+		if acc == nil {
+			lo := firstLo + bIdx*step
+			acc = &rangeAccum{lo: lo, hi: lo + step - 1}
+			byIdx[bIdx] = acc
+			order = append(order, bIdx)
+		}
+		acc.count += p.count
+	}
+	sort.Slice(order, func(i, j int) bool { return order[i] < order[j] })
+	out := make([]FacetBucket, 0, len(order))
+	for _, bIdx := range order {
+		acc := byIdx[bIdx]
+		if acc.count <= 0 {
+			continue
+		}
+		id := fmt.Sprintf("%d..%d", acc.lo, acc.hi)
+		label := fmt.Sprintf("%d-%d", acc.lo, acc.hi)
+		if acc.lo == acc.hi {
+			label = strconv.FormatInt(acc.lo, 10)
+		} else if acc.lo < 0 {
+			label = fmt.Sprintf("%d to %d", acc.lo, acc.hi)
+		}
+		out = append(out, FacetBucket{ID: id, Label: label, Count: acc.count})
+	}
+	return out
+}
+
+func bucketFloatValues(vals []floatFacetPair) []FacetBucket {
+	if len(vals) == 0 {
+		return []FacetBucket{}
+	}
+	if len(vals) <= 50 {
+		out := make([]FacetBucket, len(vals))
+		for i, p := range vals {
+			s := strconv.FormatFloat(p.val, 'f', -1, 64)
+			out[i] = FacetBucket{ID: s, Label: s, Count: p.count}
+		}
+		return out
+	}
+	minInt := int64(math.Floor(vals[0].val))
+	maxInt := int64(math.Ceil(vals[len(vals)-1].val))
+	step := niceIntBucketStep(minInt, maxInt, 10)
+	firstLo := floorDivInt64(minInt, step) * step
+	type rangeAccum struct {
+		lo, hi int64
+		count  int
+	}
+	byIdx := make(map[int64]*rangeAccum)
+	var order []int64
+	for _, p := range vals {
+		iv := int64(math.Floor(p.val))
+		bIdx := floorDivInt64(iv-firstLo, step)
+		acc := byIdx[bIdx]
+		if acc == nil {
+			lo := firstLo + bIdx*step
+			acc = &rangeAccum{lo: lo, hi: lo + step}
+			byIdx[bIdx] = acc
+			order = append(order, bIdx)
+		}
+		acc.count += p.count
+	}
+	sort.Slice(order, func(i, j int) bool { return order[i] < order[j] })
+	out := make([]FacetBucket, 0, len(order))
+	for _, bIdx := range order {
+		acc := byIdx[bIdx]
+		if acc.count <= 0 {
+			continue
+		}
+		id := fmt.Sprintf("%d..%d", acc.lo, acc.hi)
+		label := fmt.Sprintf("%d-%d", acc.lo, acc.hi)
+		if acc.lo < 0 {
+			label = fmt.Sprintf("%d to %d", acc.lo, acc.hi)
+		}
+		out = append(out, FacetBucket{ID: id, Label: label, Count: acc.count})
+	}
+	return out
+}
+
+func niceIntBucketStep(minVal, maxVal int64, targetBuckets int64) int64 {
+	if targetBuckets <= 0 {
+		targetBuckets = 10
+	}
+	span := float64(maxVal-minVal) + 1
+	if span <= float64(targetBuckets) {
+		return 1
+	}
+	raw := span / float64(targetBuckets)
+	exp := math.Pow(10, math.Floor(math.Log10(raw)))
+	if exp < 1 {
+		exp = 1
+	}
+	for _, mult := range []float64{1, 2, 5, 10} {
+		cand := mult * exp
+		if cand >= raw {
+			if cand > float64(math.MaxInt64/2) {
+				return math.MaxInt64 / 2
+			}
+			step := int64(cand)
+			if step < 1 {
+				return 1
+			}
+			return step
+		}
+	}
+	return 1
+}
+
+func floorDivInt64(a, b int64) int64 {
+	q := a / b
+	r := a % b
+	if r != 0 && ((r < 0) != (b < 0)) {
+		q--
+	}
+	return q
+}
+
+// orderFacetValues orders a facet page for reading. Numbers keep the most
+// common first; labels read alphabetically; an enum follows its declaration.
+func orderFacetValues(values []FacetCount, fieldType string, enum []string) {
+	switch fieldType {
+	case "enum":
+		rank := make(map[string]int, len(enum))
+		for i, v := range enum {
+			rank[v] = i
+		}
+		sort.SliceStable(values, func(i, j int) bool {
+			ri, iok := rank[values[i].Value]
+			rj, jok := rank[values[j].Value]
+			if iok != jok {
+				return iok
+			}
+			if iok {
+				return ri < rj
+			}
+			return facetNameLess(values[i].Value, values[j].Value)
+		})
+	case "string", "strings", "bool", "people":
+		sort.SliceStable(values, func(i, j int) bool { return facetNameLess(values[i].Value, values[j].Value) })
+	}
+}
+
+func facetNameLess(a, b string) bool {
+	if la, lb := strings.ToLower(a), strings.ToLower(b); la != lb {
+		return la < lb
+	}
+	return a < b
+}
+
+func envelopeFacet(key string) bool {
+	return key == "year" || key == "released" || key == "rating"
+}
+
+func hasActiveFacets(facets map[string][]string) bool {
+	for k, vals := range facets {
+		if strings.TrimSpace(k) == "" {
+			continue
+		}
+		for _, v := range vals {
+			if strings.TrimSpace(v) != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// facetMode selects how one facet map's values combine within a field:
+// any of them (OR), all of them (one predicate per value), or none of
+// them (negated). Fields always combine with AND.
+type facetMode int
+
+const (
+	facetAny facetMode = iota
+	facetAll
+	facetNone
+)
+
+func checkFacetValueBound(maps ...map[string][]string) error {
+	total := 0
+	for _, facets := range maps {
+		for _, vals := range facets {
+			total += len(vals)
+			if total > MaxBrowseFacetValues {
+				return fmt.Errorf("pluginitems: facet values exceed %d per query", MaxBrowseFacetValues)
+			}
+		}
+	}
+	return nil
+}
+
+func cleanFacetValues(vals []string) []string {
+	var clean []string
+	for _, v := range vals {
+		if v = strings.TrimSpace(v); v != "" {
+			clean = append(clean, v)
+		}
+	}
+	return clean
+}
+
+func sortedFacetKeys(facets map[string][]string) []string {
+	keys := make([]string, 0, len(facets))
+	for k := range facets {
+		if strings.TrimSpace(k) != "" {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// appendLibraryFacetMode emits libraryfilter facet predicates for one
+// mode: any uses the map directly, all repeats the predicate per value,
+// and none negates each field's predicate.
+func appendLibraryFacetMode(where *strings.Builder, args *[]any, facets map[string][]string, types map[string]string, mode facetMode) {
+	switch mode {
+	case facetAny:
+		libraryfilter.AppendPluginFacetClauses(where, args, facets, types)
+	case facetAll:
+		for _, key := range sortedFacetKeys(facets) {
+			for _, v := range cleanFacetValues(facets[key]) {
+				libraryfilter.AppendPluginFacetClauses(where, args, map[string][]string{key: {v}}, types)
+			}
+		}
+	case facetNone:
+		for _, key := range sortedFacetKeys(facets) {
+			cleanVals := cleanFacetValues(facets[key])
+			if len(cleanVals) == 0 {
+				continue
+			}
+			var tmp strings.Builder
+			var tmpArgs []any
+			libraryfilter.AppendPluginFacetClauses(&tmp, &tmpArgs, map[string][]string{key: cleanVals}, types)
+			clause := strings.TrimPrefix(tmp.String(), " AND ")
+			if clause == "" || clause == "0=1" {
+				continue
+			}
+			*args = append(*args, tmpArgs...)
+			where.WriteString(` AND NOT (` + clause + `)`)
+		}
+	}
+}
+
+// appendFacets resolves field types only when a browse/search uses facets.
+func (s *Service) appendFacets(ctx context.Context, lib core.LibraryID, where *strings.Builder, args *[]any, facets, allFacets, excludeFacets map[string][]string) error {
+	if !hasActiveFacets(facets) && !hasActiveFacets(allFacets) && !hasActiveFacets(excludeFacets) {
+		return nil
+	}
+	if err := checkFacetValueBound(facets, allFacets, excludeFacets); err != nil {
+		return err
+	}
+	rec, err := s.GetKindByLibrary(ctx, lib)
+	if err != nil {
+		return err
+	}
+	types := map[string]string{}
+	for _, field := range rec.Decl.Fields {
+		types[field.Key] = field.Type
+	}
+	appendLibraryFacetMode(where, args, facets, types, facetAny)
+	appendLibraryFacetMode(where, args, allFacets, types, facetAll)
+	appendLibraryFacetMode(where, args, excludeFacets, types, facetNone)
+	return nil
+}
+
+// appendBrowseFacets emits IN-subquery predicates on plugin_item_fields for
+// positive Browse queries so SQLite/PostgreSQL drive execution from
+// plugin_item_fields_lookup / plugin_item_fields_lookup_int /
+// plugin_item_fields_lookup_real instead of scanning all library items with
+// correlated EXISTS checks.
+func (s *Service) appendBrowseFacets(ctx context.Context, lib core.LibraryID, where *strings.Builder, args *[]any, facets map[string][]string) (bool, error) {
+	return s.appendBrowseFacetsMode(ctx, lib, where, args, facets, facetAny)
+}
+
+// appendBrowseFacetsMode is appendBrowseFacets for one facet mode. All
+// repeats the indexed predicate once per value so every value must be
+// present; none emits the same indexed subquery under NOT IN so items
+// having any listed value are dropped. The returned flag reports whether
+// a positive field-index predicate can drive the query.
+func (s *Service) appendBrowseFacetsMode(ctx context.Context, lib core.LibraryID, where *strings.Builder, args *[]any, facets map[string][]string, mode facetMode) (bool, error) {
+	if !hasActiveFacets(facets) {
+		return false, nil
+	}
+	rec, err := s.GetKindByLibrary(ctx, lib)
+	if err != nil {
+		return false, err
+	}
+	types := map[string]string{}
+	for _, field := range rec.Decl.Fields {
+		types[field.Key] = field.Type
+	}
+	negate := mode == facetNone
+	usedFieldIndex := false
+
+	emit := func(key string, cleanVals []string) {
+		if key == "decade" && types["decade"] == "" {
+			appendLibraryFacetMode(where, args, map[string][]string{key: cleanVals}, types, mode)
+			return
+		}
+		if base, ok := libraryfilter.SplitDateDecadeFacet(key); ok && types[base] == "date" {
+			appendBrowseDateDecadeClause(where, args, base, cleanVals, &usedFieldIndex, negate)
+			return
+		}
+		ftype := types[key]
+		if envelopeFacet(key) {
+			appendLibraryFacetMode(where, args, map[string][]string{key: cleanVals}, types, mode)
+			return
+		}
+		switch ftype {
+		case "int", "date", "duration":
+			appendBrowseIntFieldClause(where, args, key, ftype, cleanVals, &usedFieldIndex, negate)
+		case "float":
+			appendBrowseFloatFieldClause(where, args, key, cleanVals, &usedFieldIndex, negate)
+		case "people":
+			appendBrowsePeopleFieldClause(where, args, key, cleanVals, &usedFieldIndex, negate)
+		default:
+			if ftype == "" && browseAllIntRanges(cleanVals) {
+				appendBrowseIntFieldClause(where, args, key, "int", cleanVals, &usedFieldIndex, negate)
+				return
+			}
+			placeholders := make([]string, len(cleanVals))
+			*args = append(*args, key)
+			for idx, v := range cleanVals {
+				placeholders[idx] = "?"
+				*args = append(*args, v)
+			}
+			op := "IN"
+			if negate {
+				op = "NOT IN"
+			}
+			where.WriteString(` AND i.item_ref ` + op + ` (SELECT f.item_ref FROM plugin_item_fields f WHERE f.field = ? AND f.v_text IN (` + strings.Join(placeholders, ", ") + `))`)
+			if !negate {
+				usedFieldIndex = true
+			}
+		}
+	}
+
+	for _, key := range sortedFacetKeys(facets) {
+		cleanVals := cleanFacetValues(facets[key])
+		if len(cleanVals) == 0 {
+			continue
+		}
+		if mode == facetAll {
+			for _, v := range cleanVals {
+				emit(key, []string{v})
+			}
+			continue
+		}
+		emit(key, cleanVals)
+	}
+	return usedFieldIndex, nil
+}
+
+type fieldDisjunct struct {
+	sql         string
+	args        []any
+	partialPred string
+}
+
+func intRangePartialPred(lo, hi int64) string {
+	if lo > 0 || hi < 0 {
+		return `f.v_int <> 0`
+	}
+	return `(f.v_text = '' OR f.v_int <> 0)`
+}
+
+// appendBrowseFieldDisjuncts emits an item_ref IN (...) filter carrying
+// partialPred verbatim so SQLite and PostgreSQL prove the partial numeric
+// index applies. Multiple disjuncts use UNION ALL instead of a single OR so
+// SQLite seeks the partial index on every branch rather than falling back to a
+// full field scan.
+func appendBrowseFieldDisjuncts(where *strings.Builder, args *[]any, fieldKey, defaultPartialPred string, disjuncts []fieldDisjunct, negate bool) {
+	predFor := func(d fieldDisjunct) string {
+		if d.partialPred != "" {
+			return d.partialPred
+		}
+		return defaultPartialPred
+	}
+	op := "IN"
+	if negate {
+		op = "NOT IN"
+	}
+	if len(disjuncts) == 1 {
+		*args = append(*args, fieldKey)
+		*args = append(*args, disjuncts[0].args...)
+		where.WriteString(` AND i.item_ref ` + op + ` (SELECT f.item_ref FROM plugin_item_fields f WHERE f.field = ? AND ` + predFor(disjuncts[0]) + ` AND ` + disjuncts[0].sql + `)`)
+		return
+	}
+	where.WriteString(` AND i.item_ref ` + op + ` (`)
+	for idx, d := range disjuncts {
+		if idx > 0 {
+			where.WriteString(` UNION ALL `)
+		}
+		*args = append(*args, fieldKey)
+		*args = append(*args, d.args...)
+		where.WriteString(`SELECT f.item_ref FROM plugin_item_fields f WHERE f.field = ? AND ` + predFor(d) + ` AND ` + d.sql)
+	}
+	where.WriteString(`)`)
+}
+
+func appendBrowseDateDecadeClause(where *strings.Builder, args *[]any, baseField string, vals []string, used *bool, negate bool) {
+	var disjuncts []fieldDisjunct
+	for _, v := range vals {
+		if lo, hi, ok := libraryfilter.ParseDateDecadeBucket(v); ok {
+			disjuncts = append(disjuncts, fieldDisjunct{
+				sql:         `f.v_int BETWEEN ? AND ?`,
+				args:        []any{lo, hi},
+				partialPred: intRangePartialPred(lo, hi),
+			})
+		}
+	}
+	if len(disjuncts) == 0 {
+		if !negate {
+			where.WriteString(` AND 0=1`)
+		}
+		return
+	}
+	appendBrowseFieldDisjuncts(where, args, baseField, `(f.v_text = '' OR f.v_int <> 0)`, disjuncts, negate)
+	if !negate {
+		*used = true
+	}
+}
+
+func appendBrowseFloatFieldClause(where *strings.Builder, args *[]any, key string, vals []string, used *bool, negate bool) {
+	var disjuncts []fieldDisjunct
+	var exactPh []string
+	var exactArgs []any
+	for _, v := range vals {
+		if strings.Contains(v, "..") {
+			parts := strings.SplitN(v, "..", 2)
+			lo, e1 := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
+			hi, e2 := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+			if e1 == nil && e2 == nil && !math.IsNaN(lo) && !math.IsNaN(hi) && !math.IsInf(lo, 0) && !math.IsInf(hi, 0) && lo <= hi {
+				disjuncts = append(disjuncts, fieldDisjunct{
+					sql:  `f.v_real BETWEEN ? AND ?`,
+					args: []any{lo, hi},
+				})
+				continue
+			}
+		}
+		n, err := strconv.ParseFloat(v, 64)
+		if err != nil || math.IsNaN(n) || math.IsInf(n, 0) {
+			continue
+		}
+		exactPh = append(exactPh, "?")
+		exactArgs = append(exactArgs, n)
+	}
+	if len(exactPh) > 0 {
+		disjuncts = append(disjuncts, fieldDisjunct{
+			sql:  `f.v_real IN (` + strings.Join(exactPh, ", ") + `)`,
+			args: exactArgs,
+		})
+	}
+	if len(disjuncts) == 0 {
+		if !negate {
+			where.WriteString(` AND 0=1`)
+		}
+		return
+	}
+	appendBrowseFieldDisjuncts(where, args, key, `f.v_text = ''`, disjuncts, negate)
+	if !negate {
+		*used = true
+	}
+}
+
+func browseAllIntRanges(vals []string) bool {
+	if len(vals) == 0 {
+		return false
+	}
+	for _, v := range vals {
+		if !strings.Contains(v, "..") {
+			return false
+		}
+		parts := strings.SplitN(v, "..", 2)
+		lo, e1 := strconv.ParseInt(strings.TrimSpace(parts[0]), 10, 64)
+		hi, e2 := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64)
+		if e1 != nil || e2 != nil || lo > hi {
+			return false
+		}
+	}
+	return true
+}
+
+func appendBrowseIntFieldClause(where *strings.Builder, args *[]any, key, ftype string, vals []string, used *bool, negate bool) {
+	var disjuncts []fieldDisjunct
+	var exactPh []string
+	var exactArgs []any
+	exactHasZero := false
+	for _, v := range vals {
+		if ftype == "duration" {
+			if lo, hi, ok := libraryfilter.ParseDurationBucket(v); ok {
+				if hi == math.MaxInt64 {
+					disjuncts = append(disjuncts, fieldDisjunct{
+						sql:         `f.v_int >= ?`,
+						args:        []any{lo},
+						partialPred: intRangePartialPred(lo, hi),
+					})
+				} else {
+					disjuncts = append(disjuncts, fieldDisjunct{
+						sql:         `f.v_int BETWEEN ? AND ?`,
+						args:        []any{lo, hi},
+						partialPred: intRangePartialPred(lo, hi),
+					})
+				}
+				continue
+			}
+		}
+		if ftype == "date" {
+			if lo, hi, ok := libraryfilter.ParseDateYearBucket(v); ok {
+				disjuncts = append(disjuncts, fieldDisjunct{
+					sql:         `f.v_int BETWEEN ? AND ?`,
+					args:        []any{lo, hi},
+					partialPred: intRangePartialPred(lo, hi),
+				})
+				continue
+			}
+		}
+		if strings.Contains(v, "..") {
+			parts := strings.SplitN(v, "..", 2)
+			lo, e1 := strconv.ParseInt(strings.TrimSpace(parts[0]), 10, 64)
+			hi, e2 := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64)
+			if e1 == nil && e2 == nil && lo <= hi {
+				disjuncts = append(disjuncts, fieldDisjunct{
+					sql:         `f.v_int BETWEEN ? AND ?`,
+					args:        []any{lo, hi},
+					partialPred: intRangePartialPred(lo, hi),
+				})
+				continue
+			}
+		}
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			continue
+		}
+		if n == 0 {
+			exactHasZero = true
+		}
+		exactPh = append(exactPh, "?")
+		exactArgs = append(exactArgs, n)
+	}
+	if len(exactPh) > 0 {
+		pred := `f.v_int <> 0`
+		if exactHasZero {
+			pred = `(f.v_text = '' OR f.v_int <> 0)`
+		}
+		disjuncts = append(disjuncts, fieldDisjunct{
+			sql:         `f.v_int IN (` + strings.Join(exactPh, ", ") + `)`,
+			args:        exactArgs,
+			partialPred: pred,
+		})
+	}
+	if len(disjuncts) == 0 {
+		if !negate {
+			where.WriteString(` AND 0=1`)
+		}
+		return
+	}
+	appendBrowseFieldDisjuncts(where, args, key, `(f.v_text = '' OR f.v_int <> 0)`, disjuncts, negate)
+	if !negate {
+		*used = true
+	}
+}
+
+func appendBrowsePeopleFieldClause(where *strings.Builder, args *[]any, key string, vals []string, used *bool, negate bool) {
+	var pids []int64
+	for _, v := range vals {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && core.IsPluginPersonID(n) {
+			pids = append(pids, n)
+			continue
+		}
+		if pid := core.PluginPersonID(v); pid > 0 {
+			pids = append(pids, pid)
+		}
+	}
+	if len(pids) == 0 {
+		if !negate {
+			where.WriteString(` AND 0=1`)
+		}
+		return
+	}
+	placeholders := make([]string, len(pids))
+	*args = append(*args, key)
+	for idx, pid := range pids {
+		placeholders[idx] = "?"
+		*args = append(*args, pid)
+	}
+	op := "IN"
+	if negate {
+		op = "NOT IN"
+	}
+	where.WriteString(` AND i.item_ref ` + op + ` (SELECT f.item_ref FROM plugin_item_fields f WHERE f.field = ? AND f.v_int <> 0 AND f.v_int IN (` + strings.Join(placeholders, ", ") + `))`)
+	if !negate {
+		*used = true
+	}
+}
+
+func (s *Service) appendBrowsePersonFilter(ctx context.Context, lib core.LibraryID, where *strings.Builder, args *[]any, personID int64) (bool, error) {
+	if !core.IsPluginPersonID(personID) {
+		return false, nil
+	}
+	rec, err := s.GetKindByLibrary(ctx, lib)
+	if err != nil {
+		return false, err
+	}
+	var pFields []string
+	for _, field := range rec.Decl.Fields {
+		if field.Type == "people" {
+			pFields = append(pFields, field.Key)
+		}
+	}
+	if len(pFields) == 0 {
+		return false, nil
+	}
+	placeholders := make([]string, len(pFields))
+	for i, fk := range pFields {
+		placeholders[i] = "?"
+		*args = append(*args, fk)
+	}
+	*args = append(*args, personID)
+	where.WriteString(` AND i.item_ref IN (SELECT pf.item_ref FROM plugin_item_fields pf WHERE pf.field IN (` + strings.Join(placeholders, ",") + `) AND pf.v_int <> 0 AND pf.v_int = ?)`)
+	return true, nil
+}
+
+func (s *Service) appendPersonFilter(ctx context.Context, lib core.LibraryID, where *strings.Builder, args *[]any, personID int64) (bool, error) {
+	if !core.IsPluginPersonID(personID) {
+		return false, nil
+	}
+	rec, err := s.GetKindByLibrary(ctx, lib)
+	if err != nil {
+		return false, err
+	}
+	var pFields []string
+	for _, field := range rec.Decl.Fields {
+		if field.Type == "people" {
+			pFields = append(pFields, field.Key)
+		}
+	}
+	if len(pFields) == 0 {
+		return false, nil
+	}
+	placeholders := make([]string, len(pFields))
+	for i, fk := range pFields {
+		placeholders[i] = "?"
+		*args = append(*args, fk)
+	}
+	*args = append(*args, personID)
+	where.WriteString(` AND EXISTS (SELECT 1 FROM plugin_item_fields pf WHERE pf.item_ref = i.item_ref AND pf.field IN (` + strings.Join(placeholders, ",") + `) AND pf.v_int <> 0 AND pf.v_int = ?)`)
+	return true, nil
+}
+
+// FacetCollectionsQuery requests a single page of facet-backed collections
+// ordered by item count (default) or bucket name, hydrating artwork only for
+// the newest item of each bucket on the page in one batched query.
+type FacetCollectionsQuery struct {
+	LibraryID core.LibraryID
+	Level     string
+	Policy    *libraryfilter.Filter
+	FieldKey  string
+	Order     string // "count" (default) | "name"
+	Query     string
+	Offset    int
+	Limit     int
+}
+
+// FacetCollection is one facet-backed collection bucket with its newest item.
+type FacetCollection struct {
+	ID         string         `json:"id"`
+	Label      string         `json:"label"`
+	Count      int            `json:"count"`
+	NewestItem *core.KindItem `json:"-"`
+}
+
+// FacetCollectionsPage is a single page of facet collections.
+type FacetCollectionsPage struct {
+	Items []FacetCollection
+	More  bool
+}
+
+// FacetCollections returns one page of facet buckets ordered most-items-first
+// (default) or alphabetically by name (Order: "name"), resolving the newest
+// visible item + artwork across the whole page in one batched lookup.
+func (s *Service) FacetCollections(ctx context.Context, q FacetCollectionsQuery) (FacetCollectionsPage, error) {
+	if s == nil || s.db == nil {
+		return FacetCollectionsPage{}, fmt.Errorf("pluginitems: nil service")
+	}
+	fieldKey := strings.TrimSpace(q.FieldKey)
+	if q.LibraryID <= 0 || fieldKey == "" {
+		return FacetCollectionsPage{}, fmt.Errorf("pluginitems: library_id and field_key are required")
+	}
+	trimmedQuery := strings.TrimSpace(q.Query)
+	terms := foldQueryTerms(trimmedQuery)
+	if trimmedQuery != "" && len(terms) == 0 {
+		return FacetCollectionsPage{Items: []FacetCollection{}}, nil
+	}
+	rec, err := s.GetKindByLibrary(ctx, q.LibraryID)
+	if err != nil {
+		return FacetCollectionsPage{}, err
+	}
+	limit := q.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	offset := max(q.Offset, 0)
+	orderByName := strings.EqualFold(strings.TrimSpace(q.Order), "name")
+
+	itemWhere, fieldDrivenWhere, itemArgs, err := s.buildRootItemPredicates(ctx, rec, q.Level, q.Policy)
+	if err != nil {
+		return FacetCollectionsPage{}, err
+	}
+	smallLib, err := s.libraryHasAtMostItems(ctx, itemWhere, itemArgs, smallPluginLibraryMax)
+	if err != nil {
+		return FacetCollectionsPage{}, err
+	}
+
+	fieldTypes := make(map[string]string, len(rec.Decl.Fields))
+	var fieldType string
+	for _, fd := range rec.Decl.Fields {
+		fieldTypes[fd.Key] = fd.Type
+		if fd.Key == fieldKey {
+			fieldType = fd.Type
+		}
+	}
+	isEnv := envelopeFacet(fieldKey) || (fieldKey == "decade" && fieldType == "")
+	isDateDecade := false
+	if base, ok := libraryfilter.SplitDateDecadeFacet(fieldKey); ok && fieldTypes[base] == "date" {
+		isDateDecade = true
+	}
+	if !isEnv && !isDateDecade && fieldType == "" {
+		return FacetCollectionsPage{Items: []FacetCollection{}}, nil
+	}
+
+	var pageBuckets []FacetBucket
+	var pagePersonIDs []int64
+	more := false
+
+	switch {
+	case !isEnv && !isDateDecade && fieldType == "people":
+		if !smallLib && len(terms) == 0 {
+			cands, err := s.scanPeopleCandidatesLarge(ctx, fieldKey, fieldDrivenWhere, itemArgs, 2001)
+			if err != nil {
+				return FacetCollectionsPage{}, err
+			}
+			if orderByName {
+				sort.SliceStable(cands, func(i, j int) bool {
+					if !facetNameLess(cands[i].label, cands[j].label) && !facetNameLess(cands[j].label, cands[i].label) {
+						return cands[i].pid < cands[j].pid
+					}
+					return facetNameLess(cands[i].label, cands[j].label)
+				})
+			} else {
+				sort.SliceStable(cands, func(i, j int) bool {
+					if cands[i].count != cands[j].count {
+						return cands[i].count > cands[j].count
+					}
+					return facetNameLess(cands[i].label, cands[j].label)
+				})
+			}
+			if offset < len(cands) {
+				end := min(offset+limit, len(cands))
+				for _, c := range cands[offset:end] {
+					pageBuckets = append(pageBuckets, FacetBucket{ID: c.label, Label: c.label, Count: c.count})
+					pagePersonIDs = append(pagePersonIDs, c.pid)
+				}
+				more = end < len(cands)
+			}
+			break
+		}
+		orderClause := `cnt DESC, LOWER(MIN(f.v_text)) ASC, MIN(f.v_text) ASC, f.v_int ASC`
+		if orderByName {
+			orderClause = `LOWER(MIN(f.v_text)) ASC, MIN(f.v_text) ASC, f.v_int ASC`
+		}
+		var rows *sql.Rows
+		if len(terms) > 0 {
+			var subWhere strings.Builder
+			var subArgs []any
+			subWhere.WriteString(`f.field = ? AND f.v_int + 0 > 0 AND f.v_text <> ''`)
+			subArgs = append(subArgs, fieldKey)
+			appendFoldedWordPrefix(&subWhere, &subArgs, terms)
+			subArgs = append(subArgs, 50000)
+			qArgs := append(subArgs, itemArgs...)
+			qArgs = append(qArgs, limit+1, offset)
+			rows, err = s.db.QueryContext(ctx,
+				`SELECT f.v_int, MIN(f.v_text) AS label, COUNT(*) AS cnt
+				 FROM (SELECT item_ref, v_int, v_text FROM plugin_item_fields f WHERE `+subWhere.String()+` LIMIT ?) f
+				 JOIN plugin_items i ON i.item_ref = f.item_ref
+				 WHERE `+fieldDrivenWhere+`
+				 GROUP BY f.v_int
+				 ORDER BY `+orderClause+`
+				 LIMIT ? OFFSET ?`, qArgs...)
+		} else {
+			qArgs := append(append([]any(nil), itemArgs...), fieldKey, limit+1, offset)
+			rows, err = s.db.QueryContext(ctx,
+				`SELECT f.v_int, MIN(f.v_text) AS label, COUNT(*) AS cnt
+				 FROM plugin_item_fields f
+				 JOIN plugin_items i ON i.item_ref = f.item_ref
+				 WHERE `+itemWhere+` AND f.field = ? AND f.v_int <> 0 AND f.v_int > 0 AND f.v_text <> ''
+				 GROUP BY f.v_int
+				 ORDER BY `+orderClause+`
+				 LIMIT ? OFFSET ?`, qArgs...)
+		}
+		if err != nil {
+			return FacetCollectionsPage{}, err
+		}
+		for rows.Next() {
+			var pid int64
+			var label string
+			var cnt int
+			if err := rows.Scan(&pid, &label, &cnt); err != nil {
+				rows.Close()
+				return FacetCollectionsPage{}, err
+			}
+			label = strings.TrimSpace(label)
+			if label != "" && cnt > 0 {
+				pageBuckets = append(pageBuckets, FacetBucket{ID: label, Label: label, Count: cnt})
+				pagePersonIDs = append(pagePersonIDs, pid)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return FacetCollectionsPage{}, err
+		}
+		rows.Close()
+		if len(pageBuckets) > limit {
+			pageBuckets = pageBuckets[:limit]
+			pagePersonIDs = pagePersonIDs[:limit]
+			more = true
+		}
+
+	case !isEnv && !isDateDecade && (fieldType == "string" || fieldType == "strings" || fieldType == "enum" || fieldType == "bool"):
+		if !smallLib && len(terms) == 0 {
+			raw, err := s.scanFieldTextCountsLarge(ctx, fieldKey, fieldDrivenWhere, itemArgs, 2001)
+			if err != nil {
+				return FacetCollectionsPage{}, err
+			}
+			if orderByName {
+				sort.SliceStable(raw, func(i, j int) bool {
+					return facetNameLess(raw[i].Value, raw[j].Value)
+				})
+			} else {
+				sort.SliceStable(raw, func(i, j int) bool {
+					if raw[i].Count != raw[j].Count {
+						return raw[i].Count > raw[j].Count
+					}
+					return facetNameLess(raw[i].Value, raw[j].Value)
+				})
+			}
+			if offset < len(raw) {
+				end := min(offset+limit, len(raw))
+				var refineIdxs []int
+				for _, fc := range raw[offset:end] {
+					idx := len(pageBuckets)
+					pageBuckets = append(pageBuckets, FacetBucket{ID: fc.Value, Label: fc.Value, Count: fc.Count})
+					if fc.Count >= 2001 {
+						refineIdxs = append(refineIdxs, idx)
+					}
+				}
+				if len(refineIdxs) > 0 {
+					arms := make([]string, len(refineIdxs))
+					rArgs := make([]any, 0, 2*len(refineIdxs)+1+len(itemArgs))
+					for i, bIdx := range refineIdxs {
+						if i == 0 {
+							arms[i] = `SELECT CAST(? AS INTEGER) AS idx, CAST(? AS TEXT) AS val`
+						} else {
+							arms[i] = `SELECT ?, ?`
+						}
+						rArgs = append(rArgs, bIdx, pageBuckets[bIdx].ID)
+					}
+					rArgs = append(rArgs, fieldKey)
+					rArgs = append(rArgs, itemArgs...)
+					if rRows, rErr := s.db.QueryContext(ctx, `
+WITH refine(idx, val) AS (
+	`+strings.Join(arms, "\n\tUNION ALL\n\t")+`
+)
+SELECT idx, (
+	SELECT COUNT(*) FROM (
+		SELECT 1 FROM plugin_item_fields f
+		JOIN plugin_items i ON i.item_ref = f.item_ref
+		WHERE f.field = ? AND f.v_text = refine.val AND `+fieldDrivenWhere+`
+		LIMIT 25001
+	) s
+) FROM refine`, rArgs...); rErr == nil {
+						for rRows.Next() {
+							var bIdx, cnt int
+							if rRows.Scan(&bIdx, &cnt) == nil && bIdx >= 0 && bIdx < len(pageBuckets) {
+								pageBuckets[bIdx].Count = cnt
+							}
+						}
+						rRows.Close()
+					}
+				}
+				more = end < len(raw)
+			}
+			break
+		}
+		orderClause := `cnt DESC, LOWER(f.v_text) ASC, f.v_text ASC`
+		if orderByName {
+			orderClause = `LOWER(f.v_text) ASC, f.v_text ASC`
+		}
+		var rows *sql.Rows
+		if len(terms) > 0 {
+			var subWhere strings.Builder
+			var subArgs []any
+			subWhere.WriteString(`f.field = ? AND f.v_text <> ''`)
+			subArgs = append(subArgs, fieldKey)
+			appendFoldedWordPrefix(&subWhere, &subArgs, terms)
+			subArgs = append(subArgs, 50000)
+			qArgs := append(subArgs, itemArgs...)
+			qArgs = append(qArgs, limit+1, offset)
+			rows, err = s.db.QueryContext(ctx,
+				`SELECT f.v_text, COUNT(*) AS cnt
+				 FROM (SELECT item_ref, v_text FROM plugin_item_fields f WHERE `+subWhere.String()+` LIMIT ?) f
+				 JOIN plugin_items i ON i.item_ref = f.item_ref
+				 WHERE `+fieldDrivenWhere+`
+				 GROUP BY f.v_text
+				 ORDER BY `+orderClause+`
+				 LIMIT ? OFFSET ?`, qArgs...)
+		} else {
+			qArgs := append(append([]any(nil), itemArgs...), fieldKey, limit+1, offset)
+			rows, err = s.db.QueryContext(ctx,
+				`SELECT f.v_text, COUNT(*) AS cnt
+				 FROM plugin_item_fields f
+				 JOIN plugin_items i ON i.item_ref = f.item_ref
+				 WHERE `+itemWhere+` AND f.field = ? AND f.v_text <> ''
+				 GROUP BY f.v_text
+				 ORDER BY `+orderClause+`
+				 LIMIT ? OFFSET ?`, qArgs...)
+		}
+		if err != nil {
+			return FacetCollectionsPage{}, err
+		}
+		for rows.Next() {
+			var val string
+			var cnt int
+			if err := rows.Scan(&val, &cnt); err != nil {
+				rows.Close()
+				return FacetCollectionsPage{}, err
+			}
+			if val != "" && cnt > 0 {
+				pageBuckets = append(pageBuckets, FacetBucket{ID: val, Label: val, Count: cnt})
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return FacetCollectionsPage{}, err
+		}
+		rows.Close()
+		if len(pageBuckets) > limit {
+			pageBuckets = pageBuckets[:limit]
+			more = true
+		}
+
+	case !isEnv && !isDateDecade && fieldType == "int":
+		vals, err := s.scanFieldIntCounts(ctx, fieldKey, itemWhere, fieldDrivenWhere, itemArgs, smallLib)
+		if err != nil {
+			return FacetCollectionsPage{}, err
+		}
+		all := make([]FacetBucket, 0, len(vals))
+		for _, p := range vals {
+			lbl := strconv.FormatInt(p.val, 10)
+			if len(terms) > 0 && !foldedWordsMatch(lbl, terms) {
+				continue
+			}
+			all = append(all, FacetBucket{ID: lbl, Label: lbl, Count: p.count})
+		}
+		if orderByName {
+			sort.SliceStable(all, func(i, j int) bool {
+				vi, _ := strconv.ParseInt(all[i].ID, 10, 64)
+				vj, _ := strconv.ParseInt(all[j].ID, 10, 64)
+				return vi < vj
+			})
+		} else {
+			sort.SliceStable(all, func(i, j int) bool {
+				if all[i].Count != all[j].Count {
+					return all[i].Count > all[j].Count
+				}
+				vi, _ := strconv.ParseInt(all[i].ID, 10, 64)
+				vj, _ := strconv.ParseInt(all[j].ID, 10, 64)
+				return vi < vj
+			})
+		}
+		if offset < len(all) {
+			end := min(offset+limit, len(all))
+			pageBuckets = all[offset:end]
+			more = end < len(all)
+		}
+
+	case !isEnv && !isDateDecade && fieldType == "float":
+		vals, err := s.scanFieldFloatCounts(ctx, fieldKey, itemWhere, fieldDrivenWhere, itemArgs, smallLib)
+		if err != nil {
+			return FacetCollectionsPage{}, err
+		}
+		all := make([]FacetBucket, 0, len(vals))
+		for _, p := range vals {
+			lbl := strconv.FormatFloat(p.val, 'f', -1, 64)
+			if len(terms) > 0 && !foldedWordsMatch(lbl, terms) {
+				continue
+			}
+			all = append(all, FacetBucket{ID: lbl, Label: lbl, Count: p.count})
+		}
+		if orderByName {
+			sort.SliceStable(all, func(i, j int) bool {
+				vi, _ := strconv.ParseFloat(all[i].ID, 64)
+				vj, _ := strconv.ParseFloat(all[j].ID, 64)
+				return vi < vj
+			})
+		} else {
+			sort.SliceStable(all, func(i, j int) bool {
+				if all[i].Count != all[j].Count {
+					return all[i].Count > all[j].Count
+				}
+				vi, _ := strconv.ParseFloat(all[i].ID, 64)
+				vj, _ := strconv.ParseFloat(all[j].ID, 64)
+				return vi < vj
+			})
+		}
+		if offset < len(all) {
+			end := min(offset+limit, len(all))
+			pageBuckets = all[offset:end]
+			more = end < len(all)
+		}
+
+	default:
+		all, err := s.FacetBuckets(ctx, q.LibraryID, q.Level, q.Policy, fieldKey)
+		if err != nil {
+			return FacetCollectionsPage{}, err
+		}
+		if len(terms) > 0 {
+			filtered := all[:0]
+			for _, b := range all {
+				if foldedWordsMatch(b.Label, terms) || foldedWordsMatch(b.ID, terms) {
+					filtered = append(filtered, b)
+				}
+			}
+			all = filtered
+		}
+		if orderByName {
+			sort.SliceStable(all, func(i, j int) bool {
+				return facetNameLess(all[i].Label, all[j].Label)
+			})
+		} else {
+			sort.SliceStable(all, func(i, j int) bool {
+				if all[i].Count != all[j].Count {
+					return all[i].Count > all[j].Count
+				}
+				return facetNameLess(all[i].Label, all[j].Label)
+			})
+		}
+		if offset < len(all) {
+			end := min(offset+limit, len(all))
+			pageBuckets = all[offset:end]
+			more = end < len(all)
+		}
+	}
+
+	if len(pageBuckets) == 0 {
+		return FacetCollectionsPage{Items: []FacetCollection{}}, nil
+	}
+
+	var newest []*core.KindItem
+	switch {
+	case !isEnv && !isDateDecade && fieldType == "people":
+		newest, err = s.resolveNewestByPersonIDs(ctx, fieldKey, pagePersonIDs, fieldDrivenWhere, itemArgs)
+	case !isEnv && !isDateDecade && (fieldType == "string" || fieldType == "strings" || fieldType == "enum" || fieldType == "bool"):
+		newest, err = s.resolveNewestByTextBuckets(ctx, fieldKey, pageBuckets, fieldDrivenWhere, itemArgs)
+	case !isEnv && !isDateDecade && fieldType == "int":
+		newest, err = s.resolveNewestByIntBuckets(ctx, fieldKey, pageBuckets, fieldDrivenWhere, itemArgs)
+	case !isEnv && !isDateDecade && fieldType == "float":
+		newest, err = s.resolveNewestByFloatBuckets(ctx, fieldKey, pageBuckets, fieldDrivenWhere, itemArgs)
+	default:
+		newest, err = s.resolveNewestByPredicateBuckets(ctx, fieldKey, fieldTypes, pageBuckets, itemWhere, itemArgs)
+	}
+	if err != nil {
+		return FacetCollectionsPage{}, err
+	}
+
+	out := make([]FacetCollection, len(pageBuckets))
+	for i, b := range pageBuckets {
+		out[i] = FacetCollection{
+			ID:    b.ID,
+			Label: b.Label,
+			Count: b.Count,
+		}
+		if i < len(newest) && newest[i] != nil {
+			out[i].NewestItem = newest[i]
+		}
+	}
+	return FacetCollectionsPage{Items: out, More: more}, nil
+}

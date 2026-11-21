@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/braedonsaunders/ether/internal/core"
+	"github.com/braedonsaunders/ether/internal/langtag"
 )
 
 // bindReleases records the client that produced these results. Feed/backend
@@ -14,10 +15,49 @@ func (c *Client) bindReleases(results []core.Release) []core.Release {
 	}
 	out := append([]core.Release(nil), results...)
 	id := c.indexerID()
+	// The owner's per-indexer Release language is evidence for a bare
+	// DUAL/MULTI whose name names no dub (core.Release.SourceLanguage). Unset,
+	// it leaves a built-in site's definition language (stamped by its
+	// backend) in place.
+	srcLang := langtag.CanonicalBCP47(c.Config().Language)
 	for i := range out {
 		out[i].IndexerID = id
+		if srcLang != "" {
+			out[i].SourceLanguage = srcLang
+		}
 	}
+	c.markOnDemand(out)
+	c.stampSourceOrder(out)
 	return out
+}
+
+// stampSourceOrder records each Stremio add-on result's 1-based position in
+// the add-on's response so later cache sorting or asynchronous batching cannot
+// lose it. Existing positive positions survive re-binding.
+func (c *Client) stampSourceOrder(results []core.Release) {
+	if cfg := c.Config(); !cfg.IsStremio() && !cfg.IsAddon() {
+		return
+	}
+	for i := range results {
+		if results[i].SourceOrder <= 0 {
+			results[i].SourceOrder = i + 1
+		}
+	}
+}
+
+// markOnDemand marks a Stremio add-on's stream links on demand
+// (core.Release.StreamOnDemand). Such a link asks the add-on to resolve,
+// download or import that release; it is not a plain file, so every open
+// costs the add-on (and often its Usenet or debrid account) real work.
+func (c *Client) markOnDemand(results []core.Release) {
+	if cfg := c.Config(); !cfg.IsStremio() && !cfg.IsAddon() {
+		return
+	}
+	for i := range results {
+		if results[i].StreamURL != "" {
+			results[i].StreamOnDemand = true
+		}
+	}
 }
 
 // feedReleases also namespaces feed GUIDs: different indexers may use the same
@@ -49,6 +89,9 @@ func (m *Manager) releaseClient(r core.Release) (*Client, error) {
 	}
 	if found == nil {
 		return nil, fmt.Errorf("newznab: originating indexer for release %q is no longer configured", r.Name)
+	}
+	if !found.Config().Enabled {
+		return nil, fmt.Errorf("newznab: originating indexer is disabled")
 	}
 	return found, nil
 }

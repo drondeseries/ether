@@ -101,10 +101,58 @@ func readUpgradeRows(t *testing.T, db *sql.DB, table string, columns []string) [
 	return result
 }
 
+// upgradeSeededMeta are the catalog_meta keys a migration newer than the
+// delivered schema seeds (catalog/53: the rank tables' live side and rebuild
+// flag). They are new rows, not changed delivered ones; every delivered row
+// must still compare exactly.
+var upgradeSeededMeta = map[string]bool{"rank_side": true, "rank_building": true}
+
+func withoutSeededMeta(t *testing.T, name string, rows []string) []string {
+	t.Helper()
+	if name != "catalog_meta" {
+		return rows
+	}
+	var kept []string
+	for _, row := range rows {
+		var values []any
+		if err := json.Unmarshal([]byte(row), &values); err != nil {
+			t.Fatal(err)
+		}
+		if k, ok := values[0].(string); ok && upgradeSeededMeta[k] {
+			continue
+		}
+		kept = append(kept, row)
+	}
+	return kept
+}
+
+type upgradeColumnRename struct {
+	to        string
+	component string
+	version   int
+}
+
+// upgradeRenamedColumns are delivered columns a later migration renamed;
+// their values must survive under the new name once that migration applies
+// (and under the original name when a PostgreSQL transaction rolls back).
+var upgradeRenamedColumns = map[string]map[string]upgradeColumnRename{
+	"auth_users": {"allowed_sections": {to: "allowed_libraries", component: "auth", version: 9}}, // auth/9 (v0.3.8 libraries)
+}
+
 func assertUpgradeTables(t *testing.T, db *sql.DB, before map[string]upgradeTable) {
 	t.Helper()
+	applied, err := store.AppliedMigrations(context.Background(), db)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for name, table := range before {
-		if got := readUpgradeRows(t, db, name, table.columns); !reflect.DeepEqual(got, table.rows) {
+		columns := append([]string(nil), table.columns...)
+		for i, col := range columns {
+			if rename, ok := upgradeRenamedColumns[name][col]; ok && applied[rename.component] >= rename.version {
+				columns[i] = rename.to
+			}
+		}
+		if got := withoutSeededMeta(t, name, readUpgradeRows(t, db, name, columns)); !reflect.DeepEqual(got, withoutSeededMeta(t, name, table.rows)) {
 			// Fixture credentials are synthetic; include the whole row to identify the lost field.
 			t.Errorf("delivered table %s columns %v: got %v want %v", name, table.columns, got, table.rows)
 		}
@@ -152,7 +200,7 @@ func TestPrismUpgradeSQLiteLateFailureRecovery(t *testing.T) {
 	}
 	raw := openSQLiteRW(t, path)
 	assertUpgradeTables(t, raw, before)
-	if got := maxMigration(t, raw, "auth"); got != 8 {
+	if got := maxMigration(t, raw, "auth"); got != 9 {
 		t.Fatalf("completed auth steps lost: %d", got)
 	}
 	if got := maxMigration(t, raw, "catalog"); got != 9 {

@@ -222,6 +222,13 @@ func (p *allDebrid) files(ctx context.Context, id string) ([]File, error) {
 }
 
 func (p *allDebrid) Acquire(ctx context.Context, req AcquireRequest) (*Acquired, error) {
+	if req.Private && !req.privateChecked {
+		var perr error
+		req, perr = prepareAcquire(ctx, p, req, false)
+		if perr != nil {
+			return nil, perr
+		}
+	}
 	id, added := req.TorrentID, false
 	ready := false
 	if id == "" {

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/braedonsaunders/ether/internal/core"
@@ -22,6 +23,36 @@ func init() {
 	store.Register("experience_row_views", 1, `CREATE TABLE experience_row_views (id TEXT PRIMARY KEY, scope_hash TEXT NOT NULL UNIQUE, viewer_id INTEGER NOT NULL, device_id TEXT NOT NULL, protocol TEXT NOT NULL, snapshot TEXT NOT NULL, expires INTEGER NOT NULL, payload TEXT NOT NULL); CREATE INDEX experience_row_views_viewer ON experience_row_views(viewer_id,device_id);`)
 	store.Register("experience_row_views", 2, `CREATE TABLE experience_row_view_manifests (scope_hash TEXT PRIMARY KEY, viewer_id INTEGER NOT NULL, device_id TEXT NOT NULL, protocol TEXT NOT NULL, generation TEXT NOT NULL, expires INTEGER NOT NULL, payload TEXT NOT NULL);`)
 	store.Register("experience_row_views", 3, `CREATE UNIQUE INDEX experience_row_views_snapshot ON experience_row_views(snapshot);`)
+	// Retention finds expired visits by expiry, across devices. Its own
+	// component: experience_row_views' versions are pinned to the
+	// delivered schema boundary.
+	store.RegisterAfter("experience_row_views_retention", "experience_row_views")
+	store.Register("experience_row_views_retention", 1, `CREATE INDEX experience_row_views_expires ON experience_row_views(expires); CREATE INDEX experience_row_view_manifests_expires ON experience_row_view_manifests(expires);`)
+}
+
+// rowViewPruneGrace is how long past expiry a row view is kept. An expired
+// visit already answers stale; the grace keeps that answer (rather than
+// not-found) for a client that returns within it. The device's own next
+// build still clears its expired rows at once, as before.
+const rowViewPruneGrace = 7 * 24 * time.Hour
+
+// PruneRowViews deletes row views and manifests expired longer than
+// rowViewPruneGrace, so rows of devices that never come back do not stay
+// forever. Every surface's RowViewService shares these tables, so this
+// runs once per database. Expiry is unix milliseconds.
+func PruneRowViews(ctx context.Context, db *sql.DB) (int64, error) {
+	if db == nil {
+		return 0, nil
+	}
+	cutoff := time.Now().Add(-rowViewPruneGrace).UnixMilli()
+	total, err := store.PruneBatched(ctx, db,
+		`DELETE FROM experience_row_views WHERE id IN (SELECT id FROM experience_row_views WHERE expires<? ORDER BY expires LIMIT ?)`, cutoff)
+	if err != nil {
+		return total, err
+	}
+	n, err := store.PruneBatched(ctx, db,
+		`DELETE FROM experience_row_view_manifests WHERE scope_hash IN (SELECT scope_hash FROM experience_row_view_manifests WHERE expires<? ORDER BY expires LIMIT ?)`, cutoff)
+	return total + n, err
 }
 
 var ErrRowViewNotFound = fmt.Errorf("experience: row view unavailable: %w", frontend.ErrNotFound)
@@ -48,8 +79,11 @@ type RowViewOptions struct {
 	Build  func(context.Context, frontend.RowViewRequest) ([]RowViewSnapshot, error)
 	// ValidRow checks current placement, collection and viewer preference scope,
 	// including the snapshot revision; it must fail closed on uncertainty.
-	ValidRow     func(context.Context, *core.User, core.Device, core.Protocol, RowViewSnapshot) bool
-	ResolveEntry func(context.Context, *core.User, core.Device, core.Protocol, core.NeutralEntryRef) (frontend.RowEntry, error)
+	// PreparePolicy batches shared proofs for one policy pass only. It must
+	// be called again after assembly and before issuing receipts.
+	PreparePolicy func(context.Context, *core.User) (context.Context, error)
+	ValidRow      func(context.Context, *core.User, core.Device, core.Protocol, RowViewSnapshot) bool
+	ResolveEntry  func(context.Context, *core.User, core.Device, core.Protocol, core.NeutralEntryRef) (frontend.RowEntry, error)
 	// ResolveEntries may batch rehydration; every call must perform fresh policy checks.
 	ResolveEntries func(context.Context, *core.User, core.Device, core.Protocol, []core.NeutralEntryRef) ([]frontend.RowEntry, error)
 	Receipts       *Receipts
@@ -81,7 +115,16 @@ func (s *RowViewService) resolveAll(ctx context.Context, u *core.User, device co
 	return entries, nil
 }
 
-type RowViewService struct{ o RowViewOptions }
+type RowViewService struct {
+	o            RowViewOptions
+	receiptMu    sync.Mutex
+	pageReceipts map[[32]byte]rowPageReceipts
+}
+type rowPageReceipts struct {
+	tokens  []string
+	expires int64
+	epoch   int64
+}
 
 func NewRowViewService(o RowViewOptions) (*RowViewService, error) {
 	if o.DB == nil || o.TTL < time.Second || o.TTL > 24*time.Hour || o.Active == nil || o.Build == nil || o.ValidRow == nil || o.ResolveEntry == nil || o.Receipts == nil {
@@ -125,7 +168,7 @@ func (s *RowViewService) viewer(ctx context.Context, v *core.User, d core.Device
 	if v == nil || v.ID <= 0 || d.ID == "" || len(d.ID) > 512 || p == "" || len(p) > 128 {
 		return nil, ErrRowViewNotFound
 	}
-	u, err := s.o.Active(ctx, v.ID)
+	u, err := bootstrapActive(ctx, s.o.Active, v.ID)
 	if err != nil || u == nil || u.ID != v.ID {
 		return nil, ErrRowViewNotFound
 	}
@@ -146,12 +189,15 @@ func (s *RowViewService) ListRowViews(ctx context.Context, req frontend.RowViewR
 	manifestScope := hex.EncodeToString(scopeHash[:])
 	if !req.Refresh {
 		views, found, err := s.loadManifest(ctx, req, manifestScope)
-		if err != nil {
+		if err != nil && !errors.Is(err, ErrRowViewStale) {
 			return nil, err
 		}
 		if found {
-			return views, nil
+			return views, err
 		}
+		// Listing starts a visit. A cached manifest can outlive its members
+		// or policy revision; replace it instead of rejecting a fresh visit.
+		req.Refresh = errors.Is(err, ErrRowViewStale)
 	}
 	rows, err := s.o.Build(ctx, req)
 	if err != nil {
@@ -160,11 +206,19 @@ func (s *RowViewService) ListRowViews(ctx context.Context, req frontend.RowViewR
 	if len(rows) > 100 {
 		return nil, errors.New("experience: too many row views")
 	}
+	policyCtx := ctx
+	if s.o.PreparePolicy != nil {
+		policyCtx, err = s.o.PreparePolicy(ctx, u)
+		if err != nil {
+			return nil, err
+		}
+	}
 	type candidate struct{ scope, payload string }
+	var allRefs []core.NeutralEntryRef
 	candidates := make([]candidate, 0, len(rows))
 	seen := map[string]bool{}
 	for _, snap := range rows {
-		if snap.Row.ID == "" || snap.Row.Kind == "" || len(snap.Entries) == 0 || len(snap.Entries) > 1000 || snap.Placement != req.Placement || snap.ViewID != req.ViewID || snap.Item != req.Item || seen[snap.Row.ID] || !s.o.ValidRow(ctx, u, req.Device, req.Protocol, snap) {
+		if snap.Row.ID == "" || snap.Row.Kind == "" || len(snap.Entries) == 0 || len(snap.Entries) > 1000 || snap.Placement != req.Placement || snap.ViewID != req.ViewID || snap.Item != req.Item || seen[snap.Row.ID] || !s.o.ValidRow(policyCtx, u, req.Device, req.Protocol, snap) {
 			return nil, ErrRowViewNotFound
 		}
 		seen[snap.Row.ID] = true
@@ -175,9 +229,7 @@ func (s *RowViewService) ListRowViews(ctx context.Context, req frontend.RowViewR
 			}
 			seenEntries[ref] = true
 		}
-		if _, err := s.resolveAll(ctx, u, req.Device, req.Protocol, snap.Entries); err != nil {
-			return nil, ErrRowViewNotFound
-		}
+		allRefs = append(allRefs, snap.Entries...)
 		snap.Row.Entries, snap.Row.Items = nil, nil
 		snap.Row.Handle, snap.Row.ImpressionID = "", ""
 		payload, err := json.Marshal(snap)
@@ -191,6 +243,11 @@ func (s *RowViewService) ListRowViews(ctx context.Context, req frontend.RowViewR
 		hash := sha256.Sum256(scope)
 		scopeID := hex.EncodeToString(hash[:])
 		candidates = append(candidates, candidate{scope: scopeID, payload: string(payload)})
+	}
+	if len(allRefs) > 0 {
+		if _, err = s.resolveAll(policyCtx, u, req.Device, req.Protocol, allRefs); err != nil {
+			return nil, ErrRowViewNotFound
+		}
 	}
 	tx, err := s.o.DB.BeginTx(ctx, nil)
 	if err != nil {
@@ -226,20 +283,37 @@ func (s *RowViewService) ListRowViews(ctx context.Context, req frontend.RowViewR
 		if err = json.Unmarshal([]byte(oldPayload), &old); err != nil {
 			return nil, err
 		}
-		for _, ref := range old {
-			if _, err = tx.ExecContext(ctx, `UPDATE experience_row_views SET expires=0 WHERE id=? AND snapshot=? AND viewer_id=? AND device_id=? AND protocol=?`, ref.ID, ref.Snapshot, u.ID, req.Device.ID, string(req.Protocol)); err != nil {
+		if len(old) > 100 {
+			return nil, ErrRowViewStale
+		}
+		if len(old) > 0 {
+			args := []any{u.ID, req.Device.ID, string(req.Protocol)}
+			conditions := make([]string, 0, len(old))
+			for _, ref := range old {
+				conditions = append(conditions, "(id=? AND snapshot=?)")
+				args = append(args, ref.ID, ref.Snapshot)
+			}
+			if _, err = tx.ExecContext(ctx, `UPDATE experience_row_views SET expires=0 WHERE viewer_id=? AND device_id=? AND protocol=? AND (`+strings.Join(conditions, " OR ")+`)`, args...); err != nil {
 				return nil, err
 			}
 		}
 	}
 	// Expired visits cannot be resolved and must not exhaust the per-device
 	// bound as viewers encounter new rows over time.
-	if _, err = tx.ExecContext(ctx, `DELETE FROM experience_row_views WHERE viewer_id=? AND device_id=? AND expires<=?`, u.ID, req.Device.ID, now); err != nil {
+	var expiredRows, expiredManifests bool
+	if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM experience_row_views WHERE viewer_id=? AND device_id=? AND expires<=?), EXISTS(SELECT 1 FROM experience_row_view_manifests WHERE viewer_id=? AND device_id=? AND expires<=?)`, u.ID, req.Device.ID, now, u.ID, req.Device.ID, now).Scan(&expiredRows, &expiredManifests); err != nil {
 		return nil, err
 	}
-	if !exists {
-		if _, err = tx.ExecContext(ctx, `DELETE FROM experience_row_view_manifests WHERE viewer_id=? AND device_id=? AND expires<=?`, u.ID, req.Device.ID, now); err != nil {
+	if expiredRows {
+		if _, err = tx.ExecContext(ctx, `DELETE FROM experience_row_views WHERE viewer_id=? AND device_id=? AND expires<=?`, u.ID, req.Device.ID, now); err != nil {
 			return nil, err
+		}
+	}
+	if !exists {
+		if expiredManifests {
+			if _, err = tx.ExecContext(ctx, `DELETE FROM experience_row_view_manifests WHERE viewer_id=? AND device_id=? AND expires<=?`, u.ID, req.Device.ID, now); err != nil {
+				return nil, err
+			}
 		}
 		var count int
 		if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM experience_row_view_manifests WHERE viewer_id=? AND device_id=?`, u.ID, req.Device.ID).Scan(&count); err != nil {
@@ -250,42 +324,57 @@ func (s *RowViewService) ListRowViews(ctx context.Context, req frontend.RowViewR
 		}
 	}
 	refs := make([]manifestRow, 0, len(candidates))
-	for _, c := range candidates {
-		var id string
-		err = tx.QueryRowContext(ctx, `SELECT id FROM experience_row_views WHERE scope_hash=?`, c.scope).Scan(&id)
-		if errors.Is(err, sql.ErrNoRows) {
-			var count int
-			if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM experience_row_views WHERE viewer_id=? AND device_id=?`, u.ID, req.Device.ID).Scan(&count); err != nil {
-				return nil, err
-			}
-			if count >= 1000 {
-				return nil, errors.New("experience: row view limit reached")
-			}
-			id, err = rowViewToken()
-			if err != nil {
-				return nil, err
-			}
-			generation, e := rowViewToken()
-			if e != nil {
+	if len(candidates) > 0 {
+		args := make([]any, len(candidates))
+		for n, c := range candidates {
+			args[n] = c.scope
+		}
+		rows, e := tx.QueryContext(ctx, `SELECT scope_hash,id FROM experience_row_views WHERE scope_hash IN (`+store.Placeholders(len(args))+`)`, args...)
+		if e != nil {
+			return nil, e
+		}
+		existing := map[string]string{}
+		for rows.Next() {
+			var scope, id string
+			if e = rows.Scan(&scope, &id); e != nil {
+				rows.Close()
 				return nil, e
 			}
-			_, err = tx.ExecContext(ctx, `INSERT INTO experience_row_views(id,scope_hash,viewer_id,device_id,protocol,snapshot,expires,payload) VALUES(?,?,?,?,?,?,?,?)`, id, c.scope, u.ID, req.Device.ID, string(req.Protocol), generation, now+s.o.TTL.Milliseconds(), c.payload)
-			if err != nil {
-				return nil, err
-			}
-			refs = append(refs, manifestRow{ID: id, Snapshot: generation})
-		} else if err != nil {
+			existing[scope] = id
+		}
+		e = rows.Err()
+		rows.Close()
+		if e != nil {
+			return nil, e
+		}
+		var count int
+		if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM experience_row_views WHERE viewer_id=? AND device_id=?`, u.ID, req.Device.ID).Scan(&count); err != nil {
 			return nil, err
-		} else {
+		}
+		if count+len(candidates)-len(existing) > 1000 {
+			return nil, errors.New("experience: row view limit reached")
+		}
+		args = nil
+		values := make([]string, 0, len(candidates))
+		for _, c := range candidates {
+			id := existing[c.scope]
+			if id == "" {
+				id, err = rowViewToken()
+				if err != nil {
+					return nil, err
+				}
+			}
 			generation, e := rowViewToken()
 			if e != nil {
 				return nil, e
 			}
-			_, err = tx.ExecContext(ctx, `UPDATE experience_row_views SET snapshot=?,expires=?,payload=? WHERE id=?`, generation, now+s.o.TTL.Milliseconds(), c.payload, id)
-			if err != nil {
-				return nil, err
-			}
+			values = append(values, "(?,?,?,?,?,?,?,?)")
+			args = append(args, id, c.scope, u.ID, req.Device.ID, string(req.Protocol), generation, now+s.o.TTL.Milliseconds(), c.payload)
 			refs = append(refs, manifestRow{ID: id, Snapshot: generation})
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO experience_row_views(id,scope_hash,viewer_id,device_id,protocol,snapshot,expires,payload) VALUES `+strings.Join(values, ",")+` ON CONFLICT(scope_hash) DO UPDATE SET snapshot=excluded.snapshot,expires=excluded.expires,payload=excluded.payload`, args...)
+		if err != nil {
+			return nil, err
 		}
 	}
 	b, err := json.Marshal(refs)
@@ -316,7 +405,9 @@ func (s *RowViewService) ListRowViews(ctx context.Context, req frontend.RowViewR
 type manifestRow struct{ ID, Snapshot string }
 
 // loadManifest returns the shared ordered visit, revalidating every row and
-// entry. A revoked member invalidates the visit instead of shifting offsets.
+// entry. Once initial validation succeeds, found stays true on errors so a
+// concurrent refresh or policy change cannot trigger a silent rebuild.
+// A revoked member invalidates the visit instead of shifting offsets.
 func (s *RowViewService) loadManifest(ctx context.Context, req frontend.RowViewRequest, scope string) ([]frontend.RowView, bool, error) {
 	var generation, payload string
 	var expires int64
@@ -336,43 +427,93 @@ func (s *RowViewService) loadManifest(ctx context.Context, req frontend.RowViewR
 	}
 	out := make([]frontend.RowView, 0, len(refs))
 	snapshots := make([]RowViewSnapshot, 0, len(refs))
+	type storedRow struct {
+		id, payload string
+		expires     int64
+	}
+	stored := make(map[string]storedRow, len(refs))
+	if len(refs) > 0 {
+		args := []any{req.Viewer.ID, req.Device.ID, string(req.Protocol)}
+		for _, ref := range refs {
+			args = append(args, ref.Snapshot)
+		}
+		query := `SELECT id,snapshot,payload,expires FROM experience_row_views WHERE viewer_id=? AND device_id=? AND protocol=? AND snapshot IN (` + strings.TrimSuffix(strings.Repeat("?,", len(refs)), ",") + `)`
+		rows, e := s.o.DB.QueryContext(ctx, query, args...)
+		if e != nil {
+			return nil, false, e
+		}
+		for rows.Next() {
+			var snapshot string
+			var row storedRow
+			if e = rows.Scan(&row.id, &snapshot, &row.payload, &row.expires); e != nil {
+				rows.Close()
+				return nil, false, e
+			}
+			stored[snapshot] = row
+		}
+		e = rows.Err()
+		rows.Close()
+		if e != nil {
+			return nil, false, e
+		}
+	}
+	policyCtx := ctx
+	if s.o.PreparePolicy != nil {
+		policyCtx, err = s.o.PreparePolicy(ctx, req.Viewer)
+		if err != nil {
+			return nil, false, err
+		}
+	}
+	var allRefs []core.NeutralEntryRef
 	for _, ref := range refs {
-		var raw string
-		var expiry int64
-		err = s.o.DB.QueryRowContext(ctx, `SELECT payload,expires FROM experience_row_views WHERE id=? AND snapshot=? AND viewer_id=? AND device_id=? AND protocol=?`, ref.ID, ref.Snapshot, req.Viewer.ID, req.Device.ID, string(req.Protocol)).Scan(&raw, &expiry)
-		if err != nil || expiry <= s.o.Now().UnixMilli() {
+		row, found := stored[ref.Snapshot]
+		if !found || row.id != ref.ID || row.expires <= s.o.Now().UnixMilli() {
 			return nil, false, ErrRowViewStale
 		}
 		var snap RowViewSnapshot
-		if json.Unmarshal([]byte(raw), &snap) != nil || snap.Placement != req.Placement || snap.ViewID != req.ViewID || snap.Item != req.Item || !s.o.ValidRow(ctx, req.Viewer, req.Device, req.Protocol, snap) {
+		if json.Unmarshal([]byte(row.payload), &snap) != nil || snap.Placement != req.Placement || snap.ViewID != req.ViewID || snap.Item != req.Item || !s.o.ValidRow(policyCtx, req.Viewer, req.Device, req.Protocol, snap) {
 			return nil, false, ErrRowViewStale
 		}
-		if _, err := s.resolveAll(ctx, req.Viewer, req.Device, req.Protocol, snap.Entries); err != nil {
-			return nil, false, ErrRowViewStale
-		}
-		out = append(out, frontend.RowView{ID: ref.Snapshot, Title: snap.Row.Title, Kind: snap.Row.Kind, Purpose: snap.Row.Purpose, Layout: snap.Row.Layout, Rank: snap.Row.Rank})
+		allRefs = append(allRefs, snap.Entries...)
+		out = append(out, frontend.RowView{ExpiresAt: time.UnixMilli(row.expires), ID: ref.Snapshot, Title: snap.Row.Title, Kind: snap.Row.Kind, Purpose: snap.Row.Purpose, Layout: snap.Row.Layout, Rank: snap.Row.Rank})
 		snapshots = append(snapshots, snap)
+	}
+	// Rehydrate the visit as bounded batches, sharing title/parent reads across
+	// shelves rather than starting a new catalogue pass for every row.
+	if len(allRefs) > 0 {
+		if _, err := s.resolveAll(ctx, req.Viewer, req.Device, req.Protocol, allRefs); err != nil {
+			return nil, false, ErrRowViewStale
+		}
 	}
 	var current string
 	var currentExpiry int64
 	if err = s.o.DB.QueryRowContext(ctx, `SELECT generation,expires FROM experience_row_view_manifests WHERE scope_hash=? AND viewer_id=? AND device_id=? AND protocol=?`, scope, req.Viewer.ID, req.Device.ID, string(req.Protocol)).Scan(&current, &currentExpiry); err != nil || current != generation || currentExpiry <= s.o.Now().UnixMilli() {
-		return nil, false, ErrRowViewStale
+		return nil, true, ErrRowViewStale
 	}
 	active, err := s.viewer(ctx, req.Viewer, req.Device, req.Protocol)
 	if err != nil {
-		return nil, false, ErrRowViewNotFound
+		return nil, true, ErrRowViewNotFound
+	}
+	policyCtx = ctx
+	if s.o.PreparePolicy != nil {
+		policyCtx, err = s.o.PreparePolicy(ctx, active)
+		if err != nil {
+			return nil, true, err
+		}
 	}
 	for _, snap := range snapshots {
-		if !s.o.ValidRow(ctx, active, req.Device, req.Protocol, snap) {
-			return nil, false, ErrRowViewStale
+		if !s.o.ValidRow(policyCtx, active, req.Device, req.Protocol, snap) {
+			return nil, true, ErrRowViewStale
 		}
-		if _, err := s.resolveAll(ctx, active, req.Device, req.Protocol, snap.Entries); err != nil {
-			return nil, false, ErrRowViewStale
+	}
+	if len(allRefs) > 0 {
+		if _, err := s.resolveAll(ctx, active, req.Device, req.Protocol, allRefs); err != nil {
+			return nil, true, ErrRowViewStale
 		}
 	}
 	// A refresh can commit while the final policy pass is running.
 	if err = s.o.DB.QueryRowContext(ctx, `SELECT generation,expires FROM experience_row_view_manifests WHERE scope_hash=? AND viewer_id=? AND device_id=? AND protocol=?`, scope, req.Viewer.ID, req.Device.ID, string(req.Protocol)).Scan(&current, &currentExpiry); err != nil || current != generation || currentExpiry <= s.o.Now().UnixMilli() {
-		return nil, false, ErrRowViewStale
+		return nil, true, ErrRowViewStale
 	}
 	return out, true, nil
 }
@@ -409,6 +550,8 @@ func (s *RowViewService) ResolveRowView(ctx context.Context, req frontend.RowVie
 	if !s.o.ValidRow(ctx, u, req.Device, req.Protocol, snap) {
 		return page, ErrRowViewStale
 	}
+	page.ExpiresAt = time.UnixMilli(expires)
+	page.RankedTop10 = snap.Row.RankedTop10 || snap.Row.Layout.RankedTop10
 	allowedKinds := map[frontend.RowEntryKind]bool{}
 	for _, kind := range req.Kinds {
 		allowedKinds[kind] = true
@@ -464,22 +607,85 @@ func (s *RowViewService) ResolveRowView(ctx context.Context, req frontend.RowVie
 		e := &page.Entries[i]
 		subjects = append(subjects, ReceiptSubject{Kind: string(e.Kind), ID: fmt.Sprintf("%s/%s/%s", snap.Row.ID, e.Kind, entryIdentity(*e)), Purpose: snap.Row.Purpose, Rank: snap.Row.Rank, Impression: imp})
 	}
-	tokens, err := s.o.Receipts.issueBatchChecked(ctx, u, req.Device, req.Protocol, subjects, current, func(tx *sql.Tx) error {
-		var expiry int64
-		query := `SELECT expires FROM experience_row_views WHERE snapshot=? AND viewer_id=? AND device_id=? AND protocol=?`
-		if store.DialectOf(s.o.DB) == store.Postgres {
-			query += ` FOR SHARE`
+	// Vela revisits immutable pages while idle. Reuse their already-issued
+	// receipts after the same fresh policy checks, instead of consuming the
+	// device's quota again on every bootstrap. Never cache a policy failure.
+	var receiptKey [32]byte
+	var receiptEpoch int64
+	var tokens []string
+	receiptExpiry := time.Unix(s.o.Receipts.opts.Now().Add(s.o.Receipts.opts.TTL).Unix(), 0)
+	reuse := req.Protocol == "vela" && s.o.Receipts.opts.Generation == nil
+	if reuse {
+		b, e := json.Marshal([]any{u, req.Device.ID, req.Protocol, req.ID, req.Offset, req.Limit, req.Kinds, subjects})
+		if e != nil {
+			return frontend.RowViewPage{}, e
 		}
-		if err := tx.QueryRowContext(ctx, query, req.ID, u.ID, req.Device.ID, string(req.Protocol)).Scan(&expiry); err != nil || expiry <= s.o.Now().UnixMilli() {
-			return ErrRowViewStale
+		receiptKey = sha256.Sum256(b)
+		receiptEpoch, err = viewerpolicy.Read(ctx, s.o.DB)
+		if err != nil {
+			return frontend.RowViewPage{}, err
 		}
-		return nil
-	})
+		s.receiptMu.Lock()
+		cached, found := s.pageReceipts[receiptKey]
+		s.receiptMu.Unlock()
+		if found && cached.expires > s.o.Receipts.opts.Now().Unix() && cached.epoch == receiptEpoch {
+			if !current() {
+				return frontend.RowViewPage{}, ErrRowViewStale
+			}
+			after, e := viewerpolicy.Read(ctx, s.o.DB)
+			if e != nil {
+				return frontend.RowViewPage{}, e
+			}
+			if after != receiptEpoch {
+				return frontend.RowViewPage{}, ErrRowViewStale
+			}
+			live, e := s.o.Receipts.receiptsLive(ctx, u.ID, req.Device.ID, req.Protocol, cached.tokens)
+			if e != nil {
+				return frontend.RowViewPage{}, e
+			}
+			if live {
+				tokens = cached.tokens
+				receiptExpiry = time.Unix(cached.expires, 0)
+			}
+		}
+	}
+	if tokens == nil {
+		tokens, err = s.o.Receipts.issueBatchChecked(ctx, u, req.Device, req.Protocol, subjects, current, func(tx *sql.Tx) error {
+			var expiry int64
+			query := `SELECT expires FROM experience_row_views WHERE snapshot=? AND viewer_id=? AND device_id=? AND protocol=?`
+			if store.DialectOf(s.o.DB) == store.Postgres {
+				query += ` FOR SHARE`
+			}
+			if err := tx.QueryRowContext(ctx, query, req.ID, u.ID, req.Device.ID, string(req.Protocol)).Scan(&expiry); err != nil || expiry <= s.o.Now().UnixMilli() {
+				return ErrRowViewStale
+			}
+			return nil
+		})
+		if err == nil && reuse {
+			s.receiptMu.Lock()
+			if s.pageReceipts == nil {
+				s.pageReceipts = make(map[[32]byte]rowPageReceipts)
+			}
+			now := s.o.Receipts.opts.Now()
+			for key, cached := range s.pageReceipts {
+				if cached.expires <= now.Unix() {
+					delete(s.pageReceipts, key)
+				}
+			}
+			if _, exists := s.pageReceipts[receiptKey]; exists || len(s.pageReceipts) < 512 {
+				s.pageReceipts[receiptKey] = rowPageReceipts{tokens: tokens, expires: min(expires/1000, receiptExpiry.Unix()), epoch: receiptEpoch}
+			}
+			s.receiptMu.Unlock()
+		}
+	}
 	if errors.Is(err, viewerpolicy.ErrChanged) {
 		return frontend.RowViewPage{}, ErrRowViewStale
 	}
 	if err != nil {
 		return frontend.RowViewPage{}, err
+	}
+	if receiptExpiry.Before(page.ExpiresAt) {
+		page.ExpiresAt = receiptExpiry
 	}
 	page.ImpressionHandle = tokens[0]
 	for i := range page.Entries {

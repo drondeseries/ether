@@ -18,6 +18,7 @@ import (
 	"github.com/braedonsaunders/ether/internal/experience"
 	"github.com/braedonsaunders/ether/internal/frontend"
 	"github.com/braedonsaunders/ether/internal/frontend/frontendtest"
+	"github.com/braedonsaunders/ether/internal/frontend/kit/authhdr"
 	"github.com/braedonsaunders/ether/internal/frontends/silo"
 	"github.com/braedonsaunders/ether/internal/identity"
 	"github.com/braedonsaunders/ether/internal/plextv"
@@ -60,6 +61,7 @@ func (s *peopleHTTPState) update(key core.RatingKey, f func(*core.Title)) {
 
 type peopleUnusedState struct{ core.State }
 type peopleHTTPArtwork struct {
+	frontendtest.Artwork
 	state      *peopleHTTPState
 	beforeList func()
 	beforeRead func()
@@ -214,7 +216,7 @@ func TestSiloPeopleHTTPCurrentMembershipAndArtwork(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	images, err := identity.NewArtworkImageGrantService(db, "silo", grants, func() frontend.Experience { return exp }, artwork, time.Minute, time.Now)
+	images, err := identity.NewArtworkImageGrantService(db, "silo", grants, func() frontend.Experience { return exp }, artwork, time.Minute, time.Now, identity.ImageGrantOptions{Token: authhdr.MediaBrowserToken, PublicContentTags: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -355,7 +357,7 @@ func TestProductionPeopleIgnoresStaleMovieCreditCache(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	images, err := identity.NewArtworkImageGrantService(a.db, "silo", grants, func() frontend.Experience { return exp }, artwork, time.Minute, time.Now)
+	images, err := identity.NewArtworkImageGrantService(a.db, "silo", grants, func() frontend.Experience { return exp }, artwork, time.Minute, time.Now, identity.ImageGrantOptions{Token: authhdr.MediaBrowserToken, PublicContentTags: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -432,7 +434,7 @@ func TestProductionPeopleUsesFreshSafetyAndRejectsPortraitReplay(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			images, err := identity.NewArtworkImageGrantService(a.db, "silo", grants, func() frontend.Experience { return exp }, artwork, time.Minute, time.Now)
+			images, err := identity.NewArtworkImageGrantService(a.db, "silo", grants, func() frontend.Experience { return exp }, artwork, time.Minute, time.Now, identity.ImageGrantOptions{Token: authhdr.MediaBrowserToken, PublicContentTags: true})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -492,7 +494,7 @@ func TestSiloPeoplePrefetchDoesNotReachArtworkQueues(t *testing.T) {
 type hiddenPeopleExperience struct{ frontend.Experience }
 
 func TestSiloPortraitDeniesMissingReaderAndGrantChangesDuringRead(t *testing.T) {
-	for _, change := range []string{"missing_reader", "image_revoke", "source_revoke", "header_delete", "image_expiry", "source_expiry", "cancel"} {
+	for _, change := range []string{"missing_reader", "viewer_deactivated", "credit_removed", "cancel"} {
 		t.Run(change, func(t *testing.T) {
 			exp, state, artwork := peopleHTTPFixture(t)
 			ctx := context.Background()
@@ -520,7 +522,7 @@ func TestSiloPortraitDeniesMissingReaderAndGrantChangesDuringRead(t *testing.T) 
 			}
 			var current frontend.Experience = exp
 			clock := time.Now()
-			images, err := identity.NewArtworkImageGrantService(db, "silo", grants, func() frontend.Experience { return current }, artwork, time.Minute, func() time.Time { return clock })
+			images, err := identity.NewArtworkImageGrantService(db, "silo", grants, func() frontend.Experience { return current }, artwork, time.Minute, func() time.Time { return clock }, identity.ImageGrantOptions{Token: authhdr.MediaBrowserToken, PublicContentTags: true})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -543,18 +545,10 @@ func TestSiloPortraitDeniesMissingReaderAndGrantChangesDuringRead(t *testing.T) 
 				switch change {
 				case "missing_reader":
 					current = hiddenPeopleExperience{exp}
-				case "image_revoke":
-					err = images.Revoke(ctx, credential, secret)
-				case "source_revoke":
-					err = grants.RevokeDevice(ctx, 1, device.ID)
-				case "header_delete":
-					_, err = db.ExecContext(ctx, `DELETE FROM capability_headers WHERE namespace='image'`)
-				case "image_expiry":
-					// Issued image expiry is immutable. Advance the service clock
-					// past the one-minute grant instead of rewriting the row.
-					clock = clock.Add(2 * time.Minute)
-				case "source_expiry":
-					_, err = db.ExecContext(ctx, `UPDATE identity_grants SET expires=1 WHERE viewer_id=1`)
+				case "viewer_deactivated":
+					_, err = db.ExecContext(ctx, `UPDATE auth_users SET active=0 WHERE id=1`)
+				case "credit_removed":
+					state.update(key, func(title *core.Title) { title.Cast = nil })
 				case "cancel":
 					cancel()
 				}

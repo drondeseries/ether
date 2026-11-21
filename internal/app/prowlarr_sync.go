@@ -45,7 +45,7 @@ func (a *App) syncSavedProwlarr(ctx context.Context) {
 	}
 	cfg := a.cfg.Get().Prowlarr
 	cfg.Tags = config.NormalizeProwlarrTags(cfg.Tags)
-	if strings.TrimSpace(cfg.URL) == "" || cfg.APIKey == "" || len(cfg.Tags) == 0 {
+	if cfg.Disabled || strings.TrimSpace(cfg.URL) == "" || cfg.APIKey == "" || len(cfg.Tags) == 0 {
 		return
 	}
 	_, _, _, _ = a.syncProwlarr(ctx, cfg, true)
@@ -150,6 +150,13 @@ var errProwlarrSave = errors.New("prowlarr: save failed")
 // A failed read leaves the stored indexers alone. When a previous set exists,
 // kept is true and status is "unreachable".
 func (a *App) syncProwlarr(ctx context.Context, cfg config.Prowlarr, commit bool) (newznab.ProwlarrDiscovery, int, bool, error) {
+	if cfg.Disabled {
+		if commit {
+			err := a.cfg.Update(func(c *config.Config) error { c.Prowlarr = cfg; return nil })
+			return newznab.ProwlarrDiscovery{}, 0, true, err
+		}
+		return newznab.ProwlarrDiscovery{}, 0, true, nil
+	}
 	report, err := newznab.DiscoverProwlarrReport(ctx, cfg, newznab.Options{Logger: a.log})
 	if err != nil {
 		if commit && a.hasLastProwlarrSet(cfg) {
@@ -230,7 +237,7 @@ func applyProwlarrSync(c *config.Config, cfg config.Prowlarr, found []config.Ind
 // imported before it was kept), every stored value is kept. Prowlarr does
 // not know the owner's per-indexer client identity, so that is kept too.
 func mergeProwlarrIndexer(old, fresh config.Indexer) config.Indexer {
-	fresh.ClientIdentity = old.ClientIdentity
+	fresh.UserAgent = old.UserAgent
 	prev := old.ProwlarrImport
 	if prev == nil || old.DailyLimit != prev.DailyLimit {
 		fresh.DailyLimit = old.DailyLimit

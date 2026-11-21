@@ -2,10 +2,10 @@ package livetv
 
 import (
 	"fmt"
-	"github.com/braedonsaunders/ether/internal/contentrating"
 	"strings"
 	"time"
 
+	"github.com/braedonsaunders/ether/internal/contentrating"
 	"github.com/braedonsaunders/ether/internal/core"
 )
 
@@ -17,34 +17,39 @@ func interstitial(it Item) bool {
 		return true
 	}
 	switch it.Slate {
-	case "ident", "upnext", "break", "back", "tonight", "welcome", "reel":
+	case "ident", "upnext", "break", "back", "tonight", "welcome", "reel", "standby":
 		return true
 	}
 	return false
 }
 
-func (c Channel) moments(at time.Time) []Item { return c.momentsWithin(at, 0) }
+// tonightEnabledAt reports whether the "tonight"/"coming up" 3–4 programme
+// lineup graphic is active at this boundary. An explicit Tonight=true runs at
+// any hour of the day; nil preserves the evening (>= 18:00) default when UpNext
+// is enabled.
+func tonightEnabledAt(c Channel, at time.Time) bool {
+	if c.Look == nil {
+		return false
+	}
+	if c.Look.Tonight != nil {
+		return *c.Look.Tonight
+	}
+	return c.Look.UpNext && at.In(zoneOf(c.Timezone)).Hour() >= 18
+}
+
 func (c Channel) momentsWithin(at time.Time, budget time.Duration) []Item {
 	if c.Look != nil && c.Look.BreakPattern != nil {
-		// Era pods compose with the ordinary channel moments. Reserve their
-		// time first so a full pod cannot silently consume ident/up-next.
+		// Compose the pod in broadcast order (before-break moments -> spots ->
+		// after-break moments) instead of piling up bumpers after "back".
+		if pod := c.podItemsAround(at, budget, true); len(pod) > 0 {
+			return pod
+		}
 		plain := c
 		look := *c.Look
 		look.BreakPattern = nil
 		look.Breaks = ""
 		plain.Look = &look
-		regular := plain.momentsWithin(at, budget)
-		remaining := budget
-		if budget > 0 {
-			for _, item := range regular {
-				remaining -= time.Duration(item.DurationMS) * time.Millisecond
-			}
-			if remaining <= 0 {
-				return regular
-			}
-		}
-		pod := c.podItems(at, remaining)
-		return append(pod, regular...)
+		return plain.momentsWithin(at, budget)
 	}
 	if c.Look == nil || c.clipDuration == nil {
 		return nil
@@ -54,44 +59,63 @@ func (c Channel) momentsWithin(at time.Time, budget time.Duration) []Item {
 	if breaks && c.Look.BreakEvery > 0 && c.momentHistory != nil && !c.momentHistory.lastBreak.IsZero() {
 		breaks = at.Sub(c.momentHistory.lastBreak) >= time.Duration(c.Look.BreakEvery)*time.Minute
 	}
+	reelInsertionIndex := -1
 	if breaks {
-		if c.Look.BreakContent == "segments" {
-			kinds = append(kinds, c.Look.SegmentIDs...)
+		var beforeKinds, afterKinds []string
+		if cfgBefore, custom := normalizeRundown(c.Look.BeforeBreak); custom {
+			beforeKinds = cfgBefore
 		} else {
-			kinds = append(kinds, "break")
+			if tonightEnabledAt(c, at) {
+				beforeKinds = append(beforeKinds, "tonight")
+			}
+			if c.Look.UpNext {
+				beforeKinds = append(beforeKinds, "upnext")
+			}
+			if c.Look.BreakContent == "segments" {
+				beforeKinds = append(beforeKinds, c.Look.SegmentIDs...)
+			} else {
+				beforeKinds = append(beforeKinds, "break")
+			}
 		}
-		kinds = append(kinds, "back")
-	}
-
-	if c.Look.Ident {
-		kinds = append(kinds, "ident")
-	}
-	if c.Look.UpNext {
-		kinds = append(kinds, "upnext")
-	}
-	tonight := c.Look.UpNext
-	if c.Look.Tonight != nil {
-		tonight = *c.Look.Tonight
-	}
-	if tonight && at.In(zoneOf(c.Timezone)).Hour() >= 18 {
-		kinds = append(kinds, "tonight")
+		if cfgAfter, custom := normalizeRundown(c.Look.AfterBreak); custom {
+			afterKinds = cfgAfter
+		} else {
+			afterKinds = append(afterKinds, "back")
+			if c.Look.Ident {
+				afterKinds = append(afterKinds, "ident")
+			}
+		}
+		kinds = append(kinds, beforeKinds...)
+		reelInsertionIndex = len(beforeKinds) - 1
+		kinds = append(kinds, afterKinds...)
+	} else if cfgBetween, custom := normalizeRundown(c.Look.BetweenProgrammes); custom {
+		kinds = append(kinds, cfgBetween...)
+	} else {
+		if c.Look.Ident {
+			kinds = append(kinds, "ident")
+		}
+		if c.Look.UpNext {
+			kinds = append(kinds, "upnext")
+		}
+		if tonightEnabledAt(c, at) {
+			kinds = append(kinds, "tonight")
+		}
 	}
 	var base []Item
 	var reserved time.Duration
-	for _, kind := range kinds {
-		if strings.HasPrefix(kind, "plugin:") {
-			if item, ok := c.pluginItem(kind); ok {
-				base = append(base, item)
-				reserved += time.Duration(item.DurationMS) * time.Millisecond
+	reelAfterBaseIdx := -1
+	for i, kind := range kinds {
+		if item, ok := c.rundownMomentItem(kind); ok {
+			base = append(base, item)
+			reserved += time.Duration(item.DurationMS) * time.Millisecond
+			if breaks && c.Look.BreakContent != "segments" && (kind == "break" || i == reelInsertionIndex) {
+				reelAfterBaseIdx = len(base) - 1
 			}
-			continue
-		}
-		if d, ok := c.momentDuration(kind); ok && d > 0 && d%segmentDuration == 0 {
-			base = append(base, Item{Slate: kind, Title: kind, DurationMS: d.Milliseconds()})
-			reserved += d
+		} else if breaks && c.Look.BreakContent != "segments" && i == reelInsertionIndex && reelAfterBaseIdx < 0 {
+			reelAfterBaseIdx = len(base) - 1
 		}
 	}
-	if breaks && c.momentHistory != nil && len(base) > 0 {
+	if breaks && c.momentHistory != nil && (len(base) > 0 || c.Look.BreakContent == "reel") {
 		c.momentHistory.lastBreak = at
 	}
 	if budget > 0 && reserved > budget {
@@ -107,25 +131,31 @@ func (c Channel) momentsWithin(at time.Time, budget time.Duration) []Item {
 	}
 	var out []Item
 	cursor := at
-	for _, item := range base {
+	emitReel := func() {
+		if c.momentHistory != nil {
+			c.momentHistory.lastBreak = at
+		}
+		available := time.Duration(0)
+		if budget > 0 {
+			available = budget - reserved
+			if available <= 0 {
+				return
+			}
+		}
+		reel := c.reelItems(cursor, available)
+		out = append(out, reel...)
+		for _, clip := range reel {
+			cursor = cursor.Add(time.Duration(clip.DurationMS) * time.Millisecond)
+		}
+	}
+	if breaks && c.Look.BreakContent != "segments" && reelAfterBaseIdx < 0 {
+		emitReel()
+	}
+	for i, item := range base {
 		out = append(out, item)
 		cursor = cursor.Add(time.Duration(item.DurationMS) * time.Millisecond)
-		if item.Slate == "break" {
-			if c.momentHistory != nil {
-				c.momentHistory.lastBreak = at
-			}
-			available := time.Duration(0)
-			if budget > 0 {
-				available = budget - reserved
-				if available <= 0 {
-					continue
-				}
-			}
-			reel := c.reelItems(cursor, available)
-			out = append(out, reel...)
-			for _, clip := range reel {
-				cursor = cursor.Add(time.Duration(clip.DurationMS) * time.Millisecond)
-			}
+		if breaks && c.Look.BreakContent != "segments" && i == reelAfterBaseIdx {
+			emitReel()
 		}
 	}
 	return out
@@ -152,6 +182,10 @@ func guideSchedule(c Channel, from, until time.Time) []Programme {
 			look.Breaks = ""
 			look.UpNext = false
 			look.Ident = false
+			look.Tonight = nil
+			look.BeforeBreak = nil
+			look.AfterBreak = nil
+			look.BetweenProgrammes = nil
 			c.Look = &look
 		} else {
 			c.Look = nil
@@ -197,7 +231,18 @@ func (s *Service) clipRequest(c Channel, p Programme, snapshots ...[]Programme) 
 	if c.Look != nil {
 		lookID = c.Look.LookID
 	}
-	r := core.ClipRequest{LookID: lookID, Moment: p.Item.Slate, ChannelID: c.ID, Bind: map[string]string{"channel.name": c.Name, "slate.start": fmt.Sprint(p.Start.Unix())}, Art: map[string]string{}}
+	r := core.ClipRequest{
+		LookID:     lookID,
+		Moment:     p.Item.Slate,
+		ChannelID:  c.ID,
+		ReelID:     p.Item.ReelID,
+		ReelClipID: p.Item.ReelClipID,
+		Bind:       map[string]string{"channel.name": c.Name, "slate.start": fmt.Sprint(p.Start.Unix())},
+		Art:        map[string]string{},
+	}
+	if p.Item.ReelClipID != "" && r.ReelID == "" && c.Look != nil {
+		r.ReelID = c.Look.ReelID
+	}
 	if c.Look != nil {
 		r.Bug = c.Look.Bug
 		r.AssetDigest = c.Look.MomentAssets[p.Item.Slate]
@@ -218,6 +263,13 @@ func (s *Service) clipRequest(c Channel, p Programme, snapshots ...[]Programme) 
 			r.Bind["resume.minutes"] = p.Item.Summary
 		}
 	}
+	if p.Item.Slate == "tonight" {
+		if p.Start.In(zoneOf(c.Timezone)).Hour() < 18 {
+			r.Bind["lineup.heading"] = "COMING UP"
+		} else {
+			r.Bind["lineup.heading"] = "TONIGHT"
+		}
+	}
 	if p.Item.Slate != "upnext" && p.Item.Slate != "tonight" && p.Item.Slate != "back" && p.Item.Slate != "lowerthird" {
 		return r
 	}
@@ -228,17 +280,90 @@ func (s *Service) clipRequest(c Channel, p Programme, snapshots ...[]Programme) 
 	} else {
 		upcoming = Schedule(c, p.Start, p.End.Add(24*time.Hour))
 	}
+	listed := 0
 	for _, next := range upcoming {
-		if next.Item.Key != 0 && !next.Start.Before(p.End) {
+		if next.Item.Key == 0 || next.Start.Before(p.End) {
+			continue
+		}
+		at := next.Start.In(zoneOf(c.Timezone)).Format("15:04")
+		if listed == 0 {
 			r.Bind["next.title"] = next.Item.Title
-			r.Bind["next.time"] = next.Start.In(zoneOf(c.Timezone)).Format("15:04")
+			r.Bind["next.time"] = at
+			if p.Item.Slate == "back" {
+				r.Bind["now.title"] = next.Item.Title
+				r.Bind["now.meta"] = ProgrammeMeta(next.Item)
+			}
+			if p.Item.Slate == "upnext" || p.Item.Slate == "tonight" {
+				r.Bind["next.meta"] = ProgrammeMeta(next.Item)
+				r.Bind["next.logline"] = Logline(next.Item.Summary)
+			}
 			if ref := ArtworkRef(next.Item.Key, next.Item.Thumb, "poster"); ref != "" {
 				r.Art["next.poster"] = ref
 			}
+			if ref := ArtworkRef(next.Item.Key, next.Item.Art, "art"); ref != "" {
+				r.Art["next.backdrop"] = ref
+			}
+			if p.Item.Slate != "tonight" {
+				break
+			}
+		}
+		// The coming-up menu lists one row per programme, merging a series'
+		// back-to-back episodes the way a printed listing would.
+		if listed > 0 && r.Bind[fmt.Sprintf("list[%d].title", listed-1)] == next.Item.Title {
+			continue
+		}
+		r.Bind[fmt.Sprintf("list[%d].title", listed)] = next.Item.Title
+		r.Bind[fmt.Sprintf("list[%d].time", listed)] = at
+		r.Bind[fmt.Sprintf("list[%d].meta", listed)] = ProgrammeMeta(next.Item)
+		listed++
+		if listed == 4 {
 			break
 		}
 	}
 	return r
+}
+
+// ProgrammeMeta is the one-line detail under a title: season, episode and
+// episode name for a series; year and running time for a film.
+func ProgrammeMeta(it Item) string {
+	if it.Episode > 0 {
+		meta := fmt.Sprintf("S%d E%d", it.Season, it.Episode)
+		if it.EpisodeTitle != "" && it.EpisodeTitle != it.Title {
+			meta += " · " + it.EpisodeTitle
+		}
+		return meta
+	}
+	var parts []string
+	if it.ReleasedMS > 0 {
+		parts = append(parts, time.UnixMilli(it.ReleasedMS).UTC().Format("2006"))
+	}
+	if it.DurationMS >= 60000 {
+		m := it.DurationMS / 60000
+		if m >= 60 {
+			parts = append(parts, fmt.Sprintf("%dh %02dm", m/60, m%60))
+		} else {
+			parts = append(parts, fmt.Sprintf("%d min", m))
+		}
+	}
+	return strings.Join(parts, " · ")
+}
+
+// Logline is a summary's first sentence, bounded for an eight-second card.
+func Logline(summary string) string {
+	summary = strings.TrimSpace(summary)
+	for _, end := range []string{". ", "! ", "? "} {
+		if i := strings.Index(summary, end); i > 0 {
+			summary = summary[:i+1]
+		}
+	}
+	if r := []rune(summary); len(r) > 140 {
+		cut := string(r[:140])
+		if i := strings.LastIndex(cut, " "); i > 80 {
+			cut = cut[:i]
+		}
+		summary = strings.TrimRight(cut, " ,;:") + "…"
+	}
+	return summary
 }
 func (s *Service) graphicsChannel(c Channel) Channel {
 
@@ -275,8 +400,8 @@ func (s *Service) ensureGraphics() {
 	}
 	// Both maintenance paths share the measured lead and nearest-boundary order.
 	// A second, three-hour scan must not refill the queue with distant masters.
-	for _, request := range s.GraphicsRequests(s.ctx, "") {
-		s.o.Graphics.Ensure(s.ctx, request)
+	for _, request := range s.GraphicsRequests(s.serviceContext(), "") {
+		s.o.Graphics.Ensure(s.serviceContext(), request)
 	}
 }
 
@@ -304,13 +429,14 @@ func (c Channel) pluginItem(id string) (Item, bool) {
 	if c.Filter != nil && c.Filter.MaxContentRating != "" {
 		cap = c.Filter.MaxContentRating
 	}
-	if cap != "" && rating == "" && (c.Look == nil || !c.Look.AllowUnratedSegments) {
+	enf := contentrating.EnforceRating(rating)
+	if cap != "" && enf == "" && (c.Look == nil || !c.Look.AllowUnratedSegments) {
 		return Item{}, false
 	}
-	if rating != "" && (contentrating.Exceeds(rating, c.Rating) || (c.Filter != nil && contentrating.Exceeds(rating, c.Filter.MaxContentRating))) {
+	if enf != "" && (contentrating.EnforceExceeds(enf, c.Rating) || (c.Filter != nil && contentrating.EnforceExceeds(enf, c.Filter.MaxContentRating))) {
 		return Item{}, false
 	}
-	return Item{Slate: id, Title: name, Rating: rating, DurationMS: d.Milliseconds()}, true
+	return Item{Slate: id, Title: name, Rating: rating, EnforcementRating: enf, DurationMS: d.Milliseconds()}, true
 }
 
 func (c Channel) momentDuration(kind string) (time.Duration, bool) {

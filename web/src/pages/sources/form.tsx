@@ -237,15 +237,18 @@ export function RecordItem({
 export function useTests() {
   const [tests, setTests] = useState<Record<string, TestState>>({});
   const runTest = useCallback(
-    (key: string, fn: () => Promise<{ ok: boolean; error?: string; durationMs: number }>) => {
+    (
+      key: string,
+      fn: () => Promise<{ ok: boolean; message?: string; error?: string; durationMs: number }>,
+    ) => {
       setTests((s) => ({ ...s, [key]: { status: "running" } }));
       fn().then(
         (r) =>
           setTests((s) => ({
             ...s,
             [key]: r.ok
-              ? { status: "ok", durationMs: r.durationMs }
-              : { status: "fail", message: r.error ?? t("failed") },
+              ? { status: "ok", durationMs: r.durationMs, message: r.message }
+              : { status: "fail", message: r.error ?? r.message ?? t("failed") },
           })),
         (e) =>
           setTests((s) => ({ ...s, [key]: { status: "fail", message: (e as Error).message } })),
@@ -264,13 +267,25 @@ export function useTests() {
 }
 
 /** Live health for the parts of the server a page controls, shown above its tabs. */
-export function HealthStrip({ ids }: { ids: HealthItem["id"][] }) {
+export function HealthStrip({
+  ids,
+  extra = [],
+}: {
+  ids: HealthItem["id"][];
+  extra?: HealthItem[];
+}) {
   const { health, dashboard } = useApp();
   if (!dashboard) return null;
-  const items = health.filter((h) => ids.includes(h.id));
+  // Only what the owner uses: an unused source ("off") is left out.
+  const items = ids
+    .map((id) => extra.find((h) => h.id === id) ?? health.find((h) => h.id === id))
+    .filter((h): h is HealthItem => !!h && h.level !== "off");
   if (!items.length) return null;
   return (
-    <ul aria-label={t("Status")} className="grid gap-3 sm:grid-cols-2">
+    <ul
+      aria-label={t("Status")}
+      className={`grid gap-3 sm:grid-cols-2 ${items.length >= 3 ? "xl:grid-cols-4" : ""}`}
+    >
       {items.map((h) => (
         <li key={h.id}>
           <Link
@@ -297,6 +312,9 @@ export function HealthStrip({ ids }: { ids: HealthItem["id"][] }) {
  * draft lives in the caller; closing without saving discards it.
  */
 export function RecordDrawer({
+  summary,
+  enabled,
+  onEnabledChange,
   open,
   title,
   description,
@@ -308,10 +326,14 @@ export function RecordDrawer({
   onRemove,
   removeLabel = t("Remove"),
   removeDisabled,
+  subtabs,
   tools,
   error,
   children,
 }: {
+  summary?: ReactNode;
+  enabled?: boolean;
+  onEnabledChange?: (enabled: boolean) => void;
   open: boolean;
   title: ReactNode;
   description?: ReactNode;
@@ -325,6 +347,7 @@ export function RecordDrawer({
   onRemove?: () => void;
   removeLabel?: string;
   removeDisabled?: boolean;
+  subtabs?: ReactNode;
   /** Extra footer controls on the left, e.g. a connection test. */
   tools?: ReactNode;
   error?: unknown;
@@ -336,6 +359,7 @@ export function RecordDrawer({
       onClose={onClose}
       title={title}
       description={description}
+      subtabs={subtabs}
       size="lg"
       footer={
         <div className="flex w-full flex-wrap items-center gap-2">
@@ -362,7 +386,18 @@ export function RecordDrawer({
       }
     >
       <div className="space-y-4">
+        {summary}
         {error ? <MutationError error={error} /> : null}
+        {onEnabledChange ? (
+          <label className="flex items-center justify-between gap-3 rounded-md border border-border px-3 py-2 text-sm">
+            <span className="font-medium">{t("Enabled")}</span>
+            <Switch
+              aria-label={t("Enabled")}
+              checked={enabled ?? true}
+              onChange={(e) => onEnabledChange(e.currentTarget.checked)}
+            />
+          </label>
+        ) : null}
         {children}
       </div>
     </Drawer>

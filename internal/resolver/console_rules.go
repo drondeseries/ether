@@ -30,10 +30,6 @@ func (h *consoleAPI) previewRules(w http.ResponseWriter, r *http.Request) {
 		consoleError(w, 400, "invalid", err.Error())
 		return
 	}
-	if err := h.s.validateRanking(in.Profile.Ranking, in.Profile.ReleaseRules); err != nil {
-		consoleError(w, 400, "invalid", err.Error())
-		return
-	}
 	warning := releasepolicy.ConflictWith(in.Profile.ReleaseRules, h.s.fieldLookup())
 	if len(in.Names) > 100 {
 		consoleError(w, 400, "invalid", "at most 100 filenames")
@@ -89,7 +85,7 @@ func (h *consoleAPI) previewRules(w http.ResponseWriter, r *http.Request) {
 		var trace Trace
 		// Console preview is device-neutral, just like normal release search.
 		caps := core.ClientCaps{}
-		candidates, _, err := h.s.rankCandidates(ctx, core.ResolveRequest{Title: title, Client: caps}, searchRequestFor(title), in.Profile, results, &trace, "")
+		candidates, _, err := h.s.rankCandidatesLocal(ctx, core.ResolveRequest{Title: title, Client: caps}, searchRequestFor(title), in.Profile, results, &trace, "", false)
 		if err != nil {
 			h.fail(w, err)
 			return
@@ -108,16 +104,40 @@ func (h *consoleAPI) previewRules(w http.ResponseWriter, r *http.Request) {
 			return out[i].Rank < out[j].Rank
 		})
 	} else {
+		hot := h.s.rankingSession(ctx, core.ClientCaps{})
+		if hot != nil {
+			defer hot.Close()
+		}
 		for _, rel := range results {
-			v := policy.Evaluate(rel, releasepolicy.Context{})
+			pctx := releasepolicy.Context{}
+			if hot != nil {
+				pctx.ExternalMatch = func(r core.Release, c core.ReleaseCondition) (bool, bool) {
+					return hot.Match(r, c, false)
+				}
+			}
+			v := policy.Evaluate(rel, pctx)
 			out = append(out, ConsoleRelease{Release: browserRelease(rel), Preferences: &v, Rejected: v.Rejected})
 		}
-		ranking := in.Profile.EffectiveRanking()
+		// Filenames alone have no quality order or formats to compare; the
+		// fallback tier and the Prefer rules' scores order them.
+		ruleScore := func(v releasepolicy.Result) int {
+			total := 0
+			for _, r := range in.Profile.ReleaseRules {
+				if r.Action == "prefer" && !r.Disabled && v.PreferRule(r.ID) > 0 {
+					total += in.Profile.CustomFormatScores[core.RuleFormatPrefix+r.ID]
+				}
+			}
+			return total
+		}
 		sort.SliceStable(out, func(i, j int) bool {
 			if out[i].Rejected != out[j].Rejected {
 				return !out[i].Rejected
 			}
-			return releasepolicy.BetterByRanking(*out[i].Preferences, *out[j].Preferences, ranking)
+			a, b := *out[i].Preferences, *out[j].Preferences
+			if a.Fallback != b.Fallback {
+				return a.Fallback < b.Fallback
+			}
+			return ruleScore(a) > ruleScore(b)
 		})
 		rank := 0
 		for i := range out {

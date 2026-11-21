@@ -19,6 +19,7 @@ type ViewerCatalogRules interface {
 	RefreshViewerRules(context.Context) error
 	ViewerRules(int64) catalog.ViewerRules
 	PutViewerRules(context.Context, int64, catalog.ViewerRules) error
+	LibraryPolicies() catalog.LibraryPolicies
 }
 
 // Personalization is the engine behind the viewers, Home Designer and
@@ -28,9 +29,8 @@ type Personalization interface {
 	RecentActivity(ctx context.Context, userID int64, limit int) ([]core.ViewerActivity, error)
 	Taste(ctx context.Context, user *core.User) (*core.TasteProfile, error)
 	SetTasteOverrides(ctx context.Context, user *core.User, overrides []core.TasteOverride) (*core.TasteProfile, error)
-	// PreviewHome is exactly what /hubs (or /hubs/sections/{id} when
-	// section is "movies", "shows" or a section id) serves the viewer in
-	// the context.
+	// PreviewHome is what Home (/hubs) or a library's Recommended page
+	// ("library:<id>") serves the viewer in the context.
 	PreviewHome(ctx context.Context, user *core.User, hc core.HubContext, section string, limit int) (*core.HomePreview, error)
 	Refresh(ctx context.Context, user *core.User) error
 	// HomeLayout is the saved Home layout document; SetHomeLayout
@@ -40,8 +40,7 @@ type Personalization interface {
 	// PreviewLayout assembles what the viewer would see under a draft
 	// document without saving it.
 	PreviewLayout(ctx context.Context, user *core.User, hc core.HubContext, section string, limit int, d core.HomeLayout) (*core.HomePreview, error)
-	// LayoutDefaults is the default row count per section (home, movies,
-	// shows).
+	// LayoutDefaults is the default row count per surface (home, library).
 	LayoutDefaults() map[string]int
 	AvailableRows(ctx context.Context) ([]core.RowDescriptor, error)
 	RowInsights(ctx context.Context, days int) ([]core.RowInsight, error)
@@ -66,8 +65,15 @@ func (h *Handler) personalizationRoutes(api func(pattern string, fn http.Handler
 	api("PUT /api/viewers/{id}/taste/overrides", h.handleViewerOverrides)
 	api("GET /api/viewers/{id}/home", h.handleViewerHome)
 	api("POST /api/viewers/{id}/refresh", h.handleViewerRefresh)
+	api("GET /api/viewers/{id}/trakt", h.handleTraktStatus)
+	api("POST /api/viewers/{id}/trakt/device", h.handleTraktStart)
+	api("POST /api/viewers/{id}/trakt/poll", h.handleTraktPoll)
+	api("POST /api/viewers/{id}/trakt/disconnect", h.handleTraktDisconnect)
 	api("GET /api/layout", h.handleGetLayout)
 	api("PUT /api/layout", h.handlePutLayout)
+	api("GET /api/layout/libraries/{id}", h.handleGetLibraryLayout)
+	api("PUT /api/layout/libraries/{id}", h.handlePutLibraryLayout)
+	api("DELETE /api/layout/libraries/{id}", h.handleResetLibraryLayout)
 	api("POST /api/layout/preview", h.handleLayoutPreview)
 	api("POST /api/layout/impact", h.handleLayoutImpact)
 	api("GET /api/insights/rows", h.handleInsightRows)
@@ -284,6 +290,7 @@ type homeRow struct {
 	Slot         int               `json:"slot,omitempty"`
 	AnchorSlot   int               `json:"anchorSlot,omitempty"`
 	Placement    string            `json:"placement,omitempty"`
+	HiddenCode   string            `json:"hiddenCode,omitempty"`
 	HiddenReason string            `json:"hiddenReason,omitempty"`
 	Policy       *core.RowPolicy   `json:"policy,omitempty"`
 	PolicyLayer  string            `json:"policyLayer,omitempty"`
@@ -346,7 +353,7 @@ func (h *Handler) writeHomePreview(w http.ResponseWriter, p *core.HomePreview, v
 	rows := make([]homeRow, 0, len(p.Rows))
 	for _, row := range p.Rows {
 		hr := homeRow{HubID: row.HubID, Title: row.Title, Kind: row.Kind, Reason: row.Reason, Score: row.Score,
-			Layer: row.Layer, Slot: row.Slot, AnchorSlot: row.AnchorSlot, Placement: row.Placement, HiddenReason: row.HiddenReason, Policy: row.Policy, PolicyLayer: row.PolicyLayer, Pinned: row.Pinned, Hidden: row.Hidden, Source: row.Source, Items: make([]homeTitleCard, 0, len(row.Items))}
+			Layer: row.Layer, Slot: row.Slot, AnchorSlot: row.AnchorSlot, Placement: row.Placement, HiddenCode: row.HiddenCode, HiddenReason: row.HiddenReason, Policy: row.Policy, PolicyLayer: row.PolicyLayer, Pinned: row.Pinned, Hidden: row.Hidden, Source: row.Source, Items: make([]homeTitleCard, 0, len(row.Items))}
 		for _, t := range row.Items {
 			hr.Items = append(hr.Items, homeCard(t))
 		}
@@ -425,6 +432,9 @@ func homeCard(t core.Title) homeTitleCard {
 	if c.Backdrop == "" && t.StillPath != "" {
 		c.Backdrop = adminImageURL(t.StillPath, 780)
 	}
+	if c.Poster == "" {
+		c.Poster = GeneratedPosterURL(&t, 342)
+	}
 	return c
 }
 
@@ -444,6 +454,9 @@ func (h *Handler) viewerDirectory(ctx context.Context) ([]core.User, error) {
 func (h *Handler) storedViewers(ctx context.Context) ([]ViewerRecord, error) {
 	if h.deps.ViewerDirectory != nil {
 		return h.deps.ViewerDirectory(ctx)
+	}
+	if h.deps.Users == nil {
+		return nil, nil
 	}
 	users, err := h.deps.Users.Users(ctx)
 	if err != nil {
@@ -479,10 +492,39 @@ func (h *Handler) handleViewerCatalogRules(w http.ResponseWriter, r *http.Reques
 			return
 		}
 	}
-	cfg := h.deps.Config.Get().Catalog
-	ids := make([]string, len(cfg.Exclusions))
-	for i, rule := range cfg.Exclusions {
+	pol := service.LibraryPolicies()
+	combined := make([]core.LibraryExclusion, 0, len(pol.MovieRules)+len(pol.ShowRules))
+	combined = append(combined, pol.MovieRules...)
+	combined = append(combined, pol.ShowRules...)
+	ids := make([]string, len(combined))
+	for i, rule := range combined {
 		ids[i] = catalog.RuleIdentity(rule)
 	}
-	writeJSON(w, 200, map[string]any{"policy": service.ViewerRules(u.ID), "globalRules": append([]core.LibraryExclusion{}, cfg.Exclusions...), "globalDefault": cfg.VisibilityDefault, "globalIDs": ids})
+	vr := service.ViewerRules(u.ID)
+	if len(vr.Exemptions) > 0 {
+		skip := map[string]bool{}
+		for _, id := range vr.Exemptions {
+			skip[id] = true
+		}
+		norm := make([]string, 0, len(vr.Exemptions))
+		seen := map[string]bool{}
+		for i, rule := range combined {
+			if catalog.IsRuleExempt(skip, rule) && !seen[ids[i]] {
+				seen[ids[i]] = true
+				norm = append(norm, ids[i])
+			}
+		}
+		for _, id := range vr.Exemptions {
+			if !seen[id] {
+				seen[id] = true
+				norm = append(norm, id)
+			}
+		}
+		vr.Exemptions = norm
+	}
+	globalDefault := "show"
+	if pol.MovieDefault == "hide" && pol.ShowDefault == "hide" {
+		globalDefault = "hide"
+	}
+	writeJSON(w, 200, map[string]any{"policy": vr, "globalRules": combined, "globalDefault": globalDefault, "globalIDs": ids})
 }

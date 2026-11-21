@@ -7,8 +7,10 @@ import (
 	"io"
 	"log/slog"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -39,9 +41,19 @@ type mediaServer struct {
 	// response mid-body: headers and that many bytes go out, then the
 	// handler blocks until the client disconnects.
 	stallAfter map[string]int64
-	size       int64 // advertised total (0 = real)
-	requests   atomic.Int64
-	ranges     []string
+	// redirect, keyed token+"|"+Range like stall, answers that one request
+	// with a 302 to the mapped Location: a one-shot hop, so a client that
+	// refuses redirects retries on its own instead of hitting a wall.
+	redirect map[string]string
+	// gate, keyed token+"|"+Range like stall, holds matching requests on a
+	// channel until the test closes it: a probe in flight stays in flight
+	// deterministically, with no wall clock in the assertion.
+	gate          map[string]chan struct{}
+	drip          map[string]mediaDrip // keyed token+"|"+Range: paced or truncated 206 bodies
+	size          int64                // advertised total (0 = real)
+	requests      atomic.Int64
+	clientCancels atomic.Int64 // requests the CLIENT cancelled while a gate held them
+	ranges        []string
 	// stallEvery, when > 0, stalls every ranged response mid-body after
 	// that many bytes, until the client disconnects.
 	stallEvery atomic.Int64
@@ -49,10 +61,40 @@ type mediaServer struct {
 	inflight atomic.Int32
 }
 
+// mediaDrip shapes one paced 206 body for a drip key: chunk bytes out,
+// pause, repeat; eof truncates after the first chunk. A pause big enough
+// to outlast the probe budget turns "paced" into "silence after the
+// first chunk", covering the 64-bytes-then-nothing case as well.
+type mediaDrip struct {
+	chunk int64
+	pause time.Duration
+	eof   bool
+}
+
+// fixtureTorBox builds the real TorBox provider for the engine fixtures.
+// Every fixture host shares one loopback address, so the fixture aliases
+// them as edges of the same CDN; production's strict approval rules run
+// unaliased, and are tested directly in TestTorBoxApprovesCDNEdge.
+func fixtureTorBox(apiURL string) *torBox {
+	p := newTorBox(testKey, fastOpts(apiURL))
+	p.edgeApproval = func(raw, candidate string) bool {
+		u, err := url.Parse(raw)
+		if err != nil {
+			return false
+		}
+		h, _, err := net.SplitHostPort(candidate)
+		if err != nil {
+			h = candidate
+		}
+		return strings.EqualFold(u.Hostname(), strings.Trim(h, "[]"))
+	}
+	return p
+}
+
 func newMediaServer(t testing.TB, size int) *mediaServer {
 	data := make([]byte, size)
 	rand.New(rand.NewSource(1)).Read(data)
-	m := &mediaServer{data: data, valid: map[string]bool{}, status: map[string]int{}, stall: map[string]time.Duration{}, stallAfter: map[string]int64{}}
+	m := &mediaServer{data: data, valid: map[string]bool{}, status: map[string]int{}, stall: map[string]time.Duration{}, stallAfter: map[string]int64{}, redirect: map[string]string{}, gate: map[string]chan struct{}{}, drip: map[string]mediaDrip{}}
 	m.Server = httptest.NewServer(http.HandlerFunc(m.serve))
 	t.Cleanup(m.Close)
 	return m
@@ -76,6 +118,9 @@ func (m *mediaServer) serve(w http.ResponseWriter, r *http.Request) {
 	if stallOnce {
 		delete(m.stallAfter, token+"|"+r.Header.Get("Range"))
 	}
+	gate := m.gate[token+"|"+r.Header.Get("Range")]
+	spec, isDrip := m.drip[token+"|"+r.Header.Get("Range")]
+	delete(m.drip, token+"|"+r.Header.Get("Range")) // one-shot, like stall
 	m.mu.Unlock()
 	if n := m.stallEvery.Load(); n > 0 && !stallOnce {
 		stallAfter, stallOnce = n, true
@@ -88,12 +133,30 @@ func (m *mediaServer) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if gate != nil { // hold the request until the test releases it
+		select {
+		case <-gate:
+		case <-r.Context().Done():
+			m.clientCancels.Add(1) // the test kept the gate: only client cancellation ended this request
+			return
+		}
+	}
 	if status != 0 {
 		w.WriteHeader(status)
 		return
 	}
 	if !ok {
 		w.WriteHeader(http.StatusForbidden)
+		return
+	}
+	m.mu.Lock()
+	rk := token + "|" + r.Header.Get("Range")
+	loc := m.redirect[rk]
+	delete(m.redirect, rk)
+	m.mu.Unlock()
+	if loc != "" {
+		w.Header().Set("Location", loc)
+		w.WriteHeader(http.StatusFound)
 		return
 	}
 	if stallOnce {
@@ -122,6 +185,35 @@ func (m *mediaServer) serve(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", a, b, size))
 		w.WriteHeader(http.StatusPartialContent)
 		w.Write(m.data[a : b+1])
+		return
+	}
+	// A drained edge's answer: valid headers, then either a paced dribble
+	// (pause between chunks) or a truncated body that hits EOF after one
+	// chunk — old eligibility evidence, no flow proof.
+	if isDrip {
+		var a, b int64
+		fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &a, &b)
+		b = min(b, int64(len(m.data))-1)
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", a, b, len(m.data)))
+		w.WriteHeader(http.StatusPartialContent)
+		fl, _ := w.(http.Flusher)
+		for off := a; off <= b; off += spec.chunk {
+			end := min(off+spec.chunk, b+1)
+			if _, err := w.Write(m.data[off:end]); err != nil {
+				return // the client hung up
+			}
+			if fl != nil {
+				fl.Flush()
+			}
+			if spec.eof {
+				return // promised range truncated: EOF before the sample completes
+			}
+			select {
+			case <-r.Context().Done():
+				return
+			case <-time.After(spec.pause):
+			}
+		}
 		return
 	}
 	var body io.ReadSeeker = bytes.NewReader(m.data)
@@ -246,6 +338,10 @@ func (p *fakeProvider) totalCalls() int {
 
 func (p *fakeProvider) Kind() string { return p.kind }
 
+func (p *fakeProvider) supportsAtomicHashCache(infoHash string) bool {
+	return len(infoHash) == 40
+}
+
 func (p *fakeProvider) CheckCached(_ context.Context, hashes []string) (map[string]bool, error) {
 	p.count("check")
 	if !p.bulk {
@@ -267,7 +363,14 @@ func (p *fakeProvider) Find(_ context.Context, hash string) (string, error) {
 	return p.torrents[hash], nil
 }
 
-func (p *fakeProvider) Acquire(_ context.Context, req AcquireRequest) (*Acquired, error) {
+func (p *fakeProvider) Acquire(ctx context.Context, req AcquireRequest) (*Acquired, error) {
+	if req.Private && !req.privateChecked {
+		var perr error
+		req, perr = prepareAcquire(ctx, p, req, false)
+		if perr != nil {
+			return nil, perr
+		}
+	}
 	p.count("acquire")
 	p.wait(p.acqDelay)
 	p.mu.Lock()

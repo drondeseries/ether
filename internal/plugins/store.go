@@ -15,11 +15,31 @@ import (
 
 	"github.com/braedonsaunders/ether/internal/config"
 	"github.com/braedonsaunders/ether/internal/logredact"
+	"github.com/braedonsaunders/ether/internal/plugins/wasm"
 	"github.com/braedonsaunders/ether/internal/store"
 	"github.com/braedonsaunders/ether/internal/textclip"
 )
 
 func init() {
+	// v9: pushed poster overlay badges owned by plugins (#594).
+	store.Register("plugins", 9, `
+CREATE TABLE IF NOT EXISTS plugin_poster_badges(plugin_id TEXT NOT NULL,set_key TEXT NOT NULL,title_key TEXT NOT NULL,labels_json TEXT NOT NULL,updated_at INTEGER NOT NULL,PRIMARY KEY(plugin_id,set_key,title_key));
+CREATE INDEX IF NOT EXISTS plugin_poster_badges_title_key ON plugin_poster_badges(title_key);
+`)
+
+	// Keep cadence across restarts; retained calls also seed existing installs.
+	store.Register("plugins", 7, `
+CREATE TABLE plugins_schedule_runs(plugin TEXT NOT NULL,call TEXT NOT NULL,last_run INTEGER NOT NULL,PRIMARY KEY(plugin,call));
+INSERT INTO plugins_schedule_runs(plugin,call,last_run) SELECT plugin,route,MAX(created)*1000 FROM plugins_calls GROUP BY plugin,route;
+`)
+
+	// Host-owned digests are separate from plugin KV quotas and cannot be forged by plugins.
+	store.Register("plugins", 6, `CREATE TABLE plugins_hash_cache(plugin TEXT NOT NULL,kkey TEXT NOT NULL,value BLOB NOT NULL,PRIMARY KEY(plugin,kkey));`)
+
+	// v4: settled journal rows (undone, or shadow records that were never
+	// applied) are the only ones retention removes; this partial index
+	// finds them by age without walking the live, undoable history.
+	store.Register("plugins", 4, `CREATE INDEX plugins_journal_settled ON plugins_journal(created) WHERE undone=1 OR shadow=1;`)
 	// v3: ranking steps left out because the plugin ran out of time.
 	store.Register("plugins", 3, `ALTER TABLE plugins_health ADD COLUMN ranking_skipped INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE plugins_health ADD COLUMN ranking_skipped_at INTEGER NOT NULL DEFAULT 0;`)
@@ -45,14 +65,37 @@ CREATE INDEX plugins_logs_plugin ON plugins_logs(plugin,id);
 `)
 }
 
+// scheduleLastRun is host-owned state, independent of plugin KV and call retention.
+func (s *storage) scheduleLastRun(ctx context.Context, plugin, call string) (time.Time, error) {
+	var at int64
+	err := s.db.QueryRowContext(ctx, `SELECT last_run FROM plugins_schedule_runs WHERE plugin=? AND call=?`, plugin, call).Scan(&at)
+	if errors.Is(err, sql.ErrNoRows) {
+		return time.Time{}, nil
+	}
+	if err != nil {
+		return time.Time{}, err
+	}
+	return time.UnixMilli(at), nil
+}
+
+func (s *storage) markScheduleRun(ctx context.Context, plugin, call string, at time.Time) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO plugins_schedule_runs(plugin,call,last_run) VALUES(?,?,?) ON CONFLICT(plugin,call) DO UPDATE SET last_run=excluded.last_run`, plugin, call, at.UnixMilli())
+	return err
+}
+
 // Limits from SPEC §5.1.5, §5.7 and §5.13.
 const (
-	KVQuotaBytes   = 50 << 20
-	OutboxCap      = 1000
-	CallsCap       = 200
-	LogsCap        = 200
-	EventLogMaxAge = 7 * 24 * time.Hour
-	MaxFetchBytes  = 10 << 20
+	KVQuotaBytes     = 50 << 20
+	KVQuotaKeys      = 10000
+	KVKeyChargeBytes = 256
+	OutboxCap        = 1000
+	CallsCap         = 200
+	LogsCap          = 200
+	EventLogMaxAge   = 7 * 24 * time.Hour
+	// JournalSettledMaxAge is how long an undone or shadow journal entry
+	// (one undo can no longer act on) stays in the activity history.
+	JournalSettledMaxAge = 90 * 24 * time.Hour
+	MaxFetchBytes        = wasm.MaxFetchBodyBytes
 )
 
 // Grants is what the owner has granted one plugin on top of its manifest
@@ -61,10 +104,12 @@ const (
 // "viewers.write_watch_state", "collections", "folders", "secrets",
 // "events").
 type Grants struct {
-	Viewers []int64  `json:"viewers,omitempty"`
-	Folders []string `json:"folders,omitempty"`
-	Revoked []string `json:"revoked,omitempty"`
-	LAN     bool     `json:"lan,omitempty"`
+	Viewers       []int64  `json:"viewers,omitempty"`
+	Folders       []string `json:"folders,omitempty"`
+	LocalHosts    []string `json:"localHosts,omitempty"`
+	OperatorHosts []string `json:"operatorHosts,omitempty"`
+	Revoked       []string `json:"revoked,omitempty"`
+	LAN           bool     `json:"lan,omitempty"`
 }
 
 func (g Grants) revoked(key string) bool {
@@ -129,6 +174,10 @@ type Health struct {
 	// budget; zero once a ranking finishes in time again.
 	RankingSkipped   int64     `json:"rankingSkipped"`
 	RankingSkippedAt time.Time `json:"rankingSkippedAt,omitempty"`
+	// Sidecar is "waiting" while a plugin that runs as its own program
+	// (a remote plugin with no URL endpoint) has no sidecar connected.
+	// It is computed live for the console, never stored.
+	Sidecar string `json:"sidecar,omitempty"`
 }
 
 // JournalEntry is one recorded write and its inverse.
@@ -306,6 +355,13 @@ func (s *storage) putFiles(ctx context.Context, plugin, version string, files ma
 	return tx.Commit()
 }
 
+// dropOtherVersions deletes a plugin's artifact files except the current
+// and previous versions, the only two install, runtime and rollback read.
+func (s *storage) dropOtherVersions(ctx context.Context, plugin, current, previous string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM plugins_artifacts WHERE plugin=? AND version<>? AND version<>?`, plugin, current, previous)
+	return err
+}
+
 func (s *storage) file(ctx context.Context, plugin, version, path string) ([]byte, bool) {
 	var b []byte
 	err := s.db.QueryRowContext(ctx, `SELECT content FROM plugins_artifacts WHERE plugin=? AND version=? AND path=?`, plugin, version, path).Scan(&b)
@@ -313,6 +369,12 @@ func (s *storage) file(ctx context.Context, plugin, version, path string) ([]byt
 		return nil, false
 	}
 	return b, true
+}
+
+func (s *storage) hasFile(ctx context.Context, plugin, version, path string) bool {
+	var one int
+	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM plugins_artifacts WHERE plugin=? AND version=? AND path=?`, plugin, version, path).Scan(&one)
+	return err == nil
 }
 
 func (s *storage) grants(ctx context.Context, plugin string) (Grants, error) {
@@ -418,6 +480,20 @@ func (s *storage) kvUsed(ctx context.Context, plugin string) (int64, error) {
 	return n.Int64, err
 }
 
+func (s *storage) kvUsage(ctx context.Context, plugin string) (KVUsage, error) {
+	var used int64
+	var count int64
+	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(size),0),COUNT(*) FROM plugins_kv WHERE plugin=?`, plugin).Scan(&used, &count); err != nil {
+		return KVUsage{}, err
+	}
+	return KVUsage{
+		Bytes:      used + count*KVKeyChargeBytes,
+		Keys:       count,
+		QuotaBytes: KVQuotaBytes,
+		QuotaKeys:  KVQuotaKeys,
+	}, nil
+}
+
 func (s *storage) kvGet(ctx context.Context, plugin, key string) ([]byte, bool, error) {
 	var b []byte
 	err := s.db.QueryRowContext(ctx, `SELECT value FROM plugins_kv WHERE plugin=? AND kkey=?`, plugin, key).Scan(&b)
@@ -463,7 +539,7 @@ func (s *storage) kvPut(ctx context.Context, plugin, key string, value []byte) e
 	if !exists {
 		count++
 	}
-	if count > 10000 || used-old+int64(len(value))+count*256 > KVQuotaBytes {
+	if count > KVQuotaKeys || used-old+int64(len(value))+count*KVKeyChargeBytes > KVQuotaBytes {
 		return ErrQuotaExceeded
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO plugins_kv(plugin,kkey,value,size) VALUES(?,?,?,?) ON CONFLICT(plugin,kkey) DO UPDATE SET value=excluded.value,size=excluded.size`, plugin, key, value, len(value))
@@ -594,6 +670,15 @@ func (s *storage) journalList(ctx context.Context, plugin string, limit int, liv
 func (s *storage) markUndone(ctx context.Context, id int64) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE plugins_journal SET undone=1 WHERE id=?`, id)
 	return err
+}
+
+// pruneJournal deletes settled journal entries older than
+// JournalSettledMaxAge. Live entries (applied, not shadow, not undone) are
+// what "Undo everything" and undo-to-here replay, so they are never pruned.
+func (s *storage) pruneJournal(ctx context.Context) (int64, error) {
+	return store.PruneBatched(ctx, s.db,
+		`DELETE FROM plugins_journal WHERE id IN (SELECT id FROM plugins_journal WHERE (undone=1 OR shadow=1) AND created<? ORDER BY created LIMIT ?)`,
+		s.now().Add(-JournalSettledMaxAge).Unix())
 }
 
 func capRing(ctx context.Context, db *sql.DB, table, plugin string, cap int) {
@@ -809,7 +894,13 @@ func (s *storage) purge(ctx context.Context, plugin string) error {
 		`DELETE FROM onair_feed_values WHERE plugin=?`,
 		`DELETE FROM plugins_grants WHERE plugin=?`,
 		`DELETE FROM plugins_settings WHERE plugin=?`,
+		`DELETE FROM plugins_setup WHERE plugin=?`,
 		`DELETE FROM plugins_kv WHERE plugin=?`,
+		`DELETE FROM plugin_poster_badges WHERE plugin_id=?`,
+		`DELETE FROM plugins_hash_cache WHERE plugin=?`,
+		`DELETE FROM plugins_remote_hashes WHERE plugin=?`,
+		`DELETE FROM plugins_remote_hash_budget WHERE plugin=?`,
+		`DELETE FROM plugins_schedule_runs WHERE plugin=?`,
 		`DELETE FROM plugins_health WHERE plugin=?`,
 		`DELETE FROM plugins_outbox WHERE plugin=?`,
 		`DELETE FROM plugins_proposals WHERE plugin=?`,

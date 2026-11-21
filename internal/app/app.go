@@ -26,17 +26,24 @@ import (
 	"github.com/braedonsaunders/ether/internal/diagnostics"
 	"github.com/braedonsaunders/ether/internal/discovery"
 	"github.com/braedonsaunders/ether/internal/episodeorder"
+	"github.com/braedonsaunders/ether/internal/events"
 	"github.com/braedonsaunders/ether/internal/experience"
 	"github.com/braedonsaunders/ether/internal/extras"
 	"github.com/braedonsaunders/ether/internal/favorites"
+	"github.com/braedonsaunders/ether/internal/flows"
+	"github.com/braedonsaunders/ether/internal/frontend"
+	"github.com/braedonsaunders/ether/internal/frontends/vela"
 	"github.com/braedonsaunders/ether/internal/handles/capability"
 	"github.com/braedonsaunders/ether/internal/hoststat"
-	"github.com/braedonsaunders/ether/internal/identity"
+	"github.com/braedonsaunders/ether/internal/httpclient"
 	"github.com/braedonsaunders/ether/internal/langfeat"
+	"github.com/braedonsaunders/ether/internal/libraries"
+	"github.com/braedonsaunders/ether/internal/libraryfilter"
 	"github.com/braedonsaunders/ether/internal/livetv"
 	"github.com/braedonsaunders/ether/internal/llm"
 	"github.com/braedonsaunders/ether/internal/logredact"
 	"github.com/braedonsaunders/ether/internal/markers"
+	"github.com/braedonsaunders/ether/internal/mdblist"
 	"github.com/braedonsaunders/ether/internal/migrate"
 	"github.com/braedonsaunders/ether/internal/newznab"
 	"github.com/braedonsaunders/ether/internal/notify"
@@ -45,9 +52,8 @@ import (
 	"github.com/braedonsaunders/ether/internal/overlays"
 	"github.com/braedonsaunders/ether/internal/personalize"
 	"github.com/braedonsaunders/ether/internal/playback"
-	"github.com/braedonsaunders/ether/internal/plex"
 	"github.com/braedonsaunders/ether/internal/plexguid"
-	"github.com/braedonsaunders/ether/internal/plexmeta"
+	plexmeta "github.com/braedonsaunders/ether/internal/plexmeta"
 	"github.com/braedonsaunders/ether/internal/plextv"
 	"github.com/braedonsaunders/ether/internal/plexwatch"
 	"github.com/braedonsaunders/ether/internal/prefetch"
@@ -77,7 +83,8 @@ import (
 	"github.com/braedonsaunders/ether/internal/trickplay"
 	"github.com/braedonsaunders/ether/internal/updater"
 	"github.com/braedonsaunders/ether/internal/usenet"
-	"github.com/braedonsaunders/ether/internal/viewerpolicy"
+	"github.com/braedonsaunders/ether/internal/vault"
+	"github.com/braedonsaunders/ether/internal/veladist"
 	"github.com/braedonsaunders/ether/internal/watchlist"
 	"log/slog"
 	"net/http"
@@ -101,6 +108,8 @@ type Options struct {
 	Version                string
 	// Logger receives everything; the admin log ring is teed onto it.
 	Logger *slog.Logger
+	// LogLevel controls the process handler, including existing child loggers.
+	LogLevel *slog.LevelVar
 	// Spike forces spike mode (local files, no Usenet) on top of config.
 	Spike bool
 	// SpikeFiles are extra local files for spike mode.
@@ -121,8 +130,13 @@ type Options struct {
 	// CatalogNow, when set, is the catalog clock from construction. Tests
 	// pin it so a minute snapshot cannot expire while a background browse runs.
 	CatalogNow func() time.Time
+	// FlowActions optionally injects a Flows action registry; nil creates an
+	// empty registry ready for dynamic built-in and plugin action registration.
+	FlowActions flows.ActionRegistry
 	// plextvHTTP, when set, is the HTTP client used by the plex.tv client in tests.
 	plextvHTTP *http.Client
+	// urlImages, when set, replaces the untrusted remote image fetcher in tests.
+	urlImages frontend.UntrustedImageFetcher
 	// diskUsage, when set, replaces the cache volume measurement behind the
 	// segment cache's free-space floor, so tests never depend on the free
 	// space of the machine running them.
@@ -145,9 +159,11 @@ type App struct {
 	opts             Options
 	log              *slog.Logger
 	logs             *admin.LogBuffer
+	playLogs         *stats.SessionLogSink
 	support          *diagnostics.Recorder
 	cfg              *config.Store
 	proxyMu          sync.Mutex
+	pluginLiveTVMu   sync.Mutex
 	prowlarrMu       sync.Mutex
 	prowlarrState    string
 	prowlarrKept     bool
@@ -179,28 +195,34 @@ type App struct {
 	// (heartbeated; see rolling.go).
 	draining atomic.Bool
 
-	tmdb          *tmdb.Client
-	catalog       *catalog.Catalog
-	collections   *collections.Service
-	images        *artwork.Images
-	favorites     *favorites.Service
-	notInterested *notinterested.Service
-	playlists     core.Playlists
-	state         *state.State
-	trakt         *trakt.Client
-	simklDevice   *simkl.DeviceManager
-	llm           *llm.Service
-	recommend     *recommend.Recommender
-	personalize   *personalize.Engine
-	subtitles     *subtitles.Service
-	lang          *langfeat.Service
-	fetcher       *usenet.Fetcher
-	cache         *segcache.Cache
-	cacheConfig   atomic.Pointer[config.Cache]
-	engine        *stream.Engine
-	indexers      *newznab.Manager
-	sites         *cardigann.Service // built-in indexer sites from owner-installed definitions
-	addons        *stremio.Service   // Stremio stream addons configured as indexers
+	tmdb        *tmdb.Client
+	libraries   *libraries.Service
+	catalog     *catalog.Catalog
+	collections *collections.Service
+	images      *artwork.Images
+	// titlePosterRenderer draws generated posters (titlePosters).
+	titlePosterOnce     sync.Once
+	titlePosterRenderer *artwork.Renderer
+	favorites           *favorites.Service
+	notInterested       *notinterested.Service
+	playlists           core.Playlists
+	state               *state.State
+	trakt               *trakt.Client
+	simklDevice         *simkl.DeviceManager
+	mdblistTokens       *mdblist.TokenStore
+	llm                 *llm.Service
+	recommend           *recommend.Recommender
+	personalize         *personalize.Engine
+	subtitles           *subtitles.Service
+	lang                *langfeat.Service
+	fetcher             *usenet.Fetcher
+	cache               *segcache.Cache
+	cacheConfig         atomic.Pointer[config.Cache]
+	engine              *stream.Engine
+	vault               vault.Store
+	indexers            *newznab.Manager
+	sites               *cardigann.Service // built-in indexer sites from owner-installed definitions
+	addons              *stremio.Service   // Stremio stream addons configured as indexers
 	// Debrid: torrent releases stream through owner debrid accounts. The
 	// wrappers dispatch on the payload and delegate Usenet to engine and
 	// indexers, so every consumer uses media and sources.
@@ -254,12 +276,16 @@ type App struct {
 	safety            *safety.Service
 	updates           *updateState
 	frontends         *frontendRuntime
+	velaOnce          sync.Once
+	velaDist          *veladist.Manager
+	velaSkinsOnce     sync.Once
+	velaSkins         *vela.SkinStore
+	velaSkinHTTP      *http.Client
 	frontendClients   *frontendClients
-	plexServer        *plex.Server
 	artwork           *artworkservice.Source
 	downloadRemuxer   core.DownloadRemuxer
-	plexBuildMu       sync.Mutex
-	plexClose         func()
+	plexMetaMu        sync.Mutex
+	plexMetaClose     func()
 	spikeLibrary      *spike.Library
 	handler           http.Handler
 	instanceLock      *instanceLock
@@ -278,15 +304,23 @@ type App struct {
 	// integrity is the database's last integrity check (SQLite).
 	integrity         atomic.Pointer[store.Integrity]
 	integrityChecking atomic.Bool
+	// compaction is the owner's "Compact database" action (dbcompact.go).
+	compaction databaseCompaction
 	// restart is an owner-requested restart (restart.go).
 	restart restartState
 	// Extensibility (docs/extend/SPEC.md). Each runtime type lives in its own
 	// file and is owned by one workstream: extend.go, console_stream.go,
 	// plugins.go and agent.go.
-	extendRT  *extendRuntime
-	streamRT  *consoleStreamRuntime
-	pluginsRT *pluginRuntime
-	agentRT   *agentRuntime
+	extendRT       *extendRuntime
+	streamRT       *consoleStreamRuntime
+	pluginsRT      *pluginRuntime
+	agentRT        *agentRuntime
+	eventBus       *events.Bus
+	eventRegistry  *events.Registry
+	systemEvents   *systemEventHooks
+	flowsRT        *flowsRuntime
+	pluginLiveOnce sync.Once
+	pluginLive     *PluginLiveService
 }
 
 // New builds every component. Nothing listens until Run.
@@ -297,13 +331,16 @@ func New(ctx context.Context, opts Options) (_ *App, err error) {
 	if opts.Version == "" {
 		opts.Version = updater.Version
 	}
-	a := &App{opts: opts, logs: admin.NewLogBuffer(4000)}
+	a := &App{opts: opts, logs: admin.NewLogBuffer(4000), playLogs: stats.NewSessionLogSink()}
 	base := opts.Logger
 	if base == nil {
-		base = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+		if a.opts.LogLevel == nil {
+			a.opts.LogLevel = new(slog.LevelVar)
+		}
+		base = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: a.opts.LogLevel}))
 	}
-	// The in-memory buffer behind Logs gets the same scrubbing as the file.
-	a.log = slog.New(logredact.Handler(admin.TeeHandler(base.Handler(), a.logs)))
+	// The in-memory buffer behind Logs and the per-play session sink get the same scrubbing as the file.
+	a.log = slog.New(logredact.Handler(a.playLogs.Wrap(admin.TeeHandler(base.Handler(), a.logs))))
 	slog.SetDefault(a.log)
 	// Serve holds the data directory's lock across starts, so a retried
 	// start never lets another instance in; an App run on its own takes it.
@@ -357,6 +394,21 @@ func New(ctx context.Context, opts Options) (_ *App, err error) {
 	}
 	if a.cfg, err = config.Open(opts.DataDir); err != nil {
 		return nil, startFail(startup.FailConfig, fmt.Errorf("config: %w", err))
+	}
+	// Subscribe independently of playback/source wiring: specialist roles also
+	// serve the console. Keep a startup --log-level override until an edit.
+	if a.opts.LogLevel != nil {
+		if opts.Logger == nil {
+			level := slog.LevelInfo
+			_ = level.UnmarshalText([]byte(a.cfg.Get().Server.LogLevel))
+			a.opts.LogLevel.Set(level)
+		}
+		a.cfg.Subscribe(func(c config.Config) {
+			level := slog.LevelInfo
+			if c.Server.LogLevel == "" || level.UnmarshalText([]byte(c.Server.LogLevel)) == nil {
+				a.opts.LogLevel.Set(level)
+			}
+		})
 	}
 	if warning := config.DataDirWarning(opts.DataDir); warning != "" {
 		a.log.Warn(warning)
@@ -443,7 +495,21 @@ func New(ctx context.Context, opts Options) (_ *App, err error) {
 		a.Close() // libera o instance lock (o db não foi aberto)
 		return nil, startFail(openFailure(err, dbCfg.IsPostgres()), fmt.Errorf("database: %w", err))
 	}
-	a.cfg.SetPolicyEpoch(func() error { return viewerpolicy.Bump(context.Background(), a.db) })
+	phaseStart := time.Now()
+	phase := func(name string) {
+		a.log.Info("startup phase", "phase", name, "duration", time.Since(phaseStart))
+		phaseStart = time.Now()
+	}
+	// The rest of construction writes through the gate in startup steps
+	// (restored-dump import, credential sealing, seeding). Hold the gate
+	// in maintenance mode until New returns so anything already writing
+	// beside it queues instead of failing at 10 s (#407).
+	if endHold, herr := store.MaintenanceHold(ctx, a.db); herr != nil {
+		a.log.Warn("startup maintenance hold", "err", herr)
+	} else {
+		defer endHold()
+	}
+	a.cfg.SetPolicyEpoch(a.publishPolicyConfig)
 	if err := a.checkRestoredIntegrity(ctx); err != nil {
 		return nil, err
 	}
@@ -456,10 +522,33 @@ func New(ctx context.Context, opts Options) (_ *App, err error) {
 		a.Close()
 		return nil, fmt.Errorf("cluster: %w", err)
 	}
+	a.initEventBus()
 	// A restored PostgreSQL-style bundle leaves a logical dump to import.
 	if err := a.importRestoredDump(ctx); err != nil {
 		a.Close()
 		return nil, err
+	}
+	// Libraries (v0.3.8 §1): seed Movies/TV Shows and move the retired
+	// config library names onto libraries 1/2 exactly once.
+	if a.libraries, err = libraries.New(ctx, a.db, libraries.Options{Logger: a.log, CompileCataloguePolicy: func(specs []core.LibraryExclusion, fallback string) (*libraryfilter.Filter, error) {
+		if a.catalog == nil {
+			return nil, fmt.Errorf("catalogue unavailable")
+		}
+		return a.catalog.CompileLibraryRules(specs, fallback)
+	}, CompilePluginPolicy: func(ctx context.Context, id core.LibraryID, specs []core.LibraryExclusion, fallback string) (*libraryfilter.Filter, error) {
+		if a.pluginsRT == nil || a.pluginsRT.pluginitems == nil {
+			return nil, fmt.Errorf("plugin items unavailable")
+		}
+		return a.pluginsRT.pluginitems.CompilePolicy(ctx, id, specs, fallback)
+	}}); err != nil {
+		a.Close()
+		return nil, fmt.Errorf("libraries: %w", err)
+	}
+	if moviesName, showsName := a.cfg.LegacyLibraryNames(); moviesName != "" || showsName != "" {
+		if err := a.libraries.MigrateConfigNames(ctx, moviesName, showsName); err != nil {
+			a.Close()
+			return nil, fmt.Errorf("libraries: migrate config names: %w", err)
+		}
 	}
 	if err := a.checkCredentialKey(ctx); err != nil {
 		a.Close()
@@ -481,11 +570,16 @@ func New(ctx context.Context, opts Options) (_ *App, err error) {
 		return nil, fmt.Errorf("migrate app overrides: %w", err)
 	}
 	cfg = a.cfg.Get()
+	if err := a.libraries.MigrateConfigRules(ctx, cfg.Catalog.Exclusions, cfg.Catalog.VisibilityDefault); err != nil {
+		a.Close()
+		return nil, fmt.Errorf("libraries: migrate config rules: %w", err)
+	}
 	// Recheck after the shared settings overlay and override migration, before
 	// constructing services. Role/address settings remain node-local.
 	if err := a.validateRuntimeSettings(cfg.Server, dbCfg); err != nil {
 		return nil, startFail(startup.FailConfig, fmt.Errorf("node settings: %w", err))
 	}
+	phase("database setup and credential blobs")
 	a.tracker.Set(startup.PhaseStartingServices)
 	if a.deployment != nil && !cfg.Server.NodeRoles.FullServer() {
 		if cfg.Server.NodeRoles.Has(config.RoleServer) {
@@ -494,6 +588,7 @@ func New(ctx context.Context, opts Options) (_ *App, err error) {
 			}
 			a.connectServerHooks()
 			a.initUpdates()
+			a.wireSystemEvents()
 			a.syncOwnerRecovery(ctx)
 			started = true
 			return a, nil
@@ -524,15 +619,19 @@ func New(ctx context.Context, opts Options) (_ *App, err error) {
 		started = true
 		return a, nil
 	}
+	phase("role selection")
 	cfg = a.adoptMountedCache(cfg)
 	if err := a.build(ctx, cfg); err != nil {
 		a.Close()
 		return nil, err
 	}
+	phase("service construction")
 	a.connectClusterHooks()
 	a.initUpdates()
+	a.wireSystemEvents()
 	// Keep the owner's recovery sign-in in step with the database.
 	a.syncOwnerRecovery(ctx)
+	phase("hooks and recovery")
 	started = true
 	return a, nil
 }
@@ -544,7 +643,7 @@ func (a *App) build(ctx context.Context, cfg config.Config) error {
 	a.support = diagnostics.New(a.supportDeps())
 	// One guide client serves the import console and the background sync,
 	// so a listing fetched by either is cached for the other.
-	ua := "Ether/" + a.opts.Version + " (+https://github.com/braedonsaunders/ether)"
+	ua := httpclient.FormatUserAgent(a.opts.Version)
 	a.guides = resolver.NewTrashGuides(resolver.TrashOptions{UserAgent: ua})
 	a.dictionarry = resolver.NewDictionarry(resolver.DictionarryOptions{UserAgent: ua})
 	a.qualitySync = resolver.NewQualitySyncer(resolver.QualitySyncDeps{
@@ -562,65 +661,21 @@ func (a *App) build(ctx context.Context, cfg config.Config) error {
 	// Identity precedes model construction: background builders receive a fully
 	// initialized auth service. Scorer consumers are built inside the model's
 	// dependency phase before its workers start.
-	for _, build := range []func(context.Context, config.Config) error{
+	for phase, build := range []func(context.Context, config.Config) error{
 		a.buildCatalogue, func(context.Context, config.Config) error {
 			a.safety.SetCatalogPolicy(a.catalog.VisibleForViewer, a.catalog.DiscoveryVisibleForViewer)
-			return nil
+			return a.rebuildPolicyInputs(ctx)
 		}, a.buildIdentity, a.buildSessionEvents, a.buildPersonalization,
 		a.buildSources, a.buildPlayback, a.buildClusterPlayback, a.buildPrefetch, a.buildIntegrations,
 	} {
+		phaseStart := time.Now()
 		if err := build(ctx, cfg); err != nil {
 			return err
 		}
+		a.log.Info("startup phase", "phase", []string{"catalogue", "policy", "identity", "session events", "personalization", "sources", "playback", "cluster playback", "prefetch", "integrations"}[phase], "duration", time.Since(phaseStart))
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	a.stopPrewarm = cancel
-	a.prewarmDone = make(chan struct{})
-	go func() {
-		defer close(a.prewarmDone)
-		a.prewarmBrowse(ctx)
-	}()
+
 	return nil
-}
-
-// prewarmBrowse fills the catalog and statement caches before the first viewer
-// request. It stays on local reads: episode expansion can fetch seasons and
-// take the write lock, and a request in flight must not wait for that.
-func (a *App) prewarmBrowse(ctx context.Context) {
-	if a == nil || a.catalog == nil {
-		return
-	}
-	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
-	defer cancel()
-	movies, _ := a.catalog.Browse(ctx, core.BrowseQuery{Sort: core.SortAdded, Desc: true, Limit: 16, Filter: core.Filter{Type: core.TypeMovie, KnownAddedDate: true}})
-	shows, _ := a.catalog.Browse(ctx, core.BrowseQuery{Sort: core.SortTitle, Limit: 16, Filter: core.Filter{Type: core.TypeShow}})
-	keys := make([]core.RatingKey, 0, len(movies.Items)+len(shows.Items))
-	for _, title := range movies.Items {
-		keys = append(keys, title.Key)
-	}
-	for _, title := range shows.Items {
-		keys = append(keys, title.Key)
-	}
-	if len(keys) > 0 {
-		_, _ = a.catalog.CachedGetMany(ctx, keys)
-	}
-}
-
-// warmFixtureEpisodes fills the show-episode cache after the scorecard import.
-// It runs only before the listener opens.
-func (a *App) warmFixtureEpisodes(ctx context.Context) {
-	if a == nil || a.catalog == nil {
-		return
-	}
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	shows, err := a.catalog.Browse(ctx, core.BrowseQuery{Sort: core.SortTitle, Limit: 16, Filter: core.Filter{Type: core.TypeShow}})
-	if err != nil {
-		return
-	}
-	for _, show := range shows.Items {
-		_, _ = a.catalog.Grandchildren(ctx, show.Key)
-	}
 }
 
 // applyConfig pushes an edited config into the running components.
@@ -647,12 +702,17 @@ func (a *App) applyConfig(c config.Config) {
 	if a.transcoder != nil {
 		a.transcoder.UpdateConfig(c.Transcode)
 	}
+	if a.deployment != nil && a.deployment.encoder != nil {
+		a.deployment.encoder.UpdateConfig(privateEncoderConfig(c, a.deployment.settings.Capacity))
+	}
 	a.trakt.UpdateConfig(c.Trakt)
 	a.subtitles.UpdateConfig(c.OpenSubtitles)
+	a.subtitles.UpdateSubDL(c.SubDL)
 	a.subtitles.UpdateProviders(c.Subtitles.Providers)
 	// Re-publish section titles when Movies / TV Shows library names change.
 	a.publishLibrarySections()
 	a.registrar.Trigger()
+	a.publishDashboard()
 }
 
 // protectedReleases is every release that must survive cache eviction:
@@ -670,9 +730,8 @@ func (a *App) protectedReleases() map[string]bool {
 // Handler is the combined Plex + owner UI handler (tests).
 func (a *App) Handler() http.Handler { return a.handler }
 
-// settleBeforeListen finishes startup database work that would otherwise
-// hold the write lock across the first play. The listener is not open yet.
-func (a *App) settleBeforeListen(ctx context.Context) {
+// warmPlaybackPolicy initializes optional confirmation state after listening.
+func (a *App) warmPlaybackPolicy(ctx context.Context) {
 	if a.safety != nil && a.users != nil {
 		owner, err := a.users.Owner(ctx)
 		if err == nil && owner != nil {
@@ -681,12 +740,7 @@ func (a *App) settleBeforeListen(ctx context.Context) {
 			}
 		}
 	}
-	if a.db != nil && store.DialectOf(a.db) == store.SQLite {
-		a.upgradeProgress("checkpoint", 0, 0)
-		if _, err := a.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
-			a.log.Warn("startup checkpoint", "err", err)
-		}
-	}
+
 }
 
 // Config is the settings store.
@@ -694,6 +748,7 @@ func (a *App) Config() *config.Store { return a.cfg }
 
 // Run serves until ctx is cancelled.
 func (a *App) Run(ctx context.Context) error {
+	runStart := time.Now()
 	ctx = store.WithWorkProgress(ctx, a.upgradeProgress)
 	if a.deployment != nil && !a.cfg.Get().Server.NodeRoles.FullServer() {
 		if roles := a.cfg.Get().Server.NodeRoles; roles.Has(config.RoleServer) || roles.Has(config.RoleDelivery) {
@@ -720,13 +775,66 @@ func (a *App) Run(ctx context.Context) error {
 		return err
 	}
 	defer stopPrivate()
+	a.log.Info("startup phase", "phase", "cluster and private listener", "duration", time.Since(runStart))
+	runStart = time.Now()
+	// Seal credentials before consumers begin serving requests.
+	endHold, holdErr := store.MaintenanceHold(ctx, a.db)
+	if holdErr != nil {
+		a.log.Warn("startup maintenance hold", "err", holdErr)
+		endHold = func() {}
+	}
 	if err := a.migrateCredentials(ctx); err != nil {
+		endHold()
 		return fmt.Errorf("convert stored credentials: %w", err)
 	}
+	endHold()
+	a.log.Info("startup phase", "phase", "stored credentials", "duration", time.Since(runStart))
+	runStart = time.Now()
 	var background backgroundGroup
 	defer background.Wait()
 	defer cancel()
+
+	front := a.opts.front
+	if front == nil {
+		ln, err := a.listen(cfg)
+		if err != nil {
+			return err
+		}
+		front = newFrontDoor(a.tracker, a.log)
+		front.serve(ln)
+		defer front.close()
+	}
+	addr := front.ln.Addr()
+	a.frontends.start(ctx, addr)
+	defer a.frontends.stop()
+	cfg = a.cfg.Get() // the port may have moved off a busy default
+	// Publish the actual listener, including automatic port fallback, without
+	// exposing the service's protected configuration to the desktop user.
+	if err := service.PublishLocalURL(a.opts.DataDir, strings.TrimSuffix(probeURL(addr), "/identity")); err != nil {
+		a.log.Warn("publish local tray endpoint", "err", err)
+	}
+	front.setTLS(a.certs.TLSConfig)
+	front.setProxies(a.cfg.TrustedProxyCIDRs)
+	front.setRemote(a.cfg.AllowRemoteConsole)
+	// A restore applied at this start counts from here: the server is
+	// about to serve on it. If it cannot be recorded, nothing is served
+	// and Serve puts the original data back.
+	if err := a.confirmRestore(); err != nil {
+		return err
+	}
+	front.gate.Open(a.handler)
+	a.markPublicReady()
+	a.log.Info("startup phase", "phase", "public listener", "duration", time.Since(runStart))
+	uiURL := fmt.Sprintf("http://localhost:%d/ether/", cfg.Server.Port)
+	a.log.Info("Ether listening", "addr", addr.String(), "ui", uiURL,
+		"version", a.opts.Version, "spike", cfg.Spike.Enabled)
+	background.start(func() { a.warmPlaybackPolicy(ctx) })
+	background.start(func() { a.catalog.FinishStartup(ctx) })
+	background.start(func() { a.playback.FinishStartup(ctx) })
+
 	background.start(func() { a.runNodeControl(ctx) })
+	background.start(func() { a.ensureVelaInstalled(ctx) })
+	background.start(func() { a.watchConsoleSessions(ctx) })
 
 	// Singleton work runs only on the cluster leader (always, standalone).
 	// trakt.Start stays on every node: it delivers this node's own
@@ -736,6 +844,8 @@ func (a *App) Run(ctx context.Context) error {
 	// Every node serves search: build its title index now, in the
 	// background, so the first search does not fall back to SQL.
 	a.catalog.WarmSearch(ctx)
+	// Every node that serves search keeps its own long-tail index.
+	background.start(func() { a.catalog.RunTail(ctx) })
 	if parityRunCatalogueWorkers() {
 		background.start(func() { a.cluster.RunAsLeader(ctx, "catalogue sync", a.catalog.Run) })
 		background.start(func() { a.cluster.RunAsLeader(ctx, "trending charts", a.catalog.RunTrends) })
@@ -755,17 +865,14 @@ func (a *App) Run(ctx context.Context) error {
 			simkl.RunDelivery(ctx, a.simklService, func() bool { return a.cfg.Get().Simkl.Enabled }, a.log.With("component", "simkl"))
 		})
 	})
+	background.start(func() {
+		a.cluster.RunAsLeader(ctx, "mdblist delivery", func(ctx context.Context) {
+			mdblist.RunDelivery(ctx, a.mdblistService, func() bool { return a.cfg.Get().MDBList.Enabled }, a.log.With("component", "mdblist"))
+		})
+	})
 	background.start(func() { a.load.Run(ctx) })
 	background.start(func() { a.cache.Run(ctx) })
 	background.start(func() { a.cachefill.Run(ctx) })
-	if parityRunRegistrar() {
-		if a.clustered() {
-			background.start(func() { a.runRegistrarAsLeader(ctx) })
-			background.start(func() { a.registrar.RunPortMapping(ctx) })
-		} else if err := a.registrar.Start(ctx); err != nil {
-			a.log.Warn("plex.tv registrar", "err", err)
-		}
-	}
 
 	background.start(func() { a.housekeeping(ctx) })
 	background.start(func() { a.checkpointWAL(ctx) })
@@ -804,47 +911,29 @@ func (a *App) Run(ctx context.Context) error {
 	background.start(func() { a.runBudgets(ctx) })
 	background.start(func() { a.cluster.RunAsLeader(ctx, "prowlarr indexer sync", a.runProwlarrSync) })
 	background.start(func() { a.runEgress(ctx) })
-	// Credential sealing and the startup WAL checkpoint finish before the
-	// listener accepts a play. A play must not wait on that write.
-	a.settleBeforeListen(ctx)
+	background.start(func() { a.runSystemEvents(ctx) })
+	background.start(func() { a.runFlows(ctx) })
 
-	front := a.opts.front
-	if front == nil {
-		ln, err := a.listen(cfg)
-		if err != nil {
-			return err
-		}
-		front = newFrontDoor(a.tracker, a.log)
-		front.serve(ln)
-		defer front.close()
-	}
-	addr := front.ln.Addr()
-	a.frontends.start(ctx, addr)
-	defer a.frontends.stop()
-	cfg = a.cfg.Get() // the port may have moved off a busy default
-	// Publish the actual listener, including automatic port fallback, without
-	// exposing the service's protected configuration to the desktop user.
-	if err := service.PublishLocalURL(a.opts.DataDir, strings.TrimSuffix(probeURL(addr), "/identity")); err != nil {
-		a.log.Warn("publish local tray endpoint", "err", err)
-	}
-	front.setTLS(a.certs.TLSConfig)
-	front.setProxies(a.cfg.TrustedProxyCIDRs)
-	front.setRemote(a.cfg.AllowRemoteConsole)
-	// A restore applied at this start counts from here: the server is
-	// about to serve on it. If it cannot be recorded, nothing is served
-	// and Serve puts the original data back.
-	if err := a.confirmRestore(); err != nil {
-		return err
-	}
-	front.gate.Open(a.handler)
-	a.markPublicReady()
-	uiURL := fmt.Sprintf("http://localhost:%d/ether/", cfg.Server.Port)
-	a.log.Info("Ether listening", "addr", addr.String(), "ui", uiURL,
-		"version", a.opts.Version, "spike", cfg.Spike.Enabled)
 	if next := startupNextStep(cfg, uiURL); next != "" {
 		a.log.Info(next)
 	}
+	// Start plex.tv publication and connectivity checks only after the
+	// front-end sections are registered and the listener gate is open, so
+	// the first servers.xml carries the library list and plex.tv's inbound
+	// connectivity probe never races a closed listener.
+	if parityRunRegistrar() {
+		if a.clustered() {
+			background.start(func() { a.runRegistrarAsLeader(ctx) })
+			background.start(func() { a.registrar.RunPortMapping(ctx) })
+		} else if err := a.registrar.Start(ctx); err != nil {
+			a.log.Warn("plex.tv registrar", "err", err)
+		}
+	}
+	if a.registrar != nil {
+		a.registrar.ListenerReady()
+	}
 	background.start(func() { a.checkIntegrityLater(ctx) })
+	a.emitServerStarted()
 	a.notifyLifecycle("server.started", "Ether is online", cfg.Server.FriendlyName+" is ready for connections.")
 	// Hang watchdog: restart via the supervisor if we stop answering.
 	watchdogErr := make(chan error, 1)
@@ -883,7 +972,10 @@ func (a *App) Run(ctx context.Context) error {
 		a.drainPrivate()
 	}
 	if runErr == nil {
+		a.emitServerStopping("shutdown")
 		a.notifyLifecycle("server.stopping", "Ether is stopping", "The server is shutting down or restarting.")
+	} else if !errors.Is(runErr, errClusterSetup) {
+		a.emitServerCrashed(runErr.Error(), "runtime")
 	}
 	// Hand leadership over first: another node takes over singleton work
 	// and plex.tv publication while this one finishes shutting down.
@@ -953,9 +1045,9 @@ func (a *App) runQualitySync(ctx context.Context) {
 func (a *App) housekeeping(ctx context.Context) {
 	pins := time.NewTicker(5 * time.Minute)
 	defer pins.Stop()
-	imageTimer := time.NewTicker(5 * time.Second)
-	defer imageTimer.Stop()
-	var imageSweep, receiptSweep headerMaintenance
+	receiptTimer := time.NewTicker(5 * time.Second)
+	defer receiptTimer.Stop()
+	var receiptSweep headerMaintenance
 	// The PMS release check is cluster-wide: leader only. Pins and
 	// seen-token flushes are this node's own.
 	lastCompat := time.Now()
@@ -968,15 +1060,8 @@ func (a *App) housekeeping(ctx context.Context) {
 		case <-ctx.Done():
 			_ = a.users.FlushSeen(context.Background())
 			return
-		case <-imageTimer.C:
-			err := imageSweep.pass(ctx, a.cluster.IsLeader(), time.Now, func(ctx context.Context, now time.Time, shard int64) error {
-				_, err := identity.PruneImageGrantShard(ctx, a.db, now, shard)
-				return err
-			})
-			if err != nil && ctx.Err() == nil {
-				a.log.Warn("image grant maintenance failed", "err", err)
-			}
-			err = receiptSweep.pass(ctx, a.cluster.IsLeader(), time.Now, func(ctx context.Context, now time.Time, shard int64) error {
+		case <-receiptTimer.C:
+			err := receiptSweep.pass(ctx, a.cluster.IsLeader(), time.Now, func(ctx context.Context, now time.Time, shard int64) error {
 				_, err := experience.PruneReceiptShard(ctx, a.db, now, shard)
 				return err
 			})

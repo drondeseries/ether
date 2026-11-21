@@ -11,17 +11,19 @@ import (
 	"github.com/braedonsaunders/ether/internal/config"
 )
 
-// configSections maps URL section names to JSON field names on Config.
+// configSections maps URL section identities to JSON field names on Config.
+// Account section names below select persisted fields, not frontend behavior.
 var configSections = map[string]string{
+	"vela":         "vela",
 	"posters":      "posters",
 	"plexservers":  "plexServers",
 	"availability": "availability",
 	"markers":      "markers", "server": "server", "plex": "plex", "usenet": "usenet", "indexers": "indexers",
 	"cache": "cache", "catalog": "catalog", "resolver": "resolver", "quality": "quality",
 	"transcode": "transcode", "trakt": "trakt", "simkl": "simkl", "opensubtitles": "openSubtitles",
-	"openSubtitles": "openSubtitles", "llm": "llm", "updates": "updates", "spike": "spike",
+	"openSubtitles": "openSubtitles", "subdl": "subdl", "llm": "llm", "updates": "updates", "spike": "spike",
 	"debrid": "debrid", "indexerSites": "indexerSites", "outbound": "outbound", "clients": "clients",
-	"clientIdentity": "clientIdentity",
+	"clientIdentity": "clientIdentity", "livetv": "liveTV", "mdblist": "mdblist",
 }
 
 func (h *Handler) handleGetConfig(w http.ResponseWriter, r *http.Request) {
@@ -65,6 +67,7 @@ func (h *Handler) saveConfig(next, prev config.Config, plexFields map[string]jso
 		// The database is node-local and chosen at startup (config file or
 		// ETHER_DATABASE_URL); the admin API shows it redacted, never edits it.
 		keepDatabase := c.Database
+		next.Server.PortExplicit = c.Server.PortExplicit || next.Server.Port != c.Server.Port
 		// Setup completion gates tokenless local-network access
 		// (requireAuth) and changes only through /api/setup/complete: a
 		// config document loaded before setup finished must not clear it.
@@ -198,9 +201,7 @@ func (h *Handler) handleGetSection(w http.ResponseWriter, r *http.Request) {
 	_ = json.Unmarshal(raw, &all)
 	out := map[string]any{"section": field, "value": json.RawMessage(all[field])}
 	if field == "clientIdentity" {
-		// The owner's selectors show each preset's literal user agent; serving
-		// the table keeps that display identical to what is sent.
-		out["presets"] = config.IdentityPresets()
+		out["defaultUserAgent"] = config.DefaultUserAgent()
 	}
 	writeJSON(w, http.StatusOK, out)
 }

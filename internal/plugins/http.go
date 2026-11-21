@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/braedonsaunders/ether/internal/artwork"
 	"github.com/braedonsaunders/ether/internal/plugins/wasm"
 	"github.com/braedonsaunders/ether/internal/viewspec"
 )
@@ -26,6 +27,11 @@ func (m *Manager) Handler() http.Handler {
 	mux.HandleFunc("POST /install/preview", m.handlePreview)
 	mux.HandleFunc("POST /install", m.handleInstall)
 	mux.HandleFunc("GET /{id}", m.handleGet)
+	mux.HandleFunc("GET /{id}/icon", m.handleIcon)
+	mux.HandleFunc("GET /runtime-limits", m.handleRuntimeLimits)
+	mux.HandleFunc("PUT /runtime-limits", m.handleRuntimeLimits)
+	mux.HandleFunc("GET /{id}/jobs", m.handleActionJobs)
+	mux.HandleFunc("POST /{id}/jobs/cancel", m.handleCancelActionJob)
 	mux.HandleFunc("GET /{id}/resources/{resource}", m.handleStremioResource)
 	mux.HandleFunc("GET /{id}/directories/{key}", m.handleDirectory)
 	mux.HandleFunc("GET /{id}/settings", m.handleGetSettings)
@@ -87,11 +93,13 @@ type Summary struct {
 	Health        string `json:"health"`
 	// HealthReason is the plain-language reason behind a non-ok health,
 	// such as "Recent calls were slow."
-	HealthReason string   `json:"healthReason,omitempty"`
-	Capabilities []string `json:"capabilities,omitempty"`
-	SourceKind   string   `json:"sourceKind,omitempty"`
-	StremioOnly  bool     `json:"stremioOnly,omitempty"`
-	InstalledAt  int64    `json:"installedAt"`
+	HealthReason string `json:"healthReason,omitempty"`
+	// HealthSidecar is "waiting" while the plugin's sidecar is not connected.
+	HealthSidecar string   `json:"healthSidecar,omitempty"`
+	Capabilities  []string `json:"capabilities,omitempty"`
+	SourceKind    string   `json:"sourceKind,omitempty"`
+	StremioOnly   bool     `json:"stremioOnly,omitempty"`
+	InstalledAt   int64    `json:"installedAt"`
 	// Roles and Host describe a Stremio add-on: what it can do, which of
 	// that is switched on, and the host it is reached at (never the link,
 	// which carries the owner's configuration).
@@ -102,7 +110,7 @@ type Summary struct {
 func (m *Manager) summary(r Record, h Health) Summary {
 	s := Summary{ID: r.ID, Name: r.Name, Version: r.Version, Kind: r.Kind, Enabled: r.Enabled,
 		Verified: r.Verified, Shadow: r.Shadow, AutoUpdate: r.AutoUpdate, UpdateVersion: r.UpdateVersion,
-		PrevVersion: r.PrevVersion, Health: h.Status, HealthReason: h.Reason, SourceKind: r.SourceKind,
+		PrevVersion: r.PrevVersion, Health: h.Status, HealthReason: h.Reason, HealthSidecar: h.Sidecar, SourceKind: r.SourceKind,
 		StremioOnly: r.Manifest.IsStremioOnly(), InstalledAt: r.InstalledAt.Unix()}
 	if r.Manifest.SpeaksStremio() {
 		// Roles and the add-on's host belong to every plugin that answers
@@ -113,18 +121,24 @@ func (m *Manager) summary(r Record, h Health) Summary {
 		}
 	}
 	if r.Manifest.IsStremioOnly() {
-		s.Summary, s.Icon = r.Manifest.Description, r.Manifest.Logo
+		s.Summary = r.Manifest.Description
 		for _, c := range r.Manifest.EffectiveEther().Capabilities {
 			s.Capabilities = append(s.Capabilities, string(c))
 		}
 	}
 	if r.Manifest.Ether != nil {
 		s.Summary = r.Manifest.Ether.Summary
-		s.Icon = r.Manifest.Ether.Icon
+		if key, ok := strings.CutPrefix(s.Summary, "$t:"); ok {
+			s.Summary = key
+			if v, ok := m.ResolveText(context.Background(), r.ID, key, "en"); ok && strings.TrimSpace(v) != "" {
+				s.Summary = v
+			}
+		}
 		for _, c := range r.Manifest.Ether.Capabilities {
 			s.Capabilities = append(s.Capabilities, string(c))
 		}
 	}
+	s.Icon = m.resolveIconURL(context.Background(), r)
 	// Plugin copy is often a "$t:" key; owners see the plugin's own text.
 	if key, ok := strings.CutPrefix(s.Summary, "$t:"); ok {
 		s.Summary = r.Manifest.Description
@@ -135,17 +149,80 @@ func (m *Manager) summary(r Record, h Health) Summary {
 	return s
 }
 
+func isHTTPURL(raw string) bool {
+	return strings.HasPrefix(raw, "http://") || strings.HasPrefix(raw, "https://")
+}
+
+func (m *Manager) resolveIconURL(ctx context.Context, r Record) string {
+	if r.Manifest.Ether != nil {
+		icon := strings.TrimSpace(r.Manifest.Ether.Icon)
+		if isHTTPURL(icon) {
+			return icon
+		}
+		if icon != "" && !unsafePath(icon) && m.store.hasFile(ctx, r.ID, r.Version, icon) {
+			rev := r.Version
+			if !r.UpdatedAt.IsZero() {
+				rev += "-" + strconv.FormatInt(r.UpdatedAt.Unix(), 10)
+			}
+			return "/ether/api/plugins/" + url.PathEscape(r.ID) + "/icon?v=" + url.QueryEscape(rev)
+		}
+	} else if logo := strings.TrimSpace(r.Manifest.Logo); isHTTPURL(logo) {
+		return logo
+	}
+	if cat, ok := m.getCatalogue().(interface{ EntryIcon(string) string }); ok {
+		if catIcon := strings.TrimSpace(cat.EntryIcon(r.ID)); isHTTPURL(catIcon) {
+			return catIcon
+		}
+	}
+	return ""
+}
+
+func (m *Manager) handleIcon(w http.ResponseWriter, r *http.Request) {
+	rec, err := m.store.record(r.Context(), r.PathValue("id"))
+	if err != nil || rec.Manifest.Ether == nil {
+		http.NotFound(w, r)
+		return
+	}
+	iconPath := strings.TrimSpace(rec.Manifest.Ether.Icon)
+	if iconPath == "" || isHTTPURL(iconPath) || unsafePath(iconPath) {
+		http.NotFound(w, r)
+		return
+	}
+	raw, ok := m.store.file(r.Context(), rec.ID, rec.Version, iconPath)
+	if !ok || len(raw) == 0 || m.iconRaster == nil {
+		http.NotFound(w, r)
+		return
+	}
+	data, ct, err := m.iconRaster.Rasterize(
+		r.Context(),
+		"plugin-icon:"+rec.ID+":"+digestOf(raw),
+		raw,
+		artwork.RasterOptions{Width: 128, Height: 128, Format: "png"},
+	)
+	if err != nil || len(data) == 0 {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", ct)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; sandbox")
+	w.Header().Set("Cache-Control", "private, max-age=3600")
+	_, _ = w.Write(data)
+}
+
 // Detail is the plugin drawer payload: overview, permissions, health, the
 // privacy label and impact.
 type Detail struct {
 	Summary
-	Manifest    Manifest `json:"manifest"`
-	Permissions struct {
-		Lines        []string    `json:"lines"`
-		Declared     Permissions `json:"declared"`
-		Grants       Grants      `json:"grants"`
-		NeedsViewers bool        `json:"needsViewers"`
-		NeedsFolders bool        `json:"needsFolders"`
+	Manifest      Manifest       `json:"manifest"`
+	RuntimeLimits *RuntimeLimits `json:"runtimeLimits,omitempty"`
+	Permissions   struct {
+		Lines              []string    `json:"lines"`
+		Declared           Permissions `json:"declared"`
+		Grants             Grants      `json:"grants"`
+		NeedsViewers       bool        `json:"needsViewers"`
+		NeedsFolders       bool        `json:"needsFolders"`
+		NeedsOperatorHosts bool        `json:"needsOperatorHosts,omitempty"`
 	} `json:"permissions"`
 	HealthDetail Health `json:"healthDetail"`
 	Privacy      struct {
@@ -160,12 +237,19 @@ type Detail struct {
 		P95MS       int64 `json:"p95Ms"`
 		EgressBytes int64 `json:"egressBytes"`
 		KVBytes     int64 `json:"kvBytes"`
+		Items       int   `json:"items"`
+		MaxItems    int   `json:"maxItems,omitempty"`
 		Slow        int64 `json:"slow"`
 		EventDrops  int64 `json:"eventDrops"`
 		Restarts    int64 `json:"restarts"`
 	} `json:"impact"`
 	// AddedPermissions is set when an update is waiting and asks for more.
 	AddedPermissions []string `json:"addedPermissions,omitempty"`
+	// BlockedLocalHosts lists private-network hosts recently blocked for this plugin.
+	BlockedLocalHosts []string `json:"blockedLocalHosts,omitempty"`
+	// PendingOperatorHosts lists unapproved addresses from settings or recent requests
+	// when the plugin declares "operator" in permissions.network.
+	PendingOperatorHosts []string `json:"pendingOperatorHosts,omitempty"`
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -206,6 +290,9 @@ func (m *Manager) fail(w http.ResponseWriter, err error) {
 		writeErr(w, http.StatusForbidden, "revoked", "This plugin has been revoked in the catalogue and cannot be enabled.", nil)
 	case errors.Is(err, ErrPermissionDenied):
 		writeErr(w, http.StatusForbidden, "permission_denied", "That access was not granted.", nil)
+	case errors.Is(err, ErrBusy):
+		w.Header().Set("Retry-After", "5")
+		writeErr(w, http.StatusServiceUnavailable, "busy", "This plugin is busy right now. Try again shortly.", nil)
 	case errors.Is(err, ErrNoRuntime):
 		writeErr(w, http.StatusServiceUnavailable, "no_runtime", "This plugin cannot run yet because its runtime is not available.", nil)
 	case errors.Is(err, ErrDisabled):
@@ -230,7 +317,7 @@ func (m *Manager) handleList(w http.ResponseWriter, r *http.Request) {
 	out := make([]Summary, 0, len(recs))
 	for _, rec := range recs {
 		h, _ := m.store.health(r.Context(), rec.ID)
-		out = append(out, m.summary(rec, h))
+		out = append(out, m.summary(rec, m.liveHealth(rec, h)))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"plugins": out})
 }
@@ -243,17 +330,24 @@ func (m *Manager) handleGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h, _ := m.store.health(r.Context(), id)
+	h = m.liveHealth(rec, h)
 	g, _ := m.store.grants(r.Context(), id)
-	d := Detail{Summary: m.summary(rec, h), Manifest: rec.Manifest, HealthDetail: h}
+	d := Detail{Summary: m.summary(rec, h), Manifest: rec.Manifest, RuntimeLimits: m.grantedRuntimeLimits(rec.Manifest), HealthDetail: h}
 	d.Permissions.Lines, d.Permissions.NeedsViewers, d.Permissions.NeedsFolders = PermissionSheet(rec.Manifest)
 	if rec.Manifest.Ether != nil {
 		d.Permissions.Declared = rec.Manifest.Ether.Permissions
 		d.Privacy.DeclaredHosts = rec.Manifest.Ether.Permissions.Network
 	}
 	d.Permissions.Grants = g
+	d.Permissions.NeedsOperatorHosts = DeclaresOperatorHosts(rec.Manifest)
+	d.BlockedLocalHosts = m.BlockedLocalHosts(id)
+	if d.Permissions.NeedsOperatorHosts {
+		row, _ := m.store.settings(r.Context(), id)
+		d.PendingOperatorHosts = PendingOperatorHosts(rec.Manifest, g, row.Settings, row.Schema, m.BlockedOperatorHosts(id), false)
+	}
 	d.Privacy.ObservedHosts = h.Observed
 	for host := range h.Observed {
-		if rec.Manifest.Ether == nil || !hostAllowed(rec.Manifest.Ether.Permissions.Network, host) {
+		if !networkHostDeclaredOrGranted(rec.Manifest, g, host) {
 			d.Privacy.Undeclared = append(d.Privacy.Undeclared, host)
 		}
 	}
@@ -262,6 +356,10 @@ func (m *Manager) handleGet(w http.ResponseWriter, r *http.Request) {
 	d.Impact.Calls, d.Impact.Errors, d.Impact.P50MS, d.Impact.P95MS = count, errs, p50, p95
 	d.Impact.EgressBytes, d.Impact.Slow, d.Impact.EventDrops, d.Impact.Restarts = h.EgressBytes, h.Slow, h.Drops, h.Restarts
 	d.Impact.KVBytes, _ = m.store.kvUsed(r.Context(), id)
+	if fn := m.kindBackends().KindItemCount; fn != nil {
+		d.Impact.Items, _ = fn(r.Context(), id)
+	}
+	d.Impact.MaxItems = m.grantedMaxItems(rec.Manifest, m.runtimeCeilings(id))
 	if rec.UpdateVersion != "" && rec.updateManifest != "" {
 		if next, err := ParseManifest([]byte(rec.updateManifest)); err == nil {
 			d.AddedPermissions = PermissionDiff(rec.Manifest, next)
@@ -663,11 +761,13 @@ func (m *Manager) handleGrants(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid", "The request was not understood.", nil)
 		return
 	}
-	if err := m.SetGrants(r.Context(), r.PathValue("id"), g); err != nil {
+	id := r.PathValue("id")
+	if err := m.SetGrants(r.Context(), id, g); err != nil {
 		m.fail(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"status": "saved", "grants": g})
+	saved, _ := m.GrantsOf(r.Context(), id)
+	writeJSON(w, http.StatusOK, map[string]any{"status": "saved", "grants": saved})
 }
 
 func (m *Manager) handleShadow(w http.ResponseWriter, r *http.Request) {
@@ -986,7 +1086,10 @@ func (m *Manager) handleAction(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(resp.Body)
 		return
 	}
-	m.startActionJob(id, resp.Body)
+	if err := m.startActionJob(id, resp.Body); err != nil {
+		m.fail(w, err)
+		return
+	}
 	result, err := m.saveActionProposal(r.Context(), id, resp.Body)
 	if err != nil {
 		m.fail(w, err)

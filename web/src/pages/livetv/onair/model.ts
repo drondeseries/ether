@@ -42,6 +42,9 @@ export type ReelClip = {
   size?: number;
   preview?: string;
   thumbnail?: string;
+  link?: boolean;
+  cached?: boolean;
+  tags?: string[];
 };
 export type Reel = {
   id: string;
@@ -72,6 +75,9 @@ export type ChannelLook = {
   momentAssets?: Record<string, string>;
   breakPlacement?: "natural" | "even" | "between";
   tonight?: boolean;
+  beforeBreak?: string[];
+  afterBreak?: string[];
+  betweenProgrammes?: string[];
   bug?: BugSettings;
   breakPattern?: BreakPattern;
   lookId: string;
@@ -108,20 +114,22 @@ export type PersonalRecipe = {
   maxShowShare: number;
   nightMaxMinutes: number;
 };
+export type ProgrammeBinding = {
+  title: string;
+  time?: string;
+  reason?: string;
+  meta?: string;
+  logline?: string;
+  poster?: string;
+  backdrop?: string;
+};
 export type Bindings = {
   channel?: { name: string; logo?: string };
   viewer?: { name: string; greeting?: string };
-  now?: { title: string };
-  next?: {
-    title: string;
-    time?: string;
-    reason?: string;
-    meta?: string;
-    logline?: string;
-    backdrop?: string;
-  };
+  now?: ProgrammeBinding;
+  next?: ProgrammeBinding;
   offair?: { message: string };
-  list?: { title: string; time: string; reason?: string; meta?: string; poster?: string }[];
+  list?: (ProgrammeBinding & { time: string })[];
   greeting?: string;
 };
 export type OnAirAsset = {
@@ -137,6 +145,16 @@ export type OnAirAsset = {
   license?: string;
   usedBy: string[];
   url?: string;
+  link?: boolean;
+  tags?: string[];
+};
+export type DownloaderStatus = {
+  available: boolean;
+  source: "managed" | "path" | "configured" | "none";
+  version?: string;
+  pinnedVersion: string;
+  canInstall: boolean;
+  canUpdate: boolean;
 };
 const enc = encodeURIComponent;
 const write = <T>(path: string, method: string, body?: unknown) =>
@@ -168,6 +186,8 @@ export const onair = {
     write<ReelClip>(`/onair/reels/${enc(id)}/clips/${enc(clip.id)}`, "PUT", clip),
   deleteClip: (id: string, clip: string) =>
     write<void>(`/onair/reels/${enc(id)}/clips/${enc(clip)}`, "DELETE"),
+  resolveClip: (id: string, clip: string) =>
+    write<ReelClip>(`/onair/reels/${enc(id)}/clips/${enc(clip)}/resolve`, "POST"),
   clipPreview: (id: string, clip: string) =>
     `/ether/api/onair/reels/${enc(id)}/clips/${enc(clip)}/preview`,
   assets: () => apiFetch<OnAirAsset[]>("/onair/assets"),
@@ -179,6 +199,9 @@ export const onair = {
     return write<OnAirAsset>("/onair/assets", "POST", data);
   },
   deleteAsset: (id: string) => write<void>(`/onair/assets/${enc(id)}`, "DELETE"),
+  downloaderStatus: () => apiFetch<DownloaderStatus>("/onair/downloader"),
+  installDownloader: (update = false) =>
+    write<DownloaderStatus>("/onair/downloader/install", "POST", { update }),
   rundown: (id: string, viewer?: string) =>
     apiFetch<{ id: string; title: string; start: string; end: string; reason: string }[]>(
       `/livetv/channels/${enc(id)}/rundown?viewer=${enc(viewer ?? "")}`,

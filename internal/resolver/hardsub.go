@@ -3,6 +3,7 @@ package resolver
 import (
 	"context"
 	"encoding/json"
+	"slices"
 	"strings"
 	"time"
 
@@ -55,9 +56,88 @@ func (s *Service) SubtitleVerdict(ctx context.Context, id string) (bool, bool) {
 	s.mu.Unlock()
 	return n != 0, true
 }
+
+// subtitleVerdicts reads only these candidates, once per bounded SQL batch.
+// Keep the result local to the ranking pass: a shared-cache eviction must not
+// turn the subsequent candidate loop back into scalar database reads.
+func (s *Service) subtitleVerdicts(ctx context.Context, ids []string) map[string]bool {
+	now := s.now()
+	out := make(map[string]bool, len(ids))
+	var missing []string
+	s.mu.RLock()
+	for _, id := range ids {
+		if v, ok := s.subVerdicts[id]; ok {
+			out[id] = v
+		} else if at := s.subMiss[id]; at.IsZero() || now.Before(at) || now.Sub(at) >= time.Minute {
+			missing = append(missing, id)
+		}
+	}
+	s.mu.RUnlock()
+	if s.db == nil {
+		return out
+	}
+	slices.Sort(missing)
+	missing = slices.Compact(missing)
+	for batch := range store.Chunks(missing, 500) {
+		args := make([]any, len(batch))
+		for n, id := range batch {
+			args[n] = id
+		}
+		rows, err := s.db.QueryContext(ctx, `SELECT release_id,burned FROM resolver_hardsub WHERE release_id IN (`+store.Placeholders(len(batch))+`)`, args...)
+		if err != nil {
+			continue
+		}
+		found := map[string]bool{}
+		for rows.Next() {
+			var id string
+			var burned int
+			if err = rows.Scan(&id, &burned); err != nil {
+				break
+			}
+			found[id] = burned != 0
+		}
+		if err == nil {
+			err = rows.Err()
+		}
+		rows.Close()
+		if err != nil {
+			continue
+		}
+		s.mu.Lock()
+		if s.subVerdicts == nil {
+			s.subVerdicts = map[string]bool{}
+		}
+		if s.subMiss == nil {
+			s.subMiss = map[string]time.Time{}
+		}
+		if len(s.subVerdicts)+len(found) > 10000 {
+			clear(s.subVerdicts)
+		}
+		if len(s.subMiss)+len(batch) > 10000 {
+			clear(s.subMiss)
+		}
+		for _, id := range batch {
+			// A probe may have completed while the batch was being read.
+			if v, ok := s.subVerdicts[id]; ok {
+				out[id] = v
+				continue
+			}
+			if v, ok := found[id]; ok {
+				out[id], s.subVerdicts[id] = v, v
+				delete(s.subMiss, id)
+			} else {
+				s.subMiss[id] = now
+			}
+		}
+		s.mu.Unlock()
+	}
+	return out
+}
+
 func (s *Service) RememberSubtitleVerdict(ctx context.Context, id string, v bool) error {
 	if s.db != nil {
-		if _, err := s.db.ExecContext(ctx, `INSERT INTO resolver_hardsub VALUES (?,?) ON CONFLICT(release_id) DO UPDATE SET burned=excluded.burned`, id, store.BoolInt(v)); err != nil {
+		now := s.now().Unix()
+		if _, err := s.db.ExecContext(ctx, `INSERT INTO resolver_hardsub(release_id,burned,updated_at) VALUES (?,?,?) ON CONFLICT(release_id) DO UPDATE SET burned=excluded.burned,updated_at=excluded.updated_at`, id, store.BoolInt(v), now); err != nil {
 			return err
 		}
 	}
@@ -236,7 +316,7 @@ func (s *Service) ClaimSubtitleCheck(ctx context.Context, id string) (bool, erro
 		return false, nil
 	}
 	if s.db != nil {
-		res, err := s.db.ExecContext(ctx, `INSERT INTO resolver_subtitle_checks(release_id) VALUES (?) ON CONFLICT(release_id) DO NOTHING`, id)
+		res, err := s.db.ExecContext(ctx, `INSERT INTO resolver_subtitle_checks(release_id,updated_at) VALUES (?,?) ON CONFLICT(release_id) DO NOTHING`, id, s.now().Unix())
 		if err != nil {
 			return false, err
 		}
@@ -256,4 +336,11 @@ func (s *Service) ClaimSubtitleCheck(ctx context.Context, id string) (bool, erro
 }
 func init() {
 	store.Register("resolver", 5, `CREATE TABLE resolver_subtitle_checks (release_id TEXT PRIMARY KEY);`)
+	store.RegisterAfter("resolver_retention", "resolver")
+	store.Register("resolver_retention", 1, `
+ALTER TABLE resolver_hardsub ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE resolver_subtitle_checks ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX resolver_hardsub_updated ON resolver_hardsub(updated_at) WHERE updated_at>0;
+CREATE INDEX resolver_subtitle_checks_updated ON resolver_subtitle_checks(updated_at) WHERE updated_at>0;
+`)
 }

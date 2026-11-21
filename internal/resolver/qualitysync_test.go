@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -45,7 +46,7 @@ func newSyncFixture(t *testing.T, tree map[string]string, cfg config.Config) *sy
 			if err := mutate(&next); err != nil {
 				return err
 			}
-			if _, err := NewFormatScorer(next.Resolver.CustomFormats, next.Resolver.CustomFormatScores); err != nil {
+			if _, err := NewFormatScorer(next.Resolver.CustomFormats); err != nil {
 				return fmt.Errorf("%w: %v", ErrImportRejected, err)
 			}
 			f.cfg = next
@@ -73,7 +74,8 @@ func TestQualitySyncUpdatesProfileAndDefinitionsExactly(t *testing.T) {
 				p := trashImported("My HD", "hd-bluray-web")
 				p.Import.TrashID = "p1"
 				p.CustomFormatScores = map[string]int{"cf-web1": 1, "cf-gone": 50}
-				p.MinSizeMBPerMin, p.PreferLargest = 7, true
+				p.MinSizeMBPerMin = 7
+				p.CustomFormatScores[core.FormatAudioTranscode] = -99
 				return p
 			}(),
 			// A backfilled 0 must not keep an unused managed format alive.
@@ -101,8 +103,11 @@ func TestQualitySyncUpdatesProfileAndDefinitionsExactly(t *testing.T) {
 		t.Fatalf("report %+v", report)
 	}
 	prof := f.cfg.Quality.Profiles[0]
-	wantScores := map[string]int{"cf-web1": 1700, "cf-brdisk": -10000, "cf-manual": 0}
-	if len(prof.CustomFormatScores) != len(wantScores) || prof.CustomFormatScores["cf-web1"] != 1700 || prof.CustomFormatScores["cf-brdisk"] != -10000 {
+	// The guide's scores exactly, plus Ether's streaming formats with the
+	// owner's own tuning of them kept.
+	wantScores := core.StreamingFormatScores()
+	wantScores["cf-web1"], wantScores["cf-brdisk"], wantScores[core.FormatAudioTranscode] = 1700, -10000, -99
+	if !maps.Equal(prof.CustomFormatScores, wantScores) {
 		t.Fatalf("scores %v, want exactly %v", prof.CustomFormatScores, wantScores)
 	}
 	if prof.MediaType != core.MediaMovie || prof.Import == nil || prof.Import.SyncedAt != f.now || prof.Import.Profile != "hd-bluray-web" {
@@ -111,7 +116,7 @@ func TestQualitySyncUpdatesProfileAndDefinitionsExactly(t *testing.T) {
 	if !slices.Equal(prof.AllowedQualities, []string{"bluray-1080", "webrip-1080", "webdl-1080"}) {
 		t.Fatalf("qualities %v", prof.AllowedQualities)
 	}
-	if prof.MinSizeMBPerMin != 7 || !prof.PreferLargest {
+	if prof.MinSizeMBPerMin != 7 || prof.CustomFormatScores[core.FormatAudioTranscode] != -99 {
 		t.Fatalf("owner tuning lost: %+v", prof)
 	}
 	defs := map[string]core.CustomFormat{}
@@ -133,13 +138,13 @@ func TestQualitySyncUpdatesProfileAndDefinitionsExactly(t *testing.T) {
 	if _, ok := defs["cf-old"]; ok {
 		t.Fatal("unreferenced managed definition kept")
 	}
-	if manual := f.cfg.Quality.Profiles[1].CustomFormatScores; len(manual) != 2 || manual["cf-manual"] != 5 || manual["cf-brdisk"] != 0 {
+	if manual := f.cfg.Quality.Profiles[1].CustomFormatScores; len(manual) != 1 || manual["cf-manual"] != 5 {
 		t.Fatalf("dangling 0 score for a removed definition kept: %v", manual)
 	}
 	if f.cfg.Quality.Sync.LastRun != f.now || f.cfg.Quality.Sync.LastError != "" {
 		t.Fatalf("sync state %+v", f.cfg.Quality.Sync)
 	}
-	if _, err := NewFormatScorer(f.cfg.Resolver.CustomFormats, f.cfg.Resolver.CustomFormatScores); err != nil {
+	if _, err := NewFormatScorer(f.cfg.Resolver.CustomFormats); err != nil {
 		t.Fatalf("sync broke scoring: %v", err)
 	}
 
@@ -157,6 +162,9 @@ func TestQualitySyncSkipsFailedAndUnusableProfiles(t *testing.T) {
 	tree := trashTree()
 	tree["radarr/quality-profiles/impossible.json"] = `{"trash_id":"p9","name":"Impossible","minFormatScore":999999,
 		"items":[{"name":"WEBDL-1080p","allowed":true}],"formatItems":{"WEB Tier 01":"cf-web1"}}`
+	tree["radarr/quality-profiles/unusable.json"] = `{"trash_id":"p10","name":"Unusable","items":[{"name":"WEBDL-1080p","allowed":false}]}`
+	unusable := trashImported("Unusable", "unusable")
+	unusable.CustomFormatScores = map[string]int{"cf-web1": 9}
 	bad := trashImported("Bad", "missing")
 	bad.CustomFormatScores = map[string]int{"cf-web1": 4}
 	impossible := trashImported("Impossible", "impossible")
@@ -165,26 +173,30 @@ func TestQualitySyncSkipsFailedAndUnusableProfiles(t *testing.T) {
 		trashImported("Good", "hd-bluray-web"),
 		bad,
 		impossible,
+		unusable,
 	}}}
 	f := newSyncFixture(t, tree, cfg)
 	report, err := f.syncer.Sync(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if report.ProfilesUpdated != 1 || len(report.Warnings) != 2 {
+	if report.ProfilesUpdated != 2 || len(report.Warnings) != 3 {
 		t.Fatalf("report %+v", report)
 	}
 	joined := strings.Join(report.Warnings, "\n")
 	if !strings.Contains(joined, "Bad") || !strings.Contains(joined, "no such profile") && !strings.Contains(joined, "no longer exists") {
 		t.Fatalf("warnings %v", report.Warnings)
 	}
-	if !strings.Contains(joined, "Impossible") || !strings.Contains(joined, "no release could ever be accepted") {
-		t.Fatalf("unusable warning missing: %v", report.Warnings)
+	if !strings.Contains(joined, "Impossible") || !strings.Contains(joined, "at most 1700") {
+		t.Fatalf("minimum warning missing: %v", report.Warnings)
 	}
 	if got := f.cfg.Quality.Profiles[1]; got.CustomFormatScores["cf-web1"] != 4 || got.Import.SyncedAt.IsZero() != true {
 		t.Fatalf("failed profile overwritten: %+v", got)
 	}
-	if got := f.cfg.Quality.Profiles[2]; got.CustomFormatScores["cf-web1"] != 8 {
+	if got := f.cfg.Quality.Profiles[2]; got.CustomFormatScores["cf-web1"] != 1700 || got.Import.SyncedAt.IsZero() {
+		t.Fatalf("unreachable minimum profile was not updated: %+v", got)
+	}
+	if got := f.cfg.Quality.Profiles[3]; got.CustomFormatScores["cf-web1"] != 9 || !got.Import.SyncedAt.IsZero() {
 		t.Fatalf("unusable profile overwritten: %+v", got)
 	}
 	if f.cfg.Quality.Sync.LastError == "" {
@@ -240,7 +252,7 @@ func TestQualitySyncDictionarry(t *testing.T) {
 			if err := mutate(&next); err != nil {
 				return err
 			}
-			if _, err := NewFormatScorer(next.Resolver.CustomFormats, next.Resolver.CustomFormatScores); err != nil {
+			if _, err := NewFormatScorer(next.Resolver.CustomFormats); err != nil {
 				return fmt.Errorf("%w: %v", ErrImportRejected, err)
 			}
 			f.cfg = next

@@ -31,6 +31,14 @@ func init() {
 	store.Register("state_watch_recent_settings", 1, `CREATE INDEX state_watch_recent_settings ON state_watch(user_id,updated_at DESC,rating_key) WHERE last_viewed_at>0;`)
 }
 
+func init() {
+	// state_watch_played serves a viewer's played-episodes listing (Jellyfin
+	// Filters=IsPlayed, SortBy=DatePlayed): the played rows in last-played
+	// order, so the page follows the viewer's history, not the library
+	// (#405). view_count>0 keeps unplayed rows out of the index entirely.
+	store.Register("state_watch_played", 1, `CREATE INDEX state_watch_played ON state_watch(user_id,last_viewed_at DESC,rating_key) WHERE view_count>0;`)
+}
+
 // RecentlyViewedSettings reads a bounded viewer prefix in settings-write order.
 func (s *State) RecentlyViewedSettings(ctx context.Context, uid int64, _ time.Time, limit int) ([]core.HistoryEntry, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT rating_key,last_viewed_at FROM state_watch WHERE user_id=? AND last_viewed_at>0 ORDER BY updated_at DESC,rating_key ASC LIMIT ?`, uid, min(max(limit, 1), 1000))
@@ -49,4 +57,10 @@ func (s *State) RecentlyViewedSettings(ctx context.Context, uid int64, _ time.Ti
 		out = append(out, h)
 	}
 	return out, rows.Err()
+}
+
+// Match both recency terms of InProgress, including imported rows sharing a
+// last-viewed timestamp. Both SQLite and PostgreSQL support this partial index.
+func init() {
+	store.Register("state_resume_order", 1, `CREATE INDEX state_resume_order ON state_watch(user_id,last_viewed_at DESC,updated_at DESC) WHERE view_offset_ns>0;`)
 }

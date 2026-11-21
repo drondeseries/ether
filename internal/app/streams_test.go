@@ -49,7 +49,7 @@ func TestPlexSubtitlesUsesStreamPreferenceLanguages(t *testing.T) {
 	a := &App{trackprefs: prefs, subtitles: subtitles.New(subtitles.Options{
 		Config: config.OpenSubtitles{Enabled: true, APIKey: "k"}, CacheDir: t.TempDir(), BaseURL: srv.URL,
 	})}
-	p := plexSubtitles{a}
+	p := subtitleSurface{app: a}
 	title := &core.Title{Key: core.MovieKey(10331), Type: core.TypeMovie, IDs: core.IDs{TMDB: 10331}}
 	viewer := &core.User{ID: 3, SubtitleLanguages: []string{"en"}}
 
@@ -57,6 +57,10 @@ func TestPlexSubtitlesUsesStreamPreferenceLanguages(t *testing.T) {
 	if err != nil || len(offers) != 1 || offers[0].ID != 7 || offers[0].Language != "fr" || offers[0].Provider != "OpenSubtitles" ||
 		!offers[0].PerfectMatch || offers[0].Title != "Night.of.the.Living.Dead.1968.1080p" {
 		t.Fatalf("search: %+v %v", offers, err)
+	}
+	offers, err = p.SearchSubtitles(ctx, title, viewer, "", "Night.of.the.Living.Dead.1968.1080p")
+	if err != nil || len(offers) != 1 || offers[0].Language != "fr" {
+		t.Fatalf("inherited search: %+v %v", offers, err)
 	}
 	st, err := p.DownloadSubtitle(ctx, title, viewer, 7)
 	if err != nil || st.Language != "fr" {

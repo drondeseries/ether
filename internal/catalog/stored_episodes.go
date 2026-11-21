@@ -10,6 +10,23 @@ import (
 	"github.com/braedonsaunders/ether/internal/core"
 )
 
+// pageCursorTTL bounds how long a key-order page end is remembered for the
+// next sequential page. A client walking a whole section (Tracearr) pages
+// for far longer than one cache minute, and background catalogue writes
+// bump the generation throughout; a cursor that dies with either stamp
+// sends every later page back to an OFFSET scan over all prior rows.
+const pageCursorTTL = 10 * time.Minute
+
+func pageCursorLive(cur cachedBrowse, gen uint64, minute int64) bool {
+	if len(cur.page.Items) != 1 {
+		return false
+	}
+	if cur.gen == gen && cur.minute == minute {
+		return true
+	}
+	return !cur.at.IsZero() && time.Since(cur.at) < pageCursorTTL
+}
+
 // Key bounds for episode and season rating keys.
 var (
 	episodeKeyStart = int64(core.KindEpisode)*1_000_000_000_000_000 - 1
@@ -23,8 +40,13 @@ var (
 func splitStoredFilter(f core.Filter, childKind core.KeyKind) (show core.Filter, childExclude []core.RatingKey) {
 	show = core.Filter{
 		KnownAddedDate:         f.KnownAddedDate,
-		HiddenMovieGeneration:  f.HiddenMovieGeneration,
-		HiddenShowGeneration:   f.HiddenShowGeneration,
+		GatePolicy:             f.GatePolicy,
+		ShowGateCutoff:         f.ShowGateCutoff,
+		EpisodeGateCutoff:      f.EpisodeGateCutoff,
+		GateNow:                f.GateNow,
+		GateRev:                f.GateRev,
+		HiddenMovieSeq:         f.HiddenMovieSeq,
+		HiddenShowSeq:          f.HiddenShowSeq,
 		ExcludeGenres:          f.ExcludeGenres,
 		ExcludeKeywords:        f.ExcludeKeywords,
 		Type:                   core.TypeShow,
@@ -62,9 +84,15 @@ func splitStoredFilter(f core.Filter, childKind core.KeyKind) (show core.Filter,
 func (c *Catalog) childFilterConds(alias string, f core.Filter, childExclude []core.RatingKey) ([]string, []any) {
 	var conds []string
 	var args []any
-	if alias == "e" && f.HiddenEpisodeGeneration != "" {
-		clause := "NOT EXISTS (SELECT 1 FROM availability_hidden ah WHERE ah.kind='episode' AND ah.generation=? AND ah.rating_key=" + alias + ".key)"
-		args = append(args, f.HiddenEpisodeGeneration)
+	if alias == "e" {
+		if ec, ea := episodeGateSQL(alias, f, c.now().Unix()); ec != "" {
+			conds = append(conds, ec)
+			args = append(args, ea...)
+		}
+	}
+	if alias == "e" && f.HiddenEpisodeSeq != 0 {
+		clause := "NOT EXISTS (SELECT 1 FROM availability_hidden ah WHERE ah.kind='episode' AND ah.from_seq<=? AND ah.to_seq>? AND ah.rating_key=" + alias + ".key)"
+		args = append(args, f.HiddenEpisodeSeq, f.HiddenEpisodeSeq)
 		if len(f.AvailabilityKeepKeys) > 0 {
 			clause = "(" + clause + " OR " + alias + ".key IN (" + placeholders(len(f.AvailabilityKeepKeys)) + "))"
 			for _, key := range f.AvailabilityKeepKeys {
@@ -115,18 +143,9 @@ func (c *Catalog) childFilterConds(alias string, f core.Filter, childExclude []c
 		conds = append(conds, alias+".runtime_sec>=?")
 		args = append(args, int64(f.MinRuntime.Seconds()))
 	}
-	if fc := strings.TrimSpace(f.FirstCharacter); fc != "" {
-		switch {
-		case fc == "#" || fc == "0":
-			conds = append(conds, alias+".sort_title<>'' AND "+alias+".sort_title < 'a'")
-		case fc == "~" || fc == "…":
-			conds = append(conds, alias+".sort_title >= '{'")
-		case len(fc) == 1 && ((fc[0] >= 'a' && fc[0] <= 'z') || (fc[0] >= 'A' && fc[0] <= 'Z')):
-			lo := strings.ToLower(fc)
-			hi := string(lo[0] + 1)
-			conds = append(conds, alias+".sort_title >= ? AND "+alias+".sort_title < ?")
-			args = append(args, lo, hi)
-		}
+	if cond, condArgs := c.childSortNameCond(alias, sortNameRangeOf(f)); cond != "" {
+		conds = append(conds, cond)
+		args = append(args, condArgs...)
 	}
 	if len(f.Years) > 0 {
 		conds = append(conds, alias+".year IN ("+placeholders(len(f.Years))+")")
@@ -259,6 +278,47 @@ func (c *Catalog) storedEpisodesWhere(f core.Filter) (string, []any, error) {
 	return strings.Join(conds, " AND "), outArgs, nil
 }
 
+// storedEpisodesProbeWhere selects stored, aired, non-adult episodes (e) and
+// probes each episode's series (t) by primary key in a correlated EXISTS with
+// OFFSET 0 so PostgreSQL and SQLite walk an episode index in order without
+// hashing or scanning catalog_titles t.
+func (c *Catalog) storedEpisodesProbeWhere(f core.Filter) (string, []any, error) {
+	show, childExclude := splitStoredFilter(f, core.KindEpisode)
+	where, args, err := c.browseWhere(show)
+	if err != nil {
+		return "", nil, err
+	}
+	conds := []string{
+		"e.type='episode'",
+		"e.adult=0",
+		"e.release_known=1",
+		"e.released_ts<=?",
+		"e.show_key<>0",
+	}
+	outArgs := []any{c.now().Unix()}
+	cConds, cArgs := c.childFilterConds("e", f, childExclude)
+	conds = append(conds, cConds...)
+	outArgs = append(outArgs, cArgs...)
+	visibility, visibilityArgs := c.childVisibilityConds(f.ChildVisibility)
+	showCond := "t.key=e.show_key AND " + where
+	probeArgs := append([]any{}, args...)
+	if len(visibility) > 0 {
+		showCond += " AND " + strings.Join(visibility, " AND ")
+		probeArgs = append(probeArgs, visibilityArgs...)
+	}
+	if f.Group != nil {
+		clause, a, err := c.compileBrowseGroup(f.Group, "e", core.KindEpisode)
+		if err != nil {
+			return "", nil, err
+		}
+		showCond += " AND (" + clause + ")"
+		probeArgs = append(probeArgs, a...)
+	}
+	conds = append(conds, "EXISTS(SELECT 1 FROM catalog_titles t WHERE "+showCond+" LIMIT 1 OFFSET 0)")
+	outArgs = append(outArgs, probeArgs...)
+	return strings.Join(conds, " AND "), outArgs, nil
+}
+
 // StoredEpisodesByKey returns up to limit stored, aired, non-adult episodes
 // after the key after, in key order (series, season, episode), of the
 // series the browse filter show admits. It reads the key range and probes
@@ -266,12 +326,12 @@ func (c *Catalog) storedEpisodesWhere(f core.Filter) (string, []any, error) {
 // library; it refreshes nothing.
 func (c *Catalog) StoredEpisodesByKey(ctx context.Context, show core.Filter, after core.RatingKey, limit int) ([]core.Title, error) {
 	show = c.viewerPaging(ctx, show)
-	where, args, err := c.storedEpisodesWhere(show)
+	where, args, err := c.storedEpisodesProbeWhere(show)
 	if err != nil {
 		return nil, err
 	}
 	lo := max(int64(after), episodeKeyStart)
-	q := `SELECT ` + prefixedCols("e") + ` FROM catalog_titles e JOIN catalog_titles t ON t.key=e.show_key WHERE e.key>? AND e.key<? AND ` + where + ` ORDER BY e.key LIMIT ?`
+	q := `SELECT ` + prefixedCols("e") + ` FROM catalog_titles e WHERE e.key>? AND e.key<? AND ` + where + ` ORDER BY e.key LIMIT ?`
 	return c.queryPagedTitles(ctx, q, append(append([]any{lo, episodeKeyEnd}, args...), limit)...)
 }
 
@@ -279,7 +339,7 @@ func (c *Catalog) StoredEpisodesByKey(ctx context.Context, show core.Filter, aft
 // total, a large count is served from the last one while it recounts.
 func (c *Catalog) CountStoredEpisodes(ctx context.Context, show core.Filter) (int, error) {
 	show = c.viewerPaging(ctx, show)
-	where, args, err := c.storedEpisodesWhere(show)
+	where, args, err := c.storedEpisodesProbeWhere(show)
 	if err != nil {
 		return 0, err
 	}
@@ -300,7 +360,7 @@ func (c *Catalog) CountStoredEpisodes(ctx context.Context, show core.Filter) (in
 			return 0, err
 		}
 		if !bySeries {
-			if err := c.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM catalog_titles e JOIN catalog_titles t ON t.key=e.show_key WHERE e.key>? AND e.key<? AND `+where,
+			if err := c.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM catalog_titles e WHERE e.key>? AND e.key<? AND `+where,
 				append([]any{episodeKeyStart, episodeKeyEnd}, args...)...).Scan(&total); err != nil {
 				return 0, err
 			}
@@ -316,6 +376,18 @@ func (c *Catalog) CountStoredEpisodes(ctx context.Context, show core.Filter) (in
 	switch {
 	case ok && ent.gen == gen && ent.minute == minute:
 		return ent.total, nil
+	case ok && ent.total >= staleCountMin:
+		// A busy catalogue bumps the write generation constantly; serving
+		// the last large total while a recount runs behind the read keeps
+		// a page's total from recounting the whole section (as
+		// CountStoredSeasons does).
+		if time.Since(ent.counted) >= recountEvery {
+			_ = c.hydrate(ctx, "count:"+ckey, 0, func(ctx context.Context) error {
+				_, err := count(ctx)
+				return err
+			})
+		}
+		return ent.total, nil
 	}
 	return count(ctx)
 }
@@ -324,12 +396,16 @@ func (c *Catalog) CountStoredEpisodes(ctx context.Context, show core.Filter) (in
 // popularity order of episodes is their key order. TMDB gives episodes no
 // popularity; this checks the index's two ends rather than assuming it.
 func (c *Catalog) EpisodesUnranked(ctx context.Context) (bool, error) {
-	// Separate MIN and MAX subqueries, so each is one index seek.
+	// Separate MIN and MAX subqueries, so each is one index seek. After the
+	// title index swap the index is the partial catalog_titles_child_pop;
+	// SQLite uses a partial index only when the query repeats its WHERE
+	// term (type='episode' alone does not imply the IN list). Without it
+	// each subquery read every episode: 3 to 12 s on a 540k-title library.
 	var ranked bool
-	err := c.db.QueryRowContext(ctx, `SELECT COALESCE((SELECT MIN(popularity) FROM catalog_titles WHERE type='episode' AND browsable=0),0)<>0
-		OR COALESCE((SELECT MAX(popularity) FROM catalog_titles WHERE type='episode' AND browsable=0),0)<>0
-		OR COALESCE((SELECT MIN(popularity) FROM catalog_titles WHERE type='episode' AND browsable=1),0)<>0
-		OR COALESCE((SELECT MAX(popularity) FROM catalog_titles WHERE type='episode' AND browsable=1),0)<>0`).Scan(&ranked)
+	err := c.db.QueryRowContext(ctx, `SELECT COALESCE((SELECT MIN(popularity) FROM catalog_titles WHERE type='episode' AND browsable=0 AND `+childPopPartial+`),0)<>0
+		OR COALESCE((SELECT MAX(popularity) FROM catalog_titles WHERE type='episode' AND browsable=0 AND `+childPopPartial+`),0)<>0
+		OR COALESCE((SELECT MIN(popularity) FROM catalog_titles WHERE type='episode' AND browsable=1 AND `+childPopPartial+`),0)<>0
+		OR COALESCE((SELECT MAX(popularity) FROM catalog_titles WHERE type='episode' AND browsable=1 AND `+childPopPartial+`),0)<>0`).Scan(&ranked)
 	return !ranked, err
 }
 
@@ -362,7 +438,7 @@ func (c *Catalog) BrowseStoredEpisodes(ctx context.Context, q core.BrowseQuery) 
 	}
 	var afterKey core.RatingKey
 	if offset > 0 && !groupHasState(q.Filter.Group) && !q.SortLastViewed {
-		if cur, ok := c.browseCache[cursorPrefix+strconv.Itoa(offset)]; ok && cur.gen == gen && cur.minute == minBucket && len(cur.page.Items) == 1 {
+		if cur, ok := c.browseCache[cursorPrefix+strconv.Itoa(offset)]; ok && pageCursorLive(cur, gen, minBucket) {
 			afterKey = cur.page.Items[0].Key
 		}
 	}
@@ -408,12 +484,24 @@ func (c *Catalog) BrowseStoredEpisodes(ctx context.Context, q core.BrowseQuery) 
 	case keyOrder && (offset == 0 || afterKey > 0):
 		items, err = c.StoredEpisodesByKey(ctx, q.Filter, afterKey, limit)
 	case keyOrder:
-		where, args, werr := c.storedEpisodesWhere(q.Filter)
+		where, args, werr := c.storedEpisodesProbeWhere(q.Filter)
 		if werr != nil {
 			return core.Page{}, werr
 		}
-		sqlQ := `SELECT ` + prefixedCols("e") + ` FROM catalog_titles e JOIN catalog_titles t ON t.key=e.show_key WHERE e.key>? AND e.key<? AND ` + where + ` ORDER BY e.key ASC LIMIT ? OFFSET ?`
+		sqlQ := `SELECT ` + prefixedCols("e") + ` FROM catalog_titles e WHERE e.key>? AND e.key<? AND ` + where + ` ORDER BY e.key ASC LIMIT ? OFFSET ?`
 		items, err = c.queryPagedTitles(ctx, sqlQ, append(append([]any{episodeKeyStart, episodeKeyEnd}, args...), limit, offset)...)
+	case len(q.SecondarySorts) == 0 && q.Desc && (q.Sort == core.SortReleased || q.Sort == core.SortAdded || q.Sort == core.SortUpdated):
+		where, args, werr := c.storedEpisodesProbeWhere(q.Filter)
+		if werr != nil {
+			return core.Page{}, werr
+		}
+		if q.Sort == core.SortUpdated && q.Filter.UpdatedAfter == 0 {
+			where = "e.fetched_at>=? AND " + where
+			args = append([]any{int64(0)}, args...)
+		}
+		order := storedChildOrder("e", q)
+		sqlQ := `SELECT ` + prefixedCols("e") + ` FROM catalog_titles e WHERE ` + where + ` ORDER BY ` + order + `, e.key ASC LIMIT ? OFFSET ?`
+		items, err = c.queryPagedTitles(ctx, sqlQ, append(append([]any{}, args...), limit, offset)...)
 	default:
 		where, args, werr := c.storedEpisodesWhere(q.Filter)
 		if werr != nil {
@@ -436,20 +524,25 @@ func (c *Catalog) BrowseStoredEpisodes(ctx context.Context, q core.BrowseQuery) 
 	if q.NoTotal {
 		total = offset + len(items)
 	}
-	if !groupHasState(q.Filter.Group) && !q.SortLastViewed && c.writeGen.Load() == gen {
-		cachedItems := make([]core.Title, len(items))
-		for i := range items {
-			cachedItems[i] = cloneTitle(items[i])
-		}
+	if !groupHasState(q.Filter.Group) && !q.SortLastViewed {
 		c.cacheMu.Lock()
 		if len(c.browseCache) >= 512 {
 			c.browseCache = map[string]cachedBrowse{}
 		}
-		c.browseCache[bkey] = cachedBrowse{page: core.Page{Items: cachedItems, Total: total}, gen: gen, minute: minBucket}
+		if c.writeGen.Load() == gen {
+			cachedItems := make([]core.Title, len(items))
+			for i := range items {
+				cachedItems[i] = cloneTitle(items[i])
+			}
+			c.browseCache[bkey] = cachedBrowse{page: core.Page{Items: cachedItems, Total: total}, gen: gen, minute: minBucket}
+		}
+		// The cursor is stored even when a write landed during the read:
+		// it only names where this sequential walk reached, and losing it
+		// to background writes would break the chain on a busy catalogue.
 		if keyOrder && len(items) > 0 {
 			last := items[len(items)-1].Key
 			c.browseCache[cursorPrefix+strconv.Itoa(offset+len(items))] = cachedBrowse{
-				page: core.Page{Items: []core.Title{{Key: last}}}, gen: gen, minute: minBucket,
+				page: core.Page{Items: []core.Title{{Key: last}}}, gen: gen, minute: minBucket, at: time.Now(),
 			}
 		}
 		c.cacheMu.Unlock()
@@ -647,7 +740,7 @@ func (c *Catalog) BrowseStoredSeasons(ctx context.Context, q core.BrowseQuery) (
 	}
 	var afterKey core.RatingKey
 	if offset > 0 && q.Filter.Group == nil && !q.SortLastViewed {
-		if cur, ok := c.browseCache[cursorPrefix+strconv.Itoa(offset)]; ok && cur.gen == gen && cur.minute == minBucket && len(cur.page.Items) == 1 {
+		if cur, ok := c.browseCache[cursorPrefix+strconv.Itoa(offset)]; ok && pageCursorLive(cur, gen, minBucket) {
 			afterKey = cur.page.Items[0].Key
 		}
 	}
@@ -753,20 +846,22 @@ func (c *Catalog) BrowseStoredSeasons(ctx context.Context, q core.BrowseQuery) (
 	if q.NoTotal {
 		total = offset + len(items)
 	}
-	if q.Filter.Group == nil && !q.SortLastViewed && c.writeGen.Load() == gen {
-		cachedItems := make([]core.Title, len(items))
-		for i := range items {
-			cachedItems[i] = cloneTitle(items[i])
-		}
+	if q.Filter.Group == nil && !q.SortLastViewed {
 		c.cacheMu.Lock()
 		if len(c.browseCache) >= 512 {
 			c.browseCache = map[string]cachedBrowse{}
 		}
-		c.browseCache[bkey] = cachedBrowse{page: core.Page{Items: cachedItems, Total: total}, gen: gen, minute: minBucket}
+		if c.writeGen.Load() == gen {
+			cachedItems := make([]core.Title, len(items))
+			for i := range items {
+				cachedItems[i] = cloneTitle(items[i])
+			}
+			c.browseCache[bkey] = cachedBrowse{page: core.Page{Items: cachedItems, Total: total}, gen: gen, minute: minBucket}
+		}
 		if keyOrder && len(items) > 0 {
 			last := items[len(items)-1].Key
 			c.browseCache[cursorPrefix+strconv.Itoa(offset+len(items))] = cachedBrowse{
-				page: core.Page{Items: []core.Title{{Key: last}}}, gen: gen, minute: minBucket,
+				page: core.Page{Items: []core.Title{{Key: last}}}, gen: gen, minute: minBucket, at: time.Now(),
 			}
 		}
 		c.cacheMu.Unlock()

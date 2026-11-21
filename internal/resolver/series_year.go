@@ -68,6 +68,9 @@ func (s *Service) prepareSeriesYears(ctx context.Context, t *core.Title, sreq co
 		lookups++
 		lctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 		conflict, err := s.seriesYearConflict(lctx, t.ShowKey, sreq.Title, y)
+		if err == nil && !conflict && sreq.EnglishTitle != "" && !releaseparse.TitlesMatch(sreq.EnglishTitle, sreq.Title) {
+			conflict, err = s.seriesYearConflict(lctx, t.ShowKey, sreq.EnglishTitle, y)
+		}
 		cancel()
 		if err != nil {
 			s.log.Debug("series year lookup failed; keeping the year check", "show", t.ShowKey, "year", y, "err", err)
@@ -102,4 +105,48 @@ func (s *Service) seriesYearAccepted(show core.RatingKey, year int) bool {
 // year that differs from the show's.
 func seriesYearGuessed(rel core.Release, sreq core.SearchRequest) bool {
 	return sreq.Type == core.TypeEpisode && !releaseparse.SeriesYearMatches(releaseparse.EpisodeSeriesYear(rel.Name, rel.Info.Year), sreq.Year)
+}
+
+// hasSeriesNamesake asks only on use and caches bounded catalogue answers.
+func (s *Service) hasSeriesNamesake(ctx context.Context, t *core.Title, req core.SearchRequest) bool {
+	if s.seriesNamesake == nil || t == nil {
+		return false
+	}
+	if s.hasSeriesNamesakeTitle(ctx, t.ShowKey, req.Title, req.Year) {
+		return true
+	}
+	if req.EnglishTitle != "" && !releaseparse.TitlesMatch(req.EnglishTitle, req.Title) {
+		return s.hasSeriesNamesakeTitle(ctx, t.ShowKey, req.EnglishTitle, req.Year)
+	}
+	return false
+}
+
+func (s *Service) hasSeriesNamesakeTitle(ctx context.Context, showKey core.RatingKey, title string, year int) bool {
+	if title == "" {
+		return false
+	}
+	key := "namesake/" + seriesYearKey(showKey, year) + "/" + title
+	now := s.now()
+	s.years.mu.Lock()
+	v, ok := s.years.seen[key]
+	s.years.mu.Unlock()
+	if ok && now.Sub(v.at) < seriesYearTTL {
+		return v.conflict
+	}
+	lookup, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	found, err := s.seriesNamesake(lookup, showKey, title, year)
+	if err != nil {
+		return false
+	}
+	s.years.mu.Lock()
+	if s.years.seen == nil {
+		s.years.seen = map[string]seriesYearVerdict{}
+	}
+	if len(s.years.seen) >= 4096 {
+		clear(s.years.seen)
+	}
+	s.years.seen[key] = seriesYearVerdict{conflict: found, at: now}
+	s.years.mu.Unlock()
+	return found
 }

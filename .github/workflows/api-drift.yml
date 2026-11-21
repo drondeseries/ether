@@ -17,10 +17,10 @@ jobs:
       issues: write # report a failed check
     steps:
       # Keeps the token in git config: scripts/drift-watch.sh pushes the branch.
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0 # zizmor: ignore[artipacked]
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 # zizmor: ignore[artipacked]
         with:
           fetch-depth: 0
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           cache: true
@@ -28,13 +28,16 @@ jobs:
         id: plan
         continue-on-error: true
         env:
+          # Authenticated GitHub API calls: anonymous release lookups share the
+          # runner IP's 60/hour limit and fail with HTTP 403.
+          GH_TOKEN: ${{ github.token }}
           DRIFT_WATCH_SKIP_RECORD: "1"
         run: scripts/drift-watch.sh plan
       - name: Open or update the drift pull request
         if: steps.plan.outcome == 'success'
         env:
           GH_TOKEN: ${{ github.token }}
-          DRIFT_PR_BASE: prism
+          DRIFT_PR_BASE: main
           DRIFT_WATCH_OPEN_PR: "1"
           DRIFT_WATCH_SKIP_RECORD: "1"
         run: scripts/drift-watch.sh pr

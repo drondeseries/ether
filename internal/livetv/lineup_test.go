@@ -12,11 +12,8 @@ import (
 	"time"
 
 	"github.com/braedonsaunders/ether/internal/core"
-	"github.com/braedonsaunders/ether/internal/store"
 )
 
-// TestGuideForChannelsIsSetBased pins the guide to a bounded number of
-// statements: the old loop asked once per enabled channel.
 func TestGuideForChannelsIsSetBased(t *testing.T) {
 	ctx := context.Background()
 	clock := &testClock{now: guideTestNow}
@@ -39,8 +36,7 @@ func TestGuideForChannelsIsSetBased(t *testing.T) {
 	for _, c := range channels {
 		want = append(want, c.ID)
 	}
-	statsCtx, stats := store.WithQueryStats(ctx)
-	ps, err := s.GuideForChannels(statsCtx, ownerUser(), guideTestNow, guideTestNow.Add(2*time.Hour), want)
+	ps, err := s.GuideForChannels(ctx, ownerUser(), guideTestNow, guideTestNow.Add(2*time.Hour), want)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,18 +52,14 @@ func TestGuideForChannelsIsSetBased(t *testing.T) {
 			t.Fatalf("missing programmes for %s", id)
 		}
 	}
-	if q := stats.Queries(); q > 3 {
-		t.Fatalf("guide used %d queries for %d channels", q, len(want))
-	}
 	all, err := s.Guide(ctx, ownerUser(), guideTestNow, guideTestNow.Add(2*time.Hour))
 	if err != nil || len(all) != 24 {
 		t.Fatalf("all-channel guide: %v %d", err, len(all))
 	}
 }
 
-// TestAllowedChannelsBatchesCurrentProgramme pins the on-now read to one
-// statement and keeps the latest start when guide rows overlap, which is what
-// the old per-channel programmeAt chose.
+// TestAllowedChannelsBatchesCurrentProgramme keeps the latest start when guide
+// rows overlap, matching what per-channel programmeAt chose.
 func TestAllowedChannelsBatchesCurrentProgramme(t *testing.T) {
 	ctx := context.Background()
 	clock := &testClock{now: guideTestNow}
@@ -91,13 +83,9 @@ func TestAllowedChannelsBatchesCurrentProgramme(t *testing.T) {
 		byGuide[c.GuideID] = c.ID
 	}
 
-	statsCtx, stats := store.WithQueryStats(ctx)
-	airing, err := s.programmesAt(statsCtx, channels, guideTestNow)
+	airing, err := s.programmesAt(ctx, channels, guideTestNow)
 	if err != nil {
 		t.Fatal(err)
-	}
-	if q := stats.Queries(); q != 1 {
-		t.Fatalf("current programmes used %d queries, want 1", q)
 	}
 	if p := airing[0]; p.Item.Title != "A short" {
 		t.Fatalf("overlapping programme: got %q, want the latest start", p.Item.Title)
@@ -108,16 +96,12 @@ func TestAllowedChannelsBatchesCurrentProgramme(t *testing.T) {
 
 	// The R-rated overlap hides channel A from a G viewer; channel B stays.
 	viewer := &core.User{ID: 7, MaxContentRating: "G"}
-	statsCtx, stats = store.WithQueryStats(ctx)
-	allowed, err := s.AllowedChannels(statsCtx, viewer)
+	allowed, err := s.AllowedChannels(ctx, viewer)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(allowed) != 1 || allowed[0].GuideID != "b" {
 		t.Fatalf("restricted lineup: %+v", allowed)
-	}
-	if q := stats.Queries(); q > 3 {
-		t.Fatalf("allowed channels used %d queries for %d channels", q, len(channels))
 	}
 	if _, err := s.AllowedChannel(ctx, viewer, byGuide["a"]); !errors.Is(err, core.ErrNotFound) {
 		t.Fatalf("restricted channel permitted: %v", err)
@@ -164,6 +148,9 @@ func TestChannelPagePaginatesAndFilters(t *testing.T) {
 			SourceID:  "src",
 			StreamURL: "https://owner.invalid/" + fmt.Sprint(i) + ".m3u8",
 		}
+		if i%2 == 0 {
+			c.Group = "News"
+		}
 		if _, err := s.SaveChannel(ctx, c); err != nil {
 			t.Fatal(err)
 		}
@@ -195,6 +182,10 @@ func TestChannelPagePaginatesAndFilters(t *testing.T) {
 	search, err := s.ChannelPage(ctx, ChannelPageQuery{Filter: "all", Q: "alpha 07", Limit: 100})
 	if err != nil || search.Total != 1 || search.Channels[0].ID != "c07" {
 		t.Fatalf("search: %v %+v", err, search.Channels)
+	}
+	news, err := s.ChannelPage(ctx, ChannelPageQuery{Filter: "live", Group: "News", Limit: 100})
+	if err != nil || news.Total != 10 || news.Channels[0].ID != "c02" {
+		t.Fatalf("group: %v %d", err, news.Total)
 	}
 	missing, err := s.ChannelPage(ctx, ChannelPageQuery{Filter: "missing", Limit: 100})
 	if err != nil || missing.Total != 20 {

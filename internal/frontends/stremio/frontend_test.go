@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -42,14 +43,23 @@ func TestManifestRequiresSurfaceGrantAndProvidesCORS(t *testing.T) {
 	}
 }
 
-type lazyFixture struct{ issued bool }
+type lazyFixture struct {
+	issued               bool
+	issuedReq, warmedReq *frontend.PlanRequest
+}
 
 func (f *lazyFixture) Issue(_ context.Context, credential string, request frontend.PlanRequest) (string, error) {
 	if credential != "grant" || request.Protocol != "stremio" || request.Item.TMDB() != 42 || !request.Intent.Options.DirectPlay {
 		return "", errors.New("wrong scope")
 	}
 	f.issued = true
+	f.issuedReq = &request
 	return "/sessions/lazy/scoped/file", nil
+}
+func (f *lazyFixture) Warm(_ context.Context, credential string, request frontend.PlanRequest) {
+	if credential == "grant" {
+		f.warmedReq = &request
+	}
 }
 func (*lazyFixture) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusPartialContent)
@@ -79,6 +89,11 @@ func TestStreamUsesLazyCapabilityAndNeverOpensOnDiscovery(t *testing.T) {
 	inst.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/stremio/grant/stream/movie/tmdb:42.json", nil))
 	if w.Code != 200 || !lazy.issued || !strings.Contains(w.Body.String(), "https://ether.example/stremio/sessions/lazy/scoped/file") || strings.Contains(w.Body.String(), "grant") {
 		t.Fatalf("response: %d %s", w.Code, w.Body.String())
+	}
+	// The stream list warms the exact request the lazy URL plays, so the
+	// viewer's pick joins a resolve that started before it.
+	if lazy.warmedReq == nil || !reflect.DeepEqual(*lazy.warmedReq, *lazy.issuedReq) {
+		t.Fatalf("stream list did not warm the issued request: %+v", lazy.warmedReq)
 	}
 }
 
@@ -169,6 +184,9 @@ func TestSeriesRowUsesShowIdentityWithoutAnItemRead(t *testing.T) {
 	episode := frontend.Title{Key: 99, Type: "episode", Title: "Pilot", ShowKey: 42, ShowTitle: "Visible", ShowYear: 2020}
 	episode.ShowIDs.TMDB = 42
 	experience := frontendtest.Experience{
+		ViewsFunc: func(context.Context, *frontend.Viewer) ([]frontend.View, error) {
+			return []frontend.View{{ID: "shows", Type: "show"}}, nil
+		},
 		RowsFunc: func(_ context.Context, req frontend.RowRequest) ([]frontend.Row, error) {
 			if req.Purpose != frontend.RowContinue {
 				t.Fatalf("purpose %q", req.Purpose)
@@ -244,6 +262,8 @@ func TestRowCatalogSkipsUnsupportedEntries(t *testing.T) {
 			{Kind: frontend.RowEntryDirectory, Directory: &frontend.RowDirectory{Title: "Unsupported"}},
 			{Kind: frontend.RowEntryTitle, Title: &title},
 		}}}, nil
+	}, ViewsFunc: func(context.Context, *frontend.Viewer) ([]frontend.View, error) {
+		return []frontend.View{{ID: "movies", Type: "movie"}}, nil
 	}}
 	inst, err := (Frontend{}).Mount(context.Background(), frontend.Host{Identity: identity, Experience: experience, Sessions: frontendtest.Sessions{}})
 	if err != nil {
@@ -302,9 +322,13 @@ func TestCatalogPaginatesAcrossLibraries(t *testing.T) {
 				if q.Offset != 2 {
 					t.Fatalf("first offset %d", q.Offset)
 				}
-				return frontend.Page{Total: 2}, nil
+				if q.NoTotal {
+					// A page without a total reports offset plus its items.
+					return frontend.Page{Total: q.Offset}, nil
+				}
+				return frontend.Page{Total: 1}, nil
 			}
-			if view != "second" || q.Offset != 0 {
+			if view != "second" || q.Offset != 1 || !q.NoTotal {
 				t.Fatalf("second: %s %+v", view, q)
 			}
 			title := frontend.Title{Title: "Second library", Type: "movie"}

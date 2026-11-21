@@ -4,9 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/braedonsaunders/ether/internal/httpclient"
 	"io"
 	"mime"
+	"net"
 	"net/http"
 	"net/url"
 	"path"
@@ -17,6 +17,7 @@ import (
 
 	"github.com/braedonsaunders/ether/internal/core"
 	"github.com/braedonsaunders/ether/internal/egress"
+	"github.com/braedonsaunders/ether/internal/httpclient"
 	"github.com/braedonsaunders/ether/internal/safefetch"
 )
 
@@ -62,7 +63,16 @@ func (d *directClients) init() {
 			g = &safefetch.Guard{}
 		}
 		mk := func() *http.Client {
-			return g.Client(&http.Client{Transport: streamingTransport(nil, egress.CapStremio), CheckRedirect: dropHeadersAcrossOrigins})
+			tr := streamingTransport(nil, egress.CapStremio)
+			// Xtream VOD shares these guarded stream pools with addon files.
+			tr.Proxy = func(req *http.Request) (*url.URL, error) {
+				cap := egress.CapStremio
+				if p, ok := req.Context().Value(directKey{}).(Payload); ok && p.StreamProvider != "" {
+					cap = egress.CapLiveTV
+				}
+				return egress.ProxyFunc(cap)(req)
+			}
+			return g.Client(&http.Client{Transport: tr, CheckRedirect: dropHeadersAcrossOrigins})
 		}
 		d.primary, d.hedge = mk(), mk()
 	})
@@ -91,7 +101,7 @@ func withDirect(ctx context.Context, p Payload) context.Context {
 // prepareDirect applies a direct payload's policy to a media request:
 // the trusted origin and, on the link's own origin, the addon's headers.
 func prepareDirect(req *http.Request, p Payload) *http.Request {
-	req = req.WithContext(safefetch.WithTrustedOriginFor(req.Context(), p.Origin, req.URL.String()))
+	req = req.WithContext(safefetch.WithTrustedOriginFor(withDirect(req.Context(), p), p.Origin, req.URL.String()))
 	if safefetch.SameOrigin(p.Link, req.URL.String()) {
 		for k, v := range p.Headers {
 			if k != "Range" && k != "Host" {
@@ -110,13 +120,22 @@ func prepareDirect(req *http.Request, p Payload) *http.Request {
 // that is still fetching a file, or behind a misbehaving proxy, may serve
 // it properly later, so none marks the release bad. Only a release whose
 // own link is malformed is rejected (core.ErrReleaseRejected).
+//
+// An on-demand link (core.Release.OpensOnDemand) makes the add-on fetch the
+// release, so work nobody is waiting to watch (a warm-up, a prefetch, an
+// availability check) never opens one: it answers core.ErrForegroundOnly.
+// A probe the add-on does not answer in time also wraps core.ErrPrepareSlow:
+// it may still be preparing the release.
 func (s *Service) DirectPayload(ctx context.Context, rel core.Release) ([]byte, error) {
 	link, err := url.Parse(rel.StreamURL)
 	if err != nil || (link.Scheme != "http" && link.Scheme != "https") || link.Host == "" {
 		return nil, fmt.Errorf("debrid: %q has no HTTP stream link: %w", rel.Name, core.ErrReleaseRejected)
 	}
+	if rel.OpensOnDemand() && !core.OnDemandStreamsAllowed(ctx) && !core.OnDemandWarmGranted(ctx, rel) {
+		return nil, fmt.Errorf("debrid: add-on stream %q opens only for Play: %w", rel.Name, core.ErrForegroundOnly)
+	}
 	base := Payload{Key: payloadKey(rel), ReleaseID: rel.ID, Kind: KindHTTP, Link: rel.StreamURL, URL: rel.StreamURL,
-		StreamProvider: rel.StreamProvider, Headers: rel.StreamHeaders, Origin: rel.StreamOrigin, Release: rel.Name}
+		StreamProvider: rel.StreamProvider, Headers: rel.StreamHeaders, Origin: rel.StreamOrigin, Release: rel.Name, Target: rel.Target}
 	pctx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(pctx, http.MethodGet, rel.StreamURL, nil)
@@ -124,7 +143,7 @@ func (s *Service) DirectPayload(ctx context.Context, rel core.Release) ([]byte, 
 		return nil, fmt.Errorf("debrid: %q: invalid stream link: %w", rel.Name, core.ErrReleaseRejected)
 	}
 	req.Header.Set("Range", "bytes=0-0")
-	req.Header.Set("User-Agent", httpclient.UserAgent)
+	req.Header.Set("User-Agent", httpclient.UserAgent())
 	s.direct.init()
 	resp, err := s.directRequest(s.direct.primary, prepareDirect(req, base), base)
 	if err != nil {
@@ -133,6 +152,10 @@ func (s *Service) DirectPayload(ctx context.Context, rel core.Release) ([]byte, 
 		}
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
+		}
+		var timeout net.Error
+		if pctx.Err() != nil || errors.As(err, &timeout) && timeout.Timeout() {
+			return nil, fmt.Errorf("debrid: stream from %s did not answer in time: %w: %w", link.Host, core.ErrSourceUnavailable, core.ErrPrepareSlow)
 		}
 		return nil, fmt.Errorf("debrid: stream from %s: %w: %v", link.Host, core.ErrSourceUnavailable, sanitize(err))
 	}
@@ -157,6 +180,13 @@ func (s *Service) DirectPayload(ctx context.Context, rel core.Release) ([]byte, 
 	}
 	base.Size = size
 	base.Path = directFileName(rel.Name, resp, ctype)
+	// If the HTTP server supplies no filename, directFileName uses our
+	// catalogue-renumbered release label, rather than an IMDb filename.
+	if base.Target != nil && base.Target.Season == 0 && base.Path == rel.Name+videoTypes[ctype] {
+		target := *base.Target
+		target.AddonSpecialEpisode = 0
+		base.Target = &target
+	}
 	if final := resp.Request.URL.String(); final != "" {
 		base.URL = final // the addon's redirect target; the link stays in Link
 	}
@@ -222,11 +252,14 @@ func (s *Service) directRequest(hc *http.Client, req *http.Request, p Payload) (
 		if s.opts.AcquireStreamProvider == nil {
 			return nil, core.ErrSourceUnavailable
 		}
-		var err error
-		release, err = s.opts.AcquireStreamProvider(req.Context(), p.StreamProvider)
+		ctx, cancel := context.WithCancel(req.Context())
+		req = req.WithContext(core.WithProviderLeaseCancel(ctx, cancel))
+		slot, err := s.opts.AcquireStreamProvider(req.Context(), p.StreamProvider)
 		if err != nil {
+			cancel()
 			return nil, err
 		}
+		release = func() { slot(); cancel() }
 	}
 	resp, err := hc.Do(req)
 	if err != nil {

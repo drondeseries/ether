@@ -19,9 +19,13 @@ type fixtureHost struct {
 	kv                   map[string][]byte
 	folders              map[string][]plugins.FolderEntry
 	channel, guide, boot []byte
+	settings             map[string]any
 }
 
 func (h *fixtureHost) Settings(_ context.Context) (map[string]any, error) {
+	if h.settings != nil {
+		return h.settings, nil
+	}
 	if h.folders != nil {
 		return map[string]any{"folder": "/media"}, nil
 	}
@@ -41,6 +45,14 @@ func (h *fixtureHost) KVList(_ context.Context, p string) ([]string, error) {
 		}
 	}
 	return out, nil
+}
+func (h *fixtureHost) KVUsage(context.Context) (plugins.KVUsage, error) {
+	var used int64
+	for _, v := range h.kv {
+		used += int64(len(v))
+	}
+	keys := int64(len(h.kv))
+	return plugins.KVUsage{Bytes: used + keys*plugins.KVKeyChargeBytes, Keys: keys, QuotaBytes: plugins.KVQuotaBytes, QuotaKeys: plugins.KVQuotaKeys}, nil
 }
 func (h *fixtureHost) FoldersList(_ context.Context, root, path string) ([]plugins.FolderEntry, error) {
 	if path != "" {
@@ -145,7 +157,7 @@ func TestExamplesPackAndRunHosted(t *testing.T) {
 }
 
 func TestStudioExamplesPackAndConform(t *testing.T) {
-	for _, name := range []string{"tvmaze", "october-after-dark", "canada-live", "easydebrid", "travel-mode", "movie-night"} {
+	for _, name := range []string{"tvmaze", "october-after-dark", "canada-live", "easydebrid", "travel-mode", "movie-night", "english-dubs", "smart-lights"} {
 		t.Run(name, func(t *testing.T) {
 			pkg, err := kit.LoadDir(name)
 			if err != nil {
@@ -165,4 +177,20 @@ func TestStudioExamplesPackAndConform(t *testing.T) {
 			}
 		})
 	}
+}
+
+func (fixtureHost) FoldersHash(context.Context, string, string) (plugins.FolderHash, error) {
+	return plugins.FolderHash{}, nil
+}
+
+func (fixtureHost) FoldersHashStart(context.Context, string, string) (plugins.FolderHashJob, error) {
+	return plugins.FolderHashJob{}, nil
+}
+
+func (fixtureHost) FoldersHashPoll(context.Context, string) (plugins.FolderHashJob, error) {
+	return plugins.FolderHashJob{}, nil
+}
+
+func (fixtureHost) FoldersHashCancel(context.Context, string) (plugins.FolderHashJob, error) {
+	return plugins.FolderHashJob{}, nil
 }

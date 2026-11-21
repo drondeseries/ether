@@ -43,7 +43,7 @@ func TestInfuseAndTVOSPoolPicksHEVCOverAV1UnlessAdvertised(t *testing.T) {
 	}
 	cfg := testCfg()
 	for i := range cfg.Quality.Profiles {
-		cfg.Quality.Profiles[i].PreferredCodecs = []string{"av1", "hevc", "h264"}
+		cfg.Quality.Profiles[i].CustomFormatScores[core.CodecFormat("av1")] = 30
 	}
 
 	for _, tc := range []struct {
@@ -73,12 +73,12 @@ func TestInfuseAndTVOSPoolPicksHEVCOverAV1UnlessAdvertised(t *testing.T) {
 		},
 		{
 			name: "Plex Apple TV profile without AV1 picks HEVC unchanged",
-			caps: core.ClientCaps{Protocol: "plex", Product: "Plex for Apple TV", Platform: "tvOS", Device: "Apple TV", MaxHeight: 2160, VideoCodecs: []string{"h264", "hevc"}},
+			caps: core.ClientCaps{Protocol: "plex", PreserveEmptyVideoCodecs: true, Product: "Plex for Apple TV", Platform: "tvOS", Device: "Apple TV", MaxHeight: 2160, VideoCodecs: []string{"h264", "hevc"}},
 			want: "hevc",
 		},
 		{
 			name: "Plex client with unrestricted codecs is unchanged",
-			caps: core.ClientCaps{Protocol: "plex", Product: "Plex for Windows", Platform: "Windows", MaxHeight: 2160},
+			caps: core.ClientCaps{Protocol: "plex", PreserveEmptyVideoCodecs: true, Product: "Plex for Windows", Platform: "Windows", MaxHeight: 2160},
 			want: "av1",
 		},
 	} {

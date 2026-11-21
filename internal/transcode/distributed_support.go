@@ -30,6 +30,9 @@ func (m *Manager) SupportsDistributedRequest(req core.HLSRequest) bool {
 	if closed || cfg.SpikeGovernor || (cfg.RTXVideo.Mode != "" && cfg.RTXVideo.Mode != "off") {
 		return false
 	}
+	if cfg.VideoTranscodingOff() && !req.Decision.VideoCopy && req.Info.Video() != nil {
+		return false
+	}
 	f := m.feat
 	if len(f.muxers) == 0 || len(f.demuxers) == 0 || len(f.decoders) == 0 || len(f.bsfs) == 0 || !f.inputProtocols["http"] || !f.inputProtocols["https"] || !f.inputProtocols["tcp"] || !f.inputProtocols["tls"] {
 		return false

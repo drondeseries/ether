@@ -11,10 +11,16 @@ import (
 	"time"
 
 	"github.com/braedonsaunders/ether/internal/core"
+	"github.com/braedonsaunders/ether/internal/libraryfilter"
+	"github.com/braedonsaunders/ether/internal/reqmemo"
 	"github.com/braedonsaunders/ether/internal/store"
 )
 
 func init() {
+	libraryfilter.RegisterMediaTypeMigration("collections", 9, "collections_specs", "spec_json", "id")
+	// Profile membership checks seek one title within a collection, independent of its size.
+	store.Register("collections", 8, `CREATE INDEX collections_members_profile_lookup ON collections_members(spec_id,key,shared);`)
+
 	store.Register("collections", 2, `
 CREATE TABLE collections_specs (
   id INTEGER PRIMARY KEY,
@@ -207,6 +213,17 @@ func sanitizeStoredRules(rules []core.CollectionRule, warnings []string) ([]core
 }
 
 func (s *Service) loadRows(ctx context.Context) ([]*specRow, error) {
+	rows, err := reqmemo.Do(ctx, fmt.Sprintf("collections-rows:%p", s), func() ([]*specRow, error) { return s.readRows(ctx) })
+	// List sorts its result; keep the memoized order private.
+	return append([]*specRow(nil), rows...), err
+}
+
+func (s *Service) forgetRowMemo(ctx context.Context) {
+	reqmemo.Forget(ctx, fmt.Sprintf("collections-rows:%p", s))
+	reqmemo.ForgetPrefix(ctx, fmt.Sprintf("collections-lastchance:%p:", s))
+}
+
+func (s *Service) readRows(ctx context.Context) ([]*specRow, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT `+specCols+` FROM collections_specs ORDER BY builtin ASC, id ASC`)
 	if err != nil {
 		return nil, err
@@ -240,6 +257,75 @@ func (s *Service) rowByID(ctx context.Context, id string) (*specRow, error) {
 		return nil, core.ErrNotFound
 	}
 	return r, err
+}
+
+// ensurePluginLayoutRow finds or provisions a hidden backing specRow for a
+// plugin list source placed directly in Home Designer ("plugin:<id>/<key>").
+func (s *Service) ensurePluginLayoutRow(ctx context.Context, kindID string) (*specRow, error) {
+	kind, ok := s.kindRegistry().Lookup(kindID)
+	if !ok {
+		return nil, core.ErrNotFound
+	}
+	r, err := scanSpecRow(s.db.QueryRowContext(ctx, `SELECT `+specCols+` FROM collections_specs WHERE slug=? AND builtin=0 LIMIT 1`, kindID))
+	if err == nil {
+		return r, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+	desc := kind.Describe()
+	name := strings.TrimSpace(desc.Label.Resolved)
+	if name == "" {
+		name = kindID
+	}
+	mediaType := MediaMixed
+	if len(desc.MediaTypes) == 1 {
+		switch desc.MediaTypes[0] {
+		case "movie":
+			mediaType = MediaMovie
+		case "show":
+			mediaType = MediaShow
+		}
+	}
+	sp := core.CollectionSpec{
+		Name:      name,
+		MediaType: mediaType,
+		Sources:   []core.CollectionSource{{Kind: kindID}},
+		Match:     MatchAll,
+		Sort:      "source",
+		Refresh:   RefreshDaily,
+		Enabled:   true,
+		Targets:   core.CollectionTargets{Users: core.AllUsers()},
+	}
+	Normalize(&sp)
+	js, err := specJSON(sp)
+	if err != nil {
+		return nil, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	var existingID int64
+	if err := tx.QueryRowContext(ctx, `SELECT id FROM collections_specs WHERE slug=? AND builtin=0 LIMIT 1`, kindID).Scan(&existingID); err == nil {
+		_ = tx.Rollback()
+		return s.rowByID(ctx, strconv.FormatInt(existingID, 10))
+	}
+	id, err := s.nextID(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	now := s.now().Unix()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO collections_specs(id,slug,builtin,owner_user_id,spec_json,enabled,created_at,updated_at)
+		VALUES(?, ?, 0, 0, ?, 1, ?, ?)`, id, kindID, js, now, now); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	s.forgetRowMemo(ctx)
+	return s.rowByID(ctx, strconv.FormatInt(id, 10))
 }
 
 func (s *Service) rowByKey(ctx context.Context, key core.RatingKey) (*specRow, error) {
@@ -300,6 +386,7 @@ func (s *Service) insertRow(ctx context.Context, sp core.CollectionSpec, owner i
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
+	s.forgetRowMemo(ctx)
 	return s.rowByID(ctx, strconv.FormatInt(id, 10))
 }
 
@@ -334,6 +421,7 @@ func (s *Service) updateRow(ctx context.Context, id int64, sp core.CollectionSpe
 	if n, _ := res.RowsAffected(); n == 0 {
 		return core.ErrNotFound
 	}
+	s.forgetRowMemo(ctx)
 	return nil
 }
 
@@ -353,7 +441,11 @@ func (s *Service) deleteRow(ctx context.Context, id int64) error {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM collections_members WHERE spec_id=?`, id); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.forgetRowMemo(ctx)
+	return nil
 }
 
 // saveBuild persists a build's members and report.
@@ -394,7 +486,11 @@ func (s *Service) saveBuild(ctx context.Context, id int64, expected, resolved st
 		hash, at.Unix(), at.Unix(), itemCount, string(wj), hash, id); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.forgetRowMemo(ctx)
+	return nil
 }
 
 func (s *Service) loadMembers(ctx context.Context, id int64) ([]core.RatingKey, map[core.RatingKey]bool, error) {
@@ -422,6 +518,64 @@ func (s *Service) loadMembers(ctx context.Context, id int64) ([]core.RatingKey, 
 	return out, unshared, rows.Err()
 }
 
+func (s *Service) loadMembersMany(ctx context.Context, ids []int64) (map[int64][]core.RatingKey, map[int64]map[core.RatingKey]bool, error) {
+	keysByID := make(map[int64][]core.RatingKey, len(ids))
+	unsharedByID := make(map[int64]map[core.RatingKey]bool)
+	if len(ids) == 0 {
+		return keysByID, unsharedByID, nil
+	}
+	uniq := make([]int64, 0, len(ids))
+	seen := make(map[int64]struct{}, len(ids))
+	for _, id := range ids {
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		uniq = append(uniq, id)
+	}
+	for chunk := range store.Chunks(uniq, 500) {
+		var q strings.Builder
+		q.WriteString(`SELECT spec_id,key,shared FROM collections_members WHERE spec_id IN (`)
+		args := make([]any, len(chunk))
+		for i, id := range chunk {
+			if i > 0 {
+				q.WriteByte(',')
+			}
+			q.WriteByte('?')
+			args[i] = id
+		}
+		q.WriteString(`) ORDER BY spec_id,pos`)
+		rows, err := s.db.QueryContext(ctx, q.String(), args...)
+		if err != nil {
+			return nil, nil, err
+		}
+		for rows.Next() {
+			var specID, k int64
+			var shared int
+			if err := rows.Scan(&specID, &k, &shared); err != nil {
+				rows.Close()
+				return nil, nil, err
+			}
+			rk := core.RatingKey(k)
+			keysByID[specID] = append(keysByID[specID], rk)
+			if shared == 0 {
+				m := unsharedByID[specID]
+				if m == nil {
+					m = map[core.RatingKey]bool{}
+					unsharedByID[specID] = m
+				}
+				m[rk] = true
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, nil, err
+		}
+		rows.Close()
+	}
+	return keysByID, unsharedByID, nil
+}
+
 func (s *Service) meta(ctx context.Context, k string) string {
 	var v string
 	_ = s.db.QueryRowContext(ctx, `SELECT v FROM collections_meta WHERE k=?`, k).Scan(&v)
@@ -444,6 +598,9 @@ func specFromFilter(c core.Collection) core.CollectionSpec {
 		Refresh: RefreshLive, Enabled: true, Sort: string(c.Sort), SortDesc: c.Sort != core.SortTitle,
 		Artwork: core.CollectionArtwork{Mode: "auto"},
 		Targets: core.CollectionTargets{CollectionsTab: true, Users: core.AllUsers()},
+	}
+	if f.Topic != "" {
+		sp.Sources[0].Params = map[string]string{"topic": f.Topic}
 	}
 	switch typ {
 	case core.TypeMovie:

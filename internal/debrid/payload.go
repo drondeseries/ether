@@ -33,21 +33,28 @@ const payloadMagic = "ETHER-DEBRID/1\n"
 // fresh link can be generated after the last one expires. It never holds
 // an API key.
 type Payload struct {
-	Key       string              `json:"key,omitempty"`       // payload cache key (release + target)
-	ReleaseID string              `json:"releaseId,omitempty"` // core.Release.ID (segment cache key)
-	Provider  string              `json:"provider"`            // config.DebridProvider.ID
-	Kind      string              `json:"kind"`                // config.DebridKinds
-	InfoHash  string              `json:"infoHash"`            // lower-case hex v1 info hash
-	Magnet    string              `json:"magnet,omitempty"`    // magnet URI used to (re)add the torrent
-	TorrentID string              `json:"torrentId,omitempty"` // provider torrent / magnet id
-	FileID    string              `json:"fileId,omitempty"`    // provider file id
-	Path      string              `json:"path"`                // file path inside the torrent
-	Size      int64               `json:"size"`                // file size in bytes
-	Link      string              `json:"link,omitempty"`      // provider-side file link (RD/AllDebrid), unrestricted on demand
-	URL       string              `json:"url,omitempty"`       // last direct download URL
-	Expires   time.Time           `json:"expires,omitempty"`   // when URL should be regenerated
-	Target    *core.ReleaseTarget `json:"target,omitempty"`
-	Release   string              `json:"release,omitempty"` // release name, for logs
+	Key       string    `json:"key,omitempty"`       // payload cache key (release + target)
+	ReleaseID string    `json:"releaseId,omitempty"` // core.Release.ID (segment cache key)
+	Provider  string    `json:"provider"`            // config.DebridProvider.ID
+	Kind      string    `json:"kind"`                // config.DebridKinds
+	InfoHash  string    `json:"infoHash"`            // lower-case hex v1 info hash
+	Magnet    string    `json:"magnet,omitempty"`    // magnet URI used to (re)add the torrent
+	Private   bool      `json:"private,omitempty"`   // private-tracker torrent: bare hash & existing cache only
+	TorrentID string    `json:"torrentId,omitempty"` // provider torrent / magnet id
+	FileID    string    `json:"fileId,omitempty"`    // provider file id
+	Path      string    `json:"path"`                // file path inside the torrent
+	Size      int64     `json:"size"`                // file size in bytes
+	Link      string    `json:"link,omitempty"`      // provider-side file link (RD/AllDebrid), unrestricted on demand
+	URL       string    `json:"url,omitempty"`       // last direct download URL
+	Expires   time.Time `json:"expires,omitempty"`   // when URL should be regenerated
+	// OnReplayEdge records that URL stands on a CDN edge the engine moved
+	// the link to (resumeOnAnotherEdge), not on the host the provider
+	// signed. Media reads on such a link refuse redirects: a followed hop
+	// would receive the signed URL as Go's Referer header, token included,
+	// from an authority the provider never approved.
+	OnReplayEdge bool                `json:"onReplayEdge,omitempty"`
+	Target       *core.ReleaseTarget `json:"target,omitempty"`
+	Release      string              `json:"release,omitempty"` // release name, for logs
 	// Direct HTTP streams (Kind KindHTTP, direct.go): Link is the addon's
 	// stream link, Headers the request headers it requires and Origin the
 	// owner-configured addon origin. Link and Headers can carry the
@@ -86,7 +93,7 @@ func (p Payload) Name() string { return path.Base(strings.ReplaceAll(p.Path, "\\
 
 // handle is the provider-facing identity of the payload's file.
 func (p Payload) handle() Handle {
-	return Handle{TorrentID: p.TorrentID, FileID: p.FileID, Path: p.Path, Size: p.Size, Link: p.Link, Magnet: p.Magnet, InfoHash: p.InfoHash}
+	return Handle{TorrentID: p.TorrentID, FileID: p.FileID, Path: p.Path, Size: p.Size, Link: p.Link, Magnet: p.Magnet, InfoHash: p.InfoHash, Private: p.Private}
 }
 
 // fileTag identifies the file independently of the provider (base name and

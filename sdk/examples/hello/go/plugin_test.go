@@ -25,7 +25,9 @@ import (
 	etherplugin "github.com/braedonsaunders/ether/sdk/go"
 )
 
-type noopHost struct{}
+// noopHost answers the host calls this example makes; any other Host method
+// panics through the nil embedded interface.
+type noopHost struct{ plugins.Host }
 
 type parityHost struct {
 	noopHost
@@ -38,6 +40,9 @@ func (noopHost) KVGet(context.Context, string) ([]byte, bool, error) { return ni
 func (noopHost) KVPut(context.Context, string, []byte) error         { return nil }
 func (noopHost) KVDelete(context.Context, string) error              { return nil }
 func (noopHost) KVList(context.Context, string) ([]string, error)    { return nil, nil }
+func (noopHost) KVUsage(context.Context) (plugins.KVUsage, error) {
+	return plugins.KVUsage{QuotaBytes: plugins.KVQuotaBytes, QuotaKeys: plugins.KVQuotaKeys}, nil
+}
 func (noopHost) SecretGet(context.Context, string) (string, error) {
 	return "", plugins.ErrPermissionDenied
 }
@@ -579,4 +584,20 @@ func TestHostedTypeScriptAsyncHandler(t *testing.T) {
 	if err != nil || resp.Status != http.StatusOK || !strings.Contains(string(resp.Body), "Hello from Ether") {
 		t.Fatalf("async hosted response: %d %s %v", resp.Status, resp.Body, err)
 	}
+}
+
+func (noopHost) FoldersHash(context.Context, string, string) (plugins.FolderHash, error) {
+	return plugins.FolderHash{}, nil
+}
+
+func (noopHost) FoldersHashStart(context.Context, string, string) (plugins.FolderHashJob, error) {
+	return plugins.FolderHashJob{}, nil
+}
+
+func (noopHost) FoldersHashPoll(context.Context, string) (plugins.FolderHashJob, error) {
+	return plugins.FolderHashJob{}, nil
+}
+
+func (noopHost) FoldersHashCancel(context.Context, string) (plugins.FolderHashJob, error) {
+	return plugins.FolderHashJob{}, nil
 }

@@ -65,15 +65,19 @@ const NowMarker = memo(function NowMarker({
 });
 export function ScheduleTimeline({
   channelId,
+  snapshot,
   range: requestedRange,
   loadMore = false,
+  showLegend = true,
   onSelect,
   onAdd,
   selectedId,
 }: {
   channelId: string;
+  snapshot?: TimelineResponse;
   range: TimelineRange;
   loadMore?: boolean;
+  showLegend?: boolean;
   onSelect?: (element: TimelineElement) => void;
   onAdd?: (value: { start: number; blockId?: string }) => void;
   selectedId?: string;
@@ -111,6 +115,11 @@ export function ScheduleTimeline({
     return () => ro.disconnect();
   }, []);
   useEffect(() => {
+    if (snapshot) {
+      setData(snapshot);
+      setError("");
+      return;
+    }
     let live = true;
     const append = loadMore && loaded.current > range.from;
     if (!append) setData(undefined);
@@ -165,7 +174,7 @@ export function ScheduleTimeline({
       controller.abort();
       clearTimeout(timer);
     };
-  }, [channelId, range.from, range.to, loadMore]);
+  }, [channelId, range.from, range.to, loadMore, snapshot]);
   const scale = width / (hours * HOUR),
     total = Math.max(width, (range.to - range.from) * scale);
   const items = useMemo(
@@ -501,17 +510,19 @@ export function ScheduleTimeline({
           {error}
         </p>
       )}
-      <div
-        className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-fg-muted"
-        aria-label={t("Legend")}
-      >
-        {TIMELINE_KINDS.map((k) => (
-          <span key={k} className="inline-flex items-center gap-1">
-            <i className={`schedule-key schedule-${k}`} />
-            {kindLabel(k)}
-          </span>
-        ))}
-      </div>
+      {showLegend && (
+        <div
+          className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-fg-muted"
+          aria-label={t("Legend")}
+        >
+          {TIMELINE_KINDS.map((k) => (
+            <span key={k} className="inline-flex items-center gap-1">
+              <i className={`schedule-key schedule-${k}`} />
+              {kindLabel(k)}
+            </span>
+          ))}
+        </div>
+      )}
       {tip &&
         createPortal(
           <div

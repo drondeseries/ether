@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"sort"
+	"slices"
 	"sync"
 
 	"github.com/braedonsaunders/ether/internal/frontend"
@@ -14,6 +14,10 @@ import (
 // or hydrate titles to learn it.
 type libraryCounter interface {
 	LibraryCount(context.Context, *frontend.Viewer, string) (int, error)
+}
+
+type indexedLibraryCounter interface {
+	IndexedLibraryCount(context.Context, *frontend.Viewer, string) (int, error)
 }
 
 type viewFact struct {
@@ -28,34 +32,52 @@ type viewFactKey struct {
 	sections string
 }
 
+// viewFactCacheLimit bounds remembered (viewer, view) counts. Entries
+// are keyed by viewer, view, rating and section set, so without a cap
+// the map grows with every distinct combination ever browsed and is
+// never pruned (a stale generation only replaces its own key).
+const viewFactCacheLimit = 4096
+
 type viewFactCache struct {
 	mu sync.Mutex
 	m  map[viewFactKey]viewFact
 }
 
 func (i *instance) fillJellyfinViewFacts(r *http.Request, viewer *frontend.Viewer, viewID string, item map[string]any) {
-	if i == nil || r == nil || viewer == nil || item == nil || i.host.Experience == nil {
+	if r == nil || item == nil {
 		return
 	}
-	counter, ok := i.host.Experience.(libraryCounter)
-	if !ok {
-		return
+	if count, ok := i.cachedLibraryCount(r.Context(), viewer, viewID); ok {
+		item["ChildCount"] = count
+	}
+}
+
+func (i *instance) cachedLibraryCount(ctx context.Context, viewer *frontend.Viewer, viewID string) (int, bool) {
+	if i == nil || viewer == nil || i.host.Experience == nil {
+		return 0, false
+	}
+	var countFn func(context.Context, *frontend.Viewer, string) (int, error)
+	if ic, ok := i.host.Experience.(indexedLibraryCounter); ok {
+		countFn = ic.IndexedLibraryCount
+	} else if lc, ok := i.host.Experience.(libraryCounter); ok {
+		countFn = lc.LibraryCount
+	} else {
+		return 0, false
 	}
 	key, gen, cacheable := i.viewFactKey(viewer, viewID)
 	if cacheable {
 		if fact, hit := i.views.get(key); hit && fact.gen == gen {
-			item["ChildCount"] = fact.count
-			return
+			return fact.count, true
 		}
 	}
-	count, err := counter.LibraryCount(r.Context(), viewer, viewID)
+	count, err := countFn(ctx, viewer, viewID)
 	if err != nil {
-		return
+		return 0, false
 	}
 	if cacheable {
 		i.views.store(key, viewFact{gen: gen, count: count})
 	}
-	item["ChildCount"] = count
+	return count, true
 }
 
 func (c *viewFactCache) get(key viewFactKey) (viewFact, bool) {
@@ -71,6 +93,11 @@ func (c *viewFactCache) store(key viewFactKey, fact viewFact) {
 	if c.m == nil {
 		c.m = map[viewFactKey]viewFact{}
 	}
+	if _, exists := c.m[key]; !exists && len(c.m) >= viewFactCacheLimit {
+		// Counts are cheap to recompute and generation-checked on
+		// read, so dropping the whole map when full is safe.
+		clear(c.m)
+	}
 	c.m[key] = fact
 }
 
@@ -78,7 +105,7 @@ func (i *instance) viewFactKey(viewer *frontend.Viewer, viewID string) (viewFact
 	if i.host.PageFreshness == nil || viewer == nil {
 		return viewFactKey{}, 0, false
 	}
-	sections := append([]int(nil), viewer.AllowedSections...)
-	sort.Ints(sections)
+	sections := append([]frontend.LibraryID(nil), viewer.AllowedLibraries...)
+	slices.Sort(sections)
 	return viewFactKey{viewer: viewer.ID, view: viewID, rating: viewer.MaxContentRating, sections: fmt.Sprint(sections)}, i.host.PageFreshness().Catalog, true
 }

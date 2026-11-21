@@ -2,7 +2,6 @@ package livetv
 
 import (
 	"context"
-	"encoding/json"
 	"time"
 
 	"github.com/braedonsaunders/ether/internal/core"
@@ -39,11 +38,7 @@ func (s *Service) probeSessionInput(ctx context.Context, ss *session) (*core.Med
 	if err != nil {
 		return nil, err
 	}
-	key := ss.inputURL
-	if len(ss.inputHeaders) != 0 {
-		encoded, _ := json.Marshal(ss.inputHeaders)
-		key = stableID(ss.inputURL, string(encoded))
-	}
+	key := probeCacheKey(ss)
 	started := time.Now()
 	s.probeMu.Lock()
 	entry, found := s.probeCache[key]
@@ -110,10 +105,11 @@ func (s *Service) probeLiveCached(ctx context.Context, key, input string) (*core
 }
 
 func (s *Service) probeLiveUncached(ctx context.Context, input string) (*core.MediaInfo, error) {
-	if p, ok := s.o.Transcoder.(liveProber); ok {
+	tc := s.transcoder()
+	if p, ok := tc.(liveProber); ok {
 		return p.ProbeLive(ctx, input)
 	}
-	return s.o.Transcoder.Probe(ctx, input)
+	return tc.Probe(ctx, input)
 }
 
 func (s *Service) storeProbeLocked(key string, info core.MediaInfo) {

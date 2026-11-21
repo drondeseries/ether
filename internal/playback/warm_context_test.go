@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/braedonsaunders/ether/internal/config"
 	"github.com/braedonsaunders/ether/internal/core"
 )
 
@@ -74,5 +75,96 @@ func TestWarmPreparationIsSpeculativeUntilPromoted(t *testing.T) {
 	}
 	if core.IsSpeculative(context.Background()) {
 		t.Fatal("an ordinary context is speculative")
+	}
+}
+
+type spySpeculativeResolver struct {
+	core.Resolver
+	speculative bool
+	purpose     string
+	remaining   time.Duration
+}
+
+func (s *spySpeculativeResolver) Resolve(ctx context.Context, req core.ResolveRequest) (*core.Resolution, error) {
+	s.speculative = core.IsSpeculative(ctx) && core.SpeculativeIndexerWork(ctx)
+	s.purpose = core.IndexerPurpose(ctx)
+	if deadline, ok := ctx.Deadline(); ok {
+		s.remaining = time.Until(deadline)
+	}
+	return s.Resolver.Resolve(ctx, req)
+}
+
+func TestCheckFileAvailabilityUsesUpdatedTimeout(t *testing.T) {
+	h := newHarness(t, []*fakeRelease{{ID: "r1", Name: "Film.mkv", Size: 1 << 20}}, []string{"r1"})
+	defer h.m.Close()
+	spy := &spySpeculativeResolver{Resolver: h.resolver}
+	h.m.deps.Resolver = spy
+	for _, budget := range []time.Duration{13 * time.Second, 300 * time.Millisecond} {
+		cfg := h.m.config()
+		cfg.Plex.FileCheckTimeout = config.Duration(budget)
+		h.m.SetConfig(cfg)
+		live, err := h.m.CheckFileAvailability(t.Context(), owner, movieKey, defaultCaps("plex-detail"), "r1")
+		if err != nil || !live {
+			t.Fatalf("check with %v = (%v, %v)", budget, live, err)
+		}
+		if spy.remaining <= 0 || spy.remaining > budget || spy.remaining < budget-100*time.Millisecond {
+			t.Fatalf("resolver allowance = %v, want approximately %v", spy.remaining, budget)
+		}
+	}
+}
+
+func TestCheckFileAvailabilityRunsAsSpeculativeWarmup(t *testing.T) {
+	h := newHarness(t, []*fakeRelease{{ID: "r1", Name: "Film.mkv", Size: 1 << 20}}, []string{"r1"})
+	defer h.m.Close()
+	spy := &spySpeculativeResolver{Resolver: h.resolver}
+	h.m.deps.Resolver = spy
+	live, err := h.m.CheckFileAvailability(context.Background(), owner, movieKey, defaultCaps("plex-detail"), "r1")
+	if err != nil || !live {
+		t.Fatalf("CheckFileAvailability = (%v, %v), want (true, nil)", live, err)
+	}
+	if !spy.speculative || spy.purpose != core.IndexerPurposeWarmup {
+		t.Fatalf("CheckFileAvailability context: speculative=%v purpose=%q, want true / %q", spy.speculative, spy.purpose, core.IndexerPurposeWarmup)
+	}
+}
+
+// withOpenOnDemand turns on the owner setting that lets a detail page's file
+// check open on-demand add-on streams.
+func withOpenOnDemand(h *harness, _ *Options) {
+	h.cfg.Resolver.OpenOnDemandAddonStreams = true
+}
+
+type spyOnDemandResolver struct {
+	core.Resolver
+	allowed bool
+}
+
+func (s *spyOnDemandResolver) Resolve(ctx context.Context, req core.ResolveRequest) (*core.Resolution, error) {
+	s.allowed = core.OnDemandStreamsAllowed(ctx)
+	return s.Resolver.Resolve(ctx, req)
+}
+
+// The owner switch decides whether the detail-page check may open on-demand
+// add-on streams; with it off the check stays a plain refusal (#426).
+func TestCheckFileAvailabilityHonoursOpenOnDemandSetting(t *testing.T) {
+	h := newHarness(t, []*fakeRelease{{ID: "r1", Name: "Film.mkv", Size: 1 << 20}}, []string{"r1"})
+	defer h.m.Close()
+	off := &spyOnDemandResolver{Resolver: h.resolver}
+	h.m.deps.Resolver = off
+	if _, err := h.m.CheckFileAvailability(context.Background(), owner, movieKey, defaultCaps("plex-detail"), "r1"); err != nil {
+		t.Fatalf("CheckFileAvailability error = %v", err)
+	}
+	if off.allowed {
+		t.Fatal("off by default but the file check was admitted to open an on-demand stream")
+	}
+
+	on := newHarness(t, []*fakeRelease{{ID: "r1", Name: "Film.mkv", Size: 1 << 20}}, []string{"r1"}, withOpenOnDemand)
+	defer on.m.Close()
+	spy := &spyOnDemandResolver{Resolver: on.resolver}
+	on.m.deps.Resolver = spy
+	if _, err := on.m.CheckFileAvailability(context.Background(), owner, movieKey, defaultCaps("plex-detail"), "r1"); err != nil {
+		t.Fatalf("CheckFileAvailability error = %v", err)
+	}
+	if !spy.allowed {
+		t.Fatal("setting on but the file check was not admitted to open an on-demand stream")
 	}
 }

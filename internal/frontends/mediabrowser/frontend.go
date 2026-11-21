@@ -6,11 +6,13 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net/http"
+	"path/filepath"
 	"time"
 
 	"github.com/braedonsaunders/ether/internal/frontend"
 	"github.com/braedonsaunders/ether/internal/frontend/kit/conformance"
 	"github.com/braedonsaunders/ether/internal/frontend/kit/route"
+	"github.com/braedonsaunders/ether/internal/webclient"
 )
 
 // Jellyfin provides the native Jellyfin API on an independent surface.
@@ -47,11 +49,24 @@ func mount(ctx context.Context, host frontend.Host, machineID string, protocol f
 	r := &route.Router{}
 
 	life, cancel := context.WithCancel(ctx)
-	inst := &instance{host: host, info: info, router: r, protocol: protocol, life: life, cancel: cancel, extraClient: newExtraHTTPClient(host.DirectProxy)}
+	inst := &instance{host: host, info: info, router: r, protocol: protocol, life: life, cancel: cancel, extraClient: newExtraHTTPClient(host.DirectProxy), anon: newAnonIndex()}
+	if protocol == "jellyfin" && host.ClientsDir != "" {
+		inst.webClient = webclient.New(filepath.Join(host.ClientsDir, "jellyfin-web"), host.MetadataHTTP)
+		// Turning Jellyfin on (setup, the Apps page, or a start with it
+		// enabled) fetches the official Jellyfin Web build in the background,
+		// so the first app that loads /web finds it ready. An installed
+		// build is reused with no network.
+		inst.webClient.Begin()
+	}
 	if host.PageFreshness != nil {
 		inst.pages = newBrowseCache()
 	}
 	r.SetMiddleware(inst.routeMiddleware)
+	r.SetFallback(func(w http.ResponseWriter, req *http.Request, status int) {
+		inst.requestLog(route.Route{Pattern: "<unmatched>"}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mediaBrowserError(w, r, status)
+		})).ServeHTTP(w, req)
+	})
 	unmatched := &unmatchedLogger{}
 	r.SetUnmatched(func(req *http.Request, status int) { unmatched.log(inst, req, status) })
 	mounted := false
@@ -66,7 +81,15 @@ func mount(ctx context.Context, host frontend.Host, machineID string, protocol f
 			current.ServerName = frontend.AdvertisedName(host.Config())
 		}
 		return current
-	}, inst.publicViewers, host.ClientIP); err != nil {
+	}, inst.publicViewers, host.ClientIP, inst.webClient); err != nil {
+		return nil, err
+	}
+
+	if err := r.Handle("GET", "/Items/{itemId}/Images", http.HandlerFunc(inst.itemImages)); err != nil {
+		return nil, err
+	}
+
+	if err := r.Handle("POST", "/Items/{itemId}/Images/{imageType}", http.HandlerFunc(inst.uploadImage)); err != nil {
 		return nil, err
 	}
 
@@ -86,10 +109,21 @@ func mount(ctx context.Context, host frontend.Host, machineID string, protocol f
 	if err := r.Handle("GET", "/LiveTv/Info", http.HandlerFunc(inst.liveTVInfo)); err != nil {
 		return nil, err
 	}
+	if err := r.Handle("GET", "/LiveTv/GuideInfo", http.HandlerFunc(inst.liveTVGuideInfo)); err != nil {
+		return nil, err
+	}
+	if protocol == "emby" {
+		if err := r.Handle("GET", "/LiveTv/ChannelTags", http.HandlerFunc(inst.channelTags)); err != nil {
+			return nil, err
+		}
+	}
 	if err := r.Handle("GET", "/LiveTv/Channels", http.HandlerFunc(inst.channels)); err != nil {
 		return nil, err
 	}
 	if err := r.Handle("GET", "/LiveTv/Channels/{id}", http.HandlerFunc(inst.channel)); err != nil {
+		return nil, err
+	}
+	if err := r.Handle("POST", "/LiveTv/Programs", http.HandlerFunc(inst.postProgrammes)); err != nil {
 		return nil, err
 	}
 	if err := r.Handle("GET", "/LiveTv/Programs", http.HandlerFunc(inst.programmes)); err != nil {
@@ -105,8 +139,13 @@ func mount(ctx context.Context, host frontend.Host, machineID string, protocol f
 		return nil, err
 	}
 	for _, method := range []string{"GET", "HEAD"} {
-		if err := r.Handle(method, "/Videos/{id}/{source}/Subtitles/{index}/{name}", http.HandlerFunc(inst.subtitle)); err != nil {
-			return nil, err
+		for _, path := range []string{
+			"/Videos/{id}/{source}/Subtitles/{index}/{name}",
+			"/Videos/{id}/{source}/Subtitles/{index}/{start}/{name}",
+		} {
+			if err := r.Handle(method, path, http.HandlerFunc(inst.subtitle)); err != nil {
+				return nil, err
+			}
 		}
 	}
 	if err := inst.playbackRoutes(); err != nil {
@@ -121,7 +160,13 @@ func mount(ctx context.Context, host frontend.Host, machineID string, protocol f
 	if err := inst.browseRoutes(); err != nil {
 		return nil, err
 	}
+	if err := inst.webSigninRoutes(); err != nil {
+		return nil, err
+	}
 	if err := inst.routes(); err != nil {
+		return nil, err
+	}
+	if err := inst.dashboardRoutes(); err != nil {
 		return nil, err
 	}
 	mounted = true
@@ -141,6 +186,10 @@ type instance struct {
 	personal    personalIdentityCache
 	views       viewFactCache
 	extraClient *http.Client
+	// webClient installs and serves the official Jellyfin Web build. Nil on
+	// Emby and when the host supplies no clients directory.
+	webClient *webclient.Installer
+	anon      *anonIndex
 }
 
 func (i *instance) Handler() http.Handler {
@@ -150,19 +199,29 @@ func (i *instance) Handler() http.Handler {
 		// Stored blurhashes and dimensions are joined on every request. This
 		// budget only covers hashing already in flight, and the page cache
 		// clears it before a fill so the cache is never held open for it.
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		inner := next
+		next = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			ctx := frontend.WithSynchronousArtworkMetadata(r.Context(), 100*time.Millisecond)
-			next.ServeHTTP(w, r.WithContext(ctx))
+			inner.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
-	if i.protocol != "emby" {
-		return next
-	}
+	// Jellyfin and Emby both answer cross-origin requests (Jellyfin's
+	// default CorsHosts is "*"): web-based clients served from another
+	// origin, such as desktop wrappers around a web app, preflight every
+	// call and give up before connecting without these headers.
+	jellyfin := i.protocol == "jellyfin"
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Jellyfin's CORS middleware only answers requests that carry an
+		// Origin (recorded server responses have no CORS headers otherwise).
+		if jellyfin && r.Header.Get("Origin") == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
 		h := w.Header()
 		h.Set("Access-Control-Allow-Origin", "*")
 		h.Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS")
-		h.Set("Access-Control-Allow-Headers", "Accept, Accept-Language, Authorization, Cache-Control, Content-Disposition, Content-Encoding, Content-Language, Content-Length, Content-MD5, Content-Range, Content-Type, Date, Host, If-Match, If-Modified-Since, If-None-Match, If-Unmodified-Since, Origin, OriginToken, Pragma, Range, Slug, Transfer-Encoding, Want-Digest, X-MediaBrowser-Token, X-Emby-Token, X-Emby-Client, X-Emby-Client-Version, X-Emby-Device-Id, X-Emby-Device-Name, X-Emby-Authorization")
+		h.Set("Access-Control-Allow-Headers", "Accept, Accept-Language, Authorization, Cache-Control, Content-Disposition, Content-Encoding, Content-Language, Content-Length, Content-MD5, Content-Range, Content-Type, Date, Host, If-Match, If-Modified-Since, If-None-Match, If-Unmodified-Since, Origin, OriginToken, Pragma, Range, Slug, Transfer-Encoding, Want-Digest, X-MediaBrowser-Token, X-Emby-Token, X-Emby-Client, X-Emby-Client-Version, X-Emby-Device-Id, X-Emby-Device-Name, X-Emby-Authorization, X-MediaBrowser-Client, X-MediaBrowser-Device-Id")
+		h.Set("Access-Control-Allow-Private-Network", "true")
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -190,6 +249,11 @@ func (i *instance) Listeners() []frontend.ListenerSpec {
 // UDP discovery is multiplexed by the host via DiscoveryResponder.
 func (i *instance) Discovery() []frontend.Announcer { return nil }
 func (i *instance) Status(context.Context) frontend.Status {
-	return frontend.Status{TargetVersion: i.info.Version, Conformance: conformance.Status(string(i.protocol), i.info.Version)}
+	ready := false
+	if i.webClient != nil {
+		st, _ := i.webClient.State()
+		ready = st == webclient.StatusReady
+	}
+	return frontend.Status{WebPlayerReady: ready, TargetVersion: i.info.Version, Conformance: conformance.Status(string(i.protocol), i.info.Version)}
 }
 func (i *instance) Close(context.Context) error { i.cancel(); return nil }

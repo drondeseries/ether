@@ -8,6 +8,7 @@ import { Section } from "../../components/layout";
 import { SettingsRow } from "../../components/SettingsRow";
 import { SortableList } from "../../components/Sortable";
 import { t, tn } from "../../i18n";
+import { useLocale } from "../../i18n/react";
 import { apiFetch } from "../../lib/api";
 import { isPluginDescriptor, textOf, useRegistry, type Descriptor } from "../../lib/extend";
 import { useAsync } from "../../lib/hooks";
@@ -121,7 +122,7 @@ function PluginStateBadge({ plugin }: { plugin?: PluginRecord }) {
 
 async function testPluginSource(
   pluginId: string,
-): Promise<{ ok: boolean; error?: string; durationMs: number }> {
+): Promise<{ ok: boolean; message?: string; error?: string; durationMs: number }> {
   const started = Date.now();
   const res = await apiFetch<{
     ok?: boolean;
@@ -134,6 +135,7 @@ async function testPluginSource(
   });
   return {
     ok: res?.ok ?? true,
+    message: res?.message,
     error: res?.error ?? res?.message,
     durationMs: res?.durationMs ?? res?.latencyMs ?? Date.now() - started,
   };
@@ -252,7 +254,7 @@ export function PluginSourceCards({
             const testState = tests[d.owner];
             const tested =
               testState?.status === "ok"
-                ? { ok: true, message: undefined }
+                ? { ok: true, message: testState.message }
                 : testState?.status === "fail"
                   ? { ok: false, message: testState.message }
                   : undefined;
@@ -275,7 +277,10 @@ export function PluginSourceCards({
                 name={label}
                 position={i + 1}
                 description={details}
-                problem={lastError ?? null}
+                notice={tested?.ok ? (tested.message ?? null) : null}
+                problem={
+                  tested && !tested.ok && tested.message ? tested.message : (lastError ?? null)
+                }
                 logo={<Puzzle size={18} />}
                 meta={
                   <>
@@ -314,7 +319,7 @@ export function PluginSourceCards({
         description={classBadgeLabel(activeClass)}
         footer={
           active ? (
-            <div className="flex w-full items-center justify-between gap-2">
+            <div className="flex w-full flex-wrap items-center justify-between gap-2">
               <TestButton
                 state={tests[active.owner] ?? { status: "idle" }}
                 onTest={() => runTest(active.owner, () => testPluginSource(active.owner))}
@@ -368,44 +373,33 @@ export function PluginSourceCards({
 }
 
 /**
- * Displays plugin-contributed stream sources and their declared daily budgets
- * on the Sources -> Usage tab.
+ * Plugin-contributed stream sources with their declared daily caps, for the
+ * Sources › Statistics usage table.
  */
-export function PluginSourceUsage() {
+export function usePluginSourceSummaries(): {
+  id: string;
+  label: string;
+  kind: string;
+  summary: string;
+}[] {
   const { descriptors } = useRegistry<SourceKindMeta>("sourceKind");
-  const plugins = useMemo(() => descriptors.filter((d) => isPluginDescriptor(d)), [descriptors]);
-
-  if (plugins.length === 0) return null;
-
-  return (
-    <Section
-      title={t("Plugin sources")}
-      description={t(
-        "Stream sources contributed by enabled plugins and their declared daily caps.",
-      )}
-      bodyClassName="divide-y divide-border"
-    >
-      {plugins.map((d) => {
-        const label = textOf(d.label) || d.owner;
-        const cls = normalizeClass(d.meta?.class);
-        const abilities = (d.meta?.abilities ?? []).map(abilityLabel);
-        const limits = limitsSummary(d.meta?.limits);
-        return (
-          <div key={d.id} className="flex flex-wrap items-start justify-between gap-4 px-5 py-4">
-            <div className="min-w-0 flex-1 space-y-1">
-              <div className="flex flex-wrap items-center gap-2">
-                <p className="font-medium text-fg">{label}</p>
-                <Badge variant="outline">{classBadgeLabel(cls)}</Badge>
-              </div>
-              <p className="text-xs text-fg-muted">
-                {[...abilities, ...(limits.length ? limits : [t("Automatic rate limits")])]
-                  .filter(Boolean)
-                  .join(" · ")}
-              </p>
-            </div>
-          </div>
-        );
-      })}
-    </Section>
+  const { locale } = useLocale();
+  return useMemo(
+    () =>
+      descriptors
+        .filter((d) => isPluginDescriptor(d))
+        .map((d) => {
+          const abilities = (d.meta?.abilities ?? []).map(abilityLabel);
+          const limits = limitsSummary(d.meta?.limits);
+          return {
+            id: d.id,
+            label: textOf(d.label) || d.owner,
+            kind: classBadgeLabel(normalizeClass(d.meta?.class)),
+            summary: [...abilities, ...(limits.length ? limits : [t("Automatic rate limits")])]
+              .filter(Boolean)
+              .join(" · "),
+          };
+        }),
+    [descriptors, locale],
   );
 }

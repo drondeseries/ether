@@ -29,6 +29,20 @@ type certTrust struct {
 	fingerprint string
 	verified    bool
 	reason      string
+	// misses counts consecutive failed handshakes for this certificate.
+	misses int
+}
+
+// trustHandshakeConfirm is how many handshakes in a row must fail before the
+// console says the server did not accept a secure connection. One failure is
+// not proof: every restart checks before its listener serves, and a dial can
+// blip. Until it is confirmed, the earlier result stands and the registrar
+// looks again at its next tick.
+const trustHandshakeConfirm = 2
+
+// pending reports a handshake failure that is not confirmed yet.
+func (t certTrust) pending() bool {
+	return t.misses > 0 && t.misses < trustHandshakeConfirm
 }
 
 // VerifyTrust checks the installed certificate and remembers the result.
@@ -86,10 +100,52 @@ func (m *CertManager) VerifyTrust(ctx context.Context, identityHash, serverName 
 		}
 	}
 	fp := Fingerprint(leaf)
+	var changed bool
+	defer func() {
+		if changed {
+			m.notifyChange()
+		}
+	}()
 	m.mu.Lock()
-	m.trust = certTrust{fingerprint: fp, verified: ok, reason: reason}
-	m.mu.Unlock()
-	return ok, reason
+	defer m.mu.Unlock()
+	prev := m.trust
+	next := certTrust{fingerprint: fp, verified: ok, reason: reason}
+	if reason == CertReasonHandshake {
+		next.misses = 1
+		if m.trust.fingerprint == fp {
+			next.misses = m.trust.misses + 1
+		}
+		if next.misses < trustHandshakeConfirm {
+			// The chain, name and dates just passed. Keep an earlier
+			// verified result for this certificate; otherwise (a fresh
+			// start) the console shows "checking", not a warning.
+			next.verified, next.reason = m.trust.fingerprint == fp && m.trust.verified, ""
+		}
+	}
+	m.trust = next
+	changed = next.fingerprint != prev.fingerprint || next.verified != prev.verified || next.reason != prev.reason
+	return next.verified, next.reason
+}
+
+// forgetHandshakeMisses drops handshake failures recorded before the
+// listener was up: they say nothing about the certificate, and the
+// registrar re-checks against the live listener on its next tick. A
+// confirmed pre-listen verdict reverts to "checking" until then.
+func (m *CertManager) forgetHandshakeMisses() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.trust.reason == CertReasonHandshake {
+		m.trust.reason = ""
+	}
+	m.trust.misses = 0
+}
+
+// trustPending reports an unconfirmed handshake failure for the installed
+// certificate, which the registrar re-checks at its next tick.
+func (m *CertManager) trustPending(fingerprint string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.trust.fingerprint == fingerprint && m.trust.pending()
 }
 
 func verifyPlexDirect(leaf *x509.Certificate, intermediates []*x509.Certificate, roots *x509.CertPool, identityHash string, now time.Time) (bool, string) {

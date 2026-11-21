@@ -86,6 +86,8 @@ func (s *Service) seedBuiltins(ctx context.Context) error {
 func mergeBuiltin(fixed, edited core.CollectionSpec) core.CollectionSpec {
 	out := fixed
 	out.Enabled = edited.Enabled
+	out.PreviewOnFocus = edited.PreviewOnFocus
+	out.RankedTop10 = edited.RankedTop10
 	out.Targets = edited.Targets
 	out.Artwork = edited.Artwork
 	out.Rotate = edited.Rotate
@@ -103,7 +105,7 @@ func mkRule(field, op string, v any) core.CollectionRule {
 	return core.CollectionRule{Field: field, Op: op, Value: b}
 }
 
-func ratingExceeds(rating, max string) bool { return contentrating.Exceeds(rating, max) }
+func ratingExceeds(rating, max string) bool { return contentrating.EnforceExceeds(rating, max) }
 
 // refreshInterval is how often a scheduled collection is rebuilt.
 func refreshInterval(r string) time.Duration {

@@ -92,7 +92,32 @@ func (i *instance) authenticate(r *http.Request) (*frontend.Viewer, string, erro
 		if grants, ok := i.host.Identity.(frontend.GrantDeviceIdentity); ok {
 			claim := device(r)
 			boundViewer, stored, _, bindingErr := grants.ResolveGrantDevice(r.Context(), token, claim.ID)
+			// Device ids are form-decoded ("+" is a space, as Jellyfin does).
+			// A grant issued before that stored the literal "+" form.
+			if legacy := strings.ReplaceAll(claim.ID, " ", "+"); bindingErr != nil && legacy != claim.ID {
+				if bv, st, _, e := grants.ResolveGrantDevice(r.Context(), token, legacy); e == nil {
+					boundViewer, stored, bindingErr, claim.ID = bv, st, nil, legacy
+				}
+			}
+			// Jellyfin for Android's native player signs requests with the
+			// web layer's device id followed by the user's id as a dashed UUID.
+			if base, ok := userScopedDeviceID(claim.ID, v.ID); bindingErr != nil && ok {
+				if bv, st, _, e := grants.ResolveGrantDevice(r.Context(), token, base); e == nil {
+					boundViewer, stored, bindingErr, claim.ID = bv, st, nil, base
+				}
+			}
+			// Android TV hashes installation+username for sign-in, then
+			// installation+user UUID for authenticated calls (and a random
+			// UUID for Quick Connect). These hashes cannot be correlated.
+			// Treat its token as a bearer credential, as Jellyfin does, but
+			// retain the stored device for every downstream capability.
+			if bindingErr != nil && i.protocol == "jellyfin" && frontend.JellyfinAndroidTVClient(claim.Client) {
+				if bv, st, _, e := grants.ResolveGrantDevice(r.Context(), token, ""); e == nil && frontend.JellyfinAndroidTVClient(st.Client) {
+					boundViewer, stored, bindingErr, claim.ID = bv, st, nil, st.ID
+				}
+			}
 			if bindingErr != nil || boundViewer == nil || boundViewer.ID != v.ID || stored.ID == "" || (claim.ID != "" && claim.ID != stored.ID) {
+				i.logIdentityFailure("device-binding", frontend.ErrNotFound)
 				return nil, "", errors.New("invalid device grant")
 			}
 			// Device ID is authoritative from the grant; client metadata is
@@ -110,6 +135,21 @@ func (i *instance) authenticate(r *http.Request) (*frontend.Viewer, string, erro
 	}
 	return v, token, err
 }
+
+// userScopedDeviceID strips a trailing user id from a device id when it is
+// exactly this viewer's id as a dashed UUID ("<device><uuid>").
+func userScopedDeviceID(claim string, viewerID int64) (string, bool) {
+	guid, err := ids.GUID(ids.User, viewerID)
+	if err != nil || len(guid) != 32 {
+		return "", false
+	}
+	dashed := guid[:8] + "-" + guid[8:12] + "-" + guid[12:16] + "-" + guid[16:20] + "-" + guid[20:]
+	if len(claim) <= len(dashed) || !strings.EqualFold(claim[len(claim)-len(dashed):], dashed) {
+		return "", false
+	}
+	return claim[:len(claim)-len(dashed)], true
+}
+
 func (i *instance) viewer(r *http.Request) (*frontend.Viewer, string, error) {
 	p, ok := r.Context().Value(principalKey{}).(principal)
 	if !ok || p.viewer == nil {
@@ -348,11 +388,6 @@ func (i *instance) finishSignIn(ctx context.Context, v *frontend.Viewer, dev fro
 	}); ok {
 		_ = note.NoteSignIn(ctx, v.ID)
 	}
-	if warm, ok := i.host.VirtualPaths.(interface {
-		Warm(context.Context, *frontend.Viewer, frontend.Device)
-	}); ok {
-		warm.Warm(ctx, v, dev)
-	}
 }
 
 // authUserDTO is the sign-in user: static keys only. Preferences, home order
@@ -388,7 +423,7 @@ func (i *instance) baseUserDTO(v *frontend.Viewer) (user, policy, configuration 
 		"ForceRemoteSourceTranscoding": false, "EnableContentDeletion": false, "EnableContentDownloading": false,
 		"EnableSyncTranscoding": false, "EnableMediaConversion": false, "EnableAllDevices": true, "EnableAllChannels": true,
 		"EnabledDevices": []string{}, "EnabledChannels": []string{}, "EnableContentDeletionFromFolders": []string{}, "AllowedTags": []string{}, "BlockedTags": []string{},
-		"EnableAllFolders": len(v.AllowedSections) == 0, "InvalidLoginAttemptCount": 0, "LoginAttemptsBeforeLockout": -1,
+		"EnableAllFolders": len(v.AllowedLibraries) == 0, "InvalidLoginAttemptCount": 0, "LoginAttemptsBeforeLockout": -1,
 		"MaxActiveSessions": v.StreamLimit, "EnablePublicSharing": false, "RemoteClientBitrateLimit": 0,
 		"AuthenticationProviderId": "Ether", "PasswordResetProviderId": "Ether", "SyncPlayAccess": i.syncPlayAccess(),
 	}
@@ -454,6 +489,27 @@ func identityError(w http.ResponseWriter, err error) {
 		http.Error(w, "Unauthorized", 401)
 	}
 }
+
+// Log only fixed stage/reason values: exported diagnostics must never carry
+// the submitted name, password, device identifier, code, or polling secret.
+func (i *instance) logIdentityFailure(stage string, err error) {
+	if i.host.Log == nil {
+		return
+	}
+	reason := "rejected"
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		reason = "timed-out"
+	case errors.Is(err, context.Canceled):
+		reason = "canceled"
+	case errors.Is(err, frontend.ErrRateLimited):
+		reason = "rate-limited"
+	case errors.Is(err, frontend.ErrIdentityUnavailable):
+		reason = "unavailable"
+	}
+	i.host.Log.Debug("MediaBrowser authentication failed", "stage", stage, "reason", reason)
+}
+
 func (i *instance) quickEnabled() bool {
 	if i.host.Config != nil {
 		if value, ok := i.host.Config()["quickConnect"].(bool); ok {
@@ -475,7 +531,7 @@ func (i *instance) routes() error {
 				http.Error(w, "Unauthorized", 401)
 				return
 			}
-			jsonReply(w, map[string]any{"Id": i.info.ID, "ServerName": i.info.ServerName, "Version": i.info.Version, "ProductName": i.info.ProductName, "StartupWizardCompleted": true, "WebSocketPortNumber": i.listenerPort()})
+			jsonReply(w, i.systemInfoDTO(r))
 		}},
 		{"POST", "/Sessions/Capabilities", i.capabilitiesQuery},
 		{"POST", "/Sessions/Capabilities/Full", func(w http.ResponseWriter, r *http.Request) {
@@ -510,6 +566,7 @@ func (i *instance) routes() error {
 			w.WriteHeader(204)
 		}},
 		{"GET", "/socket", i.socket},
+		{"GET", "/embywebsocket", i.socket},
 		{"POST", "/Users/AuthenticateByName", func(w http.ResponseWriter, r *http.Request) {
 			var body struct{ Username, Pw string }
 			mediaType, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
@@ -548,6 +605,7 @@ func (i *instance) routes() error {
 			}
 			token, err := i.host.Identity.SignIn(i.identityContext(r), body.Username, body.Pw, device(r))
 			if err != nil {
+				i.logIdentityFailure("password", err)
 				identityError(w, err)
 				return
 			}
@@ -613,6 +671,7 @@ func (i *instance) routes() error {
 			}
 			details, err := i.host.Identity.QuickConnectDetails(i.identityContext(r), secret[0])
 			if err != nil {
+				i.logIdentityFailure("quick-connect-poll", err)
 				identityError(w, err)
 				return
 			}
@@ -660,6 +719,7 @@ func (i *instance) routes() error {
 				token, err = i.host.Identity.QuickConnectPoll(i.identityContext(r), body.Secret)
 			}
 			if err != nil {
+				i.logIdentityFailure("quick-connect-redemption", err)
 				identityError(w, err)
 				return
 			}

@@ -64,6 +64,9 @@ type Caps struct {
 	Roles config.NodeRoles `json:"roles,omitempty"`
 	// Transcode is true when ffmpeg is available on the node.
 	Transcode bool `json:"transcode"`
+	// VideoTranscoding is "off" when this node has disabled movie/show video
+	// re-encoding (empty or "on" means enabled).
+	VideoTranscoding string `json:"videoTranscoding,omitempty"`
 	// HWAccel names the hardware transcoder ("videotoolbox", "nvenc", …);
 	// empty or "none" for software only.
 	HWAccel string `json:"hwAccel,omitempty"`
@@ -73,6 +76,10 @@ type Caps struct {
 	// EgressIP is the public address the node reaches the internet from,
 	// when known (providers may flag one account used from several).
 	EgressIP string `json:"egressIp,omitempty"`
+	// OnAirAssets is the On Air asset file format the node supports
+	// (onair.AssetFilesVersion); 0 means it reads asset bytes from the
+	// database only.
+	OnAirAssets int `json:"onairAssets,omitempty"`
 }
 
 // Node is one cluster member.

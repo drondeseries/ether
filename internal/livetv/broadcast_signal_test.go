@@ -31,6 +31,10 @@ func TestBroadcastAllCandidatesFailUsesLiveSignal(t *testing.T) {
 		c.Look = &ChannelLook{LookID: "signal-test"}
 		c.Items[0].DurationMS = 3600000
 		c.Items[1].DurationMS = 3600000
+		if _, err := s.SaveChannel(t.Context(), c); err != nil {
+			t.Fatal(err)
+		}
+		s.ReconcileEnabled()
 		runner := &broadcastFakeRunner{}
 		format := smallBroadcastFormat()
 		planner := &scheduleBroadcastPlanner{s: s, channel: c, user: core.User{ID: 1, IsOwner: true}, format: format, runner: runner}
@@ -43,7 +47,9 @@ func TestBroadcastAllCandidatesFailUsesLiveSignal(t *testing.T) {
 			t.Fatal(err)
 		}
 		b.start()
-		time.Sleep(18 * time.Second)
+		// Admission now retries the on-air candidate at the bounded 15s cadence.
+		// Observe two retries without requiring unready alternates to be probed.
+		time.Sleep(32 * time.Second)
 		synctest.Wait()
 		b.close()
 		frames := runner.encoders[0].snapshot()
@@ -59,7 +65,7 @@ func TestBroadcastAllCandidatesFailUsesLiveSignal(t *testing.T) {
 				t.Fatalf("black fill after deadline at tick %d", i+45)
 			}
 		}
-		if playback.attempts.Load() < 4 {
+		if playback.attempts.Load() < 2 {
 			t.Fatalf("candidate retries stopped: %d", playback.attempts.Load())
 		}
 	})

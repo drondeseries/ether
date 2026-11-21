@@ -2,14 +2,95 @@ package etherplugin
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 )
+
+var (
+	mockBadgeSetKeyRe = regexp.MustCompile(`^[a-z][a-z0-9_]{0,31}$`)
+	mockBadgeIMDBRe   = regexp.MustCompile(`^tt[0-9]{1,12}$`)
+)
+
+func normalizeMockBadgeLabel(raw string) (string, error) {
+	if len(raw) < 1 || len(raw) > MaxBadgeLabelLen {
+		return "", fmt.Errorf("badge label must be 1 to %d characters", MaxBadgeLabelLen)
+	}
+	buf := make([]byte, len(raw))
+	nonSpace := false
+	for i := 0; i < len(raw); i++ {
+		c := raw[i]
+		if c >= 'a' && c <= 'z' {
+			c = c - 'a' + 'A'
+		}
+		switch {
+		case c >= 'A' && c <= 'Z',
+			c >= '0' && c <= '9',
+			c == '+', c == '&', c == '\'', c == '.', c == '/', c == '-':
+			nonSpace = true
+		case c == ' ':
+		default:
+			return "", fmt.Errorf("badge label must contain only [A-Z0-9 +&'./-]")
+		}
+		buf[i] = c
+	}
+	if !nonSpace {
+		return "", fmt.Errorf("badge label must not be blank")
+	}
+	return string(buf), nil
+}
+
+func resolveMockBadgeTitleKey(ref BadgeTitleRef, catalog map[string]CatalogTitleSummary) (string, error) {
+	typ := strings.TrimSpace(ref.Type)
+	if typ != "movie" && typ != "show" {
+		return "", fmt.Errorf("badge title.type must be movie or show")
+	}
+	if ref.TMDB < 0 {
+		return "", fmt.Errorf("badge title.tmdb must be positive")
+	}
+	imdb := strings.ToLower(strings.TrimSpace(ref.IMDB))
+	if imdb != "" && !mockBadgeIMDBRe.MatchString(imdb) {
+		return "", fmt.Errorf("badge title.imdb must match tt<digits>")
+	}
+	if ref.TMDB == 0 && imdb == "" {
+		return "", fmt.Errorf("badge title requires tmdb or imdb")
+	}
+	if ref.TMDB > 0 {
+		for _, item := range catalog {
+			if item.Type == typ && int64(item.TMDBID) == ref.TMDB {
+				return fmt.Sprint(item.ID), nil
+			}
+		}
+	}
+	if imdb != "" {
+		for _, item := range catalog {
+			if item.Type == typ && strings.EqualFold(item.IMDBID, imdb) {
+				return fmt.Sprint(item.ID), nil
+			}
+		}
+	}
+	if ref.TMDB > 0 {
+		return fmt.Sprintf("tmdb:%s:%d", typ, ref.TMDB), nil
+	}
+	return fmt.Sprintf("imdb:%s:%s", typ, imdb), nil
+}
+
+func countDistinctMockBadgeTitles(sets map[string]map[string][]string) int64 {
+	seen := map[string]struct{}{}
+	for _, setMap := range sets {
+		for k := range setMap {
+			seen[k] = struct{}{}
+		}
+	}
+	return int64(len(seen))
+}
 
 // RecordedLog is one log message recorded by MockHost.
 type RecordedLog struct {
@@ -18,31 +99,55 @@ type RecordedLog struct {
 	Attrs   map[string]any
 }
 
+// RecordedPublishedEvent is one plugin event recorded by MockHost.PublishEvent.
+type RecordedPublishedEvent struct {
+	Key         string
+	Payload     map[string]any
+	Correlation *EventCorrelation
+}
+
 // MockHost is an in-memory Host implementation for unit tests.
 type MockHost struct {
-	mu            sync.RWMutex
-	KV            map[string]string
-	Secrets       map[string]string
-	Catalog       map[string]CatalogTitleSummary
-	History       map[int64][]ViewerWatchEntry
-	WatchState    map[string]bool
-	Collections   []map[string]any
-	Folders       map[string][]FolderEntry
-	Notifications []string
-	Logs          []RecordedLog
-	FetchHandler  func(ctx context.Context, req HostFetchRequest) (HostFetchResponse, error)
+	mu               sync.RWMutex
+	KV               map[string]string
+	Badges           map[string]map[string][]string
+	BadgeQuotaTitles int64
+	Secrets          map[string]string
+	Catalog          map[string]CatalogTitleSummary
+	History          map[int64][]ViewerWatchEntry
+	WatchState       map[string]bool
+	Collections      []map[string]any
+	Kinds            map[string][]KindItem      // kindKey -> pushed items, in upsert order
+	KindHiddenIDs    map[string]map[string]bool // kindKey -> externalID -> hidden by mock library Rules (#615)
+	KindPolicyFilter func(kindKey string, item KindItem) bool
+	Sources          []SourceCandidate // returned by ResolveSources
+	Blobs            map[string][]byte // cache blob ref -> bytes
+	Folders          map[string][]FolderEntry
+	PublishedEvents  []RecordedPublishedEvent
+	Notifications    []string
+	Logs             []RecordedLog
+	FetchHandler     func(ctx context.Context, req HostFetchRequest) (HostFetchResponse, error)
+	// LastStreamURLViewer/Item/Part record the most recent StreamURL or StreamPartURL call.
+	LastStreamURLViewer int64
+	LastStreamURLItem   string
+	LastStreamURLPart   *int
 }
 
 // NewMockHost creates an initialized MockHost.
 func NewMockHost() *MockHost {
 	return &MockHost{
-		KV:          map[string]string{},
-		Secrets:     map[string]string{},
-		Catalog:     map[string]CatalogTitleSummary{},
-		History:     map[int64][]ViewerWatchEntry{},
-		WatchState:  map[string]bool{},
-		Folders:     map[string][]FolderEntry{},
-		Collections: []map[string]any{},
+		KV:               map[string]string{},
+		Badges:           map[string]map[string][]string{},
+		BadgeQuotaTitles: PosterBadgeQuotaTitles,
+		Secrets:          map[string]string{},
+		Catalog:          map[string]CatalogTitleSummary{},
+		History:          map[int64][]ViewerWatchEntry{},
+		WatchState:       map[string]bool{},
+		Folders:          map[string][]FolderEntry{},
+		Collections:      []map[string]any{},
+		Kinds:            map[string][]KindItem{},
+		KindHiddenIDs:    map[string]map[string]bool{},
+		Blobs:            map[string][]byte{},
 	}
 }
 
@@ -82,6 +187,120 @@ func (m *MockHost) KVList(_ context.Context, prefix string) ([]string, error) {
 	}
 	sort.Strings(keys)
 	return keys, nil
+}
+
+// KVUsage returns in-memory KV usage matching the host's 256-byte key charge.
+func (m *MockHost) KVUsage(_ context.Context) (KVUsage, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var used int64
+	for _, v := range m.KV {
+		used += int64(len(v))
+	}
+	keys := int64(len(m.KV))
+	return KVUsage{
+		Bytes:      used + keys*256,
+		Keys:       keys,
+		QuotaBytes: 50 << 20,
+		QuotaKeys:  10000,
+	}, nil
+}
+
+func (m *MockHost) badgeQuotaLocked() int64 {
+	if m.BadgeQuotaTitles > 0 {
+		return m.BadgeQuotaTitles
+	}
+	return PosterBadgeQuotaTitles
+}
+
+// BadgesSet stores or clears (empty Labels) poster badges in memory, enforcing
+// the same label and per-plugin title bounds as Ether (#594).
+func (m *MockHost) BadgesSet(_ context.Context, setKey string, entries []BadgeEntry) error {
+	if !mockBadgeSetKeyRe.MatchString(setKey) {
+		return fmt.Errorf("badge set key must match ^[a-z][a-z0-9_]{0,31}$")
+	}
+	if len(entries) > MaxBadgeEntriesPerCall {
+		return fmt.Errorf("badges.set accepts at most %d entries per call", MaxBadgeEntriesPerCall)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.Badges == nil {
+		m.Badges = map[string]map[string][]string{}
+	}
+	nextSet := map[string][]string{}
+	for k, v := range m.Badges[setKey] {
+		nextSet[k] = append([]string{}, v...)
+	}
+	hasUpsert := false
+	for _, e := range entries {
+		if len(e.Labels) > MaxBadgeLabelsPerTitle {
+			return fmt.Errorf("badge entry may have at most %d labels per title", MaxBadgeLabelsPerTitle)
+		}
+		titleKey, err := resolveMockBadgeTitleKey(e.Title, m.Catalog)
+		if err != nil {
+			return err
+		}
+		if len(e.Labels) == 0 {
+			delete(nextSet, titleKey)
+			continue
+		}
+		var clean []string
+		seen := make(map[string]bool, len(e.Labels))
+		for _, raw := range e.Labels {
+			norm, err := normalizeMockBadgeLabel(raw)
+			if err != nil {
+				return err
+			}
+			if !seen[norm] {
+				seen[norm] = true
+				clean = append(clean, norm)
+			}
+		}
+		nextSet[titleKey] = clean
+		hasUpsert = true
+	}
+	preview := make(map[string]map[string][]string, len(m.Badges)+1)
+	for k, v := range m.Badges {
+		preview[k] = v
+	}
+	if len(nextSet) == 0 {
+		delete(preview, setKey)
+	} else {
+		preview[setKey] = nextSet
+	}
+	quota := m.badgeQuotaLocked()
+	if hasUpsert {
+		if titles := countDistinctMockBadgeTitles(preview); titles > quota {
+			return fmt.Errorf("poster badge quota exceeded (%d > %d titles)", titles, quota)
+		}
+	}
+	if len(nextSet) == 0 {
+		delete(m.Badges, setKey)
+	} else {
+		m.Badges[setKey] = nextSet
+	}
+	return nil
+}
+
+// BadgesClear removes every badge in setKey from the in-memory store (#594).
+func (m *MockHost) BadgesClear(_ context.Context, setKey string) error {
+	if !mockBadgeSetKeyRe.MatchString(setKey) {
+		return fmt.Errorf("badge set key must match ^[a-z][a-z0-9_]{0,31}$")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.Badges, setKey)
+	return nil
+}
+
+// BadgesUsage returns the distinct badged title count and configured quota (#594).
+func (m *MockHost) BadgesUsage(_ context.Context) (BadgeUsage, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return BadgeUsage{
+		Titles:      countDistinctMockBadgeTitles(m.Badges),
+		QuotaTitles: m.badgeQuotaLocked(),
+	}, nil
 }
 
 // SecretGet reads a secret from the in-memory secrets map.
@@ -189,6 +408,36 @@ func (m *MockHost) FoldersStat(_ context.Context, root, path string) (FolderEntr
 	return FolderEntry{Name: path, Path: path}, nil
 }
 
+// PublishEvent records one published plugin event on MockHost.
+func (m *MockHost) PublishEvent(_ context.Context, key string, payload any, corr *EventCorrelation) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var doc map[string]any
+	if payload != nil {
+		b, err := json.Marshal(payload)
+		if err != nil {
+			return err
+		}
+		if err := json.Unmarshal(b, &doc); err != nil {
+			return fmt.Errorf("event payload must be a JSON object: %w", err)
+		}
+	}
+	if doc == nil {
+		doc = map[string]any{}
+	}
+	var corrCopy *EventCorrelation
+	if corr != nil {
+		cp := *corr
+		corrCopy = &cp
+	}
+	m.PublishedEvents = append(m.PublishedEvents, RecordedPublishedEvent{
+		Key:         key,
+		Payload:     doc,
+		Correlation: corrCopy,
+	})
+	return nil
+}
+
 // NotifyOwner appends text to Notifications.
 func (m *MockHost) NotifyOwner(_ context.Context, text string) error {
 	m.mu.Lock()
@@ -203,6 +452,308 @@ func (m *MockHost) Log(_ context.Context, level, message string, attrs map[strin
 	defer m.mu.Unlock()
 	m.Logs = append(m.Logs, RecordedLog{Level: level, Message: message, Attrs: attrs})
 	return nil
+}
+
+// KindUpsert records pushed items under their kind, replacing same-id items.
+func (m *MockHost) KindUpsert(_ context.Context, kindKey string, items []KindItem) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.Kinds == nil {
+		m.Kinds = map[string][]KindItem{}
+	}
+	for _, it := range items {
+		replaced := false
+		for i, old := range m.Kinds[kindKey] {
+			if old.ID == it.ID {
+				m.Kinds[kindKey][i] = it
+				replaced = true
+			}
+		}
+		if !replaced {
+			m.Kinds[kindKey] = append(m.Kinds[kindKey], it)
+		}
+	}
+	return len(items), nil
+}
+
+// KindDelete drops recorded items by external id.
+func (m *MockHost) KindDelete(_ context.Context, kindKey string, externalIDs []string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	drop := map[string]bool{}
+	for _, id := range externalIDs {
+		drop[id] = true
+	}
+	kept := m.Kinds[kindKey][:0]
+	for _, it := range m.Kinds[kindKey] {
+		if !drop[it.ID] {
+			kept = append(kept, it)
+		}
+	}
+	m.Kinds[kindKey] = kept
+	return nil
+}
+
+// KindItems pages recorded items; the cursor is the last item id seen.
+func (m *MockHost) KindItems(_ context.Context, kindKey, cursor string, limit int) (KindPage, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if limit <= 0 {
+		limit = 200
+	}
+	var out []KindItem
+	after := cursor == ""
+	for _, it := range m.Kinds[kindKey] {
+		if !after {
+			after = it.ID == cursor
+			continue
+		}
+		out = append(out, it)
+		if len(out) == limit {
+			return KindPage{Items: out, NextCursor: it.ID}, nil
+		}
+	}
+	if out == nil {
+		out = []KindItem{}
+	}
+	return KindPage{Items: out}, nil
+}
+
+func (m *MockHost) mockKindItemAllowed(kindKey string, item KindItem) bool {
+	if hidden := m.KindHiddenIDs[kindKey]; hidden != nil && hidden[item.ID] {
+		return false
+	}
+	if m.KindPolicyFilter != nil && !m.KindPolicyFilter(kindKey, item) {
+		return false
+	}
+	return true
+}
+
+// KindVisible filters ids against MockHost.Kinds, KindHiddenIDs, and
+// KindPolicyFilter (#615). Requires a viewer token on ctx (WithViewerToken).
+func (m *MockHost) KindVisible(ctx context.Context, kindKey string, ids []string) ([]string, error) {
+	if _, ok := ViewerTokenFromContext(ctx); !ok {
+		return nil, fmt.Errorf("kinds.visible: no authenticated frontend adapter viewer token on context")
+	}
+	if len(ids) > MaxKindVisibleIDs {
+		return nil, fmt.Errorf("kinds.visible: batch larger than %d ids", MaxKindVisibleIDs)
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	byID := make(map[string]KindItem, len(m.Kinds[kindKey]))
+	for _, it := range m.Kinds[kindKey] {
+		byID[it.ID] = it
+	}
+	out := make([]string, 0, len(ids))
+	seen := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		it, ok := byID[id]
+		if !ok || !m.mockKindItemAllowed(kindKey, it) {
+			continue
+		}
+		out = append(out, id)
+	}
+	return out, nil
+}
+
+// KindBrowse filters and pages MockHost.Kinds with KindHiddenIDs and
+// KindPolicyFilter applied (#615). Requires a viewer token on ctx.
+func (m *MockHost) KindBrowse(ctx context.Context, kindKey string, query KindBrowseQuery) (KindPage, error) {
+	if _, ok := ViewerTokenFromContext(ctx); !ok {
+		return KindPage{}, fmt.Errorf("kinds.browse: no authenticated frontend adapter viewer token on context")
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	limit := query.Limit
+	if limit <= 0 {
+		limit = 200
+	}
+	needle := strings.ToLower(strings.TrimSpace(query.Query))
+	var matched []KindItem
+	for _, it := range m.Kinds[kindKey] {
+		if !m.mockKindItemAllowed(kindKey, it) {
+			continue
+		}
+		if query.ParentID != "" && it.ParentID != query.ParentID {
+			continue
+		}
+		if query.Level != "" && it.Level != query.Level {
+			continue
+		}
+		if needle != "" && !strings.Contains(strings.ToLower(it.Title+" "+it.Summary), needle) {
+			continue
+		}
+		if len(query.Facets) > 0 && !mockItemMatchesFacets(it, query.Facets) {
+			continue
+		}
+		if len(query.AllFacets) > 0 && !mockItemMatchesAllFacets(it, query.AllFacets) {
+			continue
+		}
+		if len(query.ExcludeFacets) > 0 && mockItemMatchesAnyFacet(it, query.ExcludeFacets) {
+			continue
+		}
+		matched = append(matched, it)
+	}
+	if query.Desc {
+		for i, j := 0, len(matched)-1; i < j; i, j = i+1, j-1 {
+			matched[i], matched[j] = matched[j], matched[i]
+		}
+	}
+	var out []KindItem
+	after := query.Cursor == ""
+	for i, it := range matched {
+		if !after {
+			after = it.ID == query.Cursor
+			continue
+		}
+		out = append(out, it)
+		if len(out) == limit {
+			next := ""
+			if i+1 < len(matched) {
+				next = it.ID
+			}
+			return KindPage{Items: out, NextCursor: next}, nil
+		}
+	}
+	if out == nil {
+		out = []KindItem{}
+	}
+	return KindPage{Items: out}, nil
+}
+
+func mockItemMatchesFacets(item KindItem, facets map[string][]string) bool {
+	for k, want := range facets {
+		if len(want) == 0 {
+			continue
+		}
+		raw, ok := item.Fields[k]
+		if !ok || len(raw) == 0 {
+			return false
+		}
+		var vals []string
+		var single string
+		if json.Unmarshal(raw, &vals) != nil {
+			if json.Unmarshal(raw, &single) == nil && single != "" {
+				vals = []string{single}
+			}
+		}
+		if len(vals) == 0 {
+			return false
+		}
+		found := false
+		for _, w := range want {
+			for _, h := range vals {
+				if strings.EqualFold(w, h) {
+					found = true
+					break
+				}
+			}
+			if found {
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+func mockItemMatchesAnyFacet(item KindItem, facets map[string][]string) bool {
+	for k, want := range facets {
+		if len(want) == 0 {
+			continue
+		}
+		if mockItemMatchesFacets(item, map[string][]string{k: want}) {
+			return true
+		}
+	}
+	return false
+}
+
+func mockItemMatchesAllFacets(item KindItem, facets map[string][]string) bool {
+	for k, want := range facets {
+		for _, w := range want {
+			if w == "" {
+				continue
+			}
+			if !mockItemMatchesFacets(item, map[string][]string{k: {w}}) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// ResolveSources returns the canned Sources.
+func (m *MockHost) ResolveSources(_ context.Context, _ SourceQuery) ([]SourceCandidate, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return append([]SourceCandidate{}, m.Sources...), nil
+}
+
+// CachePut stores bytes under a sha256 blob ref, like the real cache.
+func (m *MockHost) CachePut(_ context.Context, _, _ string, data []byte) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.Blobs == nil {
+		m.Blobs = map[string][]byte{}
+	}
+	ref := fmt.Sprintf("blob:%x", sha256.Sum256(data))
+	m.Blobs[ref] = append([]byte{}, data...)
+	return ref, nil
+}
+
+// CacheOpen reads stored blob bytes back.
+func (m *MockHost) CacheOpen(_ context.Context, blobRef string) ([]byte, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	b, ok := m.Blobs[blobRef]
+	if !ok {
+		return nil, fmt.Errorf("blob %q not found", blobRef)
+	}
+	return append([]byte{}, b...), nil
+}
+
+// CacheDelete removes a stored blob from memory; deleting an absent ref succeeds.
+func (m *MockHost) CacheDelete(_ context.Context, blobRef string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.Blobs, blobRef)
+	return nil
+}
+
+// StreamURL mints a deterministic stand-in URL and records the last call, so
+// a plugin's frontend adapter can be tested without a real ticket issuer.
+func (m *MockHost) StreamURL(_ context.Context, viewerID int64, itemRef string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.LastStreamURLViewer = viewerID
+	m.LastStreamURLItem = itemRef
+	m.LastStreamURLPart = nil
+	return "/ether/v1/kind-media/mock-" + strconv.FormatInt(viewerID, 10), nil
+}
+
+// StreamPartURL mints a deterministic part-scoped stand-in URL and records the
+// last call (#576).
+func (m *MockHost) StreamPartURL(_ context.Context, viewerID int64, itemRef string, partIndex int) (string, error) {
+	if partIndex < 0 {
+		return "", fmt.Errorf("stream url: partIndex must be non-negative")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cp := partIndex
+	m.LastStreamURLViewer = viewerID
+	m.LastStreamURLItem = itemRef
+	m.LastStreamURLPart = &cp
+	return "/ether/v1/kind-media/mock-" + strconv.FormatInt(viewerID, 10) + "?part=" + strconv.Itoa(partIndex), nil
 }
 
 // AssertValidViewSpec validates a ViewSpecDocument for structural rules and
@@ -491,6 +1042,33 @@ func (h *TestHarness) Action(action string, input map[string]any) (int, ActionRe
 	return res.Status, out, err
 }
 
+// FlowAction calls a plugin flow action route with X-Ether-Idempotency-Key.
+func (h *TestHarness) FlowAction(key string, req FlowActionRequest) (int, FlowActionResponse, error) {
+	route := "/ether/v1/flow-actions/" + url.PathEscape(key)
+	if m := h.Plugin.Manifest(); m.Ether != nil && m.Ether.Contributes != nil {
+		for _, fa := range m.Ether.Contributes.FlowActions {
+			if fa.Key == key && fa.Route != "" {
+				route = fa.Route
+				break
+			}
+		}
+	}
+	b, _ := json.Marshal(req)
+	hdrs := map[string]string{}
+	if req.IdempotencyKey != "" {
+		hdrs[HeaderIdempotencyKey] = req.IdempotencyKey
+	}
+	res := h.Request(RawRequest{
+		Method:  http.MethodPost,
+		Path:    route,
+		Headers: hdrs,
+		Body:    b,
+	})
+	var out FlowActionResponse
+	err := json.Unmarshal(res.Body, &out)
+	return res.Status, out, err
+}
+
 // Tool calls POST /ether/tool/{name}.
 func (h *TestHarness) Tool(name string, input map[string]any) (int, ToolResponse, error) {
 	b, _ := json.Marshal(input)
@@ -515,4 +1093,20 @@ func (h *TestHarness) File(path, rangeHeader string) RawResponse {
 		Path:    "/ether/file/" + strings.TrimLeft(path, "/"),
 		Headers: hdrs,
 	})
+}
+
+func (*MockHost) FoldersHash(context.Context, string, string) (FolderHash, error) {
+	return FolderHash{}, fmt.Errorf("folders.hash requires the hosted runtime")
+}
+
+func (*MockHost) FoldersHashStart(context.Context, string, string) (FolderHashJob, error) {
+	return FolderHashJob{}, fmt.Errorf("folders.hash requires the hosted runtime")
+}
+
+func (*MockHost) FoldersHashPoll(context.Context, string) (FolderHashJob, error) {
+	return FolderHashJob{}, fmt.Errorf("folders.hash requires the hosted runtime")
+}
+
+func (*MockHost) FoldersHashCancel(context.Context, string) (FolderHashJob, error) {
+	return FolderHashJob{}, fmt.Errorf("folders.hash requires the hosted runtime")
 }

@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"path/filepath"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/braedonsaunders/ether/internal/experience"
 	"github.com/braedonsaunders/ether/internal/favorites"
 	"github.com/braedonsaunders/ether/internal/llm"
+	"github.com/braedonsaunders/ether/internal/mdblist"
 	"github.com/braedonsaunders/ether/internal/notinterested"
 	"github.com/braedonsaunders/ether/internal/personalize"
 	"github.com/braedonsaunders/ether/internal/recommend"
@@ -26,8 +28,11 @@ func (a *App) buildPersonalization(ctx context.Context, cfg config.Config) error
 	log := a.log
 	dataDir := a.opts.DataDir
 	var err error
-	// Watch state and recommendations.
+	// Watch state and recommendations. Default the account-sync journal gate
+	// closed until buildPlexWatch installs per-viewer consent checks, so a
+	// server without Plex never accumulates undeliverable journal rows.
 	a.state = state.New(a.db, state.Options{Now: parityClock(), Logger: log.With("component", "state"), Availability: a.dbAvail, PendingSQLite: store.DialectOf(a.db) == store.SQLite})
+	a.state.SetJournalGate(func(context.Context, *sql.Tx, int64) (int64, bool, error) { return 0, false, nil })
 	basePlaylists := a.state.Playlists()
 	marked, ok := basePlaylists.(core.TransactionalMarkedPlaylists)
 	if !ok {
@@ -52,7 +57,8 @@ func (a *App) buildPersonalization(ctx context.Context, cfg config.Config) error
 		AllowedTitles: func(ctx context.Context, u *core.User, keys []core.RatingKey) (bool, error) {
 			return a.favoriteTitlesCached(ctx, u, keys, visibility)
 		},
-		Changed: func(ctx context.Context, id int64, subject favorites.Subject) { a.favoriteChanged(ctx, id, subject) },
+		PreloadTitles: a.catalog.PreloadStored,
+		Changed:       func(ctx context.Context, id int64, subject favorites.Subject) { a.favoriteChanged(ctx, id, subject) },
 	})
 	if err != nil {
 		return fmt.Errorf("favorites: %w", err)
@@ -77,7 +83,17 @@ func (a *App) buildPersonalization(ctx context.Context, cfg config.Config) error
 			a.log.Warn("state: watch progress lost at shutdown", "err", err)
 		}
 	})
-	a.trakt = trakt.New(trakt.Options{Config: cfg.Trakt, DB: a.db, Sealer: a.cfg, Catalog: a.catalog, NodeID: a.clusterNodeID(), Logger: log.With("component", "trakt")})
+	a.trakt = trakt.New(trakt.Options{
+		Config:  cfg.Trakt,
+		DB:      a.db,
+		Sealer:  a.cfg,
+		Catalog: a.catalog,
+		NodeID:  a.clusterNodeID(),
+		Logger:  log.With("component", "trakt"),
+		OnTokenExpired: func(userID int64, username, errMsg string) {
+			a.emitTokenExpired("trakt", "watch_sync", username, userID, errMsg)
+		},
+	})
 	a.trakt.SubscribeTo(a.state)
 	a.simklDevice = &simkl.DeviceManager{AuthConfig: a.simklAuth, Tokens: simkl.TokenStore{DB: a.db, Sealer: a.cfg}}
 	unsubSimkl := a.state.Subscribe(func(ev state.Event) {
@@ -91,6 +107,18 @@ func (a *App) buildPersonalization(ctx context.Context, cfg config.Config) error
 		}
 	})
 	a.closers = append(a.closers, unsubSimkl)
+	a.mdblistTokens = &mdblist.TokenStore{DB: a.db, Sealer: a.cfg}
+	unsubMDBList := a.state.Subscribe(func(ev state.Event) {
+		if !a.cfg.Get().MDBList.Enabled {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := mdblist.Enqueue(ctx, a.db, ev); err != nil {
+			a.log.Warn("mdblist: enqueue failed", "err", err)
+		}
+	})
+	a.closers = append(a.closers, unsubMDBList)
 	a.closers = append(a.closers, a.trakt.Close)
 	a.llm = llm.New(llm.ServiceOptions{
 		Client:  llm.NewClient(llm.ClientOptions{Config: cfg.LLM, Logger: log.With("component", "llm")}),
@@ -129,16 +157,36 @@ func (a *App) buildPersonalization(ctx context.Context, cfg config.Config) error
 			return a.availability.FilterDiscovery(ctx, ts)
 		},
 		CatalogRulesRevision: a.catalog.ViewerRulesRevision,
-		UserPolicy:           a.safety.UserPolicy, Allowed: a.safety.Allowed,
+		// A custom library's Recommended rows are scoped to that library's
+		// membership — the same filter its All browse runs (#549).
+		LibraryMembers: a.libraryRecommendationMembers,
+		LibrarySections: func(ctx context.Context) map[int]core.MediaType {
+			if a.libraries == nil {
+				return nil
+			}
+			listed, err := a.libraries.List(ctx)
+			if err != nil {
+				return nil
+			}
+			out := make(map[int]core.MediaType, len(listed))
+			for _, l := range listed {
+				if l.Source != core.LibraryPlugin && (l.MediaType == core.TypeMovie || l.MediaType == core.TypeShow) {
+					out[int(l.ID)] = l.MediaType
+				}
+			}
+			return out
+		},
+		UserPolicy: a.safety.UserPolicy, Allowed: a.safety.Allowed,
 		LLM: a.llm, Trakt: a.trakt, Playlists: a.playlists, Favorites: a.favoriteSignals, NotInterested: a.notInterestedSignals, NotInterestedSnapshot: a.notInterestedSnapshot,
 		ExtraHomeRows: a.extraHomeRows,
 		Dependencies: func(scorer core.PersonalScorer) (core.Recommender, core.CollectionRows, error) {
-			opts := append(a.collectionOptions(cfg), collections.WithState(a.state), collections.WithAuth(a.users), collections.WithScorer(scorer), collections.WithVibeRefiner(a.llm))
+			opts := append(a.collectionOptions(cfg), collections.WithState(a.state), collections.WithAuth(a.users), collections.WithScorer(scorer))
 			var err error
 			a.collections, err = collections.New(a.db, a.catalog, log.With("component", "collections"), opts...)
 			if err != nil {
 				return nil, nil, fmt.Errorf("collections: %w", err)
 			}
+			a.wireCatalogueSources()
 			a.recommend = recommend.New(recommend.Options{Catalog: a.catalog, State: a.state, LLM: a.llm, Scorer: scorer, Logger: log.With("component", "recommend")})
 			return a.recommend, a.collections, nil
 		},
@@ -178,6 +226,7 @@ func (a *App) buildPersonalization(ctx context.Context, cfg config.Config) error
 	a.closers = append(a.closers, a.personalize.Close)
 	a.subtitles = subtitles.New(subtitles.Options{
 		Config:    cfg.OpenSubtitles,
+		SubDL:     cfg.SubDL,
 		Providers: cfg.Subtitles.Providers,
 		CacheDir:  filepath.Join(dataDir, "subtitles"),
 		Logger:    log.With("component", "subtitles"),

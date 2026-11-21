@@ -33,6 +33,13 @@ CREATE TABLE segcache_files (file TEXT PRIMARY KEY, created INTEGER NOT NULL);
 ALTER TABLE segcache_releases ADD COLUMN file TEXT NOT NULL DEFAULT '';
 ALTER TABLE segcache_releases ADD COLUMN provenance TEXT NOT NULL DEFAULT '';
 `)
+	// Retention and the heartbeat orphan scan. The partial index holds only
+	// releases with no cached segments, so segment writes never maintain it.
+	store.Register("segcache", 3, `
+CREATE INDEX segcache_releases_empty ON segcache_releases(touched) WHERE segments=0;
+CREATE INDEX segcache_segments_file ON segcache_segments(file);
+CREATE INDEX segcache_files_created ON segcache_files(created);
+`)
 	// Evicted bytes whose files are still being unlinked (one row per
 	// eviction pass), so free-space measurements on any node count them as
 	// free. Its own component keeps the segcache numbering independent.
@@ -73,7 +80,7 @@ func OpenShared(dir string, budget int64, db *sql.DB, node string, logger *slog.
 	if logger == nil {
 		logger = slog.Default()
 	}
-	c := &Cache{dir: dir, logger: logger.With("component", "shared-cache"), budget: budget, now: time.Now}
+	c := &Cache{dir: dir, logger: logger.With("component", "shared-cache"), budget: max(budget, 0), now: time.Now, protectTTL: defaultProtectTTL}
 	s := &sharedCache{db: db, node: node, c: c, active: map[string]map[string]bool{}}
 	c.shared = s
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -119,6 +126,7 @@ func OpenShared(dir string, budget int64, db *sql.DB, node string, logger *slog.
 	if err = os.MkdirAll(c.dataDir, 0755); err != nil {
 		return nil, err
 	}
+	c.initEvictWorker(false)
 	return c, nil
 }
 func randomName() string {
@@ -255,6 +263,7 @@ func (s *sharedCache) put(id string, seg int, b []byte) error {
 	}
 	var err error
 	var old string
+	var used int64
 	err = s.tx(ctx, func(tx *sql.Tx) error {
 		var size int64
 		err := tx.QueryRowContext(ctx, `SELECT file,size FROM segcache_segments WHERE release_id=? AND segment=?`, id, seg).Scan(&old, &size)
@@ -271,8 +280,10 @@ func (s *sharedCache) put(id string, seg int, b []byte) error {
 		if _, err = tx.ExecContext(ctx, `INSERT INTO segcache_releases(release_id,bytes,segments,touched) VALUES(?,?,?,?) ON CONFLICT(release_id) DO UPDATE SET bytes=segcache_releases.bytes+excluded.bytes,segments=segcache_releases.segments+excluded.segments,touched=excluded.touched`, id, int64(len(b))-size, count, time.Now().Unix()); err != nil {
 			return err
 		}
-		_, err = tx.ExecContext(ctx, `UPDATE segcache_pool SET used=used+? WHERE id=1`, int64(len(b))-size)
-		return err
+		if _, err = tx.ExecContext(ctx, `UPDATE segcache_pool SET used=used+? WHERE id=1`, int64(len(b))-size); err != nil {
+			return err
+		}
+		return tx.QueryRowContext(ctx, `SELECT used FROM segcache_pool WHERE id=1`).Scan(&used)
 	})
 	if err != nil {
 		return err
@@ -280,7 +291,9 @@ func (s *sharedCache) put(id string, seg int, b []byte) error {
 	if old != "" {
 		s.unlink(old)
 	}
-	s.sweep(false)
+	if s.c.shouldWakeSharedEvict(used) {
+		s.c.signalEvict()
+	}
 	return nil
 }
 func (s *sharedCache) unlink(file string) {
@@ -384,8 +397,12 @@ func (s *sharedCache) releaseBytes(id string) int64 {
 }
 
 type sharedProvenance struct {
-	Source string            `json:"source,omitempty"`
-	Causes []core.CacheCause `json:"causes,omitempty"`
+	Source    string            `json:"source,omitempty"`
+	Indexer   string            `json:"indexer,omitempty"`
+	Origin    string            `json:"origin,omitempty"`
+	RatingKey core.RatingKey    `json:"ratingKey,omitempty"`
+	CachedAt  time.Time         `json:"cachedAt,omitzero"`
+	Causes    []core.CacheCause `json:"causes,omitempty"`
 }
 
 func (s *sharedCache) recordProvenance(p core.CacheProvenance) {
@@ -415,8 +432,20 @@ func (s *sharedCache) recordProvenance(p core.CacheProvenance) {
 				prov = sharedProvenance{}
 			}
 		}
+		if prov.CachedAt.IsZero() {
+			prov.CachedAt = now
+		}
 		if p.Source != "" {
 			prov.Source = p.Source
+		}
+		if p.Indexer != "" {
+			prov.Indexer = p.Indexer
+		}
+		if p.Origin != "" {
+			prov.Origin = p.Origin
+		}
+		if p.RatingKey != 0 {
+			prov.RatingKey = p.RatingKey
 		}
 		if p.Cause != "" {
 			prov.Causes = mergeCause(prov.Causes, core.CacheCause{Code: p.Cause, FirstSeen: now, Shelf: p.Shelf})
@@ -430,7 +459,9 @@ func (s *sharedCache) recordProvenance(p core.CacheProvenance) {
 			n = 1
 			at = now.Unix()
 		}
-		_, err = tx.ExecContext(ctx, `INSERT INTO segcache_releases(release_id,title,size,plays,played,file,provenance) VALUES(?,?,?,?,?,?,?) ON CONFLICT(release_id) DO UPDATE SET title=CASE WHEN excluded.title<>'' THEN excluded.title ELSE segcache_releases.title END,size=CASE WHEN excluded.size>0 THEN excluded.size ELSE segcache_releases.size END,plays=segcache_releases.plays+excluded.plays,played=CASE WHEN excluded.played>0 THEN excluded.played ELSE segcache_releases.played END,file=CASE WHEN excluded.file<>'' THEN excluded.file ELSE segcache_releases.file END,provenance=excluded.provenance`, p.ReleaseID, p.Title, p.Size, n, at, p.File, string(body))
+		// touched also marks a release without segments as recently described,
+		// so Prune keeps it until its first segment lands.
+		_, err = tx.ExecContext(ctx, `INSERT INTO segcache_releases(release_id,title,size,plays,played,file,provenance,touched) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(release_id) DO UPDATE SET touched=CASE WHEN segcache_releases.segments=0 THEN excluded.touched ELSE segcache_releases.touched END,title=CASE WHEN excluded.title<>'' THEN excluded.title ELSE segcache_releases.title END,size=CASE WHEN excluded.size>0 THEN excluded.size ELSE segcache_releases.size END,plays=segcache_releases.plays+excluded.plays,played=CASE WHEN excluded.played>0 THEN excluded.played ELSE segcache_releases.played END,file=CASE WHEN excluded.file<>'' THEN excluded.file ELSE segcache_releases.file END,provenance=excluded.provenance`, p.ReleaseID, p.Title, p.Size, n, at, p.File, string(body), now.Unix())
 		return err
 	})
 	s.log(err)
@@ -461,6 +492,10 @@ func (s *sharedCache) releases() []ReleaseUsage {
 				s.log(err)
 			} else {
 				r.source = prov.Source
+				r.indexer = prov.Indexer
+				r.origin = prov.Origin
+				r.ratingKey = prov.RatingKey
+				r.cachedAt = prov.CachedAt
 				r.causes = prov.Causes
 			}
 		}
@@ -485,17 +520,88 @@ func (s *sharedCache) releases() []ReleaseUsage {
 	}
 	return out
 }
-func (s *sharedCache) remove(id string) error { return s.evictWhere(id, false) }
-func (s *sharedCache) sweep(expire bool)      { s.log(s.evictWhere("", expire)) }
-func (s *sharedCache) evictWhere(id string, expire bool) error {
+func (s *sharedCache) releaseDetail(id string) (ReleaseDetail, bool) {
+	ctx, cancel := s.context()
+	defer cancel()
+	var bytes, size int64
+	var raw string
+	err := s.db.QueryRowContext(ctx, `SELECT bytes,size,COALESCE(provenance,'') FROM segcache_releases WHERE release_id=?`, id).Scan(&bytes, &size, &raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		if len(s.pins()[id]) == 0 {
+			return ReleaseDetail{}, false
+		}
+		return buildReleaseDetail(id, nil, 0, 0, time.Time{}), true
+	}
+	if err != nil {
+		s.log(err)
+		return ReleaseDetail{}, false
+	}
+	var first time.Time
+	if raw != "" {
+		var prov sharedProvenance
+		if json.Unmarshal([]byte(raw), &prov) == nil {
+			first = earliestTime(prov.CachedAt, prov.Causes)
+		}
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT segment,touched FROM segcache_segments WHERE release_id=? ORDER BY segment`, id)
+	if err != nil {
+		s.log(err)
+		return ReleaseDetail{}, false
+	}
+	defer rows.Close()
+	var keys []int
+	var earliest int64
+	for rows.Next() {
+		var seg int
+		var touched int64
+		if rows.Scan(&seg, &touched) == nil {
+			keys = append(keys, seg)
+			if touched > 0 && (earliest == 0 || touched < earliest) {
+				earliest = touched
+			}
+		}
+	}
+	s.logRows("release_detail", rows.Err())
+	if len(keys) == 0 && len(s.pins()[id]) == 0 {
+		return ReleaseDetail{}, false
+	}
+	if earliest > 0 {
+		t := time.Unix(earliest, 0)
+		if first.IsZero() || t.Before(first) {
+			first = t
+		}
+	}
+	return buildReleaseDetail(id, keys, bytes, size, first), true
+}
+func (s *sharedCache) remove(id string) error {
+	_, err := s.evictWhere(id, false, false)
+	return err
+}
+func (s *sharedCache) sweep(expire bool) {
+	_, err := s.evictWhere("", expire, false)
+	s.log(err)
+}
+func (s *sharedCache) sweepWatermarked() {
+	for !s.closed() {
+		more, err := s.evictWhere("", false, true)
+		if err != nil {
+			s.log(err)
+			return
+		}
+		if !more {
+			return
+		}
+	}
+}
+func (s *sharedCache) evictWhere(id string, expire bool, watermarked bool) (bool, error) {
 	if err := s.checkMount(); err != nil {
-		return err
+		return false, err
 	}
 	s.c.mu.Lock()
 	budget, p, closed := s.c.budget, s.c.policy, s.c.closed
 	s.c.mu.Unlock()
 	if closed {
-		return ErrClosed
+		return false, ErrClosed
 	}
 	prot, _ := s.c.protected()
 	s.c.evictMu.Lock()
@@ -506,6 +612,7 @@ func (s *sharedCache) evictWhere(id string, expire bool) error {
 	var files []string
 	var reclaimed int64
 	var reclaimID string
+	var more bool
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		var used int64
 		if err := tx.QueryRowContext(ctx, `SELECT used FROM segcache_pool WHERE id=1`).Scan(&used); err != nil {
@@ -515,7 +622,30 @@ func (s *sharedCache) evictWhere(id string, expire bool) error {
 		// The cap is absolute, so a pass that runs after another node's
 		// eviction compares against the pool usage that eviction left.
 		limit := usageLimit(budget, floorCap, floorOK)
-		within := func() bool { return limit < 0 || used <= limit }
+		target := limit
+		if watermarked {
+			if limit < 0 {
+				return nil
+			}
+			trigger := false
+			if budget > 0 {
+				high := highWatermark(budget)
+				low := lowWatermark(budget)
+				if low < target {
+					target = low
+				}
+				if used >= high && used > target {
+					trigger = true
+				}
+			}
+			if floorOK && used > floorCap {
+				trigger = true
+			}
+			if !trigger || used <= target {
+				return nil
+			}
+		}
+		within := func() bool { return target < 0 || used <= target }
 		if id == "" && !expire && within() {
 			return nil
 		}
@@ -567,6 +697,9 @@ func (s *sharedCache) evictWhere(id string, expire bool) error {
 			if prot[v.id] || (id == "" && !expired && within()) {
 				continue
 			}
+			if watermarked && limit >= 0 && used <= limit && used == v.size {
+				break
+			}
 			if _, err = tx.ExecContext(ctx, `DELETE FROM segcache_segments WHERE release_id=? AND segment=? AND file=?`, v.id, v.seg, v.file); err != nil {
 				return err
 			}
@@ -591,11 +724,14 @@ func (s *sharedCache) evictWhere(id string, expire bool) error {
 			// space yet; floor measurements on any node count it as free.
 			reclaimID = rand.Text()
 			_, err = tx.ExecContext(ctx, `INSERT INTO segcache_reclaim(id,node,bytes,at) VALUES(?,?,?,`+s.nowSQL()+`)`, reclaimID, s.node, reclaimed)
+			if watermarked && !within() {
+				more = true
+			}
 		}
 		return err
 	})
 	if err != nil {
-		return err
+		return false, err
 	}
 	if s.beforeUnlink != nil {
 		s.beforeUnlink()
@@ -612,7 +748,7 @@ func (s *sharedCache) evictWhere(id string, expire bool) error {
 	s.c.mu.Lock()
 	s.c.metrics.EvictedBytes += reclaimed
 	s.c.mu.Unlock()
-	return nil
+	return more, nil
 }
 func (s *sharedCache) heartbeat() {
 	ctx, cancel := s.context()
@@ -653,6 +789,36 @@ func (s *sharedCache) heartbeat() {
 	for _, f := range files {
 		s.unlink(f)
 	}
+}
+
+// releaseRetention is how long a shared release row outlives its last
+// segment. It matches the replay-boost window, so pruning never changes an
+// eviction score.
+const releaseRetention = 30 * 24 * time.Hour
+
+// Prune deletes shared release rows that have no cached segments, no pins,
+// and neither a touch nor a play within releaseRetention. A local cache keeps
+// no rows and returns 0. The outer predicates are rechecked against a row a
+// concurrent Put just refilled.
+func (c *Cache) Prune(ctx context.Context) (int64, error) {
+	if c == nil || c.shared == nil {
+		return 0, nil
+	}
+	c.mu.Lock()
+	now := c.now()
+	c.mu.Unlock()
+	nowSec := now.Unix()
+	cutoff := now.Add(-releaseRetention).Unix()
+	pins, err := store.PruneBatched(ctx, c.shared.db,
+		`DELETE FROM segcache_pins WHERE (release_id,reason,owner) IN (SELECT release_id,reason,owner FROM segcache_pins WHERE expires>0 AND expires<=? LIMIT ?)`,
+		nowSec)
+	if err != nil {
+		return pins, err
+	}
+	releases, err := store.PruneBatched(ctx, c.shared.db,
+		`DELETE FROM segcache_releases WHERE segments=0 AND bytes=0 AND touched<? AND release_id IN (SELECT r.release_id FROM segcache_releases r WHERE r.segments=0 AND r.touched<? AND r.bytes=0 AND r.played<? AND NOT EXISTS(SELECT 1 FROM segcache_pins p WHERE p.release_id=r.release_id AND (p.expires=0 OR p.expires>?)) ORDER BY r.touched LIMIT ?)`,
+		cutoff, cutoff, cutoff, nowSec)
+	return pins + releases, err
 }
 
 // Shared reports whether this cache uses the cluster's NAS pool.

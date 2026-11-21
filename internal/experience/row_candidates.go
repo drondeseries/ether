@@ -10,16 +10,18 @@ import (
 
 // RankedCandidate carries protocol-neutral selection and presentation data.
 type RankedCandidate struct {
-	ID        string
-	Purpose   core.RowPurpose
-	Title     string
-	Type      core.MediaType
-	Style     string
-	Promoted  bool
-	Items     []core.Title
-	More      bool
-	Key       core.RatingKey
-	ItemCount int
+	RankedTop10    bool
+	ID             string
+	Purpose        core.RowPurpose
+	Title          string
+	Type           core.MediaType
+	PreviewOnFocus bool
+	Style          string
+	Promoted       bool
+	Items          []core.Title
+	More           bool
+	Key            core.RatingKey
+	ItemCount      int
 }
 
 // CandidateRanker assembles one ranked pool for a visit. A non-nil predicate
@@ -48,7 +50,7 @@ func (c CandidateComposer) Rows(ctx context.Context, req frontend.RowRequest, si
 	if req.Viewer == nil || c.Ranker == nil {
 		return nil, core.ErrNotFound
 	}
-	restricted := !req.Viewer.IsOwner && (req.Viewer.MaxContentRating != "" || len(req.Viewer.AllowedSections) > 0 || c.Restricted == nil || c.Restricted(req.Viewer))
+	restricted := !req.Viewer.IsOwner && (req.Viewer.MaxContentRating != "" || len(req.Viewer.AllowedLibraries) > 0 || c.Restricted == nil || c.Restricted(req.Viewer))
 	var allow func(context.Context, *core.User, *core.Title) bool
 	if restricted {
 		allow = c.Visibility.Visible
@@ -69,6 +71,11 @@ func (c CandidateComposer) Rows(ctx context.Context, req frontend.RowRequest, si
 		if err != nil {
 			return nil, err
 		}
+		// A purpose-specific request will discard Continue rows. Do not
+		// walk the viewer's history again to replace a row it cannot return.
+		if req.Purpose != "" {
+			return hubs, nil
+		}
 		if c.Resume == nil {
 			return nil, core.ErrNotFound
 		}
@@ -80,6 +87,9 @@ func (c CandidateComposer) Rows(ctx context.Context, req frontend.RowRequest, si
 		for i := range hubs {
 			if hubs[i].ID == "home.continue" {
 				hubs[i].Items = resume
+				// Continuation has one shared featured presentation, whether
+				// the ranker supplied its placeholder or we insert the row.
+				hubs[i].Style, hubs[i].Promoted = "hero", true
 				inserted = true
 			}
 		}

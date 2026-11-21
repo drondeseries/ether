@@ -286,20 +286,22 @@ func TestFacets(t *testing.T) {
 	}
 }
 
-func TestSearchJoinsBrowsable(t *testing.T) {
+// A search hit is a summary: it is not stored, and does not join the
+// library's listings, until someone opens it (owner decision, 0.3.6).
+func TestSearchDoesNotStoreHits(t *testing.T) {
 	ctx := context.Background()
 	c := newTestCatalog(t, fakeTMDB(t))
 	res, err := c.Search(ctx, "Hidden", nil, 10)
 	if err != nil || len(res) != 1 || res[0].Title != "Hidden Gem" {
 		t.Fatalf("search: %v %v", res, err)
 	}
-	// Search publishes summaries immediately and persists them in the background.
-	// Wait for that publication before asserting the stored browse projection.
 	c.WaitRefreshes()
-	// Hidden Gem is below thresholds but must now be browsable (added_at set -> SortAdded works).
 	page, err := c.Browse(ctx, core.BrowseQuery{Filter: core.Filter{Query: "Hidden"}})
-	if err != nil || page.Total != 1 {
-		t.Fatalf("searched title not browsable: %+v %v", page, err)
+	if err != nil || page.Total != 0 {
+		t.Fatalf("searched title listed: %+v %v", page, err)
+	}
+	if got, err := c.StoredTitle(ctx, res[0].Key); err != nil || got.Title != "Hidden Gem" {
+		t.Fatalf("search summary not readable: %v %v", got, err)
 	}
 }
 
@@ -494,5 +496,32 @@ func TestRecentAirMatchesAddedOrder(t *testing.T) {
 			added = showPage.Items[0].AddedAt
 		}
 		t.Fatalf("show added %v browse %v err %v", shows[0].AddedAt, added, err)
+	}
+}
+
+func TestTitlesInFilterBatch(t *testing.T) {
+	ctx := context.Background()
+	c := newTestCatalog(t, fakeTMDB(t))
+	if err := c.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Get(ctx, core.MovieKey(550)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Get(ctx, core.MovieKey(551)); err != nil {
+		t.Fatal(err)
+	}
+	f := core.Filter{Type: core.TypeMovie, Genres: []string{"Family"}}
+	keys := []core.RatingKey{core.MovieKey(550), core.MovieKey(551), core.MovieKey(999999)}
+	members, err := c.TitlesInFilter(ctx, f, keys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if members[core.MovieKey(550)] || !members[core.MovieKey(551)] || members[core.MovieKey(999999)] {
+		t.Fatalf("batch membership = %v", members)
+	}
+	one, err := c.TitleInFilter(ctx, f, core.MovieKey(551))
+	if err != nil || !one {
+		t.Fatalf("TitleInFilter = %v, %v", one, err)
 	}
 }

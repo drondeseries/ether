@@ -37,6 +37,7 @@ type Indexer struct {
 	// usenetReady reports whether a Usenet provider is enabled; nil means
 	// unknown (no debrid-only source check).
 	usenetReady func() bool
+	packNamer   PackNamer
 }
 
 var _ core.Indexer = (*Indexer)(nil)
@@ -46,6 +47,11 @@ func NewIndexer(inner core.Indexer, svc *Service) *Indexer { return &Indexer{inn
 
 // SetUsenetReady wires the "is a Usenet provider enabled" check used by
 // MissingSources. Call before the indexer is used.
+// SetPackNamer sets what reads real file names out of an obfuscated Usenet
+// season pack (PAR2) so its wanted episode can be found. Without one, only
+// packs with readable file names resolve.
+func (x *Indexer) SetPackNamer(n PackNamer) { x.packNamer = n }
+
 func (x *Indexer) SetUsenetReady(fn func() bool) { x.usenetReady = fn }
 
 // sourceInventory is what MissingSources needs from the inner indexer
@@ -176,7 +182,7 @@ func (x *Indexer) SearchWith(ctx context.Context, req core.SearchRequest, arrive
 	explain := x.explainUncached(out, cached)
 	var explained []string // ids kept only to explain a not-cached failure
 	for _, r := range out {
-		if r.Protocol == core.ProtocolTorrent && r.InfoHash != "" && dropUncached && !cached[r.InfoHash] {
+		if r.Protocol == core.ProtocolTorrent && r.InfoHash != "" && (dropUncached || (definitive && r.Private)) && !cached[r.InfoHash] {
 			if explain == 0 {
 				continue
 			}
@@ -188,11 +194,11 @@ func (x *Indexer) SearchWith(ctx context.Context, req core.SearchRequest, arrive
 		}
 		kept = append(kept, r)
 	}
-	// When an episode search returned only uncached single-episode torrents
-	// (preventing the indexer's own empty-result fallback from querying
-	// season packs), search for season packs (Episode = 0) and keep cached
-	// packs so older shows whose episodes live only in cached season packs
-	// still resolve.
+	// When a foreground episode search returned only uncached single-episode
+	// torrents (preventing the indexer's own empty-result fallback from querying
+	// season packs), search torrent indexers for season packs (Episode = 0) and
+	// keep cached packs so older shows whose episodes live only in cached season
+	// packs still resolve. Speculative work keeps to the primary query.
 	hasPack := false
 	for _, r := range kept {
 		if r.Info.FullSeason {
@@ -200,7 +206,7 @@ func (x *Indexer) SearchWith(ctx context.Context, req core.SearchRequest, arrive
 			break
 		}
 	}
-	if enabled && !anyCached && !hasPack && len(torrents) > 0 && req.Type == core.TypeEpisode && req.Season > 0 && req.Episode > 0 && ctx.Err() == nil {
+	if enabled && !anyCached && !hasPack && len(torrents) > 0 && !core.SpeculativeIndexerWork(ctx) && req.Type == core.TypeEpisode && req.Season > 0 && req.Episode > 0 && ctx.Err() == nil {
 		packCached, packs := x.searchSeasonPacks(ctx, req)
 		for h, ok := range packCached {
 			if ok {
@@ -270,7 +276,8 @@ func (x *Indexer) UsenetReady() bool { return x.usenetReady == nil || x.usenetRe
 
 // playable adapts a search result to what this server can stream, or
 // reports false: torrents need an enabled debrid provider (or else play
-// through the addon link they came with), Usenet needs a Usenet provider,
+// through the addon link they came with), Usenet needs a Usenet provider
+// (or likewise its addon link),
 // and with cached-only on an HTTP link the addon labels only as uncached
 // is left out.
 func (x *Indexer) playable(r core.Release) (core.Release, bool) {
@@ -293,14 +300,25 @@ func (x *Indexer) playable(r core.Release) (core.Release, bool) {
 		}
 		return r, true
 	case core.ProtocolUsenet:
-		return r, x.usenetReady == nil || x.usenetReady()
+		if x.usenetReady == nil || x.usenetReady() {
+			return r, true
+		}
+		// An add-on Usenet stream that also gave its own play link plays
+		// through it, as a torrent does without a debrid provider.
+		if r.StreamURL == "" {
+			return r, false
+		}
+		r.Protocol = core.ProtocolHTTP
+		return r, true
 	}
 	return r, true
 }
 
-// searchSeasonPacks queries inner for season-level releases (Episode = 0)
-// and bulk-checks their debrid cache availability.
+// searchSeasonPacks queries torrent indexers in inner for season-level
+// releases (Episode = 0) and bulk-checks their debrid cache availability.
+// Usenet indexers are skipped because non-torrent results are unused here.
 func (x *Indexer) searchSeasonPacks(ctx context.Context, req core.SearchRequest) (map[string]bool, []core.Release) {
+	ctx = core.WithTorrentOnlySearch(ctx)
 	packReq := req
 	packReq.Episode = 0
 	early := x.earlyCacheChecks(ctx, nil)
@@ -410,7 +428,7 @@ func (x *Indexer) SearchRescue(ctx context.Context, req core.SearchRequest) ([]c
 	dropUncached := definitive && x.svc.Config().CachedOnly
 	explain := x.explainUncached(out, cached)
 	for _, r := range out {
-		if r.Protocol == core.ProtocolTorrent && r.InfoHash != "" && dropUncached && !cached[r.InfoHash] {
+		if r.Protocol == core.ProtocolTorrent && r.InfoHash != "" && (dropUncached || (definitive && r.Private)) && !cached[r.InfoHash] {
 			if explain == 0 {
 				continue
 			}
@@ -439,7 +457,25 @@ func (x *Indexer) FetchNZB(ctx context.Context, r core.Release) ([]byte, error) 
 		if x.usenetReady != nil && !x.usenetReady() {
 			return nil, fmt.Errorf("usenet release %q: %w", r.Name, core.ErrNotAvailable)
 		}
-		return x.inner.FetchNZB(ctx, r)
+		data, err := x.inner.FetchNZB(ctx, r)
+		if err != nil || r.Target == nil {
+			return data, err
+		}
+		if r.Info.FullSeason {
+			// A Usenet season pack plays as its wanted episode's files only.
+			return x.episodeNZB(ctx, r, data)
+		}
+		if r.Target.AllowNonVideo && (r.Target.FileIndex != nil || r.Target.ExactFile != "") {
+			// A plugin named one file in the NZB; narrow to it (and its
+			// archive set) like debrid's ChooseFile selects it.
+			return x.episodeNZB(ctx, r, data)
+		}
+		if len(r.Target.MovieTitles) > 0 || len(r.Target.WantedLanguages) > 0 {
+			if out, merr := EpisodeNZB(data, r.Target); merr == nil {
+				return out, nil
+			}
+		}
+		return data, nil
 	}
 	if !x.svc.Enabled() {
 		return nil, fmt.Errorf("torrent release %q: %w", r.Name, ErrNoProvider)
@@ -599,4 +635,26 @@ func hashOnly(hashes []string) []core.Release {
 		out[i] = core.Release{Protocol: core.ProtocolTorrent, InfoHash: h}
 	}
 	return out
+}
+
+// RecentSourceThroughput uses only account measurements already collected by
+// active streams. An unmeasured eligible account leaves selection unrestricted.
+func (x *Indexer) RecentSourceThroughput(r core.Release) float64 {
+	if x.svc == nil || r.Protocol != core.ProtocolTorrent {
+		return 0
+	}
+	var best float64
+	for _, e := range x.svc.active() {
+		if len(r.DebridCached) > 0 && !slices.Contains(r.DebridCached, e.cfg.Kind) {
+			continue
+		}
+		e.mu.Lock()
+		l := e.stats.Latency
+		e.mu.Unlock()
+		if l.ThroughputBps <= 0 || x.svc.now().Sub(l.ThroughputAt) > 2*time.Minute {
+			return 0
+		}
+		best = max(best, l.ThroughputBps)
+	}
+	return best
 }

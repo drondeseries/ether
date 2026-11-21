@@ -1,9 +1,12 @@
 package transcode
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/braedonsaunders/ether/internal/core"
 )
@@ -11,7 +14,8 @@ import (
 // The ABR ladder: one session, one shared segment Timeline, several
 // rungs. The primary rung ("base", track 0) is the decision the session
 // was started with; lower rungs are transcodes planned from the same
-// decision. Only one ffmpeg runs at a time — a segment request on an
+// decision. One steady encoder runs; a rendition switch briefly retains
+// the old encoder until the requested replacement segment is ready. A request on an
 // idle rung restarts the encoder at that segment with the rung's
 // decision (unused rungs are therefore stopped, not just paused, which
 // is the cheapest idle state). Segment files are kept per rung (the
@@ -123,7 +127,7 @@ func decisionAudioKbps(info core.MediaInfo, d core.Decision) int {
 	case d.AudioCopy:
 		return copiedAudioKbps(a)
 	default:
-		return audioBitrateKbps(d.AudioCodec, outputChannels(d.AudioCodec, a))
+		return audioBitrateKbps(d.AudioCodec, decisionAudioChannels(d, a))
 	}
 }
 
@@ -151,6 +155,9 @@ func buildRungs(info core.MediaInfo, primary core.Decision, adapt adaptiveSettin
 		codecs:  rungCodecs(info, primary, ph),
 	}
 	base.peakKbps = peakKbps(avg)
+	if primary.VideoCopy {
+		base.peakKbps = max(base.peakKbps, copyStreamPeakKbps(info, avg))
+	}
 	rungs := []rung{base}
 	// Soft encode rungs under a video-copy primary follow abrLadderUnderCopy
 	// (default on for upgrade compatibility with abrLadder). Set it false to
@@ -160,15 +167,23 @@ func buildRungs(info core.MediaInfo, primary core.Decision, adapt adaptiveSettin
 	}
 	audio := decisionAudioKbps(info, primary) // rungs carry the primary's audio
 	below := avg
+	// A rung is a genuine step down or nothing. Its class (720p, 480p…)
+	// must be visibly below the primary's picture: release heights vary
+	// (798, 800, 1036, 1040…), and a "720p" re-encode of a 798-line
+	// picture is the same quality at a worse bitrate. Players switch to a
+	// rung only when throughput cannot carry the variant above it, so a
+	// rung close to that variant's bitrate is just a needless re-encode a
+	// healthy link drifts onto.
 	for _, step := range ladderSteps {
-		if ph > 0 && step.height >= ph {
+		if ph > 0 && step.height*100 > ph*rungMaxHeightPercent {
 			continue
 		}
+		w, h := fitRungBox(v, step.height)
 		// Advertise what the rung really sends: its video never drops
 		// below the encoder floor, so copied lossless or surround audio can
 		// make a "lower" rung no cheaper than the one above it.
 		total := max(step.kbps, minRungVideoKbps+audio)
-		if below > 0 && total >= below {
+		if below > 0 && total*100 > below*rungMaxBitratePercent {
 			continue
 		}
 		d := primary
@@ -177,7 +192,7 @@ func buildRungs(info core.MediaInfo, primary core.Decision, adapt adaptiveSettin
 		d.Enhancement = core.VideoEnhancement{}
 		d.Kind = core.DecisionTranscode
 		d.VideoCopy = false
-		d.MaxHeight = minPositive(step.height, v.Height)
+		d.MaxHeight = h
 		d.BitrateKbps = total
 		// Keep HDR only when the primary keeps it in HEVC; otherwise the
 		// cheap, universally decoded SDR H.264 encode.
@@ -191,7 +206,6 @@ func buildRungs(info core.MediaInfo, primary core.Decision, adapt adaptiveSettin
 		if enhancementSelected(primary) {
 			d.Reason = "ordinary ABR rung " + step.id + " beneath RTX Video base"
 		}
-		w, h := outputSize(v.Width, v.Height, step.height)
 		rungs = append(rungs, rung{
 			id: step.id, decision: d, width: w, height: h,
 			avgKbps: total, peakKbps: peakKbps(total),
@@ -200,6 +214,40 @@ func buildRungs(info core.MediaInfo, primary core.Decision, adapt adaptiveSettin
 		below = total
 	}
 	return rungs
+}
+
+// rungMaxHeightPercent bounds a rung's class height against the
+// primary's picture height; a taller class is a near-duplicate of it.
+const rungMaxHeightPercent = 85
+
+// rungMaxBitratePercent bounds a rung's average bitrate against the
+// variant above it, so a rung only ever answers a real throughput drop.
+const rungMaxBitratePercent = 67
+
+// copyStreamPeakKbps is a copied primary's peak segment rate as the
+// stream carries it: the source file's peak less the bytes the stream
+// does not send (audio tracks it drops or re-encodes smaller), which are
+// near-constant. Advertising the file's peak would overstate BANDWIDTH and
+// push a healthy link onto a lower rung.
+func copyStreamPeakKbps(info core.MediaInfo, streamAvgKbps int) int {
+	peak := HLSCopyPeakKbps(info, 0)
+	if dropped := info.BitrateKbps - streamAvgKbps; dropped > 0 && streamAvgKbps > 0 {
+		peak -= dropped
+	}
+	return peak
+}
+
+// fitRungBox fits v's display picture into the 16:9 box of a ladder class
+// (1280x720 for 720p), never upscaling, so wide scope pictures shrink by
+// width as release naming classes them. The size is what the encoder
+// makes of the returned height (displayOutputSize), so the advertised
+// RESOLUTION matches the rung's bytes.
+func fitRungBox(v *core.StreamInfo, boxH int) (int, int) {
+	w, h := displaySize(v)
+	if w > 0 && h > 0 && w*9 > h*16 { // wider than 16:9: width bound
+		boxH = even(h * boxH * 16 / (w * 9))
+	}
+	return outputSize(w, h, boxH)
 }
 
 func peakKbps(avg int) int {
@@ -266,14 +314,40 @@ func (s *Session) Rungs() []core.HLSRung {
 	if v := s.info.Video(); v != nil {
 		fr = v.FrameRate
 	}
+
 	out := make([]core.HLSRung, 0, len(s.rungs))
-	for _, r := range s.rungs {
+	for t, r := range s.rungs {
+		peak := s.rungPeakKbpsLocked(t)
+		video, videoPeak, codec, dr := qualityMetadata(s.info, r)
+
 		out = append(out, core.HLSRung{
-			ID: r.id, Bandwidth: r.peakKbps * 1000, AverageBandwidth: r.avgKbps * 1000,
-			Width: r.width, Height: r.height, Codecs: r.codecs, FrameRate: fr,
+			VideoBitrate: video, PeakVideoBitrate: videoPeak, Codec: codec, DynamicRange: dr,
+			ID: r.id, Bandwidth: peak * 1000, AverageBandwidth: r.avgKbps * 1000,
+			Width: r.width, Height: r.height, Codecs: r.codecs, OutputCodecs: s.outputCodecs[t], OutputAudioChannels: s.outputAudioChannels[t], FrameRate: fr,
 		})
 	}
 	return out
+}
+
+// hlsPeakWindowLocked is the shortest RFC8216 peak measurement window.
+func (s *Session) hlsPeakWindowLocked() time.Duration {
+	target := s.segDur
+	if s.plan != nil {
+		target = s.plan.TargetDuration()
+	}
+	if target <= 0 {
+		target = DefaultSegmentDuration
+	}
+	return ((target + time.Second - 1) / time.Second * time.Second) / 2
+}
+
+func (s *Session) rungPeakKbpsLocked(t int) int {
+	r := s.rungs[t]
+	peak := r.peakKbps
+	if !s.isDASH() && t == 0 && s.plan != nil && s.plan.rampSegs > 0 && s.rampTranscodesLocked() {
+		peak = max(peak, encodedHLSPeakKbps(s.info, fastStartDecision(r.decision, s.info, s.adapt), rateControl{}, s.hlsPeakWindowLocked()))
+	}
+	return peak
 }
 
 // ServeRungPlaylist implements core.HLSLadderSession.
@@ -289,7 +363,19 @@ func (s *Session) ServeRungPlaylist(w http.ResponseWriter, r *http.Request, rung
 		http.NotFound(w, r)
 		return
 	}
+	s.mu.Unlock()
+	if err := s.awaitLiveTarget(r.Context(), t); err != nil {
+		http.Error(w, "live playlist unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		http.NotFound(w, r)
+		return
+	}
 	body := s.renderPlaylistLocked(t)
+	s.notePlaylistLocked(t, body)
 	s.mu.Unlock()
 	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -301,6 +387,9 @@ func (s *Session) ServeRungPlaylist(w http.ResponseWriter, r *http.Request, rung
 
 // ServeRungSegment implements core.HLSLadderSession.
 func (s *Session) ServeRungSegment(w http.ResponseWriter, r *http.Request, rungID string, n int) {
+	if !s.acceptMediaGeneration(w, r) {
+		return
+	}
 	s.mu.Lock()
 	t := s.rungTrack(rungID)
 	s.mu.Unlock()
@@ -342,3 +431,51 @@ func dashRepsLadder(info core.MediaInfo, primary core.Decision, rungs []rung) []
 
 var _ core.HLSLadderSession = (*Session)(nil)
 var _ core.GoodputSession = (*Session)(nil)
+
+// PrepareRung requests the existing ladder's segment; it creates no parallel encoder.
+func (s *Session) PrepareRung(ctx context.Context, id string, position time.Duration) error {
+	s.mu.Lock()
+	t := s.rungTrack(id)
+	n := 0
+	if s.plan != nil {
+		n = s.plan.IndexAt(position - s.base)
+	}
+	s.mu.Unlock()
+	if t < 0 {
+		return core.ErrNotAvailable
+	}
+	w := &preparationSink{header: make(http.Header)}
+	r, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://localhost/prepare", nil)
+	if err != nil {
+		return err
+	}
+	// A one-byte GET activates the lazy rung and waits for real publication.
+	r.Header.Set("Range", "bytes=0-0")
+	s.serveSegment(w, r, t, n)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if w.status >= 400 || !w.wrote {
+		return core.ErrNotAvailable
+	}
+	return nil
+}
+
+type preparationSink struct {
+	header http.Header
+	status int
+	wrote  bool
+}
+
+func (w *preparationSink) Header() http.Header         { return w.header }
+func (w *preparationSink) WriteHeader(n int)           { w.status = n; w.wrote = true }
+func (w *preparationSink) Write(p []byte) (int, error) { w.wrote = true; return io.Discard.Write(p) }
+
+func (m *Manager) ProactiveFallbackAvailable() bool {
+	if m == nil {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return !m.closed && !m.cfg.VideoTranscodingOff()
+}

@@ -11,17 +11,22 @@ type HomeSituation struct {
 	Weekend                                bool
 	Now                                    time.Time
 	LibraryID                              int
+	DefaultMaxRows                         int
 	Product, Platform, SessionID, ClientID string
 }
 
 // NeutralHomeRow carries a stable producer identity and semantic row type.
 // Kind is the owner-layout identity (for example a collection rule), not a wire context.
 type NeutralHomeRow struct {
-	ID, Title, Kind string
-	Purpose         RowPurpose
-	Type            MediaType
-	Items           []Title
-	ItemCount       int
+	ID, Title, Kind      string
+	Purpose              RowPurpose
+	Type                 MediaType
+	Items                []Title
+	ItemCount            int
+	RankedTop10          bool
+	PreviewOnFocus       bool
+	PreviewOnFocusPolicy *bool
+	Always               bool
 }
 
 // NeutralHomeLayoutSource arranges rows without a protocol-specific context.

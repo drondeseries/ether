@@ -45,6 +45,11 @@ func TestCreditsUseParentAuthorizedFacetAndPortrait(t *testing.T) {
 	}
 }
 
+// #614 changed this contract: jellyfin-sdk-kotlin (Jellyfin Android TV)
+// requires BaseItemPerson.Id to be a UUID, so a catalogue person id that
+// is not a GUID can no longer be emitted on the Jellyfin surface — the
+// credit is dropped rather than crashing the client's detail page. The
+// person remains reachable through /Persons and person search.
 func TestCataloguePersonIDIsEmittedWithoutAFacet(t *testing.T) {
 	exp := frontendtest.Experience{ItemFunc: func(context.Context, frontend.ItemRequest) (frontend.ItemDetail, error) {
 		return frontend.ItemDetail{Title: frontend.Title{Key: 5, Type: "movie", Cast: []core.Person{{ID: "lab-person", Name: "Actor", Role: "Hero"}}}}, nil
@@ -60,7 +65,7 @@ func TestCataloguePersonIDIsEmittedWithoutAFacet(t *testing.T) {
 	r.Header.Set("X-Emby-Token", "grant")
 	w := httptest.NewRecorder()
 	inst.Handler().ServeHTTP(w, r)
-	if w.Code != 200 || !strings.Contains(w.Body.String(), `"Id":"lab-person"`) || strings.Contains(w.Body.String(), "PrimaryImageTag") {
+	if w.Code != 200 || strings.Contains(w.Body.String(), `"Id":"lab-person"`) || strings.Contains(w.Body.String(), "PrimaryImageTag") || !strings.Contains(w.Body.String(), `"People":[]`) {
 		t.Fatal(w.Code, w.Body.String())
 	}
 }

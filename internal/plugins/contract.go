@@ -17,8 +17,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/braedonsaunders/ether/internal/core"
+	"github.com/braedonsaunders/ether/internal/events"
 	"github.com/braedonsaunders/ether/internal/stremio"
+	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -34,6 +38,9 @@ const (
 	KindNotificationChannel Kind = "notification_channel"
 	KindLiveTVSource        Kind = "livetv_source"
 	KindExtension           Kind = "extension"
+	// KindContent plugins declare media kinds; the owner meets each one
+	// as a Library (spec §2.1).
+	KindContent Kind = "content"
 )
 
 // Capability is one thing a plugin can do (SPEC §5.1.3).
@@ -50,12 +57,21 @@ const (
 	CapMarkers         Capability = "markers"
 	CapNotify          Capability = "notify"
 	CapEvents          Capability = "events"
+	CapFlowActions     Capability = "flow_actions"
 	CapRankingStep     Capability = "ranking_step"
 	CapRuleCondition   Capability = "rule_condition"
 	CapTools           Capability = "tools"
 	CapUI              Capability = "ui"
 	CapOnAirContent    Capability = "onair_content"
 	CapLiveTVPack      Capability = "livetv_pack"
+	CapPosterBadges    Capability = "poster_badges"
+	// Content-kind capabilities (spec §2.1). Catalog provider, kind
+	// resolver and matcher need kind content; a frontend adapter may
+	// also be an extension over the built-in libraries.
+	CapCatalogProvider Capability = "catalog_provider"
+	CapKindResolver    Capability = "kind_resolver"
+	CapFrontendAdapter Capability = "frontend_adapter"
+	CapMatcher         Capability = "matcher"
 )
 
 // Reserved capabilities are known names a manifest may not claim in v1.
@@ -128,6 +144,10 @@ type EtherBlock struct {
 	Repo    string      `json:"repo,omitempty"`
 	Icon    string      `json:"icon,omitempty"`
 	Runtime RuntimeDecl `json:"runtime"`
+	// Sidecar tells the console how to run a remote plugin's program: a
+	// Docker image, a download+command pair, or neither (docs only). Only
+	// meaningful when Runtime.Kind is "remote".
+	Sidecar *SidecarDecl `json:"sidecar,omitempty"`
 	// Cluster is "leader" (default) or "every_node".
 	Cluster     string      `json:"cluster,omitempty"`
 	Health      HealthDecl  `json:"health,omitempty"`
@@ -159,9 +179,53 @@ func (m Manifest) RuntimeKind() string {
 // RuntimeDecl declares how a plugin runs: hosted (Entry JS or Module WASM)
 // or remote (the manifest URL or a tunnel is the endpoint).
 type RuntimeDecl struct {
-	Kind   string `json:"kind"` // "hosted" or "remote"
-	Entry  string `json:"entry,omitempty"`
-	Module string `json:"module,omitempty"`
+	Kind   string         `json:"kind"` // "hosted" or "remote"
+	Entry  string         `json:"entry,omitempty"`
+	Module string         `json:"module,omitempty"`
+	Limits *RuntimeLimits `json:"limits,omitempty"`
+}
+
+// DefaultMaxPluginItems is the default per-plugin stored item ceiling across
+// its content libraries; owners can raise or lower it globally or per plugin
+// without an upper bound.
+const DefaultMaxPluginItems = 2_000_000
+
+// RuntimeLimits requests per-call hosted resources and data/catalogue ceilings.
+// Ether grants defaults for omitted fields and clamps requests to
+// owner-controlled ceilings.
+type RuntimeLimits struct {
+	FetchBytes           int64  `json:"fetchBytes,omitempty"`
+	ArchiveMemberBytes   int64  `json:"archiveMemberBytes,omitempty"`
+	ArchiveExpandedBytes int64  `json:"archiveExpandedBytes,omitempty"`
+	ArchiveMembers       int    `json:"archiveMembers,omitempty"`
+	MaxItems             int    `json:"maxItems,omitempty"`    // default 2,000,000 stored items across the plugin's libraries; owner-controlled
+	MemoryBytes          uint64 `json:"memoryBytes,omitempty"` // default 32 MiB, ceiling owner-controlled, up to 4 GiB
+	// ReadBytes is the granted per-call byte ceiling for cache.read,
+	// archive.open and archive.read, derived from MemoryBytes:
+	// clamp(memoryBytes/4, 8 MiB, 512 MiB).
+	ReadBytes int64 `json:"readBytes,omitempty"`
+	// Deadline and UnitBudget are the granted ceilings in manifests/detail
+	// and the active route's effective call limits when read via runtime.limits.
+	Deadline   string `json:"deadline,omitempty"`   // Go duration; default 12h ceiling, clamped per route on active calls
+	UnitBudget int64  `json:"unitBudget,omitempty"` // default effectively unlimited ceiling; viewer routes clamp to 10,000 units/s of Deadline
+	// PoolSize is the hosted WASM instance pool size (default 2, ceiling owner-controlled up to 4).
+	// Background jobs hold at most PoolSize-1 instances so interactive calls retain a free instance.
+	PoolSize int `json:"poolSize,omitempty"`
+}
+
+// SidecarDecl says how a remote plugin's program comes to be: a Docker image,
+// a download with a start command, or documentation only. Every field is
+// optional; an empty block is valid but the console shows only the pairing
+// code.
+type SidecarDecl struct {
+	// Docker is an image reference (registry/name:tag or @sha256).
+	Docker string `json:"docker,omitempty"`
+	// Download is an https URL to the program.
+	Download string `json:"download,omitempty"`
+	// Command starts the program after download (single line, <= 200 chars).
+	Command string `json:"command,omitempty"`
+	// Docs is an https URL with setup instructions.
+	Docs string `json:"docs,omitempty"`
 }
 
 // HealthDecl declares the health-check interval (minimum 15s).
@@ -183,7 +247,10 @@ type Permissions struct {
 	Viewers     ViewerPerms `json:"viewers,omitempty" yaml:"viewers,omitempty"`
 	Collections string      `json:"collections,omitempty" yaml:"collections,omitempty"` // ""|none|write
 	Folders     string      `json:"folders,omitempty" yaml:"folders,omitempty"`         // ""|none|read
-	Secrets     []string    `json:"secrets,omitempty" yaml:"secrets,omitempty"`
+	// Sources lets a kind resolver ask Ether to find bytes through the
+	// owner's indexers and debrid accounts (spec §4.5).
+	Sources string   `json:"sources,omitempty" yaml:"sources,omitempty"` // ""|none|search|acquire
+	Secrets []string `json:"secrets,omitempty" yaml:"secrets,omitempty"`
 }
 
 // ViewerPerms holds the three viewer permission levels.
@@ -200,25 +267,42 @@ type PackStyle struct {
 }
 
 type Contributes struct {
-	Looks          []PackStyle         `json:"looks,omitempty"`
-	OnAirFeeds     []OnAirFeed         `json:"onairFeeds,omitempty"`
-	OnAirSegments  []OnAirSegment      `json:"onairSegments,omitempty"`
-	Directories    []DirectoryMeta     `json:"directories,omitempty"`
-	Metadata       *MetadataMeta       `json:"metadata,omitempty"`
-	Source         *SourceMeta         `json:"source,omitempty"`
-	Channels       *ChannelsMeta       `json:"channels,omitempty"`
-	Subtitles      *SubtitlesMeta      `json:"subtitles,omitempty"`
-	Markers        *MarkersMeta        `json:"markers,omitempty"`
-	Notification   *NotificationMeta   `json:"notification,omitempty"`
-	Events         *EventsMeta         `json:"events,omitempty"`
-	Integration    *IntegrationMeta    `json:"integration,omitempty"`
-	ListSources    []ListSourceMeta    `json:"listSources,omitempty"`
-	RankingSteps   []RankingStepMeta   `json:"rankingSteps,omitempty"`
-	RuleConditions []RuleConditionMeta `json:"ruleConditions,omitempty"`
-	Tools          []ToolMeta          `json:"tools,omitempty"`
-	Pages          []PageMeta          `json:"pages,omitempty"`
-	Slots          []SlotMeta          `json:"slots,omitempty"`
-	Commands       []CommandMeta       `json:"commands,omitempty"`
+	Looks          []PackStyle          `json:"looks,omitempty"`
+	OnAirFeeds     []OnAirFeed          `json:"onairFeeds,omitempty"`
+	OnAirSegments  []OnAirSegment       `json:"onairSegments,omitempty"`
+	Directories    []DirectoryMeta      `json:"directories,omitempty"`
+	Metadata       *MetadataMeta        `json:"metadata,omitempty"`
+	Source         *SourceMeta          `json:"source,omitempty"`
+	Channels       *ChannelsMeta        `json:"channels,omitempty"`
+	Subtitles      *SubtitlesMeta       `json:"subtitles,omitempty"`
+	Markers        *MarkersMeta         `json:"markers,omitempty"`
+	Notification   *NotificationMeta    `json:"notification,omitempty"`
+	Events         *EventsMeta          `json:"events,omitempty"`
+	FlowActions    []FlowActionMeta     `json:"flowActions,omitempty"`
+	Integration    *IntegrationMeta     `json:"integration,omitempty"`
+	ListSources    []ListSourceMeta     `json:"listSources,omitempty"`
+	RankingSteps   []RankingStepMeta    `json:"rankingSteps,omitempty"`
+	RuleConditions []RuleConditionMeta  `json:"ruleConditions,omitempty"`
+	PosterBadges   []PosterBadgeSetMeta `json:"posterBadges,omitempty"`
+	Tools          []ToolMeta           `json:"tools,omitempty"`
+	Pages          []PageMeta           `json:"pages,omitempty"`
+	Slots          []SlotMeta           `json:"slots,omitempty"`
+	Commands       []CommandMeta        `json:"commands,omitempty"`
+	// MediaKinds declares the content kinds this plugin serves; each entry
+	// that declares a library block becomes its own library (spec §2.1).
+	MediaKinds []MediaKindMeta `json:"mediaKinds,omitempty"`
+	// FrontendAdapters declares protocol surfaces this plugin serves
+	// through Ether's generic adapter frontend (spec §6.5).
+	FrontendAdapters []FrontendAdapterMeta `json:"frontendAdapters,omitempty"`
+	// Setup declares guided setup steps for any plugin kind (§8).
+	Setup *SetupMeta `json:"setup,omitempty"`
+}
+
+// PosterBadgeSetMeta declares one poster overlay badge set contributed by a plugin (#594).
+type PosterBadgeSetMeta struct {
+	Key         string `json:"key"`
+	Label       string `json:"label"`
+	Description string `json:"description,omitempty"`
 }
 
 // SourceMeta is mandatory for stream_source.
@@ -253,9 +337,75 @@ type NotificationMeta struct {
 	MaxLength int             `json:"maxLength,omitempty"`
 }
 
-// EventsMeta is mandatory for events.
+// EventsMeta is mandatory for events. Subscribe lists built-in or plugin event
+// names delivered to POST /ether/event; Publish declares custom event schemas
+// the plugin may emit onto Ether's event bus as "plugin:<pluginId>/<key>".
 type EventsMeta struct {
-	Subscribe []string `json:"subscribe"`
+	Subscribe []string             `json:"subscribe,omitempty"`
+	Publish   []PublishedEventMeta `json:"publish,omitempty"`
+}
+
+// EventEnumOption describes one allowed option for an enum event field or flow
+// action parameter.
+type EventEnumOption struct {
+	Value string `json:"value"`
+	Label string `json:"label,omitempty"`
+}
+
+// EventFieldMeta describes one typed field in a published plugin event payload
+// or a flow action output object.
+type EventFieldMeta struct {
+	Name        string            `json:"name"`
+	Type        string            `json:"type"`
+	Label       string            `json:"label"`
+	Description string            `json:"description,omitempty"`
+	Unit        string            `json:"unit,omitempty"`
+	Enum        []EventEnumOption `json:"enum,omitempty"`
+	PII         bool              `json:"pii,omitempty"`
+	Secret      bool              `json:"secret,omitempty"`
+	Filterable  bool              `json:"filterable,omitempty"`
+	Example     any               `json:"example,omitempty"`
+}
+
+// PublishedEventMeta declares one custom event type a plugin emits through
+// Host.PublishEvent ("plugin:<pluginId>/<key>").
+type PublishedEventMeta struct {
+	Key         string           `json:"key"`
+	Label       string           `json:"label"`
+	Description string           `json:"description,omitempty"`
+	Version     int              `json:"version,omitempty"`
+	Fields      []EventFieldMeta `json:"fields,omitempty"`
+}
+
+// FlowActionParamMeta describes one configurable parameter of a plugin flow action.
+type FlowActionParamMeta struct {
+	Key         string            `json:"key"`
+	Type        string            `json:"type"`
+	Label       string            `json:"label"`
+	Description string            `json:"description,omitempty"`
+	Required    bool              `json:"required,omitempty"`
+	Secret      bool              `json:"secret,omitempty"`
+	Template    bool              `json:"template,omitempty"`
+	Default     any               `json:"default,omitempty"`
+	Enum        []EventEnumOption `json:"enum,omitempty"`
+	Unit        string            `json:"unit,omitempty"`
+	Picker      string            `json:"picker,omitempty"`
+}
+
+// FlowActionMeta declares one Flow action contributed by a plugin
+// ("plugin:<pluginId>/<key>"). Ether invokes Route with HTTP POST and an
+// X-Ether-Idempotency-Key header.
+type FlowActionMeta struct {
+	Key         string                `json:"key"`
+	Label       string                `json:"label"`
+	Description string                `json:"description,omitempty"`
+	Icon        string                `json:"icon,omitempty"`
+	Route       string                `json:"route"`
+	Idempotent  bool                  `json:"idempotent,omitempty"`
+	SideEffect  *bool                 `json:"sideEffect,omitempty"`
+	Timeout     string                `json:"timeout,omitempty"`
+	Params      []FlowActionParamMeta `json:"params,omitempty"`
+	Outputs     []EventFieldMeta      `json:"outputs,omitempty"`
 }
 
 // IntegrationMeta is mandatory for the integration kind.
@@ -280,12 +430,11 @@ type ListSourceMeta struct {
 
 // RankingStepMeta is one contributed ranking step (hosted only).
 type RankingStepMeta struct {
-	Key             string          `json:"key"`
-	Label           string          `json:"label"`
-	Hint            string          `json:"hint,omitempty"`
-	Editor          json.RawMessage `json:"editor,omitempty"`
-	DefaultPosition int             `json:"defaultPosition,omitempty"`
-	Budget          json.RawMessage `json:"budget,omitempty"`
+	Key    string          `json:"key"`
+	Label  string          `json:"label"`
+	Hint   string          `json:"hint,omitempty"`
+	Editor json.RawMessage `json:"editor,omitempty"`
+	Budget json.RawMessage `json:"budget,omitempty"`
 }
 
 // RuleConditionMeta is one contributed rule condition (hosted only).
@@ -332,6 +481,392 @@ type CommandMeta struct {
 	Action string `json:"action"` // plugin action name
 }
 
+// MediaKindMeta declares one content kind (spec §2.1).
+type MediaKindMeta struct {
+	Key     string             `json:"key"` // ^[a-z][a-z0-9-]{0,31}$, unique in the plugin
+	Label   string             `json:"label"`
+	Library KindLibraryDecl    `json:"library,omitzero"`
+	Levels  []KindLevel        `json:"levels"`           // 1..5, first is the root
+	Fields  []KindField        `json:"fields,omitempty"` //
+	Art     []KindArt          `json:"art,omitempty"`    // roles beyond poster/backdrop/thumb/logo
+	Present core.Presentations `json:"present,omitzero"`
+	Browse  KindBrowseDecl     `json:"browse"`
+	Sync    KindSyncDecl       `json:"sync"`
+	Cache   KindCacheDecl      `json:"cache,omitempty"`
+	Match   KindMatchDecl      `json:"match,omitempty"`
+}
+
+// MaxKindLibraryTabs is the maximum number of declared sub-tabs per kind library.
+const MaxKindLibraryTabs = 50
+
+// KindLibraryDecl is the optional library created for a kind on install.
+type KindLibraryDecl struct {
+	Name        string             `json:"name"` // default name; the owner may rename it after
+	Icon        string             `json:"icon,omitempty"`
+	Card        string             `json:"card,omitempty"`        // poster (default)|landscape|square
+	DateDisplay string             `json:"dateDisplay,omitempty"` // year (default)|date
+	Tabs        []KindLibraryTab   `json:"tabs,omitempty"`        // up to 50; defaults to Recommended + Library
+	Shelves     []KindLibraryShelf `json:"shelves,omitempty"`     // up to 40; default Recommended shelves
+}
+
+// KindLibraryTab declares one sub-tab shown inside a plugin library.
+type KindLibraryTab struct {
+	Key               string          `json:"key"`
+	Label             string          `json:"label"`
+	Kind              string          `json:"kind"`                        // recommended|library|collections|people|view|live
+	Facet             string          `json:"facet,omitempty"`             // declared browse.facets entry (collections or people)
+	Sort              string          `json:"sort,omitempty"`              // one of browse.sorts or lastViewed (facet collections or view)
+	Direction         string          `json:"direction,omitempty"`         // asc|desc (facet collections or view)
+	Order             string          `json:"order,omitempty"`             // count|name (facet collections or people)
+	Card              string          `json:"card,omitempty"`              // landscape (default)|poster|square (live tabs only)
+	Layout            string          `json:"layout,omitempty"`            // grid (default)|list|timeline (view tabs only)
+	Search            *bool           `json:"search,omitempty"`            // collections, people, view or live (default true)
+	SearchPlaceholder string          `json:"searchPlaceholder,omitempty"` // localizable placeholder, <= 60 chars
+	Filters           *core.TabFilter `json:"filters,omitempty"`           // saved filter rules (view tabs only)
+}
+
+// EffectiveSearch reports whether tab search is enabled. Search defaults to
+// true on collections, people, view and live tabs and is never enabled on
+// other manifest tab kinds.
+func (t KindLibraryTab) EffectiveSearch() bool {
+	if t.Kind != "collections" && t.Kind != "people" && t.Kind != "view" && t.Kind != "live" {
+		return false
+	}
+	if t.Search != nil {
+		return *t.Search
+	}
+	return true
+}
+
+// EffectiveLayout returns the tab's layout ("grid" by default for view tabs,
+// empty for other tab kinds).
+func (t KindLibraryTab) EffectiveLayout() string {
+	if t.Kind != "view" {
+		return ""
+	}
+	switch t.Layout {
+	case core.TabLayoutGrid, core.TabLayoutList, core.TabLayoutTimeline:
+		return t.Layout
+	default:
+		return core.TabLayoutGrid
+	}
+}
+
+// EffectiveCard returns the tab's card shape ("landscape" by default for live
+// tabs, empty for other tab kinds).
+func (t KindLibraryTab) EffectiveCard() string {
+	if t.Kind != "live" {
+		return ""
+	}
+	switch t.Card {
+	case "poster", "landscape", "square":
+		return t.Card
+	default:
+		return "landscape"
+	}
+}
+
+// IsZero reports whether every field of the library declaration is empty.
+func (d KindLibraryDecl) IsZero() bool {
+	return d.Name == "" && d.Icon == "" && d.Card == "" && d.DateDisplay == "" && len(d.Tabs) == 0 && len(d.Shelves) == 0
+}
+
+// EffectiveCard returns the library's card aspect ("poster" by default).
+func (d KindLibraryDecl) EffectiveCard() string {
+	switch d.Card {
+	case "landscape", "square":
+		return d.Card
+	default:
+		return "poster"
+	}
+}
+
+// EffectiveDateDisplay returns how dates are shown on cards and detail headers
+// ("year" by default, or "date" for full YYYY-MM-DD display).
+func (d KindLibraryDecl) EffectiveDateDisplay() string {
+	if d.DateDisplay == "date" {
+		return "date"
+	}
+	return "year"
+}
+
+// KindLiveRequest is the request body sent to POST /ether/v1/kinds/{kind}/live.
+type KindLiveRequest struct {
+	Tab    string `json:"tab,omitempty"`
+	Q      string `json:"q,omitempty"`
+	Filter string `json:"filter,omitempty"`
+	Cursor string `json:"cursor,omitempty"`
+	Limit  int    `json:"limit,omitempty"`
+}
+
+// KindLiveItem is one currently live stream returned by a plugin live tab.
+type KindLiveItem struct {
+	ID       string   `json:"id"`
+	Title    string   `json:"title"`
+	Subtitle string   `json:"subtitle,omitempty"`
+	Badge    string   `json:"badge,omitempty"`
+	Viewers  *int     `json:"viewers,omitempty"`
+	Tags     []string `json:"tags,omitempty"`
+	Thumb    string   `json:"thumb,omitempty"`
+	Live     *bool    `json:"live,omitempty"`
+}
+
+// IsLive reports whether the item is live (defaults to true when omitted).
+func (i KindLiveItem) IsLive() bool {
+	return i.Live == nil || *i.Live
+}
+
+// KindLiveFilter is one optional filter chip returned alongside live items.
+type KindLiveFilter struct {
+	Key   string `json:"key"`
+	Label string `json:"label"`
+}
+
+// KindLivePage is the response returned by POST /ether/v1/kinds/{kind}/live.
+type KindLivePage struct {
+	Items      []KindLiveItem   `json:"items"`
+	Filters    []KindLiveFilter `json:"filters,omitempty"`
+	NextCursor string           `json:"nextCursor,omitempty"`
+}
+
+// KindLiveResolveRequest is the request body sent to POST /ether/v1/kinds/{kind}/live/resolve.
+type KindLiveResolveRequest struct {
+	ID string `json:"id"`
+}
+
+// KindLiveResolveResponse is the direct playable stream returned by
+// POST /ether/v1/kinds/{kind}/live/resolve.
+type KindLiveResolveResponse struct {
+	URL     string            `json:"url"`
+	Headers map[string]string `json:"headers,omitempty"`
+	MIME    string            `json:"mime,omitempty"`
+	Title   string            `json:"title,omitempty"`
+}
+
+// EffectiveTabs returns the declared tabs, or the default Recommended and Library tabs.
+func (d KindLibraryDecl) EffectiveTabs() []KindLibraryTab {
+	if len(d.Tabs) > 0 {
+		out := make([]KindLibraryTab, len(d.Tabs))
+		copy(out, d.Tabs)
+		return out
+	}
+	return []KindLibraryTab{
+		{Key: "recommended", Label: "Recommended", Kind: "recommended"},
+		{Key: "library", Label: "Library", Kind: "library"},
+	}
+}
+
+// MaxKindLibraryShelves is the maximum number of declared Recommended shelves per kind library.
+const MaxKindLibraryShelves = 40
+
+// KindLibraryShelf declares one default Recommended shelf for a plugin library.
+// Each shelf gets the stable row ID "plugin:<viewID>:shelf:<key>" so the
+// library's Recommended row editor can reorder, hide, pin, or cap it.
+type KindLibraryShelf struct {
+	Key       string              `json:"key"`
+	Label     string              `json:"label"`
+	Sort      string              `json:"sort,omitempty"`      // released (default)|title|added|year|rating|index
+	Direction string              `json:"direction,omitempty"` // desc (default)|asc
+	Facet     string              `json:"facet,omitempty"`     // single-facet shorthand (declared and indexed)
+	Value     string              `json:"value,omitempty"`     // single value for facet
+	Values    []string            `json:"values,omitempty"`    // OR values for facet
+	Filters   map[string][]string `json:"filters,omitempty"`   // AND across facets, OR within each facet
+}
+
+// EffectiveSort returns the shelf's sort field ("released" by default).
+func (s KindLibraryShelf) EffectiveSort() string {
+	if s.Sort != "" {
+		return s.Sort
+	}
+	return "released"
+}
+
+// EffectiveDirection returns the shelf's sort direction ("desc" by default).
+func (s KindLibraryShelf) EffectiveDirection() string {
+	if s.Direction == "asc" {
+		return "asc"
+	}
+	return "desc"
+}
+
+// EffectiveFilters returns the shelf's facet filter map (AND across facets,
+// OR within each facet), or nil when the shelf is unfiltered.
+func (s KindLibraryShelf) EffectiveFilters() map[string][]string {
+	if s.Facet != "" {
+		if len(s.Values) > 0 {
+			vals := make([]string, 0, len(s.Values))
+			for _, v := range s.Values {
+				if v = strings.TrimSpace(v); v != "" {
+					vals = append(vals, v)
+				}
+			}
+			if len(vals) == 0 {
+				return nil
+			}
+			return map[string][]string{s.Facet: vals}
+		}
+		if v := strings.TrimSpace(s.Value); v != "" {
+			return map[string][]string{s.Facet: {v}}
+		}
+		return nil
+	}
+	if len(s.Filters) == 0 {
+		return nil
+	}
+	out := make(map[string][]string, len(s.Filters))
+	for k, raw := range s.Filters {
+		var vals []string
+		for _, v := range raw {
+			if v = strings.TrimSpace(v); v != "" {
+				vals = append(vals, v)
+			}
+		}
+		if len(vals) > 0 {
+			out[k] = vals
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// KindLevel is one hierarchy level of a kind.
+type KindLevel struct {
+	Key       string `json:"key"`
+	Label     string `json:"label"`
+	Playable  bool   `json:"playable,omitempty"`  // leaves the resolver can open; at least one level
+	Container bool   `json:"container,omitempty"` // item is a container other leaves are extracted from
+}
+
+// KindField is one declared item field.
+type KindField struct {
+	Key     string   `json:"key"`  // ^[a-z][a-zA-Z0-9_]{0,39}$
+	Type    string   `json:"type"` // string|int|float|bool|date|duration|enum|strings|people
+	Label   string   `json:"label"`
+	Indexed bool     `json:"indexed,omitempty"` // gets a typed column in the item store
+	Enum    []string `json:"enum,omitempty"`
+}
+
+// KindArt declares one extra artwork role.
+type KindArt struct {
+	Role  string `json:"role"`
+	Label string `json:"label"`
+}
+
+// Builtin kind art roles; declared roles must not repeat them.
+var BuiltinKindArtRoles = map[string]bool{"poster": true, "backdrop": true, "thumb": true, "logo": true}
+
+// DefaultKindExpandTTLHours is the default freshness window (7 days) for an
+// expanded facet bucket or people credit before opening it again triggers a
+// fresh background expansion.
+const DefaultKindExpandTTLHours = 168
+
+// KindBrowseExpand declares on-demand background expansion for specific browse
+// facets (collection buckets or people fields).
+type KindBrowseExpand struct {
+	Facets   []string `json:"facets"`             // subset of browse.facets
+	TTLHours int      `json:"ttlHours,omitempty"` // default 168 (7 days)
+}
+
+// EffectiveTTLHours returns the configured freshness window in hours,
+// defaulting to DefaultKindExpandTTLHours (168).
+func (e *KindBrowseExpand) EffectiveTTLHours() int {
+	if e == nil || e.TTLHours <= 0 {
+		return DefaultKindExpandTTLHours
+	}
+	return e.TTLHours
+}
+
+// KindBrowseDecl is how a kind library is browsed.
+type KindBrowseDecl struct {
+	Sorts        []string          `json:"sorts,omitempty"`        // subset of title|added|released|year|rating|index
+	Facets       []string          `json:"facets,omitempty"`       // field keys; each must be indexed
+	Search       bool              `json:"search"`                 // full-text over the title plus SearchFields
+	SearchFields []string          `json:"searchFields,omitempty"` // declared text fields included in search
+	Expand       *KindBrowseExpand `json:"expand,omitempty"`       // on-demand background facet/person expansion
+	// LiveSearch: client searches also call the plugin's /search route
+	// with a short budget; results are upserted and merged (§15.4).
+	LiveSearch bool `json:"liveSearch,omitempty"`
+}
+
+// Kind sync modes (spec §3.5 as narrowed by §15.4: no ondemand mode).
+const (
+	KindSyncPull = "pull"
+	KindSyncPush = "push"
+)
+
+// KindSyncDecl is how a kind's items reach Ether's store. Mode is empty
+// only for a resolver-only kind, which owns no item sync; a catalog
+// provider must pick pull or push.
+type KindSyncDecl struct {
+	Mode    string `json:"mode"`              // pull|push
+	Refresh string `json:"refresh,omitempty"` // at least 15m, pull only
+}
+
+// KindCacheDecl is the per-library blob cache budget (§5.4).
+type KindCacheDecl struct {
+	MaxBytes int64  `json:"maxBytes,omitempty"` // 0 = server default
+	TTL      string `json:"ttl,omitempty"`
+}
+
+// Blob cache budget defaults (§15.5): the per-library default quota and
+// the shared absolute cap. The shared cap is also bounded by 5% of the
+// cache disk at runtime, which only the cache owner can measure.
+const (
+	DefaultKindCacheMaxBytes int64 = 2 << 30
+	SharedKindCacheCapBytes  int64 = 10 << 30
+)
+
+// EffectiveMaxBytes resolves the declared cache cap against the default.
+func (c KindCacheDecl) EffectiveMaxBytes() int64 {
+	if c.MaxBytes <= 0 {
+		return DefaultKindCacheMaxBytes
+	}
+	return c.MaxBytes
+}
+
+// KindMatchDecl holds matcher defaults for a kind (spec §7).
+type KindMatchDecl struct {
+	// ThresholdDefault is the score (0..1) at or above which an
+	// automatic match is accepted; 0 leaves the server default.
+	ThresholdDefault float64 `json:"thresholdDefault,omitempty"`
+}
+
+// FrontendAdapterMeta declares one plugin-provided protocol surface
+// (spec §6.5).
+type FrontendAdapterMeta struct {
+	Key          string   `json:"key"`
+	Label        string   `json:"label"`
+	ProtocolHint string   `json:"protocolHint"` // opds|subsonic|custom
+	PathPrefix   string   `json:"pathPrefix"`
+	DefaultPort  int      `json:"defaultPort,omitempty"`
+	Clients      []string `json:"clients,omitempty"`
+	Auth         string   `json:"auth,omitempty"` // ether_token (default)|basic|none_lan
+	// Libraries lists the plugin's media-kind keys this adapter publishes.
+	// Ether resolves each key to the library the kind created and admits a
+	// viewer only to the libraries they may see; a viewer who sees none of
+	// them is answered 404. Empty means the adapter is not library-scoped.
+	Libraries []string `json:"libraries,omitempty"`
+}
+
+// SetupMeta declares guided setup for any plugin kind (spec §8).
+type SetupMeta struct {
+	Steps []SetupStep `json:"steps"`
+}
+
+// SetupStep is one setup wizard step. An empty Test means saving the
+// fields is the whole step; otherwise Ether posts the step's saved
+// field values to Test, conventionally /ether/v1/setup/<key>/test.
+type SetupStep struct {
+	Key      string   `json:"key"`
+	Label    string   `json:"label"`
+	Hint     string   `json:"hint,omitempty"`
+	Fields   []string `json:"fields"` // settings field keys this step collects
+	Test     string   `json:"test"`   // plugin route, or "" for no test
+	Required bool     `json:"required"`
+}
+
 // Request is one HTTP-shaped call from Ether to a plugin (SPEC §5.1.2).
 // Hosted plugins receive the same object in-process.
 type Request struct {
@@ -343,12 +878,28 @@ type Request struct {
 	Query    map[string]string `json:"query,omitempty"`
 	Headers  map[string]string `json:"headers,omitempty"`
 	Body     json.RawMessage   `json:"body,omitempty"`
+	// BodyBase64 carries the exact request bytes, base64-encoded, when the
+	// caller needs them byte-for-byte (frontend adapter routes). Body holds
+	// the parsed JSON value when the bytes are valid JSON; a non-JSON body
+	// arrives only here, never as an invalid RawMessage.
+	BodyBase64  string `json:"bodyBase64,omitempty"`
+	ContentType string `json:"contentType,omitempty"`
 	// Locale is the console locale for calls that return copy.
 	Locale string `json:"locale,omitempty"`
 }
 
+// FrontendBlob asks the host to serve cached bytes without passing them through
+// guest memory. LibraryKey scopes Ref to an owned, viewer-visible kind library.
+// MemberIndex selects an archive member; nil serves the entire blob.
+type FrontendBlob struct {
+	LibraryKey  string `json:"libraryKey"`
+	Ref         string `json:"ref"`
+	MemberIndex *int   `json:"memberIndex,omitempty"`
+}
+
 // Response is a plugin's answer to a Request.
 type Response struct {
+	Blob    *FrontendBlob     `json:"blob,omitempty"`
 	Status  int               `json:"status"`
 	Headers map[string]string `json:"headers,omitempty"`
 	Body    json.RawMessage   `json:"body,omitempty"`
@@ -366,8 +917,10 @@ type Runtime interface {
 // Installed is the host's record of one installed plugin, handed to a
 // RuntimeFactory when an instance is opened.
 type Installed struct {
-	ID       string
-	Manifest Manifest
+	RuntimeLimits *RuntimeLimits
+	Busy          func() bool
+	ID            string
+	Manifest      Manifest
 	// SourceURL is where the manifest came from (remote endpoint base).
 	SourceURL string
 	// Files returns an artifact file (entry, module, strings, schema) for
@@ -381,6 +934,43 @@ type Installed struct {
 // chosen by manifest ether.runtime.kind ("hosted" or "remote").
 type RuntimeFactory func(inst Installed) (Runtime, error)
 
+// KVUsage reports a plugin's current KV bytes (including the 256-byte charge
+// per key), key count, and configured quotas (#591).
+type KVUsage struct {
+	Bytes      int64 `json:"bytes"`
+	Keys       int64 `json:"keys"`
+	QuotaBytes int64 `json:"quotaBytes"`
+	QuotaKeys  int64 `json:"quotaKeys"`
+}
+
+// Poster badge bounds (#594).
+const (
+	MaxPosterBadgeSets     = 4
+	MaxBadgeEntriesPerCall = 500
+	MaxBadgeLabelsPerTitle = 3
+	MaxBadgeLabelLen       = 16
+	PosterBadgeQuotaTitles = 200_000
+)
+
+// BadgeTitleRef identifies a canonical movie or show by TMDB and/or IMDb id.
+type BadgeTitleRef struct {
+	Type string `json:"type"`
+	TMDB int64  `json:"tmdb,omitempty"`
+	IMDB string `json:"imdb,omitempty"`
+}
+
+// BadgeEntry pushes or clears (empty Labels) poster badges for one title.
+type BadgeEntry struct {
+	Title  BadgeTitleRef `json:"title"`
+	Labels []string      `json:"labels"`
+}
+
+// BadgeUsage reports a plugin's badged title count and per-plugin title quota.
+type BadgeUsage struct {
+	Titles      int64 `json:"titles"`
+	QuotaTitles int64 `json:"quotaTitles"`
+}
+
 // Host is the set of Ether services a plugin may call (SPEC §5.1.5).
 // Every method re-checks the plugin's live grants, so a revoke takes
 // effect mid-call. Writes are journalled; in shadow mode they are
@@ -391,6 +981,12 @@ type Host interface {
 	KVPut(ctx context.Context, key string, value []byte) error
 	KVDelete(ctx context.Context, key string) error
 	KVList(ctx context.Context, prefix string) ([]string, error)
+	KVUsage(ctx context.Context) (KVUsage, error)
+
+	// BadgesSet, BadgesClear and BadgesUsage need poster_badges (#594).
+	BadgesSet(ctx context.Context, setKey string, entries []BadgeEntry) error
+	BadgesClear(ctx context.Context, setKey string) error
+	BadgesUsage(ctx context.Context) (BadgeUsage, error)
 
 	// SecretGet returns a sealed setting the manifest declared in
 	// permissions.secrets. Hosted plugins only.
@@ -413,16 +1009,64 @@ type Host interface {
 	// CollectionsUpsert needs collections: write; journalled.
 	CollectionsUpsert(ctx context.Context, collection json.RawMessage) error
 
+	// KindUpsert and KindDelete need catalog_provider and a push-mode
+	// kind (spec §3.6): the sync engine is the only writer for pull
+	// kinds. Writes are journalled in shadow mode without applying.
+	KindUpsert(ctx context.Context, kindKey string, items []core.KindItem) (accepted int, err error)
+	KindDelete(ctx context.Context, kindKey string, externalIDs []string) error
+	// KindItems reads the plugin's own library back, keyset-paged.
+	KindItems(ctx context.Context, kindKey, cursor string, limit int) (core.KindPage, error)
+	// KindVisible returns the subset of external IDs (at most MaxKindVisibleIDs)
+	// in kindKey that the library's Rules and viewer access policy allow for the
+	// requesting frontend-adapter viewer (#615). Only viewer-authenticated
+	// frontend adapter requests may call it; the viewer comes from the adapter
+	// request context, never from guest input.
+	KindVisible(ctx context.Context, kindKey string, ids []string) ([]string, error)
+	// KindBrowse browses or searches kindKey using the same LibraryPolicy path
+	// as Ether's console and protocol projectors for the requesting
+	// frontend-adapter viewer (#615). Only viewer-authenticated frontend adapter
+	// requests may call it; the viewer comes from the adapter request context,
+	// never from guest input.
+	KindBrowse(ctx context.Context, kindKey string, q core.KindBrowseRequest) (core.KindPage, error)
+	// ResolveSources needs kind_resolver and permissions.sources
+	// (search to look, acquire to open debrid content, §4.5).
+	ResolveSources(ctx context.Context, q core.SourceQuery) ([]core.SourceCandidate, error)
+	// CachePut stores one blob in a kind library's cache namespace and
+	// returns its "blob:<sha256>" reference; CacheOpen reads one back;
+	// CacheDelete removes one from this plugin's own namespaces.
+	CachePut(ctx context.Context, libraryKey, name string, r io.Reader) (blobRef string, err error)
+	CacheOpen(ctx context.Context, blobRef string) (io.ReadSeekCloser, error)
+	CacheDelete(ctx context.Context, blobRef string) error
+
+	// StreamURL mints a short-lived, scoped ticket for one of this
+	// plugin's own kind items and returns the Ether stream URL a frontend
+	// adapter embeds instead of a plugin URL (spec §6.5). The viewer is
+	// the one the proxied request authenticated (X-Ether-Viewer); items
+	// from another plugin, or a library the viewer cannot see, are
+	// refused. Bytes are then served by Ether, never by the plugin.
+	StreamURL(ctx context.Context, itemRef string) (string, error)
+	StreamPartURL(ctx context.Context, itemRef string, partIndex *int) (string, error)
+
 	// FoldersList and FoldersStat need folders: read and an owner-picked
 	// root. They never return file contents.
 	FoldersList(ctx context.Context, root, path string) ([]FolderEntry, error)
 	FoldersStat(ctx context.Context, root, path string) (FolderEntry, error)
+	FoldersHash(ctx context.Context, root, path string) (FolderHash, error)
+	FoldersHashStart(ctx context.Context, root, path string) (FolderHashJob, error)
+	FoldersHashPoll(ctx context.Context, id string) (FolderHashJob, error)
+	FoldersHashCancel(ctx context.Context, id string) (FolderHashJob, error)
 
 	// Settings returns the plugin's current non-secret settings. Plugins
 	// read them per request instead of keeping them in instance memory,
 	// because hosted plugins run in a pool of instances that restart.
 	// Secrets stay behind SecretGet.
 	Settings(ctx context.Context) (map[string]any, error)
+
+	// PublishEvent emits one manifest-declared plugin event onto Ether's event
+	// bus as "plugin:<pluginId>/<key>". Requires the events capability and a
+	// matching entry in contributes.events.publish; payload is schema-validated
+	// and rate-limited.
+	PublishEvent(ctx context.Context, key string, payload json.RawMessage, corr events.Correlation) error
 
 	// NotifyOwner posts a console notice (rate-limited).
 	NotifyOwner(ctx context.Context, text string) error
@@ -432,10 +1076,11 @@ type Host interface {
 
 // FetchRequest is one plugin outbound HTTP call.
 type FetchRequest struct {
-	Method  string            `json:"method"`
-	URL     string            `json:"url"`
-	Headers map[string]string `json:"headers,omitempty"`
-	Body    []byte            `json:"body,omitempty"`
+	TimeoutMS int64             `json:"timeoutMs,omitempty"`
+	Method    string            `json:"method"`
+	URL       string            `json:"url"`
+	Headers   map[string]string `json:"headers,omitempty"`
+	Body      []byte            `json:"body,omitempty"`
 }
 
 // FetchResponse is the answer to a FetchRequest (body capped at 10 MiB).
@@ -443,6 +1088,25 @@ type FetchResponse struct {
 	Status  int               `json:"status"`
 	Headers map[string]string `json:"headers,omitempty"`
 	Body    []byte            `json:"body,omitempty"`
+}
+
+// FolderHashJob is a pollable background hash. Bytes is the progress so far.
+// Terminal states are done, canceled and error. Only done carries Result.
+type FolderHashJob struct {
+	ID     string      `json:"id"`
+	State  string      `json:"state"`
+	Bytes  int64       `json:"bytes"`
+	Result *FolderHash `json:"result,omitempty"`
+	Error  string      `json:"error,omitempty"`
+}
+
+// FolderHash contains digests, never file contents. ModTime is Unix seconds.
+type FolderHash struct {
+	Size    int64  `json:"size"`
+	ModTime int64  `json:"modTime"`
+	CRC32   string `json:"crc32"`
+	MD5     string `json:"md5"`
+	SHA1    string `json:"sha1"`
 }
 
 // FolderEntry is one entry from FoldersList or FoldersStat.
@@ -525,6 +1189,7 @@ type CatalogueArtifact struct {
 	Version      string
 	URL          string
 	SHA256       string
+	Icon         string
 	Kind         Kind
 	Permissions  Permissions
 	Capabilities []Capability
@@ -546,9 +1211,15 @@ var (
 
 	ErrPermissionDenied = errors.New("plugins: permission denied")
 	ErrQuotaExceeded    = errors.New("plugins: storage quota exceeded")
+	ErrRateLimited      = errors.New("plugins: rate limit exceeded")
 	ErrDisabled         = errors.New("plugins: plugin is disabled")
 	ErrNoRuntime        = errors.New("plugins: no runtime registered for this plugin")
 	ErrUnavailable      = errors.New("plugins: host service unavailable")
+	ErrBusy             = errors.New("plugins: plugin is busy")
+	// ErrUnsupportedBody reports a request body Ether could not encode for
+	// the plugin at all: the guest never ran, so it is never a plugin crash.
+	ErrUnsupportedBody = errors.New("plugins: request body cannot be delivered to the plugin")
+	ErrJobsBusy        = core.ErrJobsBusy
 
 	ErrDigestMismatch = errors.New("plugins: artifact digest does not match")
 	ErrRevoked        = errors.New("plugins: plugin was revoked")

@@ -3,6 +3,7 @@ package livetv
 import (
 	"context"
 	"encoding/json"
+	"maps"
 	"sync"
 	"time"
 )
@@ -39,34 +40,74 @@ func (s *Service) sweepState(c Channel) string {
 	return "unavailable"
 }
 
+func (s *Service) wakeHealthSweep() {
+	if s.sweepWake != nil {
+		select {
+		case s.sweepWake <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (s *Service) hasSweepableIPTV(ctx context.Context) bool {
+	if s.transcoder() == nil {
+		return false
+	}
+	if s.o.HealthSweepMinutes != nil && s.o.HealthSweepMinutes() < 0 {
+		return false
+	}
+	cs, err := s.allChannels(ctx)
+	if err != nil {
+		return false
+	}
+	for _, c := range cs {
+		if c.Kind != "iptv" || !c.Enabled || !s.channelSourceEnabled(ctx, c.SourceID) {
+			continue
+		}
+		if c.SourceID != "" && s.sourceConnectionLimit(c.SourceID) > 0 {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
 func (s *Service) healthSweepLoop() {
 	defer s.wg.Done()
 	for {
+		if !s.hasSweepableIPTV(s.serviceContext()) {
+			select {
+			case <-s.serviceContext().Done():
+				return
+			case <-s.sweepWake:
+				continue
+			}
+		}
 		minutes := 0
 		if s.o.HealthSweepMinutes != nil {
 			minutes = s.o.HealthSweepMinutes()
 		}
-		if minutes == 0 {
-			minutes = 15
-		}
-		if minutes < 0 {
+		if minutes <= 0 {
 			minutes = 15
 		}
 		if minutes > 24*60 {
 			minutes = 24 * 60
 		}
-		timer := time.NewTimer(time.Duration(minutes) * time.Minute)
+		timer := s.newTimer(time.Duration(minutes) * time.Minute)
 		select {
-		case <-s.ctx.Done():
+		case <-s.serviceContext().Done():
 			timer.Stop()
 			return
+		case <-s.sweepWake:
+			timer.Stop()
+			continue
 		case <-timer.C:
 		}
 		if s.o.HealthSweepMinutes != nil && s.o.HealthSweepMinutes() < 0 {
 			continue
 		}
-		if s.o.Transcoder != nil {
-			s.sweepChannels(s.ctx)
+		if s.transcoder() != nil {
+			s.sweepChannels(s.serviceContext())
 		}
 	}
 }
@@ -125,8 +166,9 @@ func (s *Service) sweepChannels(ctx context.Context) {
 			}
 		}()
 	}
+feed:
 	for _, c := range cs {
-		if c.Kind != "iptv" || !c.Enabled {
+		if c.Kind != "iptv" || !c.Enabled || !s.channelSourceEnabled(ctx, c.SourceID) {
 			continue
 		}
 		// A provider that sells connections sees a sweep as a channel scan
@@ -137,7 +179,7 @@ func (s *Service) sweepChannels(ctx context.Context) {
 		select {
 		case jobs <- c:
 		case <-ctx.Done():
-			break
+			break feed
 		}
 	}
 	close(jobs)
@@ -146,7 +188,10 @@ func (s *Service) sweepChannels(ctx context.Context) {
 		return
 	}
 	s.healthMu.Lock()
+	changed := !maps.Equal(s.channelHealth, next)
 	s.channelHealth = next
 	s.healthMu.Unlock()
-	s.bumpLineup()
+	if changed {
+		s.bumpLineup()
+	}
 }

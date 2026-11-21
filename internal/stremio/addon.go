@@ -157,6 +157,8 @@ type MetaPreview struct {
 	IMDBRating    string   `json:"imdbRating,omitempty"`
 	IMDbID        string   `json:"imdb_id,omitempty"`
 	TMDBID        any      `json:"tmdb_id,omitempty"`
+	MovieDBID     any      `json:"moviedb_id,omitempty"`
+	TVDBID        any      `json:"tvdb_id,omitempty"`
 	BehaviorHints struct {
 		DefaultVideoID     string `json:"defaultVideoId,omitempty"`
 		HasScheduledVideos bool   `json:"hasScheduledVideos,omitempty"`
@@ -361,18 +363,51 @@ func ParseCatalogRef(id string) (imdb string, tmdb, tvdb int64) {
 	return "", 0, 0
 }
 
-// Ref reads a catalog entry's identity: its id, else explicit imdb_id or
-// tmdb_id fields some add-ons add.
+func parseMetaNumericID(v any, prefix string) int64 {
+	switch val := v.(type) {
+	case float64:
+		if val > 0 {
+			return int64(val)
+		}
+	case int64:
+		if val > 0 {
+			return val
+		}
+	case int:
+		if val > 0 {
+			return int64(val)
+		}
+	case json.Number:
+		if n, err := val.Int64(); err == nil && n > 0 {
+			return n
+		}
+	case string:
+		s := strings.TrimSpace(val)
+		if prefix != "" {
+			s = strings.TrimPrefix(strings.ToLower(s), prefix)
+		}
+		if n, err := strconv.ParseInt(s, 10, 64); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 0
+}
+
+// Ref reads a catalog entry's identity: its id, plus any explicit imdb_id,
+// tmdb_id, moviedb_id or tvdb_id fields some add-ons include.
 func (m MetaPreview) Ref() (imdb string, tmdb, tvdb int64) {
 	imdb, tmdb, tvdb = ParseCatalogRef(m.ID)
-	if imdb == "" && tmdb == 0 && tvdb == 0 {
+	if imdb == "" {
 		imdb = IMDbID(m.IMDbID)
-		switch v := m.TMDBID.(type) {
-		case float64:
-			tmdb = int64(v)
-		case string:
-			tmdb, _ = strconv.ParseInt(v, 10, 64)
+	}
+	if tmdb == 0 {
+		tmdb = parseMetaNumericID(m.TMDBID, "tmdb:")
+		if tmdb == 0 {
+			tmdb = parseMetaNumericID(m.MovieDBID, "tmdb:")
 		}
+	}
+	if tvdb == 0 {
+		tvdb = parseMetaNumericID(m.TVDBID, "tvdb:")
 	}
 	return imdb, tmdb, tvdb
 }

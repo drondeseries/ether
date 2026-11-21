@@ -23,6 +23,15 @@ const (
 	StreamStudioReload  = "studio.reload"
 	StreamAgentApproval = "agent.approval"
 	StreamNotice        = "notice"
+	// StreamSessions says the set of live streams changed. It carries no
+	// list: Overview and Activity both refetch GET /api/status/sessions, so
+	// they always show the same streams.
+	StreamSessions = "sessions.changed"
+	// StreamFlowsChanged announces flow definition changes (create, update,
+	// delete, enable, disable, webhook token rotation, auto-disable).
+	StreamFlowsChanged = "flows.changed"
+	// StreamFlowRun announces flow run lifecycle and step progress updates.
+	StreamFlowRun = "flows.run"
 )
 
 // KnownStreamType reports whether typ is a console event type.
@@ -34,7 +43,10 @@ func KnownStreamType(typ string) bool {
 		StreamPluginsLog,
 		StreamStudioReload,
 		StreamAgentApproval,
-		StreamNotice:
+		StreamNotice,
+		StreamSessions,
+		StreamFlowsChanged,
+		StreamFlowRun:
 		return true
 	}
 	return false
@@ -107,6 +119,13 @@ func (h *StreamHub) Publish(typ string, data json.RawMessage) (StreamEvent, erro
 	return ev, nil
 }
 
+// Subscribers is the number of connected consoles.
+func (h *StreamHub) Subscribers() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.subs)
+}
+
 // Subscribe returns every event after lastID (0 delivers nothing old), then
 // live events until cancel runs. The channel is closed on cancel and when
 // the consumer falls behind and is evicted.
@@ -172,7 +191,6 @@ func StreamHandler(hub *StreamHub) http.Handler {
 		fl.Flush()
 
 		serveStreamEvents(w, r, hub, lastID, streamHeartbeat, fl)
-		return
 	})
 }
 
@@ -246,7 +264,7 @@ func (h *Handler) dashboardBody(r *http.Request) map[string]any {
 	return map[string]any{
 		"sections": sections, "names": names,
 		"setupComplete": complete, "setupSteps": steps, "version": h.version,
-		"plexEnabled": plexEnabled,
+		"plexEnabled": plexEnabled, "serverName": cfg.Server.FriendlyName,
 	}
 }
 

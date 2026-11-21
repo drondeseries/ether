@@ -59,6 +59,9 @@ func (f Frontend) Mount(_ context.Context, host frontend.Host) (frontend.Instanc
 	if err := i.mutationRoutes(); err != nil {
 		return nil, err
 	}
+	if err := i.trackPrefRoutes(); err != nil {
+		return nil, err
+	}
 	if err := i.notInterestedRoutes(); err != nil {
 		return nil, err
 	}
@@ -81,6 +84,8 @@ type instance struct {
 
 	sectionsMu    sync.Mutex
 	sectionsCache map[string]siloSectionPage
+	// sectionsGen counts each viewer's own changes (dropViewerSections).
+	sectionsGen map[int64]uint64
 
 	plansMu sync.Mutex
 	plans   map[string]playbackPlan

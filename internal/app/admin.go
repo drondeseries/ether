@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"sync"
 	"time"
@@ -29,12 +30,20 @@ import (
 
 func (a *App) buildAdmin() http.Handler {
 	local, _ := identity.NewLocal(a.db)
-	grants, _ := identity.NewGrants(a.db, a.users, 30*24*time.Hour, nil)
+	grants, _ := identity.NewGrants(a.db, a.users, 30*24*time.Hour, nil, a.cfg)
 	limiter, _ := identity.NewLoginLimiter(a.db, 15*time.Minute, 30, 8, nil)
 	pollLimiter, _ := identity.NewPollLimiter(a.db, time.Minute, 120, 60, nil)
 	quick, _ := identity.NewQuickConnect(a.db, 10*time.Minute, 30*24*time.Hour, nil)
 	invites, _ := identity.NewInvite(a.db, 24*time.Hour, 30*24*time.Hour, nil)
+	a.wireIdentityLocal(local)
+	a.wireIdentityGrants(grants)
+	a.wireIdentityLimiter(limiter, "login")
+	a.wireIdentityLimiter(pollLimiter, "poll")
+	a.wireIdentityQuickConnect(quick)
+	a.wireIdentityInvite(invites)
 	deps := admin.Deps{
+		EventBus:         a.eventBus,
+		Flows:            a.flowsAdminDeps(),
 		FavoritesMirror:  a.favorites,
 		NotInterested:    notInterestedPortal{a},
 		ViewerAlerts:     &notify.ViewerAlerts{DB: a.db, Active: a.users.ActiveUser},
@@ -63,6 +72,8 @@ func (a *App) buildAdmin() http.Handler {
 		AuthenticatePlex: a.users.Authenticate, LinkPlex: a.users.LinkPlex, LocalIdentity: local, IdentityGrants: grants, IdentityLimiter: limiter, OwnerCredentialChanged: a.syncOwnerRecovery, PollLimiter: pollLimiter, QuickConnect: quick, RefreshViewers: a.users.RefreshViewers, OwnerConfigured: func(ctx context.Context) bool { _, err := a.users.Owner(ctx); return err == nil },
 		Config:           a.cfg,
 		Frontends:        a.frontends.control,
+		Vela:             a.velaManager(),
+		VelaSkins:        a.velaSkinsAdmin(),
 		Extensions:       a.extensionHandlers(),
 		PublicExtensions: a.publicExtensionHandlers(),
 		ValidateExtra:    a.validateExtra,
@@ -73,16 +84,21 @@ func (a *App) buildAdmin() http.Handler {
 		Version:          a.opts.Version,
 		PlexAuth:         &plexAuth{app: a, pins: map[string]*plextv.PIN{}},
 		SignIn:           &plexSignIn{app: a, pins: map[string]*plextv.PIN{}},
-		IsOwnerToken: func(ctx context.Context, token string) bool {
-			if auth.IsOwnerSession(token) {
-				u, err := a.users.OwnerSession(ctx, token)
+		IsOwnerToken: func(ctx context.Context) func(context.Context, string) bool {
+			return func(ctx context.Context, token string) bool {
+				if auth.IsOwnerSession(token) {
+					u, err := a.users.OwnerSession(ctx, token)
+					return err == nil && u.IsOwner
+				}
+				u, err := a.users.Authenticate(ctx, token)
 				return err == nil && u.IsOwner
 			}
-			u, err := a.users.Authenticate(ctx, token)
-			return err == nil && u.IsOwner
-		},
+		}(context.Background()),
 		Sessions: a.users,
 		TestUsenet: func(ctx context.Context, p config.UsenetProvider) error {
+			if a.fetcher != nil {
+				return a.fetcher.TestProvider(ctx, p)
+			}
 			return usenet.TestProvider(ctx, p)
 		},
 		TestIndexer: func(ctx context.Context, ix config.Indexer) error {
@@ -100,6 +116,9 @@ func (a *App) buildAdmin() http.Handler {
 			}
 			return newznab.Test(ctx, ix, a.cfg.Get().ClientIdentity)
 		},
+		IndexerPreview: func(ix config.Indexer) (any, error) {
+			return newznab.PreviewRequestIdentity(ix, a.cfg.Get().ClientIdentity)
+		},
 		TestDebrid: func(ctx context.Context, p config.DebridProvider) error {
 			return a.debrid.Test(ctx, p)
 		},
@@ -110,9 +129,13 @@ func (a *App) buildAdmin() http.Handler {
 			return err
 		},
 		TestOpenSubtitles: subtitles.Test,
+		TestSubDL:         subtitles.TestSubDL,
 		TestTrakt:         trakt.Test,
 		TestIntroDB: func(ctx context.Context, apiKey string) error {
 			return markers.Probe(ctx, "", apiKey)
+		},
+		TestSkipDB: func(ctx context.Context, apiKey string) error {
+			return markers.ProbeSkipDB(ctx, "", apiKey)
 		},
 		TestLLM: func(ctx context.Context, c config.LLM) error {
 			c.Enabled = true // test the settings before the owner switches them on
@@ -148,14 +171,15 @@ func (a *App) buildAdmin() http.Handler {
 			}
 			return s
 		},
-		RemoteStatus: func(context.Context) any { return a.registrar.Status() },
-		SystemLoad:   func(context.Context) any { return a.load.Snapshot() },
+		PauseTierMigration: a.catalog.SetTierMigrationPaused,
+		RemoteStatus:       func(context.Context) any { return a.registrar.Status() },
+		SystemLoad:         func(context.Context) any { return a.load.Snapshot() },
 		HWAccelStatus: func(context.Context) any {
 			if a.transcoder == nil {
 				return map[string]string{"error": "ffmpeg not found"}
 			}
 			accel := a.transcoder.HWAccel()
-			hw := map[string]any{"hwaccel": accel, "ffmpeg": a.transcoder.Version(), "enhancement": a.transcoder.EnhancementStatus()}
+			hw := map[string]any{"os": runtime.GOOS, "arch": runtime.GOARCH, "hwaccel": accel, "ffmpeg": a.transcoder.Version(), "enhancement": a.transcoder.EnhancementStatus()}
 			if vendor := transcode.GPUVendor(accel.Device); vendor != "" {
 				hw["vendor"] = vendor
 			}
@@ -166,6 +190,9 @@ func (a *App) buildAdmin() http.Handler {
 			if cap.PlaybackError != "" {
 				hw["playbackError"] = cap.PlaybackError
 			}
+			if cap.HardwareToneMap != nil {
+				hw["hardwareToneMap"] = *cap.HardwareToneMap
+			}
 			if len(cap.ToneMap) > 0 {
 				hw["toneMap"] = cap.ToneMap
 			}
@@ -175,7 +202,9 @@ func (a *App) buildAdmin() http.Handler {
 			hw["filtersProbed"] = cap.FiltersProbed
 			return hw
 		},
-		DatabaseCheck: a.checkDatabase,
+		DatabaseCheck:         a.checkDatabase,
+		DatabaseCompactStatus: a.compactionStatus,
+		DatabaseCompact:       a.startCompaction,
 		ExtraStatus: map[string]admin.StatusFunc{
 			"stream":   func(context.Context) any { return a.engine.Stats() },
 			"widget":   a.widgetStatus,
@@ -186,10 +215,37 @@ func (a *App) buildAdmin() http.Handler {
 			"updates":  a.updateStatus,
 			"storage":  a.storageStatus,
 		},
-		ResolverTraces:     func(context.Context) (any, error) { return a.resolver.Traces(), nil },
-		Users:              a.users,
-		ViewerDirectory:    a.viewerDirectory,
-		Personalization:    a.personalize,
+		ResolverTraces:  func(context.Context) (any, error) { return a.resolver.Traces(), nil },
+		Users:           a.users,
+		ViewerDirectory: a.viewerDirectory,
+		Personalization: a.personalize,
+		LayoutLibraries: func(ctx context.Context) ([]admin.LayoutLibrary, error) {
+			if a.libraries == nil {
+				return []admin.LayoutLibrary{}, nil
+			}
+			libs, err := a.libraries.List(ctx)
+			if err != nil {
+				return nil, err
+			}
+			out := make([]admin.LayoutLibrary, 0, len(libs))
+			for _, l := range libs {
+				lType := string(l.MediaType)
+				if l.Source == core.LibraryPlugin {
+					lType = "plugin"
+				} else if l.MediaType != core.TypeMovie && l.MediaType != core.TypeShow {
+					continue
+				}
+				out = append(out, admin.LayoutLibrary{
+					ID:      int(l.ID),
+					Name:    l.Name,
+					Slug:    l.Key,
+					Type:    lType,
+					Section: "library:" + strconv.Itoa(int(l.ID)),
+				})
+			}
+			return out, nil
+		},
+		PluginLibraryRows:  a.pluginLibraryLayoutRows,
 		Collections:        a.collections,
 		CatalogHelper:      a.collections,
 		ViewerCatalogRules: a.catalog,
@@ -200,13 +256,41 @@ func (a *App) buildAdmin() http.Handler {
 			}
 			return a.availability.HiddenMovies(ctx)
 		},
-		CatalogVisibility: func(ctx context.Context, specs []core.LibraryExclusion, fallback string) (any, error) {
+		CatalogVisibility: func(ctx context.Context, specs []core.LibraryExclusion, fallback string, libraryID core.LibraryID) (any, error) {
+			if libraryID > 0 && a.libraries != nil {
+				lib, err := a.libraries.Get(ctx, libraryID)
+				if err != nil {
+					return nil, err
+				}
+				if lib.Source == core.LibraryPlugin {
+					if a.pluginsRT == nil || a.pluginsRT.pluginitems == nil {
+						return nil, core.ErrNotFound
+					}
+					return a.pluginsRT.pluginitems.PreviewVisibility(ctx, lib.ID, specs, fallback)
+				}
+				sf := libraryScopeFilter(lib, core.Filter{RuleVisibility: "all"})
+				return a.catalog.PreviewVisibilityScoped(ctx, specs, fallback, &sf)
+			}
 			return a.catalog.PreviewVisibilityPolicy(ctx, specs, fallback)
 		},
-		Images:      a.images,
-		PlexWatch:   a.plexWatchAPI(),
-		PlexServers: a.plexServersAPI(),
-		Prerolls:    a.prerollAdmin(),
+		LibraryBrowseFilter: func(ctx context.Context, libraryID core.LibraryID, req core.Filter) (core.Filter, error) {
+			if a.libraries == nil {
+				return req, core.ErrNotFound
+			}
+			lib, err := a.libraries.Get(ctx, libraryID)
+			if err != nil {
+				return req, err
+			}
+			return libraryScopeFilter(lib, req), nil
+		},
+		Images:          a.images,
+		TitlePosters:    a.titlePosters(),
+		OwnerArtwork:    a.artwork,
+		PlexWatch:       a.plexWatchAPI(),
+		Trakt:           a.traktAPI(),
+		PlexServers:     a.plexServersAPI(),
+		SharePlexViewer: a.sharePlexViewer,
+		Prerolls:        a.prerollAdmin(),
 	}
 	// Optional role-owned dependencies stay absent until a real local or private
 	// service supplies them. This preserves console/auth/config/catalog without
@@ -248,6 +332,11 @@ func (a *App) buildAdmin() http.Handler {
 	h := admin.NewHandler(deps)
 	if a.streamRT != nil {
 		a.streamRT.SetDashboard(h.SnapshotDashboard)
+		if a.cfg != nil {
+			a.cfg.Subscribe(func(config.Config) {
+				a.publishDashboard()
+			})
+		}
 	}
 	return sourceOwnerContext(h)
 }
@@ -257,6 +346,27 @@ func (a *App) plexWatchAPI() admin.PlexWatch {
 		return nil
 	}
 	return plexWatchAdmin{a.plexWatch}
+}
+
+func (a *App) sharePlexViewer(ctx context.Context, usernameOrEmail string, userID int64) error {
+	if a.plextv == nil {
+		return errors.New("plextv: client not initialized")
+	}
+	cfg := a.cfg.Get()
+	token := cfg.Plex.Token
+	if token == "" {
+		return errors.New("plextv: plex token not configured")
+	}
+	if cfg.Server.MachineIdentifier == "" {
+		return errors.New("plextv: server machine identifier not configured")
+	}
+	if err := a.plextv.ShareServer(ctx, token, usernameOrEmail, userID, nil); err != nil {
+		return err
+	}
+	if a.registrar != nil {
+		_ = a.registrar.SyncFriendsNow(ctx)
+	}
+	return nil
 }
 
 // debridStatus is provider health, counters and latency EWMAs plus the
@@ -367,6 +477,10 @@ func (p *plexAuth) Claim(ctx context.Context) error {
 
 func (p *plexAuth) Status() any { return p.app.registrar.Status() }
 
+func (p *plexAuth) SyncFriends(ctx context.Context) error {
+	return p.app.registrar.SyncFriendsNow(ctx)
+}
+
 // plexSignIn is the admin login: a plex.tv PIN whose token the admin
 // handler accepts only if it belongs to the owner. Unlike plexAuth it
 // changes no settings.
@@ -455,4 +569,52 @@ func (a *App) viewerDirectory(ctx context.Context) ([]admin.ViewerRecord, error)
 		out = append(out, admin.ViewerRecord{User: u.User, Active: u.Active, Origin: u.Origin, Home: u.Home, OwnerEnabled: u.OwnerEnabled, PlexShared: u.PlexShared, HasPlex: u.HasPlex})
 	}
 	return out, nil
+}
+
+func (a *App) pluginLibraryLayoutRows(ctx context.Context, viewer *core.User, libraryID int) ([]core.RowDescriptor, []core.HomeRow, error) {
+	var svc *surfaceExperience
+	if a.frontends != nil && a.frontends.siloExperience != nil {
+		svc = a.frontends.siloExperience
+	} else if a.pluginsRT != nil && a.pluginsRT.kindCatalog != nil {
+		if raw, err := a.newSurfaceExperience("silo"); err == nil {
+			svc, _ = raw.(*surfaceExperience)
+		}
+	}
+	if svc == nil || svc.Service == nil {
+		return []core.RowDescriptor{}, []core.HomeRow{}, nil
+	}
+	v := viewer
+	if v == nil || v.ID <= 0 {
+		if owner, err := a.users.Owner(ctx); err == nil && owner != nil {
+			v = owner
+		} else {
+			v = &core.User{ID: 1, IsOwner: true}
+		}
+	}
+	viewID := strconv.Itoa(libraryID)
+	sec := "library:" + viewID
+	cands, err := svc.Service.PluginLibraryCandidateRows(ctx, v, viewID)
+	if err != nil {
+		return nil, nil, err
+	}
+	descs := make([]core.RowDescriptor, 0, len(cands))
+	rows := make([]core.HomeRow, 0, len(cands))
+	for _, r := range cands {
+		descs = append(descs, core.RowDescriptor{
+			HubID:    r.ID,
+			Title:    r.Title,
+			Kind:     r.Kind,
+			Sections: []string{sec},
+			Group:    "collections",
+		})
+		rows = append(rows, core.HomeRow{
+			HubID:  r.ID,
+			Title:  r.Title,
+			Kind:   r.Kind,
+			Source: core.RowSourcePrecomposed,
+			Items:  r.Items,
+			Hub:    core.Hub{ID: r.ID, Title: r.Title, Items: r.Items, ItemCount: len(r.Items)},
+		})
+	}
+	return descs, rows, nil
 }

@@ -58,13 +58,19 @@ type Options struct {
 	// ServerLanguage is the catalog metadata language (config catalog.language,
 	// for example en-US). It is not the console locale.
 	ServerLanguage func() string
-	// PlexLayer is the viewer's cached plex.tv account settings. It sits
+	// ProfileLanguages is the owner's preferred audio languages for the
+	// title's quality profile. It fills the viewer's audio list when the
+	// viewer stored none of their own: prefs > profile preferred > file
+	// default flag > title original. Nil skips the layer.
+	ProfileLanguages func(ctx context.Context, user int64, key core.RatingKey) []string
+	// AccountLayer supplies cached account defaults from the frontend. It sits
 	// under the viewer's own row and user 0. A missing callback skips it.
-	PlexLayer func(context.Context, int64) (PlexLayer, bool)
+	AccountLayer func(context.Context, int64) (AccountLayer, bool)
 }
 
-// PlexLayer is the default language layer from a plex.tv account.
-type PlexLayer struct {
+// AccountLayer is a frontend-provided default language layer.
+type AccountLayer struct {
+	Source           string // Identity label for preference provenance, supplied by the frontend.
 	AudioLanguage    string
 	AutoSelectAudio  bool
 	SubtitleLanguage string
@@ -112,6 +118,16 @@ func New(db *sql.DB, opts ...Options) *Service {
 func Default() Rules {
 	return Rules{AudioLanguages: []string{}, SubtitleLanguages: []string{}, SubtitleMode: "off", SubtitleStyle: "normal"}
 }
+
+// canonicalizeLanguages folds the viewer's stored audio and subtitle language
+// spellings onto canonical BCP 47 tags, so "Português" and "pt-BR" are the
+// same stored preference and multi-word names ("Brazilian Portuguese") pass
+// validation instead of being rejected for their length or space.
+func (r *Rules) canonicalizeLanguages() {
+	r.AudioLanguages = canonicalLanguages(r.AudioLanguages)
+	r.SubtitleLanguages = canonicalLanguages(r.SubtitleLanguages)
+}
+
 func (r Rules) Validate() error {
 	if r.MaxBitrateKbps < 0 || r.MaxHeight < 0 {
 		return errors.New("invalid bitrate preference")
@@ -146,6 +162,7 @@ func (s *Service) PutRules(ctx context.Context, user int64, r Rules) error {
 	if user < 0 {
 		return errors.New("invalid user")
 	}
+	r.canonicalizeLanguages()
 	if err := r.Validate(); err != nil {
 		return err
 	}
@@ -207,7 +224,7 @@ func (s *Service) storedRules(ctx context.Context, user int64) (Rules, bool, err
 
 func (s *Service) GetRules(ctx context.Context, user int64) (Rules, error) {
 	r := Default()
-	r = s.fillPlexLayer(ctx, user, r)
+	r = s.fillAccountLayer(ctx, user, r)
 	if user > 0 {
 		if shared, ok, err := s.storedRules(ctx, 0); err != nil {
 			return r, err
@@ -267,6 +284,19 @@ func memoryTarget(key core.RatingKey) (int64, bool) {
 	}
 }
 
+func rememberedTrackLanguage(track core.StreamInfo) string {
+	if n := langtag.Normalize(track.Language); n != "" {
+		return n
+	}
+	if eff := langtag.EffectiveLanguages(track.Language, track.Title); len(eff) > 0 {
+		if n := langtag.Normalize(eff[0]); n != "" {
+			return n
+		}
+		return strings.ToLower(eff[0])
+	}
+	return ""
+}
+
 func (s *Service) Remember(ctx context.Context, user int64, key core.RatingKey, kind string, track *core.StreamInfo) error {
 	target, ok := memoryTarget(key)
 	if !ok {
@@ -283,8 +313,8 @@ func (s *Service) Remember(ctx context.Context, user int64, key core.RatingKey, 
 		if track.Type != kind {
 			return errors.New("stream type does not match")
 		}
-		c.Language = langtag.Normalize(track.Language)
-		c.Forced = track.Forced
+		c.Language = rememberedTrackLanguage(*track)
+		c.Forced = forced(*track)
 		c.SDH = sdh(*track)
 	}
 	b, _ := json.Marshal(c)
@@ -396,43 +426,69 @@ func (s *Service) choice(ctx context.Context, user int64, key core.RatingKey, ki
 // title, as pick ranks it).
 func SDH(t core.StreamInfo) bool { return sdh(t) }
 
+func forced(t core.StreamInfo) bool {
+	return t.Forced || (t.Type == "subtitle" && langtag.ForcedSubtitleTitle(t.Title))
+}
+
 func sdh(t core.StreamInfo) bool {
 	v := strings.ToLower(t.Title)
 	return strings.Contains(v, "sdh") || strings.Contains(v, "hearing impaired") || strings.Contains(v, "[cc]") || v == "cc"
 }
 
-// rankLanguage orders configured language preferences first, match tier
-// second, and leaves space for pick's style/default bonuses last. With at
-// most 20 configured languages plus the original language, the score stays
-// below the 10000-point explicit-choice bonus.
+// rankLanguage orders configured language preferences first, extended BCP-47
+// match rank second, and leaves space for pick's style/default bonuses last.
+// With at most 20 configured languages plus the original language, the score
+// stays below the 10000-point explicit-choice bonus.
 func rankLanguage(code string, want []string) int {
 	for i, v := range want {
-		if tier := langtag.MatchTier(v, code); tier > 0 {
-			return (len(want)-i)*300 + tier*50
+		if rank := langtag.MatchRank(v, code); rank > 0 {
+			return (len(want)-i)*300 + rank*40
 		}
 	}
 	return 0
 }
 
-func pick(streams []core.StreamInfo, kind string, want []string, style string, forcedOnly bool, memory *Choice) int {
+func rankStreamLanguage(t core.StreamInfo, want []string) int {
+	for i, v := range want {
+		if rank := langtag.BestStreamMatchRank(v, t.Language, t.Title); rank > 0 {
+			return (len(want)-i)*300 + rank*40
+		}
+	}
+	return 0
+}
+
+func pick(streams []core.StreamInfo, kind string, want []string, style string, forcedOnly bool, memory *Choice, original string) int {
 	best, score := -1, -100000
 	for i, t := range streams {
-		if t.Type != kind || (forcedOnly && !t.Forced) {
+		if t.Type != kind || (forcedOnly && !forced(t)) {
 			continue
 		}
-		n := rankLanguage(t.Language, want)
+		matched := rankStreamLanguage(t, want)
+		// A release's default flag cannot make an unrelated language a
+		// viewer preference. Audio may fall back; unwanted subtitles stay off.
+		remembered := memory != nil && rememberedTrackLanguage(t) == langtag.Normalize(memory.Language) && forced(t) == memory.Forced && sdh(t) == memory.SDH
+		if kind == "subtitle" && matched == 0 && !remembered {
+			continue
+		}
+		n := matched
 		if t.Default {
 			n += 5
+		}
+		if kind == "audio" && matched == 0 && rankStreamLanguage(t, []string{original}) > 0 {
+			// No preference matched this stream: the title's original
+			// language outranks an arbitrary first stream, but not the
+			// file's default flag.
+			n += 2
 		}
 		if kind == "subtitle" {
 			if (style == "sdh") == sdh(t) {
 				n += 10
 			}
-			if (style == "forced") == t.Forced {
+			if (style == "forced") == forced(t) {
 				n += 10
 			}
 		}
-		if memory != nil && langtag.Normalize(t.Language) == langtag.Normalize(memory.Language) && t.Forced == memory.Forced && sdh(t) == memory.SDH {
+		if remembered {
 			n += 10000
 		}
 		if n > score {
@@ -476,18 +532,21 @@ func (s *Service) selectRules(ctx context.Context, user int64, key core.RatingKe
 		return out, err
 	}
 	r = s.sharedLanguages(ctx, user, r)
+	if len(r.AudioLanguages) == 0 && s.options.ProfileLanguages != nil {
+		r.AudioLanguages = canonicalLanguages(s.options.ProfileLanguages(ctx, user, key))
+	}
 	server := s.serverLanguage()
 	want := AudioOrder(r.AudioLanguages, server, original, r.PreferOriginal)
 	var am *Choice
 	if hasA {
 		am = &a
 	}
-	out.Audio = pick(info.Streams, "audio", want, "", false, am)
+	out.Audio = pick(info.Streams, "audio", want, "", false, am, original)
 	if hasB && b.Off {
 		return out, nil
 	}
 	understood := viewerLanguages(r.AudioLanguages, server)
-	foreign := out.Audio >= 0 && len(understood) > 0 && rankLanguage(info.Streams[out.Audio].Language, understood) == 0
+	foreign := out.Audio >= 0 && len(understood) > 0 && rankStreamLanguage(info.Streams[out.Audio], understood) == 0
 	if !hasB && r.SubtitleMode == "off" && !foreign {
 		return out, nil
 	}
@@ -499,12 +558,18 @@ func (s *Service) selectRules(ctx context.Context, user int64, key core.RatingKe
 		if len(known) == 0 {
 			known = viewerLanguages(nil, server)
 		}
-		if len(known) == 0 || (out.Audio >= 0 && rankLanguage(info.Streams[out.Audio].Language, known) > 0) {
+		if len(known) == 0 || (out.Audio >= 0 && rankStreamLanguage(info.Streams[out.Audio], known) > 0) {
 			return out, nil
 		}
 	}
 	var bm *Choice
 	if hasB {
+		// A signs-only fallback on one episode must not pin partial subtitles
+		// on later episodes when this viewer asks for full dialogue. Apply this
+		// to old stored choices too, without erasing the viewer's language.
+		if b.Forced && r.SubtitleStyle == "normal" && r.SubtitleMode != "forced-only" {
+			b.Forced, b.SDH = false, false
+		}
 		bm = &b
 	}
 	style := r.SubtitleStyle
@@ -515,7 +580,7 @@ func (s *Service) selectRules(ctx context.Context, user int64, key core.RatingKe
 	if offForeign {
 		style = "forced"
 	}
-	out.Subtitle = pick(info.Streams, "subtitle", subtitleOrder(r, server, original), style, !hasB && r.SubtitleMode == "forced-only" || offForeign, bm)
+	out.Subtitle = pick(info.Streams, "subtitle", subtitleOrder(r, server, original), style, !hasB && r.SubtitleMode == "forced-only" || offForeign, bm, original)
 	return out, nil
 }
 
@@ -540,11 +605,11 @@ func (s *Service) sharedLanguages(ctx context.Context, user int64, r Rules) Rule
 	return r
 }
 
-func (s *Service) fillPlexLayer(ctx context.Context, user int64, r Rules) Rules {
-	if s == nil || s.options.PlexLayer == nil || user <= 0 {
+func (s *Service) fillAccountLayer(ctx context.Context, user int64, r Rules) Rules {
+	if s == nil || s.options.AccountLayer == nil || user <= 0 {
 		return r
 	}
-	layer, ok := s.options.PlexLayer(ctx, user)
+	layer, ok := s.options.AccountLayer(ctx, user)
 	if !ok {
 		return r
 	}
@@ -569,9 +634,10 @@ func (s *Service) serverLanguage() string {
 
 // AudioOrder is the audio preference for one playback. audio is the viewer's
 // list, or user 0's list when the viewer saved none. PreferOriginal ranks the
-// title original first. Otherwise the order is that list, the catalog
-// language, then the title original. pick uses the file default flag only
-// when none of these match.
+// title original first. Otherwise the order is that list, then the catalog
+// language. The title's original language is deliberately NOT a ranked
+// preference: pick falls back to the file's default-flagged track and only
+// then to the original language.
 func AudioOrder(audio []string, server, original string, preferOriginal bool) []string {
 	var want []string
 	if preferOriginal {
@@ -580,18 +646,15 @@ func AudioOrder(audio []string, server, original string, preferOriginal bool) []
 	for _, lang := range audio {
 		want = appendLanguage(want, lang)
 	}
-	want = appendLanguage(want, server)
-	if !preferOriginal {
-		want = appendLanguage(want, original)
-	}
+	want = appendLanguageFallback(want, server)
 	return want
 }
 
 func subtitleOrder(r Rules, server, original string) []string {
 	if len(r.SubtitleLanguages) > 0 {
-		return AudioOrder(r.SubtitleLanguages, server, original, false)
+		return appendLanguageFallback(AudioOrder(r.SubtitleLanguages, server, original, false), original)
 	}
-	return AudioOrder(r.AudioLanguages, server, original, r.PreferOriginal)
+	return appendLanguageFallback(AudioOrder(r.AudioLanguages, server, original, r.PreferOriginal), original)
 }
 
 // viewerLanguages is the language the viewer is assumed to understand.
@@ -606,7 +669,54 @@ func viewerLanguages(audio []string, server string) []string {
 	return nil
 }
 
+// canonicalLanguages folds every accepted spelling ("pt-BR", "pt_br",
+// "por", "Portuguese", "Português", "Brazilian Portuguese") onto one
+// canonical BCP 47 tag per language, preserving first-seen order and the
+// region when the spelling carries one. Identical canonical tags collapse;
+// a value no spelling maps to is kept trimmed and unchanged.
+func canonicalLanguages(langs []string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, l := range langs {
+		l = strings.TrimSpace(l)
+		if l == "" {
+			continue
+		}
+		c := langtag.CanonicalBCP47(l)
+		if c == "" {
+			c = l
+		}
+		key := strings.ToLower(c)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, c)
+	}
+	return out
+}
+
 func appendLanguage(have []string, lang string) []string {
+	lang = strings.TrimSpace(lang)
+	if lang == "" {
+		return have
+	}
+	canon := strings.ToLower(langtag.CanonicalBCP47(lang))
+	norm := langtag.Normalize(lang)
+	for _, v := range have {
+		if canon != "" && strings.ToLower(langtag.CanonicalBCP47(v)) == canon && (norm == "" || langtag.Normalize(v) == norm) {
+			return have
+		}
+		if canon == "" && strings.EqualFold(strings.TrimSpace(v), lang) {
+			return have
+		}
+	}
+	return append(have, lang)
+}
+
+// appendLanguageFallback appends a server/original fallback language only when
+// have does not already cover its normalized language family.
+func appendLanguageFallback(have []string, lang string) []string {
 	lang = strings.TrimSpace(lang)
 	if lang == "" {
 		return have
@@ -736,6 +846,7 @@ func (s *Service) updateViewerRules(ctx context.Context, user int64, update func
 			return err
 		}
 		update(&rules)
+		rules.canonicalizeLanguages()
 		if err = rules.Validate(); err != nil {
 			return err
 		}

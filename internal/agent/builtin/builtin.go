@@ -38,6 +38,7 @@ type Deps struct {
 	Profiles    ProfileService
 	Frontends   FrontendService
 	Server      ServerService
+	Flows       FlowsService // optional
 	OwnerUser   func(ctx context.Context) (*core.User, error)
 	Routes      func() []RouteInfo
 	Now         func() time.Time
@@ -171,18 +172,29 @@ type PluginService interface {
 	SetPluginEnabled(ctx context.Context, id string, enabled bool) error
 }
 
-// ProfileInfo is one quality profile with its ranking and rules.
-// A profile serves one media; a movie and a TV profile may share a name.
+// ProfileInfo is one quality profile with its quality order, format scores,
+// language settings, limits and rules. A profile serves one media; a movie and a TV profile may share a
+// name.
 type ProfileInfo struct {
-	Name    string
-	Media   string // core.MediaMovie or core.MediaTV
-	Ranking []string
-	Rules   []core.ReleaseRule
+	Name               string
+	Media              string         // core.MediaMovie or core.MediaTV
+	Scores             map[string]int // custom format id → score
+	Rules              []core.ReleaseRule
+	QualityOrder       []core.QualityItem
+	Language           string
+	PreferredLanguages []string
+	MaxHeight          int
+	MinHeight          int
+	AllowedQualities   []string
 }
 
 type ProfileService interface {
 	Profiles(ctx context.Context) ([]ProfileInfo, error)
-	SetRanking(ctx context.Context, profile, media string, ranking []string) error
+	// SetFormatScores sets the given custom format scores on a profile; a
+	// score of 0 removes the format from the profile.
+	SetFormatScores(ctx context.Context, profile, media string, scores map[string]int) error
+	// SetQualityOrder replaces only the quality groups, preserving other settings.
+	SetQualityOrder(ctx context.Context, profile, media string, order []core.QualityItem) error
 	AddRule(ctx context.Context, profile, media string, rule core.ReleaseRule) error
 }
 
@@ -245,9 +257,12 @@ func All(d Deps) []tools.Tool {
 	}
 	out := []tools.Tool{}
 	out = append(out, readTools(d)...)
+	out = append(out, qualityProfilesTool(d), qualityOrderTool(d))
 	out = append(out, writeTools(d)...)
 	out = append(out, webTools()...)
 	out = append(out, onairTools(d)...)
+	out = append(out, channelBuilderTools(d)...)
+	out = append(out, flowsTools(d)...)
 	return out
 }
 
@@ -343,44 +358,6 @@ func boolArg(in map[string]any, key string, def bool) (bool, error) {
 	return b, nil
 }
 
-func stringsArg(in map[string]any, key string, maxItems, maxLen int) ([]string, error) {
-	v, ok := in[key]
-	if !ok || v == nil {
-		return nil, nil
-	}
-	raw, is := v.([]any)
-	if !is {
-		// A spec round-trip through JSON gives []any; direct Go callers
-		// may send []string.
-		if ss, is := v.([]string); is {
-			raw = make([]any, len(ss))
-			for i, s := range ss {
-				raw[i] = s
-			}
-		} else {
-			return nil, tools.Userf("%s must be a list of text", key)
-		}
-	}
-	if len(raw) > maxItems {
-		return nil, tools.Userf("%s has too many entries (at most %d)", key, maxItems)
-	}
-	out := make([]string, 0, len(raw))
-	for _, item := range raw {
-		s, is := item.(string)
-		if !is {
-			return nil, tools.Userf("%s must be a list of text", key)
-		}
-		s = strings.TrimSpace(s)
-		if len(s) > maxLen {
-			return nil, tools.Userf("%s entries are too long (at most %d characters)", key, maxLen)
-		}
-		if s != "" {
-			out = append(out, s)
-		}
-	}
-	return out, nil
-}
-
 // keyArg parses a rating key (tools address titles by their string key).
 func keyArg(in map[string]any, key string) (core.RatingKey, error) {
 	if _, isStr := in[key].(string); !isStr {
@@ -439,10 +416,6 @@ func pInt(desc string, min, max int) map[string]any {
 func pBool(desc string) map[string]any { return map[string]any{"type": "boolean", "description": desc} }
 func pEnum(desc string, values ...string) map[string]any {
 	return map[string]any{"type": "string", "description": desc, "enum": values}
-}
-func pStrings(desc string, maxItems, maxLen int) map[string]any {
-	return map[string]any{"type": "array", "description": desc, "maxItems": maxItems,
-		"items": map[string]any{"type": "string", "maxLength": maxLen}}
 }
 func pPage() map[string]any {
 	return map[string]any{

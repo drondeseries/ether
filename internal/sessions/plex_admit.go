@@ -10,34 +10,6 @@ import (
 	"github.com/braedonsaunders/ether/internal/frontend"
 )
 
-// PlexAdmission is the source and the version and track selections for one
-// Plex plan. Plan makes the direct, remux, or transcode decision from them.
-// Open publishes that decision. The adapter renders it and does not decide again.
-type PlexAdmission struct {
-	Source               *core.PlaySession
-	Media                core.MediaInfo
-	Caps                 core.ClientCaps
-	Options              core.DecideOptions
-	PreferRemux          bool
-	Protocol             string
-	RemoteMaxBitrateKbps int
-}
-
-type plexAdmissionKey struct{}
-
-// WithPlexAdmission attaches the prepared source for one Plex Plan call.
-func WithPlexAdmission(ctx context.Context, admit func(context.Context) (PlexAdmission, error)) context.Context {
-	if admit == nil {
-		return ctx
-	}
-	return context.WithValue(ctx, plexAdmissionKey{}, admit)
-}
-
-func plexAdmissionFrom(ctx context.Context) (func(context.Context) (PlexAdmission, error), bool) {
-	admit, ok := ctx.Value(plexAdmissionKey{}).(func(context.Context) (PlexAdmission, error))
-	return admit, ok && admit != nil
-}
-
 func validPlexTranscodeID(id string) bool {
 	if id == "" || len(id) > 128 {
 		return false
@@ -52,7 +24,7 @@ func validPlexTranscodeID(id string) bool {
 	return true
 }
 
-func (b *Broker) planPlexAdmission(ctx context.Context, req frontend.PlanRequest, admit func(context.Context) (PlexAdmission, error)) (frontend.PlayPlan, error) {
+func (b *Broker) planPlexAdmission(ctx context.Context, req frontend.PlanRequest, admit func(context.Context) (PlanAdmission, error)) (frontend.PlayPlan, error) {
 	if !validPlexTranscodeID(req.Intent.ClientSessionID) || req.Device.ID == "" || req.Item == 0 || req.Viewer == nil {
 		return frontend.PlayPlan{}, core.ErrNotAvailable
 	}
@@ -130,12 +102,20 @@ func (b *Broker) planPlexAdmission(ctx context.Context, req frontend.PlanRequest
 		protocol = string(req.Protocol)
 	}
 	preferRemux := admitted.PreferRemux || req.Intent.PreferRemux
+	videoOff := req.Channel == "" && b.videoTranscodingOff()
 	dec, err := Decide(b.deps.Playback, b.deps.Transcoder, DecisionRequest{
 		Session: ps, Caps: caps, Options: opts, PreferRemux: preferRemux,
 		Protocol: protocol, RemoteMaxBitrateKbps: admitted.RemoteMaxBitrateKbps,
+		NoVideoTranscode: videoOff,
 	})
 	if err != nil {
 		return frontend.PlayPlan{}, err
+	}
+	if videoOff && decisionEncodesVideo(dec, media) {
+		return frontend.PlayPlan{}, &frontend.NoCompatiblePathError{
+			RejectedPaths: []frontend.RejectedPlaybackPath{{Path: "video", Reasons: []string{reasonVideoTranscodingOff}}},
+			Cause:         core.ErrVideoTranscodingDisabled,
+		}
 	}
 	req.Caps = caps
 	req.Intent.Options = opts
@@ -161,7 +141,7 @@ func (b *Broker) reusePlexSession(_ context.Context, v *core.Viewer, req fronten
 		b.mu.Unlock()
 		return frontend.Session{}, false, nil
 	}
-	if old.public.Protocol != "plex" || old.public.ViewerID != v.ID || old.public.Device.ID != req.Device.ID {
+	if !b.policy(old.public.Protocol).ExternalAdmission || old.public.ViewerID != v.ID || old.public.Device.ID != req.Device.ID {
 		b.mu.Unlock()
 		return frontend.Session{}, false, core.ErrUnauthorized
 	}
@@ -205,7 +185,7 @@ func (b *Broker) reusePlexSession(_ context.Context, v *core.Viewer, req fronten
 // newest match. An empty header matches only when exactly one session exists.
 func (b *Broker) PlexSessionForPlayback(ctx context.Context, a frontend.SessionAccess, item frontend.RatingKey, playbackID, transcodeID string) (string, error) {
 	viewer, err := b.viewer(ctx, a.Viewer)
-	if err != nil || a.Protocol != "plex" || a.Device.ID == "" || a.Owner || item == 0 {
+	if err != nil || !b.policy(a.Protocol).ExternalAdmission || a.Device.ID == "" || a.Owner || item == 0 {
 		return "", core.ErrUnauthorized
 	}
 	b.mu.Lock()
@@ -214,14 +194,14 @@ func (b *Broker) PlexSessionForPlayback(ctx context.Context, a frontend.SessionA
 		return "", core.ErrNotAvailable
 	}
 	if transcodeID != "" {
-		if s := b.sessions[transcodeID]; s != nil && plexViewerSession(s, viewer.ID, a.Device.ID, item) {
+		if s := b.sessions[transcodeID]; s != nil && b.viewerSession(s, viewer.ID, a.Device.ID, item) {
 			return transcodeID, nil
 		}
 	}
 	var ids []string
 	newest, newestAt := "", time.Time{}
 	for id, s := range b.sessions {
-		if !plexViewerSession(s, viewer.ID, a.Device.ID, item) {
+		if !b.viewerSession(s, viewer.ID, a.Device.ID, item) {
 			continue
 		}
 		if playbackID != "" && s.playbackID != playbackID {
@@ -245,7 +225,7 @@ func (b *Broker) PlexSessionForPlayback(ctx context.Context, a frontend.SessionA
 // this viewer and item. The newest match wins when more than one remains.
 func (b *Broker) PlexSessionForSource(ctx context.Context, a frontend.SessionAccess, item frontend.RatingKey, playID string) (string, error) {
 	viewer, err := b.viewer(ctx, a.Viewer)
-	if err != nil || a.Protocol != "plex" || a.Device.ID == "" || a.Owner || item == 0 || playID == "" {
+	if err != nil || !b.policy(a.Protocol).ExternalAdmission || a.Device.ID == "" || a.Owner || item == 0 || playID == "" {
 		return "", core.ErrUnauthorized
 	}
 	b.mu.Lock()
@@ -255,7 +235,7 @@ func (b *Broker) PlexSessionForSource(ctx context.Context, a frontend.SessionAcc
 	}
 	newest, newestAt := "", time.Time{}
 	for id, s := range b.sessions {
-		if !plexViewerSession(s, viewer.ID, a.Device.ID, item) || s.playID != playID {
+		if !b.viewerSession(s, viewer.ID, a.Device.ID, item) || s.playID != playID {
 			continue
 		}
 		if newest == "" || s.public.StartedAt.After(newestAt) {
@@ -276,14 +256,14 @@ func (b *Broker) PlexSessionSource(id string) (string, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	s := b.sessions[id]
-	if s == nil || s.public.Protocol != "plex" || s.playID == "" {
+	if s == nil || !b.policy(s.public.Protocol).ExternalAdmission || s.playID == "" {
 		return "", false
 	}
 	return s.playID, true
 }
 
-func plexViewerSession(s *brokerSession, viewer int64, device string, item core.RatingKey) bool {
-	return s != nil && s.public.Protocol == "plex" && s.public.ViewerID == viewer && s.public.Device.ID == device && s.public.Item == item
+func (b *Broker) viewerSession(s *brokerSession, viewer int64, device string, item core.RatingKey) bool {
+	return s != nil && b.policy(s.public.Protocol).ExternalAdmission && s.public.ViewerID == viewer && s.public.Device.ID == device && s.public.Item == item
 }
 
 // NotePlexEncoder records that the Plex adapter started ffmpeg under the
@@ -294,7 +274,7 @@ func (b *Broker) NotePlexEncoder(id string, format frontend.StreamFormat, decisi
 	}
 	b.mu.Lock()
 	s := b.sessions[id]
-	if s == nil || s.public.Protocol != "plex" {
+	if s == nil || !b.policy(s.public.Protocol).ExternalAdmission {
 		b.mu.Unlock()
 		return
 	}
@@ -319,6 +299,12 @@ func (b *Broker) StopProtocol(ctx context.Context, protocol frontend.Protocol) e
 		return core.ErrNotAvailable
 	}
 	b.mu.Lock()
+	for id, s := range b.previews {
+		if s.public.Protocol == protocol {
+			s.cancel()
+			delete(b.previews, id)
+		}
+	}
 	var sessionIDs, planIDs []string
 	for id, s := range b.sessions {
 		if s.public.Protocol == protocol {
@@ -364,3 +350,9 @@ func (b *Broker) dropPlexPlan(id string) {
 		b.releasePlanSource(plan.source.ID, plan.pinned)
 	}
 }
+
+// PlanAdmission and its context helpers live in internal/frontend
+// (host_sessions_experience.go).
+type PlanAdmission = frontend.PlanAdmission
+
+var WithPlanAdmission = frontend.WithPlanAdmission

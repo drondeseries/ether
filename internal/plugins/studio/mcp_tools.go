@@ -500,9 +500,20 @@ func Scaffold(req ScaffoldRequest) (ScaffoldResult, error) {
 			m.Ether.Contributes.Events = &plugins.EventsMeta{
 				Subscribe: []string{plugins.EventPlaybackCompleted},
 			}
+		case plugins.CapFlowActions:
+			needHandle = true
+			m.Ether.Contributes.FlowActions = []plugins.FlowActionMeta{
+				{
+					Key:        "run_action",
+					Label:      "Run custom action",
+					Route:      "/ether/v1/flow-actions/run_action",
+					Idempotent: true,
+					Timeout:    "15s",
+				},
+			}
 		case plugins.CapRankingStep:
 			m.Ether.Contributes.RankingSteps = []plugins.RankingStepMeta{
-				{Key: "prefer_custom", Label: "Prefer matching releases", DefaultPosition: 0},
+				{Key: "prefer_custom", Label: "Prefer matching releases"},
 			}
 		case plugins.CapRuleCondition:
 			m.Ether.Contributes.RuleConditions = []plugins.RuleConditionMeta{
@@ -749,8 +760,7 @@ func pluginCheckTool(deps ToolDeps) tools.Tool {
 				}
 			}
 
-			var eng *wasm.Engine
-			eng = deps.Engine
+			eng := deps.Engine
 			rep, err := Check(ctx, eng, CheckRequest{
 				Manifest: manifestBytes,
 				Files:    files,

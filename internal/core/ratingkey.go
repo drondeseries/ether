@@ -1,8 +1,11 @@
 package core
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"strconv"
+	"strings"
 )
 
 // RatingKey is the Plex ratingKey of an Ether item. It is derived from TMDB
@@ -28,7 +31,8 @@ import (
 //	                collections; database ids stay far below both
 //	KindPlaylist    payload = local playlist id
 //	KindExtra       payload = compact extra id from the extras registry
-//	KindLocal       payload = local file id (spike / test library)
+//	KindLocal       payload = local file id (spike / test library), or
+//	                PluginKeyBase + seq for plugin items (spec §2.2)
 type RatingKey int64
 
 type KeyKind int
@@ -47,13 +51,87 @@ const (
 
 const keyBase = 1_000_000_000_000_000 // 10^15
 
+// MaxTitleRuleKeys bounds the number of rating keys in one "title" visibility
+// condition so compiled key IN (...) predicates stay bounded.
+const MaxTitleRuleKeys = 500
+
+// PluginKeyBase and PluginKeyMaxSeq carve out the KindLocal payload range
+// [PluginKeyBase+1, PluginKeyBase+PluginKeyMaxSeq) for plugin items while
+// keeping every RatingKey below 2^53 (spec §2.2).
+const (
+	PluginKeyBase   int64 = 5_000_000_000_000
+	PluginKeyMaxSeq int64 = 2_000_000_000_000
+	// PluginKeyOffset is the base integer added to plugin_items.seq to produce
+	// its RatingKey: RatingKey(PluginKeyOffset + seq) == PluginKey(seq).
+	PluginKeyOffset int64 = int64(KindLocal)*keyBase + PluginKeyBase
+)
+
+// PluginPersonIDBase and PluginPersonIDSpan carve out deterministic positive
+// person IDs in (PluginPersonIDBase, PluginPersonIDBase+PluginPersonIDSpan)
+// for cast credited on plugin items. Values stay far above TMDB person
+// IDs (< 10^9) and safely below 2^53 for JavaScript clients.
+const (
+	PluginPersonIDBase int64 = 4_000_000_000_000
+	PluginPersonIDSpan int64 = 1_000_000_000_000
+)
+
+// PluginPersonID derives a deterministic positive synthetic person ID from a
+// person's display name (case- and whitespace-folded). Returns 0 when blank.
+func PluginPersonID(name string) int64 {
+	norm := strings.Join(strings.Fields(strings.ToLower(name)), " ")
+	if norm == "" {
+		return 0
+	}
+	sum := sha256.Sum256([]byte("plugin-person:" + norm))
+	offset := binary.BigEndian.Uint64(sum[:8])%uint64(PluginPersonIDSpan-1) + 1
+	return PluginPersonIDBase + int64(offset)
+}
+
+// IsPluginPersonID reports whether id is in the synthetic plugin-person ID range.
+func IsPluginPersonID(id int64) bool {
+	return id > PluginPersonIDBase && id < PluginPersonIDBase+PluginPersonIDSpan
+}
+
 func MovieKey(tmdb int64) RatingKey    { return RatingKey(int64(KindMovie)*keyBase + tmdb) }
 func ShowKey(tmdb int64) RatingKey     { return RatingKey(int64(KindShow)*keyBase + tmdb) }
 func CollectionKey(id int64) RatingKey { return RatingKey(int64(KindCollection)*keyBase + id) }
 func SmartKey(id int64) RatingKey      { return RatingKey(int64(KindSmart)*keyBase + id) }
 func PlaylistKey(id int64) RatingKey   { return RatingKey(int64(KindPlaylist)*keyBase + id) }
 func ExtraKey(id int64) RatingKey      { return RatingKey(int64(KindExtra)*keyBase + id) }
-func LocalKey(id int64) RatingKey      { return RatingKey(int64(KindLocal)*keyBase + id) }
+
+func LocalKey(id int64) RatingKey {
+	if id >= PluginKeyBase {
+		panic(fmt.Sprintf("core.LocalKey: payload %d overlaps PluginKeyBase (%d)", id, PluginKeyBase))
+	}
+	return RatingKey(int64(KindLocal)*keyBase + id)
+}
+
+// PluginKey builds a plugin item RatingKey from a stored sequence number in
+// [1, PluginKeyMaxSeq) (spec §2.2).
+func PluginKey(seq int64) RatingKey {
+	if seq < 1 || seq >= PluginKeyMaxSeq {
+		panic(fmt.Sprintf("core.PluginKey: seq %d out of range [1, %d)", seq, PluginKeyMaxSeq))
+	}
+	return RatingKey(int64(KindLocal)*keyBase + PluginKeyBase + seq)
+}
+
+// IsPluginKey reports whether k is a plugin item RatingKey (spec §2.2).
+func (k RatingKey) IsPluginKey() bool {
+	if k.Kind() != KindLocal {
+		return false
+	}
+	p := k.payload()
+	return p > PluginKeyBase && p < PluginKeyBase+PluginKeyMaxSeq
+}
+
+// PluginSeq returns the stored sequence number (1 .. PluginKeyMaxSeq-1) of a
+// plugin item RatingKey, or 0 when k is not a plugin key.
+func (k RatingKey) PluginSeq() int64 {
+	if !k.IsPluginKey() {
+		return 0
+	}
+	return k.payload() - PluginKeyBase
+}
 
 // SectionCollectionKey gives a persisted smart collection a distinct Plex
 // identity per library. The reserved range is below ephemeral smart keys.
@@ -184,6 +262,21 @@ func (k RatingKey) Valid() bool {
 	switch k.Kind() {
 	case KindMovie, KindShow, KindSeason, KindEpisode, KindCollection, KindSmart, KindPlaylist, KindExtra, KindLocal:
 		return k.payload() > 0 || k.Kind() == KindSeason
+	}
+	return false
+}
+
+// IsTitleKey reports whether k is a catalogue movie, show, or non-plugin local
+// title RatingKey (the keys stored in catalog_titles).
+func (k RatingKey) IsTitleKey() bool {
+	if !k.Valid() {
+		return false
+	}
+	switch k.Kind() {
+	case KindMovie, KindShow:
+		return true
+	case KindLocal:
+		return k.payload() > 0 && k.payload() < PluginKeyBase
 	}
 	return false
 }

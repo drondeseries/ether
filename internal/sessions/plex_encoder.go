@@ -6,10 +6,10 @@ import (
 	"net/http"
 )
 
-// StartPlexHLS is the opt-in universal encoder seam after the Plex adapter has
+// StartSegmentedHLS is the shared universal encoder seam after the Plex adapter has
 // performed its existing acceptance, policy, selection and grant checks. Errors
 // never authorize caller fallback or a second encoder.
-func (b *Broker) StartPlexHLS(ctx context.Context, viewer *core.User, playID, publicID string, q core.HLSRequest) (core.HLSSession, error) {
+func (b *Broker) StartSegmentedHLS(ctx context.Context, viewer *core.User, playID, publicID string, q core.HLSRequest) (core.HLSSession, error) {
 	if q.SessionID != publicID || playID == "" || !validPlexTranscodeID(publicID) {
 		return nil, core.ErrUnauthorized
 	}
@@ -19,7 +19,7 @@ func (b *Broker) StartPlexHLS(ctx context.Context, viewer *core.User, playID, pu
 	}
 	b.mu.Lock()
 	entry := b.sessions[publicID]
-	if entry == nil || entry.public.Protocol != "plex" || entry.public.ViewerID != v.ID || entry.playID != playID || b.closed {
+	if entry == nil || !b.policy(entry.public.Protocol).ExternalAdmission || entry.public.ViewerID != v.ID || entry.playID != playID || b.closed {
 		b.mu.Unlock()
 		return nil, core.ErrUnauthorized
 	}
@@ -44,7 +44,7 @@ func (b *Broker) StartPlexHLS(ctx context.Context, viewer *core.User, playID, pu
 	}
 	remote := b.deps.DistributedHLS
 	if remote != nil {
-		if remote.Supports(q) {
+		if len(q.TextSubtitleStreams) == 0 && remote.Supports(q) {
 			revision := sourceRevision(ps)
 			if revision == "" {
 				return nil, core.ErrSourceChanged
@@ -58,12 +58,29 @@ func (b *Broker) StartPlexHLS(ctx context.Context, viewer *core.User, playID, pu
 	if b.deps.Transcoder == nil {
 		return nil, core.ErrNotAvailable
 	}
-	return b.deps.Transcoder.StartHLS(ctx, q)
+	// A local Plex encoder reads the same playback source as a broker
+	// start, so it needs the same input lease: without one its retirement
+	// can never verify input-producer drain and every Plex session close
+	// ended "encoder input producer retirement is unverified" (#410).
+	var lease core.EncoderInputLease
+	if q.InputLease == nil {
+		var err error
+		lease, err = b.mintEncoderInput(ctx, playID)
+		if err != nil {
+			return nil, err
+		}
+		q.InputLease = lease
+	}
+	hs, err := b.deps.Transcoder.StartHLS(ctx, q)
+	if (err != nil || hs == nil) && lease != nil {
+		lease.SealInput()
+	}
+	return hs, err
 }
 
-// PlexHLSSession reports ownership independently of current availability. A nil
+// SegmentedHLSSession reports ownership independently of current availability. A nil
 // session with true means retained remote responsibility, never local fallback.
-func (b *Broker) PlexHLSSession(id string) (core.HLSSession, bool) {
+func (b *Broker) SegmentedHLSSession(id string) (core.HLSSession, bool) {
 	if remote := b.deps.DistributedHLS; remote != nil && remote.Allocated(id) {
 		session, _ := remote.Session(id)
 		return session, true
@@ -74,11 +91,16 @@ func (b *Broker) PlexHLSSession(id string) (core.HLSSession, bool) {
 	return b.deps.Transcoder.Session(id)
 }
 
-// StopPlexHLS returns true when the remote coordinator owns the exact execution,
-// including uncertain start/stop phases. It never claims retirement completion.
-func (b *Broker) StopPlexHLS(id string) bool {
+// StopSegmentedHLS handles local and remote encoder retirement through the broker.
+// Remote ownership includes uncertain start/stop phases; true reports ownership,
+// not proof that an asynchronous remote retirement has completed.
+func (b *Broker) StopSegmentedHLS(id string) bool {
 	if remote := b.deps.DistributedHLS; remote != nil && remote.Allocated(id) {
 		remote.Stop(id)
+		return true
+	}
+	if b.deps.Transcoder != nil {
+		b.deps.Transcoder.Stop(id)
 		return true
 	}
 	return false
@@ -91,20 +113,20 @@ func (b *Broker) BindPlexDelivery(handler http.Handler) error {
 	}
 	return core.ErrNotAvailable
 }
-func (b *Broker) ForwardPlexMedia(w http.ResponseWriter, r *http.Request, id string) bool {
+func (b *Broker) ForwardEncodedMedia(w http.ResponseWriter, r *http.Request, id string) bool {
 	if remote, ok := b.deps.DistributedHLS.(interface {
-		ForwardPlexMedia(http.ResponseWriter, *http.Request, string) bool
+		ForwardEncodedMedia(http.ResponseWriter, *http.Request, string) bool
 	}); ok {
-		return remote.ForwardPlexMedia(w, r, id)
+		return remote.ForwardEncodedMedia(w, r, id)
 	}
 	return false
 }
 
-func (b *Broker) ForwardPlexGrantMedia(w http.ResponseWriter, r *http.Request, id string) bool {
+func (b *Broker) ForwardGrantMedia(w http.ResponseWriter, r *http.Request, id string) bool {
 	if remote, ok := b.deps.DistributedHLS.(interface {
-		ForwardPlexGrantMedia(http.ResponseWriter, *http.Request, string) bool
+		ForwardGrantMedia(http.ResponseWriter, *http.Request, string) bool
 	}); ok {
-		return remote.ForwardPlexGrantMedia(w, r, id)
+		return remote.ForwardGrantMedia(w, r, id)
 	}
 	return false
 }
@@ -135,11 +157,11 @@ func (b *Broker) LoadPlexBinding(ctx context.Context, id string) ([]byte, error)
 	return nil, core.ErrNotAvailable
 }
 
-func (b *Broker) DeletePlexBinding(ctx context.Context, id string) error {
+func (b *Broker) DeleteBinding(ctx context.Context, id string) error {
 	if remote, ok := b.deps.DistributedHLS.(interface {
-		DeletePlexBinding(context.Context, string) error
+		DeleteBinding(context.Context, string) error
 	}); ok {
-		return remote.DeletePlexBinding(ctx, id)
+		return remote.DeleteBinding(ctx, id)
 	}
 	return core.ErrNotAvailable
 }

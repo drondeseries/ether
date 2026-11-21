@@ -75,7 +75,11 @@ func TestMutualTLSAdapterAndDisconnect(t *testing.T) {
 	}
 	checkKeyframeRoundTrip(t, a, f, indexedRequest, hs)
 	out := httptest.NewRecorder()
-	hs.ServeSegment(out, httptest.NewRequest("GET", "https://frontend/segment", nil), -1)
+	const mediaName = "/g-0123456789abcdef0123456789abcdef-init.mp4"
+	hs.ServeSegment(out, httptest.NewRequest("GET", "https://frontend"+mediaName, nil), -1)
+	if f.session.mediaName != mediaName {
+		t.Fatalf("remote transport lost generation filename: %q", f.session.mediaName)
+	}
 	if out.Code != 206 || out.Body.String() != "abc" || out.Header().Get("Content-Range") != "bytes 0-2/3" {
 		t.Fatalf("proxy lost representation: %v", out)
 	}
@@ -92,7 +96,7 @@ func TestMutualTLSAdapterAndDisconnect(t *testing.T) {
 		t.Fatal("retry extended lease", err)
 	}
 	for _, protocol := range []string{core.ProtocolHLS, core.ProtocolDASH, core.ProtocolHTTP} {
-		req := core.HLSRequest{SessionID: "protocol-" + protocol, Protocol: protocol, Decision: start.Decision}
+		req := core.HLSRequest{SessionID: "protocol-" + protocol, Protocol: protocol, Decision: start.Decision, PMSDASH: protocol == core.ProtocolDASH}
 		if protocol == core.ProtocolHLS {
 			index := 2
 			req.SoftSubtitleStream = &index
@@ -103,7 +107,7 @@ func TestMutualTLSAdapterAndDisconnect(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if protocol == core.ProtocolDASH && (f.request.ManifestSessionID != req.SessionID || f.request.SessionID == req.SessionID) {
+		if protocol == core.ProtocolDASH && (f.request.ManifestSessionID != req.SessionID || f.request.SessionID == req.SessionID || !f.request.PMSDASH) {
 			t.Fatal("worker did not separate public DASH URLs from exact encoder ownership")
 		}
 		checkRepresentations(t, next, protocol)

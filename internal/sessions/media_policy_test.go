@@ -55,7 +55,7 @@ func TestMediaRechecksCurrentPolicyAndScopedDevice(t *testing.T) {
 		}
 		return &core.Title{Key: k}, nil
 	}
-	broker, err := NewBroker(BrokerDeps{Events: events, Playback: playback, Transcoder: transcoder, Live: live, Progress: &fakeProgress{}, ActiveViewer: active, CanPlay: func(*core.Viewer, bool, time.Time) bool { return canPlay }, BitrateLimit: func(*core.Viewer) int { return 0 }, OnTimeline: func(*core.Viewer, core.RatingKey, time.Duration, time.Duration, string) {}, Lookup: func(ctx context.Context, v *core.Viewer, d core.Device, k core.RatingKey) (*core.Title, error) {
+	broker, err := NewBroker(BrokerDeps{SurfacePolicy: testSessionPolicy, Events: events, Playback: playback, Transcoder: transcoder, Live: live, Progress: &fakeProgress{}, ActiveViewer: active, CanPlay: func(*core.Viewer, bool, time.Time) bool { return canPlay }, BitrateLimit: func(*core.Viewer) int { return 0 }, OnTimeline: func(*core.Viewer, core.RatingKey, time.Duration, time.Duration, string) {}, Lookup: func(ctx context.Context, v *core.Viewer, d core.Device, k core.RatingKey) (*core.Title, error) {
 		lookupCalls++
 		return lookup(ctx, v, d, k)
 	}, MediaLookup: lookup, ExtractSubtitle: func(_ context.Context, _ string, _ int, _ string, w io.Writer) error {
@@ -119,6 +119,31 @@ func TestMediaRechecksCurrentPolicyAndScopedDevice(t *testing.T) {
 	bad = access
 	bad.Owner = true
 	check("GET", direct, bad, 404)
+	// Publication deletion denies new plans while current media still checks safety.
+	pendingReq := req
+	pendingReq.Device.ID = "pending"
+	pending, err := broker.Plan(ctx, pendingReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lookupAfterOpen = lookupCalls
+	originalLookup := broker.deps.Lookup
+	broker.deps.CurrentMediaLookup = lookup
+	broker.deps.Lookup = func(context.Context, *core.Viewer, core.Device, core.RatingKey) (*core.Title, error) {
+		return nil, core.ErrNotFound
+	}
+	broker.deps.MediaLookup = broker.deps.Lookup
+	if _, err := broker.Plan(ctx, req); err == nil {
+		t.Fatal("deleted membership admitted")
+	}
+	if _, err := broker.Open(ctx, frontend.OpenRequest{Viewer: viewer, Device: pendingReq.Device, Protocol: "silo", PlanID: pending.ID}); err == nil {
+		t.Fatal("deleted membership replayed pending plan")
+	}
+	check("GET", direct, access, 200)
+	check("HEAD", direct, access, 200)
+	check("GET", subtitle, access, 200)
+	broker.deps.Lookup = originalLookup
+	broker.deps.MediaLookup = lookup
 	allowed = false
 	check("GET", direct, access, 404)
 	check("HEAD", direct, access, 404)

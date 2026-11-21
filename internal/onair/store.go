@@ -66,7 +66,7 @@ func (s *Service) validateLook(ctx context.Context, l Look) error {
 	if strings.TrimSpace(l.Name) == "" || utf8.RuneCountInString(l.Name) > 120 || utf8.RuneCountInString(l.Brand.Tagline) > 40 {
 		return fmt.Errorf("name required (120 characters maximum); tagline maximum 40 characters")
 	}
-	known := " inter playfairdisplay specialelite fraunces bungee fredoka orbitron vt323 spacegrotesk ibmplexmono archivoblack notosans "
+	known := " " + strings.Join(BundledFonts, " ") + " "
 	for _, f := range []string{l.Brand.Type.Display, l.Brand.Type.Body} {
 		if !strings.Contains(known, " "+normalizeFont(f)+" ") {
 			var n int
@@ -227,7 +227,10 @@ func (s *Service) saveLook(ctx context.Context, l Look) (Look, error) {
 		s.mu.Lock()
 		s.looks[l.ID] = l
 		s.mu.Unlock()
-		s.enqueueLook(l)
+		// Never eagerly render on look save; only update cached-hash accounting
+		// and wake watchUpcoming in case an active viewer is currently watching.
+		s.refreshLookHashes(l)
+		s.WakeUpcoming()
 	}
 	return l, e
 }
@@ -239,6 +242,7 @@ func (s *Service) DeleteLook(ctx context.Context, id string) error {
 		delete(s.progress, id)
 		delete(s.lookJobs, id)
 		s.mu.Unlock()
+		s.WakeUpcoming()
 	}
 	if e == nil && s.o.Changed != nil {
 		e = s.o.Changed(ctx)
@@ -246,6 +250,10 @@ func (s *Service) DeleteLook(ctx context.Context, id string) error {
 	return e
 }
 func (s *Service) seed(ctx context.Context) error {
+	var existing string
+	if s.db.QueryRowContext(ctx, "SELECT v FROM onair_settings WHERE k='seeded'").Scan(&existing) == nil {
+		return nil
+	}
 	tx, e := s.db.BeginTx(ctx, nil)
 	if e != nil {
 		return e
@@ -262,7 +270,8 @@ func (s *Service) seed(ctx context.Context) error {
 	if n == 0 {
 		return tx.Commit()
 	}
-	for _, v := range [][10]string{{"nocturne", "Nocturne", "late-night", "#060508", "#C8102E", "#EDE6D6", "#8FA3B8", "Playfair Display", "Special Elite", "Late night · lights off"}, {"meridian", "Meridian", "cinema", "#070d1d", "#D8B26E", "#F4EEDF", "#17254a", "Fraunces", "Inter", "A world of cinema"}, {"blorp", "BLORP!", "kids", "#6B2BD9", "#FF7A00", "#ffffff", "#7CE03A", "Bungee", "Fredoka", "Totally gooey TV"}, {"neon", "NEON 84", "retro", "#12002b", "#ff4fd8", "#ffffff", "#22e6ff", "Orbitron", "VT323", "Stay tuned"}, {"personal", "Your TV", "personal", "#100b23", "#9b85ff", "#ffffff", "#ff5ca8", "Space Grotesk", "Inter", "Made for you"}, {"riot", "RIOT 90", "grunge", "#141021", "#edff38", "#ffffff", "#ed4c99", "Archivo Black", "Special Elite", "Television with a pulse"}, {"aquawave", "AQUAWAVE 00", "aqua", "#031d37", "#009edb", "#ffffff", "#8cf5ff", "Space Grotesk", "Inter", "Dive into your favourites"}, {"offset", "OFFSET 10", "flat", "#102a35", "#f15440", "#ffffff", "#ffd66e", "Inter", "Inter", "Good stories. Every day."}} {
+	// The decade looks ship with their showcase channels (showcase.go).
+	for _, v := range [][10]string{{"nocturne", "Nocturne", "late-night", "#060508", "#C8102E", "#EDE6D6", "#8FA3B8", "Playfair Display", "Special Elite", "Late night · lights off"}, {"meridian", "Meridian", "cinema", "#070d1d", "#D8B26E", "#F4EEDF", "#17254a", "Fraunces", "Inter", "A world of cinema"}, {"blorp", "BLORP!", "kids", "#6B2BD9", "#FF7A00", "#ffffff", "#7CE03A", "Bungee", "Fredoka", "Totally gooey TV"}, {"neon", "NEON 84", "retro", "#12002b", "#ff4fd8", "#ffffff", "#22e6ff", "Orbitron", "VT323", "Stay tuned"}, {"personal", "Your TV", "personal", "#100b23", "#9b85ff", "#ffffff", "#ff5ca8", "Space Grotesk", "Inter", "Made for you"}} {
 		l := familyLook(v[2], v[1])
 		l.ID = v[0]
 		l.Brand.Palette.Background = v[3]

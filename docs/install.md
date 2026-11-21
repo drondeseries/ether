@@ -125,6 +125,13 @@ if you connect Jellyfin apps to `http://HOST:32400/jellyfin`, or you can
 optionally publish `-p 8096:8096` (and `8097:8097`, `8090:8090`) if you want
 dedicated per-app ports without a path prefix.
 
+In bridge mode Ether sees only its container address (such as `172.17.0.2`),
+so Plex apps and app.plex.tv cannot reach the address it advertises and report
+that the server can't connect securely. Add your host's LAN address under
+**Apps › Away from home › Address and port › Custom server URLs**, for example
+`http://192.168.1.50:32400`. Ether also publishes the secure plex.direct form of
+that address.
+
 Already running Plex on 32400? Use bridge mode and `ETHER_PORT` so Ether does
 not take that port:
 
@@ -201,6 +208,8 @@ probe found.
 NVENC: use the NVIDIA container toolkit flags shown in
 `docker-compose.example.yml`.
 
+Health check: the image includes a built-in Docker `HEALTHCHECK` (`ether healthcheck`) that probes the local `/ether/api/health` endpoint on the configured port without authentication.
+
 ## From a tarball/zip (any OS)
 
 Release archives contain `ether`, the tray (Linux/Windows), `ffmpeg` and
@@ -250,15 +259,21 @@ for remote access outside your LAN:
   port 443 with *Secure connections* set to *Required*) at your `https://`
   domain; Ether publishes that HTTPS endpoint directly to plex.tv without
   requiring a `plex.direct` certificate.
-  A proxy on the Ether host must set `X-Forwarded-For` to the connecting
-  client's address (or append it to the existing chain). If using
-  `X-Real-IP` instead, overwrite it and remove incoming `X-Forwarded-For`.
-  Never pass client-supplied forwarding headers unchanged.
-  Ether considers forwarded addresses only from loopback peers and treats
-  any public hop in the trusted suffix as remote for playback restrictions.
+  A reverse proxy must set `X-Forwarded-For` to the connecting client's
+  address (or append it to the existing chain) and set `X-Forwarded-Proto`.
+  If using `X-Real-IP` instead, overwrite it and remove incoming
+  `X-Forwarded-For`. Never pass client-supplied forwarding headers unchanged.
+  Ether trusts forwarding headers from loopback peers (`127.0.0.1`, `::1`)
+  by default. If your reverse proxy runs on another host or container
+  network (for example Caddy, Nginx, or Traefik on another LAN machine),
+  add its IP address or CIDR range under **Apps › Overview › Away from home ›
+  Reverse proxy** (`server.trustedProxyCIDRs` in `config.json`); Ether then
+  resolves the real client IP and treats public hops in the trusted suffix
+  as remote for sessions, activity, quality profiles, and playback
+  restrictions.
   The owner console at `/ether/` answers only your home network and VPN
   (including Tailscale) by default, wherever the proxy runs. To reach it
-  through your domain, turn on **Server › General › How apps connect ›
+  through your domain, turn on **Apps › Overview › Server address ›
   Open this console from outside your network**; only the Plex account
   that owns the server can sign in. Complete initial setup before exposing
   the server.
@@ -281,19 +296,26 @@ Stremio apps require an **`https://`** addon URL unless you are connecting to
 
 ## How Ether reaches the internet
 
-Ether can send indexers, Stremio addons, debrid and Usenet through one proxy
-on this computer, and leave Plex, updates, UPnP and remote access on the
-normal connection. The setting is off until you turn it on, under
+Ether can send indexers, Stremio addons, plugins, Live TV/IPTV, debrid and
+Usenet through one proxy on this computer, and leave Plex, updates, UPnP
+and remote access on the normal connection. The setting is off until you turn it on, under
 **Server › General › How Ether reaches the internet**. Enter one proxy address,
 or pick a layout from **Common setups**, then choose **Test connection**. A
 username and password, under **More options**, are stored with Ether's other
 secrets and are not put in the address.
 
+Live TV/IPTV follows the **Stremio addons, plugins and Live TV/IPTV** option
+under **More options**. This includes M3U and Xtream playlists, guide data,
+live streams, and Xtream movies and series. Ether relays provider traffic,
+including ffmpeg and ffprobe inputs, so TV apps need no VPN app. Virtual
+channels playing your local library and Plex stay on the normal connection.
+Private provider addresses and names listed as local also stay direct.
+
 Two layouts are common:
 
 1. **Split tunnel.** Ether stays on the host network so Plex discovery and
-   remote access keep working. A VPN container publishes a proxy. Gluetun's
-   HTTP proxy listens on port 8888 when `HTTPPROXY=on`. From a host-network
+   remote access keep working. A VPN container publishes a proxy for source
+   traffic, including IPTV. Gluetun's HTTP proxy listens on port 8888 when `HTTPPROXY=on`. From a host-network
    Ether process that address is `http://127.0.0.1:8888`, because Docker DNS
    names are not visible there. On a shared Docker network it is
    `http://gluetun:8888`. SOCKS on port 1080 is only useful if you enabled a
@@ -626,15 +648,43 @@ page, then move on to the next.
 
 ## Updates
 
-By default, Ether checks the signed release feed once a day (stable or beta
+Ether checks the signed release feed about every 6 hours (stable or beta
 channel, chosen under **Maintenance › Updates**). You can turn update checks
-off completely with the **Check for updates** toggle on that page. Depending on
-your **Install updates automatically** setting, Ether either shows available
-updates in the console or applies them during the maintenance window: a
-verified binary self-replace (with an automatic rollback copy) or the platform
-installer (DMG/`EtherSetup.exe`). Linux packages and Docker containers update
-through your package manager or a new container image. Nothing is ever
-installed without a valid Ed25519 signature and SHA-256 match.
+off completely with the **Check for updates** toggle on that page.
+
+**Install updates automatically** is on for new installs (servers set up
+before v0.3.6 keep the setting they had; the Updates page suggests turning it
+on). With it on, Ether downloads a release early and installs it at a moment
+nobody notices:
+
+- inside the maintenance window (default 03:00–06:00 local time), once
+  nothing has played, transcoded or streamed Live TV for 10 minutes;
+- never while anyone is watching. A server busy through three windows in a
+  row installs the next time nobody has watched for 30 minutes;
+- right before installing it re-reads the feed, so a release that was pulled
+  is never installed, and a download for a pulled release is deleted;
+- stable releases roll out over a day: each server waits a share of that day
+  picked from a local hash of its server identity (nothing is sent anywhere),
+  so a bad release reaches few servers before it can be pulled. Beta releases
+  and **Update now** skip the wait;
+- a release marked as a security fix skips the rollout and the window and
+  installs at the next 10 quiet minutes.
+
+The new version then has to run healthily for 10 minutes; if it crash-loops,
+Ether restores the previous binary, skips that release and sends an *Update
+rolled back* notification. A successful install shows *Updated to X* on the
+Updates page and sends an *Update installed* notification. Clusters update one
+node at a time inside the window (see above).
+
+Installs Ether cannot replace by itself show the exact steps on the Updates
+page instead: the DMG download on macOS, `docker compose pull` (or Watchtower)
+for containers, and the `apt`/`dnf` command for Linux packages. Nothing is
+ever installed without a valid Ed25519 signature and SHA-256 match.
+
+Release publishers: `ether-release-sign manifest` writes the staged rollout
+(`-rollout-hours`, default 24 for stable and 0 for beta) and `-critical` into
+the signed manifest. The release workflow sets `-critical` when the release
+notes contain the line `<!-- ether-update: critical -->`.
 
 ### Database snapshots before upgrades
 

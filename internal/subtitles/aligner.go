@@ -267,16 +267,7 @@ func (a *Aligner) compute(ctx context.Context, req core.AlignRequest) *Piecewise
 }
 
 func (a *Aligner) cuesByID(id string) ([]Cue, error) {
-	r, _, err := a.s.Open(id)
-	if err != nil {
-		return nil, err
-	}
-	defer r.Close()
-	raw, err := io.ReadAll(io.LimitReader(r, 16<<20))
-	if err != nil {
-		return nil, err
-	}
-	return ParseCues(string(raw))
+	return a.s.cuesByCachedID(id)
 }
 
 // durationFit rejects subtitle files that cannot belong to a release of
@@ -401,7 +392,16 @@ func (s *Service) CuesForInfo(info core.MediaInfo) ([]Cue, bool) {
 		if st.Type != "subtitle" || !strings.HasPrefix(st.ExternalURL, URLPrefix) {
 			continue
 		}
-		if cues, err := s.TimelineAligner().cuesByID(st.ExternalURL); err == nil && len(cues) > 0 {
+		r, _, err := s.Open(st.ExternalURL)
+		if err != nil {
+			continue
+		}
+		raw, rerr := io.ReadAll(io.LimitReader(r, 16<<20))
+		r.Close()
+		if rerr != nil {
+			continue
+		}
+		if cues, perr := ParseCues(string(raw)); perr == nil && len(cues) > 0 {
 			return cues, true
 		}
 	}

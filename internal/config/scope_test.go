@@ -76,11 +76,14 @@ func TestScopeOf(t *testing.T) {
 		"cache.budgetBytes":          Local,
 		"cache.prefetchBytes":        Shared,
 		"transcode.hwAccel":          Local,
+		"transcode.videoTranscoding": Local,
 		"database":                   Local,
 		"spike":                      Local,
 		"usenet":                     Shared,
 		"indexers":                   Shared,
 		"prowlarr":                   Shared,
+		"frontends":                  Shared,
+		"vela":                       Local,
 		"setupComplete":              Shared,
 		"debrid.providers":           Shared,
 		"debrid.cachedOnly":          Shared,
@@ -121,7 +124,9 @@ func TestSplitAndMergeShared(t *testing.T) {
 		t.Errorf("local server = %v", local["server"])
 	}
 	shared := SharedJSON(a)
-	if strings.Contains(string(shared), "postgres://a") || strings.Contains(string(shared), "40001") {
+	// Match the field, not the digits: a random client identifier can
+	// contain "40001".
+	if strings.Contains(string(shared), "postgres://a") || strings.Contains(string(shared), `"publicPort":40001`) {
 		t.Errorf("node-local settings leaked into the shared part: %s", shared)
 	}
 
@@ -161,5 +166,21 @@ func TestSplitAndMergeShared(t *testing.T) {
 	}
 	if got.Catalog.Language != "en-US" || got.Updates.Channel != "stable" {
 		t.Errorf("missing shared sections did not take defaults: %+v %+v", got.Catalog, got.Updates)
+	}
+
+	// Vela app settings (including livePreview) live under Shared frontends, while
+	// node-local vela.channelUrl stays local.
+	a.Frontends = map[string]Frontend{"vela": {Enabled: true, Settings: map[string]any{"livePreview": "on-click"}}}
+	a.Vela.ChannelURL = "https://node-a.example/channel.json"
+	b.Vela.ChannelURL = "https://node-b.example/channel.json"
+	got, err = MergeShared(b, SharedJSON(a))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Frontends["vela"].Settings["livePreview"] != "on-click" {
+		t.Errorf("shared Vela livePreview not merged: %#v", got.Frontends["vela"])
+	}
+	if got.Vela.ChannelURL != "https://node-b.example/channel.json" {
+		t.Errorf("node-local Vela.ChannelURL overwritten: %q", got.Vela.ChannelURL)
 	}
 }

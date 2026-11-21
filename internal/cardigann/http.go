@@ -18,6 +18,7 @@ import (
 
 	"github.com/braedonsaunders/ether/internal/core"
 	"github.com/braedonsaunders/ether/internal/egress"
+	"github.com/braedonsaunders/ether/internal/newznab"
 
 	"golang.org/x/text/encoding"
 	"golang.org/x/text/encoding/htmlindex"
@@ -59,6 +60,7 @@ type httpSession struct {
 	flareHC *http.Client
 	log     *slog.Logger
 	site    string // display name for errors
+	hosts   *newznab.HostLimiter
 
 	mu   sync.Mutex
 	ua   string
@@ -286,8 +288,13 @@ func (s *httpSession) roundTrip(ctx context.Context, req request) (*response, er
 		if s.log != nil {
 			s.log.Debug("cardigann request", "site", s.site, "method", method, "host", target.Host, "path", target.Path)
 		}
+		releaseHost, err := s.hosts.Acquire(ctx, target.String())
+		if err != nil {
+			return nil, err
+		}
 		hresp, err := s.client.Do(hreq)
 		if err != nil {
+			releaseHost()
 			// url.Error embeds the URL, which may carry passkeys.
 			var ue *url.Error
 			if errors.As(err, &ue) {
@@ -297,6 +304,7 @@ func (s *httpSession) roundTrip(ctx context.Context, req request) (*response, er
 		}
 		data, err := io.ReadAll(io.LimitReader(hresp.Body, maxResponseBytes+1))
 		hresp.Body.Close()
+		releaseHost()
 		if err != nil {
 			return nil, fmt.Errorf("%s: read response: %w", s.site, err)
 		}
@@ -384,6 +392,11 @@ func (s *httpSession) solve(ctx context.Context, flare, target string) (*flareSo
 	if s.log != nil {
 		s.log.Info("cardigann: solving browser challenge through FlareSolverr", "site", s.site)
 	}
+	releaseHost, err := s.hosts.Acquire(ctx, endpoint)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseHost()
 	resp, err := s.flareHC.Do(req)
 	if err != nil {
 		var ue *url.Error

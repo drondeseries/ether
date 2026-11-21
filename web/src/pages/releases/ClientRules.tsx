@@ -38,7 +38,7 @@ import {
   type Errors,
 } from "../sources/form";
 import { searchSelectLabels } from "../../i18n/appkit-labels";
-import { useQuality } from "./useQuality";
+import { settleQualityRules, useQuality } from "./useQuality";
 
 const DEVICES = [
   "Plex for Apple TV",
@@ -54,7 +54,7 @@ const DEVICES = [
 ];
 const CUSTOM = "__custom__";
 
-const HEIGHTS = localized(() => [
+const RESOLUTIONS = localized(() => [
   { value: "0", label: t("Any") },
   { value: "480", label: "480p" },
   { value: "720", label: "720p" },
@@ -74,7 +74,8 @@ const FILTER_OPTIONS = localized(() => [
   { value: MEDIA_TV as "tv", label: t("Shows") },
 ]);
 
-const heightLabel = (h: number) => HEIGHTS.find((x) => x.value === String(h))?.label ?? `${h}p`;
+const resolutionLabel = (h: number) =>
+  RESOLUTIONS.find((x) => x.value === String(h))?.label ?? `${h}p`;
 
 function ruleViewer(r: QualityRule, viewers: Viewer[] | null) {
   if (!r.userId) return "";
@@ -88,7 +89,7 @@ function ruleSummary(r: QualityRule, viewers: Viewer[] | null) {
     r.product || t("Any device"),
     r.platform,
     ruleViewer(r, viewers),
-    r.maxHeight ? heightLabel(r.maxHeight) : "",
+    r.maxHeight ? resolutionLabel(r.maxHeight) : "",
   ]
     .filter(Boolean)
     .join(" · ");
@@ -138,18 +139,19 @@ export function ClientRulesTab() {
     const { index, draft } = editing;
     const list =
       index < rules.length ? rules.map((r, j) => (j === index ? draft : r)) : [...rules, draft];
+    const { rules: settled, keptAt } = settleQualityRules({ ...quality, rules: list }, index);
     setSaving(true);
     setError(null);
     setErrors({});
     try {
       await commit(
-        { ...quality, rules: list },
+        { ...quality, rules: settled },
         index < rules.length ? t("Rule saved") : t("Rule added"),
       );
       setEditing(null);
     } catch (e) {
       setError(e);
-      setErrors(recordErrors(e, `quality.rules[${index}].`));
+      setErrors(recordErrors(e, `quality.rules[${keptAt}].`));
     } finally {
       setSaving(false);
     }
@@ -168,7 +170,9 @@ export function ClientRulesTab() {
     setSaving(true);
     setError(null);
     try {
-      await commit({ ...quality, rules: rules.filter((_, j) => j !== index) }, t("Rule removed"));
+      const remaining = rules.filter((_, j) => j !== index);
+      const { rules: settled } = settleQualityRules({ ...quality, rules: remaining });
+      await commit({ ...quality, rules: settled }, t("Rule removed"));
       setEditing(null);
     } catch (e) {
       setError(e);
@@ -180,7 +184,9 @@ export function ClientRulesTab() {
   async function move(i: number, d: -1 | 1) {
     if (!quality) return;
     try {
-      await commit({ ...quality, rules: swap(rules, i, i + d) }, t("Rule order saved"));
+      const swapped = swap(rules, i, i + d);
+      const { rules: settled } = settleQualityRules({ ...quality, rules: swapped });
+      await commit({ ...quality, rules: settled }, t("Rule order saved"));
     } catch (e) {
       toastError(t("Couldn't reorder rules"), e);
     }
@@ -437,7 +443,7 @@ export function ClientRulesTab() {
                     {...searchSelectLabels()}
                     value={String(draft.maxHeight ?? 0)}
                     onChange={(v) => set({ maxHeight: Number(v) || undefined })}
-                    options={HEIGHTS}
+                    options={RESOLUTIONS}
                     ariaLabel={t("Quality limit")}
                     searchable={false}
                   />

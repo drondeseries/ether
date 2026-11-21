@@ -15,8 +15,52 @@ import (
 
 // Read re-enumerates under current policy and descriptors before touching bytes.
 func (a Source) Read(ctx context.Context, req frontend.ArtworkRequest, img frontend.Image, transform frontend.ArtworkTransform) ([]byte, string, error) {
+	if a.LandscapeThumb {
+		req.Device.Language = ""
+	}
 	if transform.Width < 0 || transform.Width > 4000 || transform.Height < 0 || transform.Height > 4000 || (transform.Format != "" && transform.Format != "jpeg" && transform.Format != "png") {
 		return nil, "", core.ErrNotAvailable
+	}
+	base, rank, wide, rankErr := frontend.UnrankArtwork(img)
+	if rankErr != nil {
+		return nil, "", rankErr
+	}
+	if rank > 0 {
+		var renderer interface {
+			Ranked(context.Context, []byte, int, bool) ([]byte, string, error)
+		}
+		ok := false
+		if a.Discovery != nil {
+			renderer, ok = a.Discovery.Overlays.(interface {
+				Ranked(context.Context, []byte, int, bool) ([]byte, string, error)
+			})
+		}
+		if !ok {
+			return nil, "", core.ErrNotAvailable
+		}
+		data, _, err := a.Read(ctx, req, base, frontend.ArtworkTransform{})
+		if err != nil {
+			return nil, "", err
+		}
+		data, ct, err := renderer.Ranked(ctx, data, rank, wide)
+		if err != nil {
+			return nil, "", err
+		}
+		return a.transform(ctx, img.Path, data, ct, transform)
+	}
+	if strings.HasPrefix(img.Path, frontend.LibraryLiveThumbPrefix) {
+		if a.LibraryLiveThumb == nil || a.URLImages == nil {
+			return nil, "", core.ErrNotAvailable
+		}
+		rawURL, err := a.LibraryLiveThumb(ctx, req.Viewer, img.Subject, img.Path)
+		if err != nil {
+			return nil, "", err
+		}
+		data, ct, err := a.URLImages.GetUntrustedURL(ctx, rawURL)
+		if err != nil {
+			return nil, "", err
+		}
+		return a.transform(ctx, img.Path, data, ct, transform)
 	}
 	if strings.HasPrefix(img.Path, frontend.LibraryCollagePrefix) {
 		data, err := a.readLibraryCollage(img.Path)
@@ -24,6 +68,9 @@ func (a Source) Read(ctx context.Context, req frontend.ArtworkRequest, img front
 			return nil, "", err
 		}
 		return a.transform(ctx, img.Path, data, "image/jpeg", transform)
+	}
+	if req.Item.IsPluginKey() && (strings.HasPrefix(img.Path, "https://") || strings.HasPrefix(img.Path, "http://")) {
+		return a.readPluginItemArt(ctx, req, img, transform)
 	}
 	entries, _, err := a.entries(ctx, req)
 	if err != nil {
@@ -128,6 +175,15 @@ func (a Source) readFreshPortrait(ctx context.Context, req frontend.ArtworkReque
 }
 
 func (a Source) remote(ctx context.Context, path string, width int) ([]byte, string, error) {
+	// Plugin items (and any other source) can carry absolute artwork URLs;
+	// fetch those through the untrusted-URL client, like programme and
+	// channel art, instead of treating them as a TMDB path.
+	if strings.HasPrefix(path, "https://") || strings.HasPrefix(path, "http://") {
+		if a.URLImages == nil {
+			return nil, "", core.ErrNotAvailable
+		}
+		return a.URLImages.GetUntrustedURL(ctx, path)
+	}
 	if a.Images == nil || a.ImageURL == nil {
 		return nil, "", core.ErrNotAvailable
 	}
@@ -139,6 +195,16 @@ func (a Source) remote(ctx context.Context, path string, width int) ([]byte, str
 }
 func (a Source) readEntry(ctx context.Context, req frontend.ArtworkRequest, entry frontendArtworkEntry, width int) ([]byte, string, error) {
 	switch {
+	case entry.programmePath != "":
+		if strings.HasPrefix(entry.programmePath, "https://") || strings.HasPrefix(entry.programmePath, "http://") {
+			if a.URLImages == nil {
+				return nil, "", core.ErrNotAvailable
+			}
+			return a.URLImages.GetUntrustedURL(ctx, entry.programmePath)
+		}
+		return a.remote(ctx, entry.programmePath, width)
+	case entry.ownerKind != "":
+		return a.OwnerArtwork(ctx, req, entry.ownerKind)
 	case entry.channel:
 		// Recheck this channel only. Listing every channel here made a home
 		// row reread the whole guide once per logo.
@@ -149,6 +215,10 @@ func (a Source) readEntry(ctx context.Context, req frontend.ArtworkRequest, entr
 		return []byte(fmt.Sprintf(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 360"><rect width="640" height="360" rx="24" fill="#182d45"/><text x="40" y="125" fill="#64dfc7" font-size="68" font-family="sans-serif">%s</text><text x="40" y="220" fill="white" font-size="30" font-family="sans-serif">%s</text></svg>`, html.EscapeString(c.Number), html.EscapeString(c.Name))), "image/svg+xml", nil
 	case entry.remotePath != "":
 		return a.remote(ctx, entry.remotePath, width)
+	case entry.generated != nil:
+		p := *entry.generated
+		p.Width = width
+		return a.Generated.Title(ctx, p)
 	case entry.discovery:
 		t, err := a.title(ctx, req.Item)
 		if err != nil || req.Viewer == nil || !a.visible(ctx, req.Viewer, t) {
@@ -158,12 +228,18 @@ func (a Source) readEntry(ctx context.Context, req frontend.ArtworkRequest, entr
 		if err != nil {
 			return nil, "", err
 		}
-		// The overlay renderer's legacy backdrop path fetches w1280.
-		// Explicit larger hero requests must read the selected source at the
-		// requested resolution; the same undersizing affects any such client.
-		if entry.discoveryKind == "backdrop" && width > 1280 {
+		// Backdrops and logos bypass fixed-size renderers; cache the selected
+		// source variant and preserve its bytes until a transform is needed.
+		if entry.discoveryKind == "backdrop" {
 			_, path := a.Discovery.Overlays.Paths(ctx, req.Viewer, t, req.Device.Language)
 			return a.remote(ctx, path, width)
+		}
+		if entry.image.Kind == frontend.ImageThumb {
+			path, _ := a.Discovery.Overlays.Paths(ctx, req.Viewer, t, req.Device.Language)
+			return a.remote(ctx, path, width)
+		}
+		if entry.discoveryKind == "logo" {
+			return a.remote(ctx, t.LogoPath, width)
 		}
 		data, ct, err := a.Discovery.RenderArtwork(ctx, req.Viewer, t, entry.discoveryKind, req.Device.Language)
 		if err == nil && a.Discovery.Overlays.CustomPostersEnabled() && width > 0 && (entry.discoveryKind == "" || entry.discoveryKind == "poster") {
@@ -219,7 +295,7 @@ func (a Source) readEntry(ctx context.Context, req frontend.ArtworkRequest, entr
 		if err != nil || path == "" {
 			return nil, "", core.ErrNotFound
 		}
-		if width <= 0 {
+		if width <= 0 && entry.image.Kind != frontend.ImageBackdrop && entry.image.Kind != frontend.ImageThumb && entry.image.Kind != frontend.ImageLogo {
 			width = defaultWidth
 		}
 		return a.remote(ctx, path, width)
@@ -233,4 +309,32 @@ func (a Source) transform(ctx context.Context, reference string, data []byte, co
 		return a.Raster.Rasterize(ctx, reference, data, artwork.RasterOptions{Width: transform.Width, Height: transform.Height, Format: transform.Format, Blur: transform.Blur})
 	}
 	return Transform(data, contentType, transform)
+}
+
+// readPluginItemArt serves a plugin library item's own artwork URL. Plugin
+// items grant their images by the URL the plugin returned, not by a
+// catalogue artwork reference; the URL must be one of the item's own.
+func (a Source) readPluginItemArt(ctx context.Context, req frontend.ArtworkRequest, img frontend.Image, transform frontend.ArtworkTransform) ([]byte, string, error) {
+	if req.Viewer == nil {
+		return nil, "", core.ErrUnauthorized
+	}
+	t, err := a.title(ctx, req.Item)
+	if err != nil || t == nil {
+		return nil, "", core.ErrNotFound
+	}
+	own := false
+	for _, p := range []string{t.PosterPath, t.BackdropPath, t.StillPath, t.LogoPath} {
+		if p != "" && p == img.Path {
+			own = true
+			break
+		}
+	}
+	if !own {
+		return nil, "", core.ErrUnauthorized
+	}
+	data, ct, err := a.remote(ctx, img.Path, transform.Width)
+	if err != nil || len(data) == 0 || len(data) > MaxImageBytes {
+		return nil, "", core.ErrNotAvailable
+	}
+	return a.transform(ctx, img.Path, data, ct, transform)
 }

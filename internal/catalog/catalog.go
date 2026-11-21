@@ -177,6 +177,15 @@ CREATE INDEX catalog_titles_type_browse_lang ON catalog_titles(type, browsable, 
 CREATE INDEX catalog_titles_type_browse_runtime ON catalog_titles(type, browsable, adult, runtime_sec, popularity DESC);
 CREATE INDEX catalog_credits_person_kind ON catalog_credits(person_tmdb, kind, key);
 `)
+	// english_title holds TMDB's primary en-US title when the catalogue
+	// language is non-English, so release matching keeps accepting English
+	// releases of foreign titles across catalogue refreshes (#609).
+	store.Register("catalog", 63, `ALTER TABLE catalog_titles ADD COLUMN english_title TEXT NOT NULL DEFAULT '';`)
+	// enforcement_rating holds the canonical US-scale enforcement rating
+	// ("G", "PG", "PG-13", "R", "NC-17") or UncertifiedAdult ("XXX"),
+	// backfilled lazily on refresh while leaving displayed content_rating
+	// untouched.
+	store.Register("catalog", 64, `ALTER TABLE catalog_titles ADD COLUMN enforcement_rating TEXT NOT NULL DEFAULT '';`)
 }
 
 // dropUnkeyableEpisodes removes mirrored seasons and episodes whose numbers
@@ -223,20 +232,27 @@ type tmdbRef struct{ client TMDB }
 
 // Catalog implements core.Catalog.
 type Catalog struct {
+	catalogueSourceLoader func(context.Context, []string) error
 	consoleEvidencePolicy atomic.Pointer[func() string]
 	consoleGatePolicies   atomic.Pointer[func() (string, string)]
+	consoleGateFilter     atomic.Pointer[func() core.Filter]
 	// consoleGateGen counts hidden-set publications. Only release-gate
 	// filters read the current sets directly, so it keys their caches
 	// instead of invalidating the whole catalogue.
 	consoleGateGen atomic.Uint64
+	ownerPolicy    atomic.Pointer[func(context.Context, *core.Title) bool]
+	releaseGate    atomic.Pointer[func(context.Context, core.Title) bool]
 	listSummaryMu  sync.Mutex
 	listSummaries  map[core.RatingKey]listSummary
+	remoteSearches remoteSearchCache // search_remote_cache.go
+	posters        posterResolver    // posters.go
 
 	startupContext    context.Context
 	metadataMu        sync.RWMutex
 	metadataProviders map[string]*metadataRegistration
 	metadataFlights   flight.Group[string, *core.Title]
 	viewerRules       viewerRuleCache
+	ownerIncludes     ownerIncludeCache
 	visibility        *libraryfilter.Filter // every rule: browsing and discovery
 	searchVis         *libraryfilter.Filter // rules scoped everywhere: explicit search
 	db                *sql.DB
@@ -244,6 +260,7 @@ type Catalog struct {
 	configUpdateMu    sync.Mutex // serializes transitions without blocking config readers
 	cfgMu             sync.RWMutex
 	cfg               config.Catalog
+	libPolicies       LibraryPolicies
 	cfgVersion        *configVersion
 	log               *slog.Logger
 	clock             atomic.Value // func() time.Time
@@ -264,18 +281,24 @@ type Catalog struct {
 	refreshMiss   map[string]time.Time
 
 	// hydrating holds the TMDB refreshes running behind reads (hydrate.go).
-	hydrateMu    sync.Mutex
-	hydrating    map[string]*hydration
-	hydrateSlots chan struct{}
+	hydrateMu     sync.Mutex
+	hydrating     map[string]*hydration
+	hydrateSlots  chan struct{}
+	seasonLoaded  map[int64]time.Time     // hydrateMu; short discovery cooldown
+	seasonLoading map[int64]chan struct{} // hydrateMu; orchestration never holds a provider slot
 
 	trendFlights flight.Group[string, trendSnapshot]
-	statsFlights flight.Group[string, Stats]
 	listMu       sync.Mutex
 	listCache    map[string]listEntry
 
-	syncing    atomic.Bool
-	progress   SyncProgress
-	progressMu sync.RWMutex
+	syncing      atomic.Bool
+	syncBatch    atomic.Int64 // adaptive sync write batch (sync.go nextSyncBatch)
+	syncContend  atomic.Int32 // consecutive sync attempts ended by write contention (sync.go)
+	detailWrites detailWrites // batched detail writes (detail_writer.go)
+	ftsFold      bool         // bulk writes fold new rows into the title FTS (fts_fold.go)
+	personFold   bool         // and new credits into person names (fts_fold.go)
+	progress     SyncProgress
+	progressMu   sync.RWMutex
 
 	yearMu         sync.RWMutex
 	yearRunning    atomic.Bool
@@ -285,12 +308,34 @@ type Catalog struct {
 	yearInflight   sync.Map
 	yearInflightN  atomic.Int32
 	yearPauseUntil atomic.Int64
-	syncYears      [2]int // 0,0 = 1900..now+2
+	// kickMovieYears coalesces on-screen keys for one reader goroutine.
+	yearKickMu   sync.Mutex
+	yearKickKeys []any
+	yearKickBusy bool
+	syncYears    [2]int // 0,0 = 1800..now+2 (the /discover walk's date range)
+
+	// exports is TMDB's daily ID export source (sync_export.go); nil syncs
+	// from /discover alone.
+	exports ExportSource
+	fill    fillState // per-ID fill backlog (sync_fill.go)
+	tail    tailState // the long-tail search index (tail_index.go)
+	// posterPrefetch, when set, starts poster lookups for long-tail search
+	// hits while the search waits for TMDB (posters, L).
+	posterPrefetch func(context.Context, []core.Title)
 
 	// High-speed in-memory read caches, invalidated atomically on writes.
-	writeGen    atomic.Uint64
-	cacheMu     sync.RWMutex
-	titleCache  map[core.RatingKey]cachedStoredTitle
+	writeGen atomic.Uint64
+	// frozenMinute drops the wall-clock minute from cache keys
+	// (FreezeCacheMinute).
+	frozenMinute atomic.Bool
+	cacheMu      sync.RWMutex
+	titleCache   map[core.RatingKey]cachedStoredTitle
+	titleSeq     uint64 // monotonic insertion counter under cacheMu
+	// exportCache holds the latest export pages' titles for the viewer
+	// that read them (queryListRows), so the page's image signer, which
+	// reads the same titles right after, does not read them again; and the
+	// rows an image grant read (ArtworkRows), for the image reads after it.
+	exportCache map[exportCacheKey]cachedStoredTitle
 	countCache  map[string]cachedCount
 	browseCache map[string]cachedBrowse
 	grandCache  map[core.RatingKey]cachedBrowse
@@ -299,6 +344,7 @@ type Catalog struct {
 
 	personMu       sync.Mutex
 	personHydrated map[int64]time.Time
+	personMeta     map[int64]personMetaEntry
 	// listMirrored is when each related list's summaries were last saved
 	// (mirror_lists.go), guarded by personMu.
 	listMirrored map[string]time.Time
@@ -307,6 +353,58 @@ type Catalog struct {
 
 	// searchIx is the in-memory title search index (search_titles.go).
 	searchIx searchIndexState
+
+	// schemaWorkMu serializes background rank/index work with SQLite tier
+	// copy/swap. Request reads and writes never take this mutex.
+	schemaWorkMu sync.Mutex
+
+	// tier is the one-off library-tier migration (tier_migrate.go).
+	tier tierMigrationState
+	// rankReady is set once the popularity rank (rank.go) has been built.
+	rankReady atomic.Bool
+	// titleIndexesSwapped is set once popularity left the title indexes
+	// (titleidx.go).
+	titleIndexesSwapped atomic.Bool
+	onStatusChange      func(progressOnly bool)
+	onSyncEvent         func(SyncEvent)
+	onTitlesAdded       func([]core.Title)
+	onMetadataError     func(MetadataErrorEvent)
+}
+
+// SyncEvent describes a catalogue sync lifecycle transition.
+type SyncEvent struct {
+	Phase      string // "started", "completed", "failed"
+	Trigger    string // "scheduled", "manual", "startup"
+	Added      int
+	Updated    int
+	Removed    int
+	DurationMS int64
+	Error      string
+}
+
+// MetadataErrorEvent describes a failed upstream metadata fetch for a title.
+type MetadataErrorEvent struct {
+	Provider  string
+	TitleKey  core.RatingKey
+	MediaType core.MediaType
+	Error     string
+}
+
+// WithOnSyncEvent registers an optional non-blocking observer for sync lifecycle events.
+func WithOnSyncEvent(fn func(SyncEvent)) Option {
+	return func(c *Catalog) { c.onSyncEvent = fn }
+}
+
+// WithOnTitlesAdded registers an optional non-blocking observer invoked when
+// newly added browsable titles are stored.
+func WithOnTitlesAdded(fn func([]core.Title)) Option {
+	return func(c *Catalog) { c.onTitlesAdded = fn }
+}
+
+// WithOnMetadataError registers an optional non-blocking observer invoked when
+// a metadata fetch fails with an upstream error.
+func WithOnMetadataError(fn func(MetadataErrorEvent)) Option {
+	return func(c *Catalog) { c.onMetadataError = fn }
 }
 
 // SaferRatingSQL is the optional Plex overlay predicate for viewer limits.
@@ -322,6 +420,7 @@ type cachedStoredTitle struct {
 	st     storedTitle
 	gen    uint64
 	minute int64
+	seq    uint64
 }
 
 type cachedCount struct {
@@ -335,6 +434,10 @@ type cachedBrowse struct {
 	page   core.Page
 	gen    uint64
 	minute int64
+	// at is when a key-order page cursor was stored; zero for pages.
+	at time.Time
+	// partial lists a ranking page's partial titles (rankProjection).
+	partial []core.RatingKey
 }
 
 type cachedFacet struct {
@@ -344,12 +447,12 @@ type cachedFacet struct {
 	counted time.Time
 }
 
+// cachedStats is the last Stats read, served only when the database cannot
+// answer.
 type cachedStats struct {
-	stats     Stats
-	gen       uint64
-	minute    int64
-	fetchedAt time.Time
-	ready     bool
+	stats       Stats
+	yearPending int
+	ready       bool
 }
 
 type listEntry struct {
@@ -359,6 +462,56 @@ type listEntry struct {
 
 // Option customises a Catalog.
 type Option func(*Catalog)
+
+// LibraryPolicies holds the canonical Movies (id=1) and TV Shows (id=2)
+// visibility rules and defaults.
+type LibraryPolicies struct {
+	MovieRules   []core.LibraryExclusion
+	MovieDefault string
+	ShowRules    []core.LibraryExclusion
+	ShowDefault  string
+}
+
+// WithLibraryPolicies installs initial canonical library visibility policies.
+func WithLibraryPolicies(p LibraryPolicies) Option {
+	return func(c *Catalog) { c.libPolicies = cloneLibraryPolicies(p) }
+}
+
+// LibraryPolicies returns a deep copy of the active canonical library policies.
+func (c *Catalog) LibraryPolicies() LibraryPolicies {
+	if c == nil {
+		return LibraryPolicies{}
+	}
+	c.cfgMu.RLock()
+	defer c.cfgMu.RUnlock()
+	return cloneLibraryPolicies(c.libPolicies)
+}
+
+// SetLibraryPolicies compiles and installs new canonical library policies.
+func (c *Catalog) SetLibraryPolicies(p LibraryPolicies) error {
+	p = cloneLibraryPolicies(p)
+	f, err := c.compileLibraryPolicies(p)
+	if err != nil {
+		return err
+	}
+	search := f.ForSearch()
+	c.configUpdateMu.Lock()
+	defer c.configUpdateMu.Unlock()
+	c.cfgMu.Lock()
+	c.libPolicies = p
+	c.visibility = f
+	c.searchVis = search
+	c.cfgVersion = &configVersion{}
+	c.writeGen.Add(1)
+	c.cfgMu.Unlock()
+	if err := c.recompileViewerRules(p); err != nil {
+		c.log.Error("catalog: recompile viewer rules", "err", err)
+	}
+	c.listMu.Lock()
+	c.listCache = map[string]listEntry{}
+	c.listMu.Unlock()
+	return nil
+}
 
 // WithStartupContext carries cancellation and upgrade progress into constructor backfills.
 func WithStartupContext(ctx context.Context) Option {
@@ -395,10 +548,23 @@ func (c *Catalog) now() time.Time {
 
 // WithResumeSchedule makes Run continue the refresh schedule recorded in
 // the database instead of syncing as soon as it starts: the first sync
-// waits until RefreshInterval has passed since the last successful sync
+// waits until RefreshInterval has passed since the recorded last sync
 // (by any node). A cluster uses it because Run restarts on every leader
 // handoff; with no recorded sync Run still syncs at once.
 func WithResumeSchedule() Option { return func(c *Catalog) { c.resumeSchedule = true } }
+
+// WithOnStatusChange registers a callback invoked when catalogue sync,
+// migration, year-correction or title-tally status changes. progressOnly is
+// true for incremental batch progress while a job is already running.
+func WithOnStatusChange(fn func(progressOnly bool)) Option {
+	return func(c *Catalog) { c.onStatusChange = fn }
+}
+
+func (c *Catalog) notifyStatus(progressOnly bool) {
+	if c != nil && c.onStatusChange != nil {
+		c.onStatusChange(progressOnly)
+	}
+}
 
 // New creates a catalogue. client may be nil (mirror-only / offline mode).
 func New(db *sql.DB, client TMDB, cfg config.Catalog, log *slog.Logger, opts ...Option) (*Catalog, error) {
@@ -409,15 +575,11 @@ func New(db *sql.DB, client TMDB, cfg config.Catalog, log *slog.Logger, opts ...
 		log = slog.Default()
 	}
 	cfg = cloneCatalogConfig(cfg)
-	visibility, err := libraryfilter.CompilePolicy(cfg.Exclusions, cfg.VisibilityDefault)
-	if err != nil {
-		return nil, err
-	}
 	stale := cfg.RefreshInterval.D()
 	if stale <= 0 {
 		stale = 24 * time.Hour
 	}
-	c := &Catalog{visibility: visibility, searchVis: visibility.ForSearch(), db: db, cfg: cfg, cfgVersion: &configVersion{}, log: log, hydrateSlots: make(chan struct{}, hydrateLimit),
+	c := &Catalog{db: db, cfg: cfg, cfgVersion: &configVersion{}, log: log, hydrateSlots: make(chan struct{}, hydrateLimit),
 		staleAfter: stale, listTTL: 15 * time.Minute, yearGap: 100 * time.Millisecond, yearAhead: make(chan core.RatingKey, 256),
 		genres: map[string]map[int]string{}, listCache: map[string]listEntry{},
 		titleCache: map[core.RatingKey]cachedStoredTitle{}, countCache: map[string]cachedCount{},
@@ -425,17 +587,28 @@ func New(db *sql.DB, client TMDB, cfg config.Catalog, log *slog.Logger, opts ...
 		personHydrated: map[int64]time.Time{}, listMirrored: map[string]time.Time{}}
 	c.setNow(time.Now)
 	c.SetTMDB(client)
+	c.posterPrefetch = c.prefetchTailPosters
 	for _, fn := range opts {
 		fn(c)
 	}
+	visibility := c.compileStoredLibraryPolicies(c.libPolicies)
+	c.visibility = visibility
+	c.searchVis = visibility.ForSearch()
 	if err := c.reloadViewerRules(context.Background()); err != nil {
 		return nil, err
 	}
+	if err := c.reloadOwnerIncludes(context.Background()); err != nil {
+		return nil, err
+	}
+	c.loadTierHints(context.Background())
 	ctx := c.startupContext
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	c.ensureSortTitlesFolded(ctx)
+	c.loadRankReady(ctx)
+	c.loadTitleIndexState(ctx)
+	c.ftsFold = ftsFoldAvailable(ctx, db)
+	c.personFold = personFoldAvailable(ctx, db)
 	c.startupContext = nil
 	return c, nil
 }
@@ -449,24 +622,13 @@ func (e *simpleError) Error() string { return e.s }
 // UpdateConfig swaps the catalogue config (wire to config.Store.Subscribe).
 func (c *Catalog) UpdateConfig(cfg config.Catalog) {
 	cfg = cloneCatalogConfig(cfg)
-	f, err := libraryfilter.CompilePolicy(cfg.Exclusions, cfg.VisibilityDefault)
-	if err != nil {
-		c.log.Error("catalog: invalid visibility rules")
-		return
-	}
-	search := f.ForSearch()
 	c.configUpdateMu.Lock()
 	defer c.configUpdateMu.Unlock()
 	c.cfgMu.Lock()
 	c.cfg = cfg
-	c.visibility = f
-	c.searchVis = search
 	c.cfgVersion = &configVersion{}
 	c.writeGen.Add(1)
 	c.cfgMu.Unlock()
-	if err := c.recompileViewerRules(cfg.Exclusions, cfg.VisibilityDefault); err != nil {
-		c.log.Error("catalog: recompile viewer rules", "err", err)
-	}
 	c.listMu.Lock()
 	c.listCache = map[string]listEntry{}
 	c.listMu.Unlock()
@@ -479,7 +641,8 @@ func (c *Catalog) config() config.Catalog {
 }
 
 // MeetsThreshold reports whether a title qualifies for the browsable set under
-// cfg: popularity >= MinPopularity OR votes >= MinVotes, and released.
+// cfg: popularity >= MinPopularity OR votes >= MinVotes, and released. A
+// saved 0/0 (Off) means the Off floor (config.Catalog.Bars).
 func MeetsThreshold(cfg config.Catalog, t core.Title, now time.Time) bool {
 	if t.Type != core.TypeMovie && t.Type != core.TypeShow {
 		return false
@@ -488,30 +651,26 @@ func MeetsThreshold(cfg config.Catalog, t core.Title, now time.Time) bool {
 		// A title with no date is treated as unreleased.
 		return false
 	}
-	if cfg.MinPopularity <= 0 && cfg.MinVotes <= 0 {
-		return true
-	}
-	popOK := cfg.MinPopularity > 0 && t.Popularity >= cfg.MinPopularity
-	voteOK := cfg.MinVotes > 0 && t.VoteCount >= cfg.MinVotes
-	if cfg.MinPopularity > 0 && cfg.MinVotes > 0 {
-		return popOK || voteOK
-	}
-	if cfg.MinPopularity > 0 {
-		return popOK
-	}
-	return voteOK
+	return meetsBars(cfg, t)
 }
 
 func (c *Catalog) meetsThreshold(t core.Title) bool {
-	return MeetsThreshold(c.config(), t, c.now())
+	if MeetsThreshold(c.config(), t, c.now()) {
+		return true
+	}
+	return (t.Type == core.TypeMovie || t.Type == core.TypeShow) && !t.Adult && t.IsReleased(c.now()) && c.isOwnerIncluded(t.Key)
 }
 
 // SetTMDB replaces the remote metadata client. Nil answers from the local catalogue only.
 func (c *Catalog) SetTMDB(client TMDB) {
 	if c != nil {
 		c.remote.Store(&tmdbRef{client: client})
+		c.remoteSearches.reset()
 	}
 }
+
+// TMDBConfigured reports whether a remote TMDB client is attached.
+func (c *Catalog) TMDBConfigured() bool { return c.tmdb() != nil }
 
 func (c *Catalog) tmdb() TMDB {
 	if c == nil {
@@ -531,3 +690,6 @@ func (c *Catalog) WriteGeneration() uint64 {
 	}
 	return c.writeGen.Load()
 }
+
+// FinishStartup completes optional bulk maintenance after the listener is ready.
+func (c *Catalog) FinishStartup(ctx context.Context) { c.ensureSortTitlesFolded(ctx) }

@@ -13,8 +13,10 @@ import {
   Code2,
   ExternalLink,
   FlaskConical,
+  Globe,
   Info,
   MoreHorizontal,
+  Network,
   PowerOff,
   RefreshCw,
   RotateCcw,
@@ -36,11 +38,14 @@ import { contributionTab, primaryContribution } from "./drawer/kinds";
 import { PluginContributions } from "./drawer/PluginContributions";
 import { PluginOverview } from "./drawer/PluginOverview";
 import { PluginSetup } from "./drawer/PluginSetup";
+import { PluginCatalogueSettings } from "./drawer/PluginCatalogueSettings";
+import { SetupWizard } from "../libraries/SetupWizard";
 import { MenuItem } from "./MenuItem";
 import { openInStudio } from "./openInStudio";
 import {
   isAddon,
   kindLabel,
+  translatePermissionLine,
   type JournalEntry,
   type PluginDetail,
   type PluginSummary,
@@ -50,8 +55,8 @@ type DrawerTab = "overview" | "adds" | "setup" | "activity";
 
 /**
  * One installed plugin. The header carries what you reach for every time
- * (health, on/off, Studio, and the ⋯ menu for updates, undo and removal);
- * the tabs are Overview, what it adds, Setup and Activity.
+ * (health, on/off, and the ⋯ menu for Studio, updates, undo and removal);
+ * the tabs are Overview, what it adds, Settings and Activity.
  */
 export function InstalledPluginDrawer({
   pluginId,
@@ -71,6 +76,7 @@ export function InstalledPluginDrawer({
   const navigate = useNavigate();
   const [params] = useSearchParams();
   const [tab, setTab] = useState<DrawerTab>("overview");
+  const [setupWizard, setSetupWizard] = useState(false);
   const [detail, setDetail] = useState<PluginDetail | null>(null);
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState<unknown>(null);
@@ -154,9 +160,43 @@ export function InstalledPluginDrawer({
 
   const retry = () =>
     run("retry", async () => {
-      await apiFetch(`/plugins/${encodeURIComponent(detail!.id)}/test`, { method: "POST" });
+      const res = await apiFetch<{ ok: boolean; message?: string }>(
+        `/plugins/${encodeURIComponent(detail!.id)}/test`,
+        { method: "POST" },
+      );
       await reload();
       await reloadCalls();
+      if (res.ok && res.message) {
+        toast.success(res.message);
+      } else if (!res.ok && res.message) {
+        setMutationError(new Error(res.message));
+      }
+    });
+
+  const allowLocalHost = (host: string) =>
+    run(`allow:${host}`, async () => {
+      const cur = detail!.permissions.grants ?? {};
+      const existing = cur.localHosts ?? [];
+      const localHosts = existing.includes(host) ? existing : [...existing, host];
+      await apiFetch(`/plugins/${encodeURIComponent(detail!.id)}/grants`, {
+        method: "PUT",
+        body: JSON.stringify({ ...cur, localHosts }),
+      });
+      await reload();
+      toast.success(t("Access updated"));
+    });
+
+  const approveOperatorHost = (host: string) =>
+    run(`approve-host:${host}`, async () => {
+      const cur = detail!.permissions.grants ?? {};
+      const existing = cur.operatorHosts ?? [];
+      const operatorHosts = existing.includes(host) ? existing : [...existing, host];
+      await apiFetch(`/plugins/${encodeURIComponent(detail!.id)}/grants`, {
+        method: "PUT",
+        body: JSON.stringify({ ...cur, operatorHosts }),
+      });
+      await reload();
+      toast.success(t("Access updated"));
     });
 
   const makeLive = () =>
@@ -192,7 +232,7 @@ export function InstalledPluginDrawer({
         title: t("Update {name}?", { name: detail.name }),
         message: t("Version {version} asks for new access: {access}", {
           version: detail.updateVersion ?? "",
-          access: pendingPerms.map((p) => t(p)).join(", "),
+          access: pendingPerms.map(translatePermissionLine).join(", "),
         }),
         confirmLabel: t("Allow and update"),
       });
@@ -268,6 +308,8 @@ export function InstalledPluginDrawer({
   ];
   const active = tabs.some((x) => x.key === tab) ? tab : "overview";
 
+  if (setupWizard && detail)
+    return <SetupWizard pluginId={detail.id} onClose={() => setSetupWizard(false)} />;
   return (
     <Drawer
       open={Boolean(pluginId)}
@@ -278,26 +320,6 @@ export function InstalledPluginDrawer({
       headerActions={
         detail ? (
           <div className="flex items-center gap-2">
-            <Button
-              variant="outline"
-              size="sm"
-              aria-label={t("Open in Studio")}
-              disabled={busy === "studio"}
-              onClick={() => {
-                setBusy("studio");
-                void openInStudio(detail.id)
-                  .then((to) => navigate(to))
-                  .catch((e) => {
-                    setMutationError(e);
-                    setBusy(null);
-                  });
-              }}
-            >
-              <Code2 size={14} />
-              <span className="hidden sm:inline">
-                {busy === "studio" ? t("Opening…") : t("Open in Studio")}
-              </span>
-            </Button>
             <label
               className="ml-1 hidden text-xs font-medium text-fg-muted sm:inline"
               htmlFor="drawer-plugin-enabled"
@@ -330,6 +352,21 @@ export function InstalledPluginDrawer({
               }
             >
               <div role="menu" aria-label={t("More actions")}>
+                <MenuItem
+                  icon={<Code2 size={14} />}
+                  label={busy === "studio" ? t("Opening…") : t("Open in Studio")}
+                  disabled={busy === "studio"}
+                  onClick={() => {
+                    setMenu(false);
+                    setBusy("studio");
+                    void openInStudio(detail.id)
+                      .then((to) => navigate(to))
+                      .catch((e) => {
+                        setMutationError(e);
+                        setBusy(null);
+                      });
+                  }}
+                />
                 {detail.sourceKind !== "studio" && !detail.stremioOnly ? (
                   <MenuItem
                     icon={<RefreshCw size={14} />}
@@ -396,6 +433,44 @@ export function InstalledPluginDrawer({
         <ErrorPanel error={loadError} onRetry={() => pluginId && void loadDetail(pluginId)} />
       ) : detail ? (
         <div className="space-y-5">
+          {active !== "setup" && detail.pendingOperatorHosts?.length
+            ? detail.pendingOperatorHosts.map((host) => (
+                <Banner
+                  key={`op:${host}`}
+                  icon={<Globe size={16} className="text-warning" />}
+                  text={t("Needs approval to connect to {host}", { host })}
+                  action={
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={busy === `approve-host:${host}`}
+                      onClick={() => void approveOperatorHost(host)}
+                    >
+                      {t("Approve")}
+                    </Button>
+                  }
+                />
+              ))
+            : null}
+          {active !== "setup" && detail.blockedLocalHosts?.length
+            ? detail.blockedLocalHosts.map((host) => (
+                <Banner
+                  key={host}
+                  icon={<Network size={16} className="text-warning" />}
+                  text={t("Blocked {host} (on your network)", { host })}
+                  action={
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={busy === `allow:${host}`}
+                      onClick={() => void allowLocalHost(host)}
+                    >
+                      {t("Allow")}
+                    </Button>
+                  }
+                />
+              ))
+            : null}
           {detail.updateVersion ? (
             <Banner
               icon={<ArrowUpCircle size={16} className="text-primary" />}
@@ -410,6 +485,28 @@ export function InstalledPluginDrawer({
                 <Button size="sm" disabled={busy === "update"} onClick={() => void applyUpdate()}>
                   {busy === "update" ? t("Updating…") : t("Update")}
                 </Button>
+              }
+            />
+          ) : null}
+          {detail.manifest.ether?.contributes?.mediaKinds?.length ? (
+            <Banner
+              icon={<Info size={16} className="text-primary" />}
+              text={t("Adds libraries: {names}", {
+                names: detail.manifest.ether.contributes.mediaKinds
+                  .map((k) => k.library.name)
+                  .join(", "),
+              })}
+              action={
+                <span className="flex gap-2">
+                  {detail.manifest.ether?.contributes?.setup ? (
+                    <Button size="sm" variant="outline" onClick={() => setSetupWizard(true)}>
+                      {t("Run setup")}
+                    </Button>
+                  ) : null}
+                  <Button size="sm" onClick={() => navigate("/libraries")}>
+                    {t("Open Libraries")}
+                  </Button>
+                </span>
               }
             />
           ) : null}
@@ -463,12 +560,15 @@ export function InstalledPluginDrawer({
               onChanged={() => void reload()}
             />
           ) : active === "setup" ? (
-            <PluginSetup
-              detail={detail}
-              onDetail={() => loadDetail(detail.id, true)}
-              onChanged={onChanged}
-              onError={setMutationError}
-            />
+            <>
+              <PluginCatalogueSettings pluginId={detail.id} onSetup={() => setSetupWizard(true)} />{" "}
+              <PluginSetup
+                detail={detail}
+                onDetail={() => loadDetail(detail.id, true)}
+                onChanged={onChanged}
+                onError={setMutationError}
+              />
+            </>
           ) : (
             <PluginActivity
               detail={detail}

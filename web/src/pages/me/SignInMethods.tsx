@@ -1,6 +1,6 @@
 import { t } from "../../i18n";
 import { formatDateTime } from "../../lib/format";
-import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode, type FormEvent } from "react";
 import {
   Alert,
   AlertDescription,
@@ -51,12 +51,19 @@ export default function SignInMethods({
   base,
   token,
   owner = false,
-  showInvite = owner,
+  self = !owner,
+  showInvite = false,
+  beforeDevices,
+  quickConnect,
 }: {
   base: string;
   token: string;
   owner?: boolean;
-  /** Invite links are for adding a viewer. The owner's own account page leaves this off. */
+  /** True when showing the signed-in person's own account rather than another viewer. */
+  self?: boolean;
+  beforeDevices?: ReactNode;
+  quickConnect?: ReactNode;
+  /** Invite links mint a new viewer account and stay off individual viewer profiles. */
   showInvite?: boolean;
 }) {
   const [methods, setMethods] = useState<Method[]>([]);
@@ -208,7 +215,7 @@ export default function SignInMethods({
       <SettingsSection
         title={t("Sign-in methods")}
         description={
-          owner && showInvite
+          owner && !self
             ? t("Accounts that can sign in as this viewer.")
             : t("Accounts that can sign in as you.")
         }
@@ -254,6 +261,7 @@ export default function SignInMethods({
           </div>
         )}
       </SettingsSection>
+      {quickConnect}
       {!owner ? (
         <form onSubmit={update}>
           <SettingsSection
@@ -323,6 +331,7 @@ export default function SignInMethods({
           )}
         </SettingsSection>
       ) : null}
+      {beforeDevices}
       <SettingsSection
         title={t("Devices")}
         description={t("Phones, TVs and browsers that stay signed in.")}

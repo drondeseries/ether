@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/fstest"
 
 	"github.com/braedonsaunders/ether/internal/admin"
 	"github.com/braedonsaunders/ether/internal/config"
@@ -437,6 +438,8 @@ func TestSectionPatchPreservesUnsetAndSecrets(t *testing.T) {
 type fakePlex struct {
 	polled   bool
 	claimErr error
+	synced   int
+	syncErr  error
 }
 
 func (f *fakePlex) StartPIN(context.Context) (string, string, string, error) {
@@ -448,6 +451,10 @@ func (f *fakePlex) PollPIN(_ context.Context, id string) (bool, error) {
 }
 func (f *fakePlex) Claim(context.Context) error { return f.claimErr }
 func (f *fakePlex) Status() any                 { return map[string]any{"claimed": true} }
+func (f *fakePlex) SyncFriends(context.Context) error {
+	f.synced++
+	return f.syncErr
+}
 
 func TestPlexPINFlow(t *testing.T) {
 	store := newStore(t, nil)
@@ -469,6 +476,33 @@ func TestPlexPINFlow(t *testing.T) {
 	rec = serve(h, req(http.MethodPost, "/ether/api/plex/claim", `{}`))
 	if rec.Code != http.StatusBadGateway || !strings.Contains(rec.Body.String(), "Plex couldn't link this server. Try again in a minute.") {
 		t.Fatalf("claim exchange failure: %d %s", rec.Code, rec.Body)
+	}
+
+	// Friend sync rejects while unclaimed, then succeeds once claimed.
+	rec = serve(h, req(http.MethodPost, "/ether/api/plex/friends/sync", `{}`))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("unclaimed friend sync: %d %s", rec.Code, rec.Body)
+	}
+	if err := store.Update(func(c *config.Config) error {
+		c.Plex.Claimed = true
+		c.Plex.Token = "server-token"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	refreshed := 0
+	h = admin.NewHandler(admin.Deps{
+		Config: store, IsOwnerToken: storedOwner(store), PlexAuth: fp,
+		RefreshViewers: func(context.Context) error { refreshed++; return nil },
+	})
+	rec = serve(h, req(http.MethodPost, "/ether/api/plex/friends/sync", `{}`))
+	if rec.Code != http.StatusOK || fp.synced != 1 || refreshed != 1 {
+		t.Fatalf("claimed friend sync: code=%d synced=%d refreshed=%d body=%s", rec.Code, fp.synced, refreshed, rec.Body)
+	}
+	fp.syncErr = errors.New("plex.tv timeout")
+	rec = serve(h, req(http.MethodPost, "/ether/api/plex/friends/sync", `{}`))
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("failed friend sync: %d %s", rec.Code, rec.Body)
 	}
 }
 
@@ -618,21 +652,38 @@ func TestDashboardDiskAndLogs(t *testing.T) {
 
 func TestSPAFallbackAndAssets(t *testing.T) {
 	store := newStore(t, func(c *config.Config) { c.SetupComplete = true })
-	h := admin.NewHandler(admin.Deps{Config: store, IsOwnerToken: storedOwner(store)})
+	ui := fstest.MapFS{
+		"index.html":    &fstest.MapFile{Data: []byte(`<!doctype html><div id="root"></div>`)},
+		"assets/app.js": &fstest.MapFile{Data: []byte(`export {};`)},
+	}
+	h := admin.NewHandler(admin.Deps{Config: store, IsOwnerToken: storedOwner(store), UI: ui})
 	// Deep client route with no token: SPA shell is public so the login
 	// prompt can render; API data stays gated.
 	rec := serve(h, req(http.MethodGet, "/ether/settings/providers", ""))
 	if rec.Code != 200 || !strings.Contains(rec.Body.String(), `id="root"`) {
 		t.Fatalf("SPA fallback: %d %s", rec.Code, rec.Body)
 	}
+	rec = serve(h, req(http.MethodGet, "/ether/assets/app.js", ""))
+	if rec.Code != 200 || !strings.Contains(rec.Header().Get("Cache-Control"), "immutable") {
+		t.Fatalf("SPA asset: %d %v", rec.Code, rec.Header())
+	}
 	rec = serve(h, req(http.MethodGet, "/ether/api/unknown", ""))
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("unknown API post-setup without token: got %d want 401", rec.Code)
 	}
-	// Bootstrap is public and secret-free.
-	rec = serve(h, req(http.MethodGet, "/ether/api/bootstrap", ""))
+	// Bootstrap is public and secret-free even when compiled without Node.
+	defaultH := admin.NewHandler(admin.Deps{Config: store, IsOwnerToken: storedOwner(store)})
+	rec = serve(defaultH, req(http.MethodGet, "/ether/api/bootstrap", ""))
 	if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"setupComplete":true`) {
 		t.Fatalf("bootstrap: %d %s", rec.Code, rec.Body)
+	}
+	rec = serve(defaultH, req(http.MethodGet, "/ether/settings/providers", ""))
+	if admin.ConsoleBuilt() {
+		if rec.Code != 200 || !strings.Contains(rec.Body.String(), `id="root"`) {
+			t.Fatalf("embedded SPA fallback: %d %s", rec.Code, rec.Body)
+		}
+	} else if rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), "Ether console is not built") {
+		t.Fatalf("unbuilt SPA fallback: %d %s", rec.Code, rec.Body)
 	}
 }
 
@@ -728,20 +779,6 @@ func TestValidateClusterWeight(t *testing.T) {
 		if len(errs) != 1 || errs[0].Field != "server.clusterWeight" {
 			t.Errorf("weight %d: errs=%v", w, errs)
 		}
-	}
-}
-
-func TestValidateLibraryNames(t *testing.T) {
-	cfg := config.Defaults(t.TempDir())
-	cfg.Server.MoviesLibraryName = "  "
-	cfg.Server.TVShowsLibraryName = ""
-	errs := admin.ValidateConfig(cfg)
-	fields := map[string]bool{}
-	for _, e := range errs {
-		fields[e.Field] = true
-	}
-	if !fields["server.moviesLibraryName"] || !fields["server.tvShowsLibraryName"] {
-		t.Fatalf("expected library name required errors, got %v", errs)
 	}
 }
 

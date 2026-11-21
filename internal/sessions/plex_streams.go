@@ -3,7 +3,6 @@ package sessions
 import (
 	"context"
 	"encoding/json"
-	"hash/fnv"
 	"io"
 	"net/http"
 	"net/url"
@@ -21,43 +20,28 @@ import (
 
 const maxPlexStreamRefs = 200_000
 
-// PlexStreamBinding is one Plex-visible stream id. WireID is zero on bind;
-// BindPlexStream assigns it. SessionID is empty for library metadata and is
-// the broker session id after Open.
-type PlexStreamBinding struct {
-	WireID    int64
-	SessionID string
-	Key       core.RatingKey
-	Index     int
-	Info      core.StreamInfo
-}
-
-// PlexStreamTable is the visible-id map. Plex offer ids are not stored here.
-type PlexStreamTable struct {
+// StreamTable is the visible-id map. Plex offer ids are not stored here.
+type StreamTable struct {
 	mu   sync.Mutex
-	byID map[int64]plexStreamRef
+	byID map[int64]adapterStreamRef
 }
 
-type plexStreamRef struct {
-	binding PlexStreamBinding
+type adapterStreamRef struct {
+	binding StreamBinding
 	slot    string
 }
 
-// NewPlexStreamTable is the visible-id map used by the broker and by Plex
+// NewStreamTable is the visible-id map used by the broker and by Plex
 // fixtures that have no broker mounted.
-func NewPlexStreamTable() *PlexStreamTable {
-	return &PlexStreamTable{byID: map[int64]plexStreamRef{}}
+func NewStreamTable() *StreamTable {
+	return &StreamTable{byID: map[int64]adapterStreamRef{}}
 }
 
-// PlexWireID is the positive int32-range id Plex clients already parse.
-// Offer rows use it directly and are not stream bindings.
-func PlexWireID(key core.RatingKey, slot string) int64 {
-	h := fnv.New64a()
-	_, _ = h.Write([]byte(strconv.FormatInt(int64(key), 10) + "/" + slot))
-	return int64(h.Sum64()%2_000_000_000) + 1
-}
+// WireID lives in internal/frontend (host_sessions_experience.go);
+// this alias keeps the broker's stream table on the same ids.
+var WireID = frontend.WireID
 
-func plexStreamSlot(index int, info core.StreamInfo) string {
+func adapterStreamSlot(index int, info core.StreamInfo) string {
 	if info.External && info.ExternalURL != "" {
 		return "external/" + info.ExternalURL
 	}
@@ -76,41 +60,47 @@ func plexStreamSlot(index int, info core.StreamInfo) string {
 	return strconv.Itoa(index)
 }
 
-func plexSameStream(a, b core.StreamInfo) bool {
+func adapterSameStream(a, b core.StreamInfo) bool {
 	return a.Type == b.Type && a.Codec == b.Codec && a.Language == b.Language &&
 		a.Channels == b.Channels && a.Title == b.Title && a.Forced == b.Forced &&
 		a.External == b.External && a.ExternalURL == b.ExternalURL
 }
 
 // Bind assigns or reuses the wire id for this slot. It does not authorize.
-func (t *PlexStreamTable) Bind(binding PlexStreamBinding) (int64, error) {
+func (t *StreamTable) Bind(binding StreamBinding) (int64, error) {
 	if t == nil {
 		return 0, core.ErrNotAvailable
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if len(t.byID) >= maxPlexStreamRefs {
-		t.byID = map[int64]plexStreamRef{}
+		t.byID = map[int64]adapterStreamRef{}
 	}
-	slot := plexStreamSlot(binding.Index, binding.Info)
-	id := PlexWireID(binding.Key, slot)
+	slot := adapterStreamSlot(binding.Index, binding.Info)
+	id := WireID(binding.Key, slot)
 	for {
 		ref, ok := t.byID[id]
-		if !ok || (ref.binding.Key == binding.Key && ref.slot == slot && plexSameStream(ref.binding.Info, binding.Info)) {
+		if !ok || (ref.binding.Key == binding.Key && ref.slot == slot && adapterSameStream(ref.binding.Info, binding.Info)) {
 			if ok && binding.SessionID != "" {
 				ref.binding.SessionID = binding.SessionID
 				ref.binding.Index = binding.Index
 				ref.binding.Info = binding.Info
 				ref.binding.WireID = id
+				if !binding.Estimated {
+					ref.binding.Estimated = false
+				}
 				t.byID[id] = ref
 				return id, nil
 			}
 			stored := binding
 			stored.WireID = id
-			if ok && stored.SessionID == "" {
-				stored.SessionID = ref.binding.SessionID
+			if ok {
+				if stored.SessionID == "" {
+					stored.SessionID = ref.binding.SessionID
+				}
+				stored.Estimated = ref.binding.Estimated && binding.Estimated
 			}
-			t.byID[id] = plexStreamRef{binding: stored, slot: slot}
+			t.byID[id] = adapterStreamRef{binding: stored, slot: slot}
 			return id, nil
 		}
 		id++
@@ -118,9 +108,9 @@ func (t *PlexStreamTable) Bind(binding PlexStreamBinding) (int64, error) {
 }
 
 // Lookup reports the binding. False means the id was never bound.
-func (t *PlexStreamTable) Lookup(id int64) (PlexStreamBinding, bool) {
+func (t *StreamTable) Lookup(id int64) (StreamBinding, bool) {
 	if t == nil || id == 0 {
-		return PlexStreamBinding{}, false
+		return StreamBinding{}, false
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -128,72 +118,48 @@ func (t *PlexStreamTable) Lookup(id int64) (PlexStreamBinding, bool) {
 	return ref.binding, ok
 }
 
-type plexServe struct {
-	remote bool
-	format string
-}
-
-type plexServeKey struct{}
-
-// WithPlexServe carries the request's remote bit and subtitle format into
-// ResolvePlexStream and OpenPlexSidecar without changing their signatures.
-func WithPlexServe(ctx context.Context, remote bool, format string) context.Context {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	return context.WithValue(ctx, plexServeKey{}, plexServe{remote: remote, format: format})
-}
-
-func plexServeFrom(ctx context.Context) plexServe {
-	if ctx == nil {
-		return plexServe{}
-	}
-	v, _ := ctx.Value(plexServeKey{}).(plexServe)
-	return v
-}
-
-// BindPlexStream assigns the visible id. WireID on the binding must be zero.
+// BindStream assigns the visible id. WireID on the binding must be zero.
 // Library metadata calls this before a viewer is known, so it does not
 // authorize. Resolve and Open do.
-func (b *Broker) BindPlexStream(_ context.Context, access frontend.SessionAccess, binding PlexStreamBinding) (int64, error) {
-	if b == nil || access.Protocol != "plex" || binding.WireID != 0 {
+func (b *Broker) BindStream(_ context.Context, access frontend.SessionAccess, binding StreamBinding) (int64, error) {
+	if b == nil || !b.policy(access.Protocol).ExternalAdmission || binding.WireID != 0 {
 		return 0, core.ErrUnauthorized
 	}
-	return b.plexStreams.Bind(binding)
+	return b.adapterStreams.Bind(binding)
 }
 
-// ResolvePlexStream returns a bound stream. An unknown id is ErrNotFound.
+// ResolveStream returns a bound stream. An unknown id is ErrNotFound.
 // A viewer who may not play is ErrUnauthorized, not a miss.
-func (b *Broker) ResolvePlexStream(ctx context.Context, access frontend.SessionAccess, wireID int64) (PlexStreamBinding, error) {
-	if b == nil || access.Protocol != "plex" || wireID == 0 {
-		return PlexStreamBinding{}, core.ErrUnauthorized
+func (b *Broker) ResolveStream(ctx context.Context, access frontend.SessionAccess, wireID int64) (StreamBinding, error) {
+	if b == nil || !b.policy(access.Protocol).ExternalAdmission || wireID == 0 {
+		return StreamBinding{}, core.ErrUnauthorized
 	}
-	binding, ok := b.plexStreams.Lookup(wireID)
+	binding, ok := b.adapterStreams.Lookup(wireID)
 	if !ok {
-		return PlexStreamBinding{}, core.ErrNotFound
+		return StreamBinding{}, core.ErrNotFound
 	}
 	viewer, err := b.confirmPlex(ctx, access)
 	if err != nil {
-		return PlexStreamBinding{}, err
+		return StreamBinding{}, err
 	}
 	// The wire id is shared by every viewer of the title. A session id
 	// attached after Open is returned only to the viewer who owns it.
-	if binding.SessionID != "" && !b.plexSessionOwned(binding.SessionID, viewer.ID) {
+	if binding.SessionID != "" && !b.adapterSessionOwned(binding.SessionID, viewer.ID) {
 		binding.SessionID = ""
 	}
 	return binding, nil
 }
 
-// OpenPlexSidecar returns an external sidecar only after the acceptance,
+// OpenSidecar returns an external sidecar only after the acceptance,
 // fenced policy, stream binding, and session agree. Failure returns no reader.
-func (b *Broker) OpenPlexSidecar(ctx context.Context, access frontend.SessionAccess, receipt auth.Acceptance, wireID int64) (io.ReadCloser, core.StreamInfo, error) {
-	if b == nil || access.Protocol != "plex" {
+func (b *Broker) OpenSidecar(ctx context.Context, access frontend.SessionAccess, receipt auth.Acceptance, wireID int64) (io.ReadCloser, core.StreamInfo, error) {
+	if b == nil || !b.policy(access.Protocol).ExternalAdmission {
 		return nil, core.StreamInfo{}, core.ErrUnauthorized
 	}
 	if b.deps.ReceiptCurrent != nil && (!receipt.Valid() || b.deps.ReceiptCurrent(ctx, receipt) != nil) {
 		return nil, core.StreamInfo{}, core.ErrUnauthorized
 	}
-	binding, err := b.ResolvePlexStream(ctx, access, wireID)
+	binding, err := b.ResolveStream(ctx, access, wireID)
 	if err != nil {
 		return nil, core.StreamInfo{}, err
 	}
@@ -215,7 +181,14 @@ func (b *Broker) OpenPlexSidecar(ctx context.Context, access frontend.SessionAcc
 		sess = b.sessions[binding.SessionID]
 		b.mu.Unlock()
 	}
-	reader, info, err := b.openExternalSidecar(ctx, sess, binding.Info)
+	if sess == nil {
+		sess = b.activeSidecarSession(viewer.ID, access.Device.ID, binding.Key)
+	}
+	source := b.playSource(sess)
+	if source == "" {
+		source = b.activePlaybackSource(viewer.ID, access.Device.ID, binding.Key)
+	}
+	reader, info, err := b.openExternalSidecar(ctx, source, binding.Info)
 	if err != nil || reader == nil {
 		if reader != nil {
 			_ = reader.Close()
@@ -228,21 +201,77 @@ func (b *Broker) OpenPlexSidecar(ctx context.Context, access frontend.SessionAcc
 	return reader, info, nil
 }
 
-func (b *Broker) confirmPlex(ctx context.Context, access frontend.SessionAccess) (*core.Viewer, error) {
-	return b.confirm(ctx, access.Viewer, core.ClientCaps{Remote: plexServeFrom(ctx).remote})
+func (b *Broker) activeSidecarSession(viewer int64, deviceID string, key core.RatingKey) *brokerSession {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var fallback *brokerSession
+	for _, s := range b.sessions {
+		if s == nil || s.public.ViewerID != viewer || s.public.Item != key {
+			continue
+		}
+		if deviceID != "" && s.clientID == deviceID {
+			return s
+		}
+		if fallback == nil {
+			fallback = s
+		}
+	}
+	return fallback
 }
 
-func (b *Broker) plexSessionOwned(id string, viewer int64) bool {
+func (b *Broker) activePlaybackSource(viewer int64, deviceID string, key core.RatingKey) string {
+	if b.deps.Playback == nil {
+		return ""
+	}
+	var found *core.PlaySession
+	if deviceID != "" {
+		if ps, ok := b.deps.Playback.SessionFor(viewer, deviceID, key); ok && ps != nil && !ps.PreparedOnly {
+			found = ps
+		}
+	}
+	if found == nil {
+		for _, ps := range b.deps.Playback.Sessions() {
+			if ps == nil || ps.PreparedOnly || ps.UserID != viewer || ps.Key != key {
+				continue
+			}
+			if deviceID != "" && ps.ClientID == deviceID {
+				found = ps
+				break
+			}
+			if found == nil {
+				found = ps
+			}
+		}
+	}
+	if found == nil {
+		return ""
+	}
+	if keyer, ok := b.deps.Playback.(interface{ SourceKey(string) string }); ok && found.ID != "" {
+		if k := keyer.SourceKey(found.ID); k != "" {
+			return k
+		}
+	}
+	if found.Resolution != nil && found.Resolution.Release.ID != "" {
+		return found.Resolution.Release.ID
+	}
+	return found.ID
+}
+
+func (b *Broker) confirmPlex(ctx context.Context, access frontend.SessionAccess) (*core.Viewer, error) {
+	return b.confirmCurrent(ctx, access.Viewer, core.ClientCaps{Remote: adapterServeRemote(ctx)})
+}
+
+func (b *Broker) adapterSessionOwned(id string, viewer int64) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	s := b.sessions[id]
-	return s != nil && s.public.Protocol == "plex" && s.public.ViewerID == viewer
+	return s != nil && b.policy(s.public.Protocol).ExternalAdmission && s.public.ViewerID == viewer
 }
 
-func (b *Broker) openExternalSidecar(ctx context.Context, s *brokerSession, info core.StreamInfo) (io.ReadCloser, core.StreamInfo, error) {
+func (b *Broker) openExternalSidecar(ctx context.Context, source string, info core.StreamInfo) (io.ReadCloser, core.StreamInfo, error) {
 	src := info.ExternalURL
 	if strings.HasPrefix(src, "ether-subtitle:") {
-		format := plexServeFrom(ctx).format
+		_, format := frontend.StreamServeFrom(ctx)
 		if format == "" {
 			format = "srt"
 		}
@@ -251,8 +280,8 @@ func (b *Broker) openExternalSidecar(ctx context.Context, s *brokerSession, info
 			actual string
 			err    error
 		)
-		if s != nil {
-			reader, actual, err = b.openSubtitle(s, src, format)
+		if source != "" && b.deps.OpenSubtitleFrom != nil {
+			reader, actual, err = b.deps.OpenSubtitleFrom(src, format, source)
 		} else if b.deps.OpenSubtitle == nil {
 			return nil, core.StreamInfo{}, core.ErrNotAvailable
 		} else {
@@ -272,7 +301,7 @@ func (b *Broker) openExternalSidecar(ctx context.Context, s *brokerSession, info
 		if err != nil {
 			return nil, core.StreamInfo{}, err
 		}
-		resp, err := plexSidecarClient.Do(req)
+		resp, err := adapterSidecarClient.Do(req)
 		if err != nil {
 			return nil, core.StreamInfo{}, err
 		}
@@ -298,4 +327,15 @@ func (b *Broker) openExternalSidecar(ctx context.Context, s *brokerSession, info
 	return f, info, nil
 }
 
-var plexSidecarClient = egress.Client(egress.CapDirect, 20*time.Second)
+var adapterSidecarClient = egress.Client(egress.CapDirect, 20*time.Second)
+
+// StreamBinding and the PlexServe context helpers live in
+// internal/frontend (host_sessions_experience.go).
+type StreamBinding = frontend.StreamBinding
+
+var WithStreamServe = frontend.WithStreamServe
+
+func adapterServeRemote(ctx context.Context) bool {
+	remote, _ := frontend.StreamServeFrom(ctx)
+	return remote
+}

@@ -6,6 +6,7 @@ import (
 	"math"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -15,6 +16,10 @@ import (
 
 // runSpec is everything needed to build one ffmpeg HLS run.
 type runSpec struct {
+	waitDecode     bool // only argv construction may spend the bounded admission budget
+	SoftwareDecode bool // keep hardware encode after a decoder init failure
+	HealTimestamps bool
+	CopyOrigin     bool // retain audio from the measured video presentation origin
 	// RampClock keeps every run of a fast-start session on the steady clock.
 	RampClock bool
 	// AuthoredTimeline preserves adaptive sessions with a separate clock.
@@ -23,10 +28,12 @@ type runSpec struct {
 	SilenceAudio     bool
 	// Only a retry of an initial run whose muxer wrote a wrapped tfdt.
 	NormalizeNegativeDTS bool
+	TextSubtitlePaths    map[int]string
 	SoftSubtitlePath     string
 	SoftSubtitleIndex    int
 	LoopInput            bool
 	LiveInput            bool
+	LiveFromBacklog      bool // live HLS input: start at its first listed segment
 	CopyTimestamps       bool
 	// RTXTimeline preserves the native session's clock and rendition-local
 	// initialization paths when ordinary FFmpeg takes over.
@@ -37,7 +44,12 @@ type runSpec struct {
 	Info              core.MediaInfo
 	Decision          core.Decision
 	// Start is the media timestamp of the run's first segment (StartSeg).
-	Start          time.Duration
+	Start time.Duration
+	// SeekFrom is the input seek point of a video copy whose demuxer cannot
+	// find the keyframe before Start itself (copyKeyframeBefore), when
+	// HasSeekFrom.
+	SeekFrom       time.Duration
+	HasSeekFrom    bool
 	SegDur         time.Duration
 	StartSeg       int
 	Dir            string
@@ -176,10 +188,18 @@ func buildArgs(s runSpec) []string {
 			}
 		}
 		if s.RTXTimeline {
-			// Both HLS and its child TS muxer must preserve timestamps: the
-			// child otherwise shifts a zero-origin B-frame run to positive DTS.
+			// Copied audio keeps the native clock unchanged. Encoded audio
+			// instead needs the shared priming shift below, even at zero delay.
 			args = append(args, "-muxdelay", "0", "-muxpreload", "0")
-			segmentOptions = append(segmentOptions, "mpegts_copyts=1", "avoid_negative_ts=disabled")
+			segmentOptions = append(segmentOptions, "mpegts_copyts=1")
+			if !s.encodesAudio() {
+				segmentOptions = append(segmentOptions, "avoid_negative_ts=disabled")
+			}
+		}
+		if s.encodesAudio() {
+			// Normalize in the child muxer, including zero-delay RTX fallback.
+			// Otherwise encoder priming can wrap into the 33-bit TS clock.
+			segmentOptions = append(segmentOptions, "avoid_negative_ts=make_non_negative")
 		}
 		if s.Start > 0 || (s.LiveInput && s.StartSeg > 0) {
 			// A new muxer resets each PID's continuity counter. Mark that reset
@@ -219,6 +239,11 @@ func buildArgs(s runSpec) []string {
 }
 
 func appendSoftSubtitleOutput(args []string, s runSpec) []string {
+	for _, track := range s.Info.Streams {
+		if path := s.TextSubtitlePaths[track.Index]; path != "" {
+			args = append(args, "-map", fmt.Sprintf("0:%d", track.Index), "-c:s", "ass", "-f", "ass", "-ignore_readorder", "1", "-flush_packets", "1", path)
+		}
+	}
 	if s.SoftSubtitlePath == "" {
 		return args
 	}
@@ -230,16 +255,19 @@ func appendSoftSubtitleOutput(args []string, s runSpec) []string {
 // one EXT-X-MAP, never refetched. A failover to an encode with different
 // SPS/PPS then decodes against the old ones. Repeating them in-band at
 // every keyframe reconfigures the open decoder. These filters only add
-// parameter sets from extradata (Annex B input passes through unchanged);
+// parameter sets from extradata; HEVC needs a complete hvcC record.
+// Annex B and in-band-only sources already carry their own parameter sets;
 // matroskaenc stores the packets length-prefixed and still writes the
 // avcC/hvcC CodecPrivate.
-func matroskaCopyParameterSets(d core.Decision, codec string) string {
+func matroskaCopyParameterSets(d core.Decision, v *core.StreamInfo) string {
 	if d.Container != ContainerMatroska {
 		return ""
 	}
-	switch codec {
+	switch v.Codec {
 	case "hevc":
-		return "hevc_mp4toannexb"
+		if v.HEVCParameterSets {
+			return "hevc_mp4toannexb"
+		}
 	case "h264":
 		return "h264_mp4toannexb"
 	}
@@ -249,6 +277,7 @@ func matroskaCopyParameterSets(d core.Decision, codec string) string {
 // buildCodecArgs is the input, stream mapping and codec part of a run's
 // command line, shared by HLS and DASH.
 func buildCodecArgs(s runSpec) []string {
+	s.waitDecode = true
 	// A card has no changing content: start its loop at zero, then place it
 	// on the programme clock. Never seek through hours of repeated input.
 	loopStart := s.Start
@@ -288,13 +317,14 @@ func buildCodecArgs(s runSpec) []string {
 		container = ContainerMPEGTS
 	}
 	transcodeVideo := v != nil && !d.VideoCopy
+	vp := planVideo(s, v)
 
 	args := []string{"-hide_banner", "-nostdin", "-loglevel", "warning", "-nostats", "-y"}
 	if s.Protocol != core.ProtocolHTTP {
 		args = append(args, "-progress", "pipe:1")
 	}
 	if transcodeVideo {
-		if _, hw := videoEncoder(d.VideoCodec, s.Accel, s.Features); !hw {
+		if _, hw := videoEncoder(d.VideoCodec, s.Accel, s.Features); !hw || (!vp.hwFrames && vp.graph != "") {
 			w, h := outputSize(v.Width, v.Height, d.MaxHeight)
 			args = append(args, "-filter_complex_threads", strconv.Itoa(min(4, softwareThreadBudget(w, h, runtime.GOMAXPROCS(0)))))
 		}
@@ -324,20 +354,34 @@ func buildCodecArgs(s runSpec) []string {
 			args = append(args, "-reconnect_streamed", "1", "-reconnect_max_retries", "3")
 		}
 		args = append(args, "-fflags", "+discardcorrupt+genpts", "-err_detect", "ignore_err")
+		if s.LiveFromBacklog {
+			args = append(args, "-live_start_index", "0")
+		}
 	}
 	if !pceBounded {
 		args = appendInputHeaders(args, s.commandHeaders())
 	}
-	if s.BigProbe {
+	sub := matroskaSubtitle(s)
+	bitmap := sub != nil && IsImageSubtitle(sub.Codec)
+	if bitmap && sub.Width > 0 && sub.Height > 0 {
+		// PGS packets may be minutes apart. The persisted canvas avoids
+		// scanning for a subtitle packet at every seek.
+		args = append(args, fmt.Sprintf("-canvas_size:%d", sub.Index), fmt.Sprintf("%dx%d", sub.Width, sub.Height))
+	}
+	if s.BigProbe || (bitmap && (sub.Width <= 0 || sub.Height <= 0)) {
 		args = append(args, "-probesize", "50000000", "-analyzeduration", "10000000")
 	} else {
+		// Persisted probe metadata is not passed to the demuxer. Even a known
+		// video size/format does not prove ffmpeg can recover every mapped
+		// stream parameter within 100 ms (audio can precede the first picture).
+		// Keep normal analysis for copies too; otherwise a successful remux
+		// can publish unknown pixel formats and broken DTS without a retry.
 		args = append(args, "-probesize", "5000000", "-analyzeduration", "2000000")
 	}
 	if !transcodeVideo && !s.LiveInput {
 		args = append(args, "-fflags", "+genpts")
 	}
-	vp := planVideo(s, v)
-	if _, hw := videoEncoder(s.Decision.VideoCodec, s.Accel, s.Features); hw && s.Accel.Name == AccelQSV && s.Accel.Device != "" && transcodeVideo {
+	if _, hw := videoEncoder(s.Decision.VideoCodec, s.Accel, s.Features); hw && s.Accel.Name == AccelQSV && s.Accel.Device != "" && transcodeVideo && !contains(vp.inputArgs, "-init_hw_device") {
 		args = append(args, "-qsv_device", s.Accel.Device)
 	}
 	args = append(args, vp.inputArgs...)
@@ -347,14 +391,38 @@ func buildCodecArgs(s runSpec) []string {
 	}
 	if s.Start > 0 && !pceOutputSeek {
 		seek := secs(s.Start)
-		if lead := hlsNVENCPreroll(s); lead > 0 {
+		noAccurateSeek := false
+		if s.CopyOrigin && d.VideoCopy {
+			seek = secs(copyOriginSeek(s.Start))
+			if s.Info.Container == "mpegts" || s.Info.Container == "mpeg" {
+				// Unindexed timestamp seeks must land before the keyframe packet.
+				seek = secs(max(0, s.Start.Truncate(time.Millisecond)-time.Millisecond))
+			}
+			noAccurateSeek = true
+		} else if s.HasSeekFrom {
+			seek = secs(s.SeekFrom)
+			noAccurateSeek = fmp4CopyDelayedMoovAudio(s, d, v, a)
+		} else if lead := hlsNVENCPreroll(s); lead > 0 {
 			// Keep the measured NVENC seek and its hardware-frame trim.
 			seek = secs(max(0, s.Start-lead).Truncate(time.Millisecond))
 		} else if start, ok := hlsAudioPreroll(s); ok {
 			seek = strconv.FormatFloat(math.Max(0, math.Floor(start)-1), 'f', 0, 64)
-			args = append(args, "-noaccurate_seek")
+			noAccurateSeek = true
 		} else if start, ok := hlsCopiedAudioPreroll(s); ok {
 			seek = strconv.FormatFloat(start, 'f', 0, 64)
+			noAccurateSeek = true
+		} else if fmp4CopyDelayedMoovAudio(s, d, v, a) {
+			noAccurateSeek = true
+		} else if s.Protocol == core.ProtocolHTTP && d.VideoCopy && !s.LiveInput {
+			// A progressive player starts at the first picture it gets:
+			// the keyframe at or before Start. Accurate seek would still
+			// cut the (transcoded) audio at Start, so the stream would
+			// open with up to a GOP of silent video (#650, Roku). Start
+			// the audio at the same demuxer landing as the video; the
+			// retained title timestamps report the true position.
+			noAccurateSeek = true
+		}
+		if noAccurateSeek {
 			args = append(args, "-noaccurate_seek")
 		}
 		args = append(args, "-ss", seek)
@@ -370,7 +438,7 @@ func buildCodecArgs(s runSpec) []string {
 	if s.LoopInput {
 		args = append(args, "-t", secs(s.Info.Duration-loopStart))
 	}
-	textSub := matroskaTextSubtitle(s)
+	textSub := matroskaSubtitle(s)
 	if textSub != nil && textSub.External && textSub.ExternalURL != "" {
 		// A sidecar file is a second input. Without the same -ss, its cues
 		// stay on the title's zero while output_ts_offset places the video
@@ -385,6 +453,10 @@ func buildCodecArgs(s runSpec) []string {
 	if textSub != nil && textSub.External && textSub.ExternalURL != "" {
 		silenceInput++
 	}
+	// Plex for Android opens subtitle format id 2 (video, audio, subtitle).
+	// A muxed subtitle with no mapped audio would land at 1. Silence fills
+	// that slot for this client only; every other command stays unchanged.
+	androidGap := androidSubtitleSlot(s, v, a, textSub)
 	if s.SilenceAudio && a != nil {
 		layout := fmt.Sprintf("%dc", decisionAudioChannels(d, a))
 		if s.Decision.AudioCopy {
@@ -395,6 +467,21 @@ func buildCodecArgs(s runSpec) []string {
 		}
 
 		args = append(args, "-re", "-f", "lavfi", "-i", fmt.Sprintf("anullsrc=r=%d:cl=%s", decisionAudioRate(d), layout))
+	}
+	if androidGap {
+		ch := decisionAudioChannels(d, nil)
+		spec := fmt.Sprintf("anullsrc=r=%d:cl=%dc", decisionAudioRate(d), ch)
+		// Title-clock runs keep source PTS. Shift this input with them, or
+		// the muxer waits on silence that starts at zero.
+		if s.titleClock() && s.Start > 0 {
+			args = append(args, "-itsoffset", secs(s.Start))
+		}
+		// anullsrc does not end. Bound it to the probed tail so a finite
+		// title is not held open by the generator.
+		if remain := s.Info.Duration - s.Start; remain > 0 {
+			args = append(args, "-t", secs(remain))
+		}
+		args = append(args, "-f", "lavfi", "-i", spec)
 	}
 	if pceOutputSeek {
 		// Output seeking rebases packet timestamps even with -copyts. Put
@@ -420,6 +507,8 @@ func buildCodecArgs(s runSpec) []string {
 		} else {
 			args = append(args, "-map", fmt.Sprintf("0:%d", a.Index))
 		}
+	} else if androidGap {
+		args = append(args, "-map", fmt.Sprintf("%d:a:0", silenceInput))
 	}
 	args = append(args, "-map_metadata", "-1", "-map_chapters", "-1", "-dn")
 	switch {
@@ -435,10 +524,22 @@ func buildCodecArgs(s runSpec) []string {
 		args = append(args, "-sn")
 	}
 
+	if bitmap {
+		// Sparse bitmap cues must not hold video/audio in the interleaver
+		// for FFmpeg's default ten seconds while waiting for another cue.
+		args = append(args, "-max_interleave_delta", "1000000")
+	}
+
 	// ---- video
 	if v != nil {
 		if d.VideoCopy {
 			args = append(args, "-c:v", "copy")
+			// A copied stream can carry a coarse demuxer time base. Explicitly
+			// retain its rate in Matroska DefaultDuration instead of the muxer's
+			// guessed 30fps. This does not duplicate or drop copied packets.
+			if d.AndroidMatroskaHLS && container == ContainerMatroska && v.FrameRate > 0 && !v.VariableFrameRate {
+				args = append(args, "-r:v", strconv.FormatFloat(v.FrameRate, 'f', 6, 64))
+			}
 			if d.StripDolbyVision {
 				filter := "dovi_rpu=strip=1"
 				if v.DolbyVisionProfile == 7 {
@@ -448,11 +549,11 @@ func buildCodecArgs(s runSpec) []string {
 					// HDR10 base NALs remain byte-for-byte unchanged.
 					filter += ",filter_units=remove_types=62|63"
 				}
-				if ps := matroskaCopyParameterSets(d, v.Codec); ps != "" {
+				if ps := matroskaCopyParameterSets(d, v); ps != "" {
 					filter += "," + ps
 				}
 				args = append(args, "-bsf:v", filter)
-			} else if ps := matroskaCopyParameterSets(d, v.Codec); ps != "" {
+			} else if ps := matroskaCopyParameterSets(d, v); ps != "" {
 				args = append(args, "-bsf:v", ps)
 			}
 			if container == ContainerFMP4 && v.Codec != "hevc" {
@@ -557,6 +658,9 @@ func buildCodecArgs(s runSpec) []string {
 			args = append(args, "-c:a", enc, "-ac", strconv.Itoa(ch), "-ar", strconv.Itoa(decisionAudioRate(d)),
 				"-b:a", fmt.Sprintf("%dk", kbps))
 			filters := append([]string(nil), d.AudioFilters...)
+			if s.CopyOrigin && d.VideoCopy {
+				filters = append(filters, "atrim=start="+strconv.FormatFloat(s.Start.Seconds(), 'f', 9, 64))
+			}
 			if start, ok := hlsAudioPreroll(s); ok {
 				rate := decisionAudioRate(d)
 				// Coarse demuxer clocks round packet PTS. Recover the decoded
@@ -568,6 +672,15 @@ func buildCodecArgs(s runSpec) []string {
 				filters = append(filters, fmt.Sprintf("aresample=%d,atrim=start=%.9f,asettb=1/%d,asetpts=N+%d", rate, start, rate, int64(math.Round(start*float64(rate)))))
 				cut := hlsAudioRestartCut(s)
 				args = append(args, "-bsf:a", fmt.Sprintf("noise=amount=0:drop='lt(pts*tb,%.9f)'", cut))
+			} else if codec == "aac" && container == ContainerFMP4 && (s.Protocol == "" || s.Protocol == core.ProtocolHLS || s.Protocol == core.ProtocolDASH) {
+				// Coarse source clocks (e.g. Matroska milliseconds) can put
+				// the next AAC DTS before the previous fragment's sample end.
+				// movenc then rejects the duration and clears PTS. async=1
+				// stamps from decoded samples while retaining the first PTS
+				// and filling/trimming real gaps, without rebasing the title
+				// clock or changing encoder priming. Warmed preroll above
+				// already establishes its own exact sample grid.
+				filters = append(filters, fmt.Sprintf("aresample=%d:async=1", decisionAudioRate(d)))
 			}
 			if s.AudioGainDB != 0 {
 				filters = append(filters, fmt.Sprintf("volume=%.1fdB", s.AudioGainDB))
@@ -582,6 +695,8 @@ func buildCodecArgs(s runSpec) []string {
 				args = append(args, "-strict", "-2")
 			}
 		}
+	} else if androidGap {
+		args = append(args, androidSilenceCodecArgs(s)...)
 	}
 
 	if s.LoopInput {
@@ -598,10 +713,44 @@ func buildCodecArgs(s runSpec) []string {
 		// Shift only decode time; presentation time must retain source order.
 		args = appendVideoClockBSF(args, "setts=pts=PTS:dts=DTS-"+strconv.FormatFloat(fastLead.Seconds(), 'f', 9, 64)+"/TB")
 	}
+	lead = max(lead, hlsEncodedClockLead(s))
 	if lead > 0 {
 		args = append(args, "-output_ts_offset", strconv.FormatFloat(lead.Seconds(), 'f', 9, 64))
 	}
 	return args
+}
+
+// hlsEncodedClockLead fixes the mux clock before any packets arrive. Using
+// the same encoder plan for every run and rendition keeps priming and video
+// reorder from causing a title-zero-only shift in the nested MP4 muxer.
+func hlsEncodedClockLead(s runSpec) time.Duration {
+	if !s.encodesAudio() || s.Decision.VideoCopy || s.LoopInput || s.LiveInput || s.RTXTimeline || s.Decision.Container != ContainerFMP4 || (s.Protocol != "" && s.Protocol != core.ProtocolHLS) {
+		return 0
+	}
+	codec := s.Decision.AudioCodec
+	priming := 0.0
+	switch codec {
+	case "", "aac":
+		priming = 1024.0 / float64(decisionAudioRate(s.Decision))
+	case "opus":
+		if s.Features.encoders == nil || s.Features.hasEncoder("libopus") {
+			priming = 0.0065
+		}
+	}
+	if priming == 0 {
+		return 0
+	}
+	encoder, _ := videoEncoder(s.Decision.VideoCodec, s.Accel, s.Features)
+	if encoder != "libx264" && encoder != "h264_nvenc" {
+		return 0
+	}
+	if s.RampClock {
+		s.FastStart = false
+	}
+	if fps := hlsOutputFPS(s); fps > 0 {
+		priming = math.Max(priming, float64(h264ReorderFrames(s))/fps)
+	}
+	return time.Duration(math.Ceil(priming * float64(time.Second)))
 }
 
 // hlsAudioPreroll warms the AAC encoder on its original sample grid. Only
@@ -650,6 +799,24 @@ func hlsCopiedAudioPreroll(s runSpec) (float64, bool) {
 		return 0, false
 	}
 	return math.Max(0, math.Floor(cut)-1), true
+}
+
+// fmp4CopyDelayedMoovAudio reports whether an HLS fMP4 copy-video restart
+// encodes audio to AC-3 or E-AC-3. FFmpeg's movenc delays dec3/dac3 until it
+// parses an encoded audio packet, while default accurate_seek discards decoded
+// audio up to -ss even though copied video begins at the preceding keyframe; a
+// video keyframe whose DTS precedes -ss then cuts the first chunk before any
+// audio packet arrives ("Cannot write moov atom before EAC3 packets parsed").
+// Starting decoded audio at the demuxer seek point with copied video gives the
+// muxer audio before the first cut, and collectChunks drops preroll chunks.
+func fmp4CopyDelayedMoovAudio(s runSpec, d core.Decision, v, a *core.StreamInfo) bool {
+	if v == nil || !d.VideoCopy || a == nil || d.AudioCopy || s.SilenceAudio || s.LiveInput || s.LoopInput {
+		return false
+	}
+	if d.Container != ContainerFMP4 || (s.Protocol != "" && s.Protocol != core.ProtocolHLS) {
+		return false
+	}
+	return d.AudioCodec == "eac3" || d.AudioCodec == "ac3"
 }
 
 func hlsAudioRestartCut(s runSpec) float64 {
@@ -855,6 +1022,12 @@ func h264ReorderFrames(s runSpec) int {
 	return delay
 }
 
+// encodesAudio includes synthetic silence, which replaces even a copied track
+// with an encoder and therefore introduces codec priming too.
+func (s runSpec) encodesAudio() bool {
+	return (!s.Decision.AudioCopy || s.SilenceAudio) && findStream(s.Info, s.Decision.AudioStream, "audio") != nil
+}
+
 // hlsMuxArgs is the HLS muxer part of a run's command line.
 func hlsMuxArgs(s runSpec) []string {
 	segDur := s.SegDur
@@ -896,7 +1069,19 @@ func hlsMuxArgs(s runSpec) []string {
 		// was moved before them. HLS does not use sidx, and the chunked
 		// path already drops it from multi-chunk segments.
 		options := "movflags=+frag_discont+skip_sidx"
-		if s.NormalizeNegativeDTS {
+		audioOnlyAAC := s.Info.Video() == nil && !s.Decision.AudioCopy && s.Decision.AudioCodec == "aac"
+		if audioOnlyAAC {
+			// MSE ignores an empty edit that delays the first AAC sample.
+			// Keep this rendition's title clock in tfdt itself, without
+			// depending on client edit-list support. frag_discont and the
+			// inner timestamp policy below preserve the absolute clock.
+			options += ":use_editlist=0"
+		}
+		if s.NormalizeNegativeDTS || audioOnlyAAC || s.encodesAudio() {
+			// Planned H264 encodes already carry a fixed priming/reorder
+			// lead on every run. Keep this safety net for copied video and
+			// other encoder plans, where negative priming must not wrap.
+			// Unlike the automatic policy it preserves positive seek times.
 			options += ":avoid_negative_ts=make_non_negative"
 		}
 		if s.VideoTimescale != 0 {
@@ -989,7 +1174,26 @@ type videoPlan struct {
 	inputArgs  []string
 	graph      string // -filter_complex, output label [vout]
 	encodeArgs []string
+	hwFrames   bool
 	err        error // the graph cannot be built; do not start ffmpeg
+}
+
+// displaySize is v's display size in square pixels: the coded size with
+// the sample aspect ratio applied (720x480 at SAR 32:27 displays 854x480).
+func displaySize(v *core.StreamInfo) (int, int) {
+	if v == nil || v.Width <= 0 || v.Height <= 0 {
+		return 0, 0
+	}
+	p := pictureOf(v)
+	return (v.Width*p.sarNum + p.sarDen/2) / p.sarDen, v.Height
+}
+
+// displayOutputSize is the encoded picture size for v at a height cap, in
+// square pixels. Encodes are made square-pixel (planPicture), so this is
+// both the coded and the displayed size of the output.
+func displayOutputSize(v *core.StreamInfo, maxH int) (int, int) {
+	w, h := displaySize(v)
+	return outputSize(w, h, maxH)
 }
 
 // outputSize scales (w,h) to height maxH, keeping aspect and even sizes.
@@ -1047,24 +1251,64 @@ func escapeFilterValue(v string) string {
 	return g.Replace(v)
 }
 
-// matroskaTextSubtitle is the selected text track Plex tvOS reads from
+// androidSubtitleSlot is the Android Matroska case where a muxed subtitle
+// has no audio in front of it. Direct play does not build these args.
+// External sidecars are input 1 already; a silent generator would steal
+// that index. No video means the subtitle cannot become output stream 2.
+func androidSubtitleSlot(s runSpec, video, audio, sub *core.StreamInfo) bool {
+	d := s.Decision
+	return d.AndroidMatroskaHLS && d.Container == ContainerMatroska && video != nil && audio == nil && sub != nil && !sub.External
+}
+
+// androidSilenceCodecArgs encodes the placeholder track. There is no source
+// audio to copy. The default matches the AAC stereo path used when a
+// decision names no audio codec.
+func androidSilenceCodecArgs(s runSpec) []string {
+	d := s.Decision
+	codec := d.AudioCodec
+	if codec == "" {
+		codec = "aac"
+	}
+	ch := decisionAudioChannels(d, nil)
+	enc := codec
+	switch codec {
+	case "mp3":
+		enc = "libmp3lame"
+	case "opus":
+		enc = "libopus"
+		if s.Features.encoders != nil && !s.Features.hasEncoder("libopus") {
+			enc = "opus"
+		}
+	}
+	kbps := audioBitrateKbps(codec, ch)
+	if d.AudioBitrateKbps > 0 && d.AudioBitrateKbps < kbps {
+		kbps = d.AudioBitrateKbps
+	}
+	args := []string{"-c:a", enc, "-ac", strconv.Itoa(ch), "-ar", strconv.Itoa(decisionAudioRate(d)), "-b:a", fmt.Sprintf("%dk", kbps)}
+	if enc == "opus" {
+		args = append(args, "-strict", "-2")
+	}
+	return args
+}
+
+// matroskaSubtitle is the selected track Plex tvOS reads from
 // inside segmented Matroska. Burned and non-Matroska decisions keep the
 // sidecar path. A nil return means the run stays subtitle-free (-sn).
-func matroskaTextSubtitle(s runSpec) *core.StreamInfo {
+func matroskaSubtitle(s runSpec) *core.StreamInfo {
 	if s.Decision.Container != ContainerMatroska || s.Decision.BurnSubtitles {
 		return nil
 	}
 	sub := findStream(s.Info, s.Decision.SubtitleStream, "subtitle")
-	if sub == nil || !IsTextSubtitle(sub.Codec) {
+	if sub == nil || (!IsTextSubtitle(sub.Codec) && !IsImageSubtitle(sub.Codec)) {
 		return nil
 	}
-	if sub.External && sub.ExternalURL == "" {
+	if sub.External && (sub.ExternalURL == "" || IsImageSubtitle(sub.Codec)) {
 		return nil
 	}
 	return sub
 }
 
-// matroskaSubtitleTrackArgs describes the one text track the segments
+// matroskaSubtitleTrackArgs describes the one subtitle track the segments
 // carry. It is the track the viewer picked, so it is flagged default:
 // ExoPlayer (Plex for Android and Android TV) picks a text track by its
 // default flag or its language, and the source's flags are the release's,
@@ -1091,11 +1335,11 @@ func (s runSpec) titleClock() bool {
 	return len(inputTimestampArgs(s)) > 0 || s.httpCopyTimestamps()
 }
 
-// matroskaSubtitleCodec copies a codec Matroska already stores as text and
+// matroskaSubtitleCodec copies native Matroska subtitle codecs and
 // rewrites the others to SubRip, which the segment muxer can header.
 func matroskaSubtitleCodec(codec string) string {
 	switch strings.ToLower(codec) {
-	case "subrip", "srt", "ass", "ssa", "webvtt":
+	case "subrip", "srt", "ass", "ssa", "webvtt", "pgs", "hdmv_pgs_subtitle", "vobsub", "dvd_subtitle", "dvbsub", "dvb_subtitle":
 		return "copy"
 	default:
 		return "srt"
@@ -1136,13 +1380,13 @@ type picturePlan struct {
 // with a contract, its depth/range/colour conversion/padding/SAR.
 func planPicture(s runSpec, v *core.StreamInfo, codec string) picturePlan {
 	d := s.Decision
-	w, h := outputSize(v.Width, v.Height, d.MaxHeight)
+	w, h := displayOutputSize(v, d.MaxHeight)
 	// Keep HDR only where HEVC can carry the decoded picture's HDR10/HLG;
 	// any other HDR picture is tone mapped (8-bit SDR output), and an SDR
 	// picture (a Dolby Vision SDR base layer) never is.
 	keepHDR := keepsHDR(v) && !d.ToneMap && codec == "hevc"
 	pic := picturePlan{
-		w: w, h: h, scaling: v.Height > 0 && h < v.Height,
+		w: w, h: h, scaling: w > 0 && h > 0 && (w != v.Width || h != v.Height),
 		tonemap: encodedRange(v) != rangeSDR && !keepHDR,
 		// tenBit and outRange describe the encoded picture; without a
 		// contract they follow keepHDR.
@@ -1150,6 +1394,19 @@ func planPicture(s runSpec, v *core.StreamInfo, codec string) picturePlan {
 	}
 	if keepHDR {
 		pic.outRange = encodedRange(v)
+	}
+	if s.Target == nil && pic.scaling && v.Width > 0 && v.Height > 0 {
+		// Encodes are square-pixel: the scale above sized the picture by
+		// its display aspect, and setsar=1 makes the stream say so. The
+		// scale filter would otherwise keep the source's sample aspect
+		// (or a near-1 rounding of it) on a display-sized picture, and
+		// TV players that size the picture from the manifest or track
+		// header instead of the SAR then stretch it. A contract session
+		// keeps its header's SAR instead (below).
+		src := pictureOf(v)
+		if n, dd := reduce(src.sarNum*v.Width*pic.h, src.sarDen*v.Height*pic.w); n != dd {
+			pic.setSAR = "setsar=1/1"
+		}
 	}
 	if t := s.Target; t != nil {
 		// A static-header session: encode the contract's picture
@@ -1182,13 +1439,23 @@ func planPicture(s runSpec, v *core.StreamInfo, codec string) picturePlan {
 
 // planFilterChain chooses the GPU or software filter chain: hardware
 // decode/scale/tone-map when a pipeline applies, else the software
-// convert/tone-map plus finish. finish sizes/pads/formats software frames.
-func planFilterChain(s runSpec, v *core.StreamInfo, pic picturePlan, accel string, burn bool, finish func([]string) []string) (inputArgs, chain []string, hwFrames bool) {
+// convert/tone-map plus finish. size/format size, pad and format software frames.
+func planFilterChain(s runSpec, v *core.StreamInfo, pic picturePlan, accel string, burn bool, size, format func([]string) []string) (inputArgs, chain []string, hwFrames bool) {
 	// Software filters only: GPU scalers neither pad nor convert SDR to
 	// HDR, and only the explicitly probed CUDA path can feed a 10-bit
 	// tone-mapped contract. Tone mappers produce limited-range BT.709.
 	p010CUDA := accel == AccelNVENC && s.Features.cudaP010ToneMap && !pictureOf(v).full && (s.Target == nil || (s.Target.pic.prim == "bt709" && s.Target.pic.matrix == "bt709" && !s.Target.pic.full))
-	gpuOff := v.Interlaced || s.PictureCrop != nil || pic.pad || pic.convert != "" || (pic.tonemap && pic.tenBit && !p010CUDA)
+	decodeOK := s.canGPUDecode()
+	// A cold asynchronous capability result previously disabled decoding for
+	// the entire first HDR run, even when the hardware supports Main10. Give
+	// this run a small demand-only budget before selecting the GPU graph.
+	if s.waitDecode && !decodeOK && pic.tonemap && !s.SoftwareDecode && (accel == AccelVideoToolbox || accel == AccelNVENC || accel == AccelQSV) {
+		if cache, ok := s.Features.decode.(*decodeProbeCache); ok {
+			decodeOK = cache.supportsWithin(s.Accel, v, 300*time.Millisecond)
+		}
+	}
+
+	gpuOff := !decodeOK || v.Interlaced || s.PictureCrop != nil || pic.pad || pic.convert != "" || (pic.tonemap && pic.tenBit && !p010CUDA)
 	dv5 := pic.tonemap && v.DolbyVision && v.DolbyVisionProfile == 5
 	gpuInput, gpuFilters, gpuOK := gpuPipeline(s, accel, pic.w, pic.h, pic.tonemap, pic.tenBit, burn)
 	if dv5 {
@@ -1200,6 +1467,7 @@ func planFilterChain(s runSpec, v *core.StreamInfo, pic picturePlan, accel strin
 		// It must not bypass the RPU-aware CPU graph either.
 		gpuOff = true
 	}
+
 	switch {
 	case gpuOK && !gpuOff:
 		inputArgs = append(inputArgs, gpuInput...)
@@ -1212,6 +1480,9 @@ func planFilterChain(s runSpec, v *core.StreamInfo, pic picturePlan, accel strin
 		// Decode, tone-map and scale on the GPU.
 		inputArgs = append(inputArgs, "-hwaccel", "videotoolbox", "-hwaccel_output_format", "videotoolbox_vld")
 		chain = append(chain, fmt.Sprintf("scale_vt=w=%d:h=%d:color_matrix=bt709:color_primaries=bt709:color_transfer=bt709", pic.w, pic.h))
+		if pic.setSAR != "" {
+			chain = append(chain, pic.setSAR)
+		}
 		hwFrames = true
 	case accel == AccelVAAPI && !burn && !gpuOff && !s.Accel.NoGPUScale && (!pic.tonemap || (s.Features.hasFilter("tonemap_vaapi") && !s.Accel.NoGPUTonemap)):
 		dev := s.Accel.Device
@@ -1231,10 +1502,12 @@ func planFilterChain(s runSpec, v *core.StreamInfo, pic picturePlan, accel strin
 			chain = append(chain, pic.setSAR)
 		}
 		hwFrames = true
-	case accel == AccelVideoToolbox:
+	case accel == AccelVideoToolbox && decodeOK:
 		inputArgs = append(inputArgs, "-hwaccel", "videotoolbox")
-	case accel == AccelNVENC && !(v.Codec == "h264" && v.BitDepth > 8):
+	case accel == AccelNVENC && decodeOK:
 		inputArgs = append(inputArgs, "-hwaccel", "cuda")
+	case accel == AccelQSV && s.Features.hwaccels["qsv"] && decodeOK:
+		inputArgs = append(inputArgs, "-hwaccel", "qsv")
 	case accel == AccelVAAPI:
 		dev := s.Accel.Device
 		if dev == "" {
@@ -1242,7 +1515,7 @@ func planFilterChain(s runSpec, v *core.StreamInfo, pic picturePlan, accel strin
 		}
 		if burn {
 			inputArgs = append(inputArgs, "-init_hw_device", "vaapi=va:"+dev, "-filter_hw_device", "va")
-			if !(v.Codec == "h264" && v.BitDepth > 8) {
+			if decodeOK {
 				inputArgs = append(inputArgs, "-hwaccel", "vaapi", "-hwaccel_device", "va")
 			}
 		} else {
@@ -1257,6 +1530,7 @@ func planFilterChain(s runSpec, v *core.StreamInfo, pic picturePlan, accel strin
 		if v.Interlaced {
 			chain = append(chain, "yadif=mode=send_frame:parity=auto:deint=all")
 		}
+		preScaled := false
 		switch {
 		case pic.convert != "":
 			chain = append(chain, pic.convert)
@@ -1265,6 +1539,15 @@ func planFilterChain(s runSpec, v *core.StreamInfo, pic picturePlan, accel strin
 				// Jellyfin's DV-aware mapper consumes 10-bit 4:2:0 and uses
 				// the decoder's RPU side data for IPT reshaping.
 				chain = append(chain, "format=yuv420p10le", "tonemapx=tonemap=hable:desat=0:t=bt709:m=bt709:p=bt709:format=yuv420p:apply_dovi=1")
+			} else if !dv5 && !pic.tenBit && s.Features.hasFilter("tonemapx") {
+				// Jellyfin's SIMD 10-bit YUV tone-mapper avoids single-threaded
+				// float32 RGB conversion on CPU filter paths (such as Windows QSV
+				// HDR->SDR, #408). Scaling 10-bit YUV first cuts pixel work 4x+.
+				if !burn && s.PictureCrop == nil && pic.scaling && (v.Width <= 0 || (pic.w <= v.Width && pic.h <= v.Height)) {
+					chain = size(chain)
+					preScaled = true
+				}
+				chain = append(chain, "format=yuv420p10le", "tonemapx=tonemap=hable:desat=0:t=bt709:m=bt709:p=bt709:format=yuv420p")
 			} else if !dv5 {
 				if filt, ok := cpuToneMap(s.Features); ok {
 					chain = append(chain, filt)
@@ -1272,7 +1555,11 @@ func planFilterChain(s runSpec, v *core.StreamInfo, pic picturePlan, accel strin
 			}
 		}
 		if !burn {
-			chain = finish(chain)
+			if preScaled {
+				chain = format(chain)
+			} else {
+				chain = format(size(chain))
+			}
 		}
 	}
 	return inputArgs, chain, hwFrames
@@ -1332,7 +1619,7 @@ func planEncodeArgs(s runSpec, pic picturePlan, enc, codec string, hwFrames bool
 		}
 	case "libx265":
 		params := "log-level=error"
-		if pic.outRange != rangeSDR {
+		if pic.outRange == rangeHDR10 || pic.outRange == rangeHLG {
 			params += hdrX265Params(pic.outRange)
 		}
 		peak := b
@@ -1341,6 +1628,8 @@ func planEncodeArgs(s runSpec, pic picturePlan, enc, codec string, hwFrames bool
 		}
 		e = append(e, "-preset", xPreset, "-crf", "23", "-maxrate", peak, "-bufsize", buf, "-x265-params", params)
 	case "h264_videotoolbox", "hevc_videotoolbox":
+		// Disable open GOPs so forced keyframes are independent HLS cuts.
+		e = append(e, "-flags", "+cgop")
 		if s.Rate.Quality {
 			e = append(e, "-q:v", "65", "-maxrate", maxr, "-bufsize", buf, "-allow_sw", "0")
 		} else {
@@ -1375,6 +1664,10 @@ func planEncodeArgs(s runSpec, pic picturePlan, enc, codec string, hwFrames bool
 			e = append(e, "-profile:v", "main10")
 		}
 	case "h264_qsv", "hevc_qsv", "av1_qsv":
+		// HLS cuts require IDR pictures, rather than ordinary forced I frames.
+		if enc != "av1_qsv" {
+			e = append(e, "-forced_idr", "1")
+		}
 		e = append(e, qsvRateArgs(qsvMode(s, enc), b, maxr, buf)...)
 		if enc == "h264_qsv" {
 			e = append(e, "-profile:v", "high")
@@ -1454,7 +1747,7 @@ func planEncodeArgs(s runSpec, pic picturePlan, enc, codec string, hwFrames bool
 		// Range follows the frames: zscale converts it, else the source's
 		// already matches (convertsColour).
 		e = append(e, "-color_primaries", s.Target.pic.prim, "-color_trc", trc, "-colorspace", s.Target.pic.matrix)
-	case pic.outRange != rangeSDR:
+	case pic.outRange == rangeHDR10 || pic.outRange == rangeHLG:
 		trc := "smpte2084"
 		if pic.outRange == rangeHLG {
 			trc = "arib-std-b67"
@@ -1530,14 +1823,28 @@ func planVideo(s runSpec, v *core.StreamInfo) videoPlan {
 	finish := func(c []string) []string { return format(size(c)) }
 
 	in := fmt.Sprintf("[0:%d]", v.Index)
-	chainInput, chain, hwFrames := planFilterChain(s, v, pic, accel, burn, finish)
+	chainInput, chain, hwFrames := planFilterChain(s, v, pic, accel, burn, size, format)
+	p.hwFrames = hwFrames
+	bitmapHW := false
+	bitmapOverlay, bitmapUpload := "", ""
+	if burn && IsImageSubtitle(sub.Codec) && !sub.External {
+		if input, filters, overlay, upload, ok := bitmapPipeline(s, v, pic, accel, swFmt); ok {
+			chainInput, chain = input, filters
+			bitmapOverlay, bitmapUpload, bitmapHW = overlay, upload, true
+			// The final overlay may use software frames. Only a hardware
+			// overlay (or the VAAPI re-upload) feeds hardware to the encoder.
+			hwFrames = upload != "" || accel == AccelVAAPI
+			p.hwFrames = hwFrames
+		}
+	}
 	// For bitmap burns, scale on VAAPI before downloading for the software
 	// overlay. Upload the result back to the same device for encoding.
 	vaapiBitmap := burn && IsImageSubtitle(sub.Codec) && !sub.External && accel == AccelVAAPI &&
-		!(v.Codec == "h264" && v.BitDepth > 8) && !s.Accel.NoGPUScale &&
+		slices.Contains(chainInput, "-hwaccel") && !s.Accel.NoGPUScale &&
 		pic.w > 0 && pic.h > 0 && s.PictureCrop == nil && !pic.pad && pic.convert == "" && !pic.tonemap && !pic.tenBit && pic.setSAR == ""
 	if vaapiBitmap {
 		chainInput = append(chainInput, "-hwaccel_output_format", "vaapi")
+		p.hwFrames = true
 		chain = []string{fmt.Sprintf("scale_vaapi=w=%d:h=%d:format=nv12", pic.w, pic.h), "hwdownload", "format=nv12"}
 	}
 	if pic.tonemap && !toneMapped(chain, hwFrames) {
@@ -1556,15 +1863,18 @@ func planVideo(s runSpec, v *core.StreamInfo) videoPlan {
 	case burn && IsImageSubtitle(sub.Codec) && !sub.External:
 		post := finish(nil)
 		subW, subH := v.Width, v.Height
-		if vaapiBitmap {
+		if bitmapHW {
+			post = nil
+			subW, subH = pic.w, pic.h
+		} else if vaapiBitmap {
 			post = format(nil)
 			subW, subH = pic.w, pic.h
-		} else if pic.scaling && s.PictureCrop == nil {
+		} else if pic.scaling || s.PictureCrop != nil {
 			// Overlay at the output size: scale the picture first and
 			// draw the subtitle onto the smaller frame, instead of
 			// overlaying every source-size frame and scaling after
-			// (#313). A cropped picture keeps the source-size overlay,
-			// where the subtitle canvas still matches it.
+			// (#313). Crop the subtitle canvas with the same coordinates
+			// before scaling so placement remains aligned with the picture.
 			chain = size(chain)
 			post = format(nil)
 			subW, subH = pic.w, pic.h
@@ -1576,6 +1886,13 @@ func planVideo(s runSpec, v *core.StreamInfo) videoPlan {
 		subScale := "null"
 		if subW > 0 && subH > 0 {
 			subScale = fmt.Sprintf("scale=%d:%d", subW, subH)
+		}
+		if crop := s.PictureCrop; crop != nil {
+			// Subtitle canvases can differ from the coded picture (for
+			// example 1920x1080 PGS on 1920x800 video). Express the
+			// picture crop in canvas coordinates without first upscaling
+			// the subtitle to a source-sized intermediate.
+			subScale = fmt.Sprintf("crop=iw*%d/%d:ih*%d/%d:iw*%d/%d:ih*%d/%d:exact=1,", crop.width, v.Width, crop.height, v.Height, crop.x, v.Width, crop.y, v.Height) + subScale
 		}
 		// Without -copyts, -ss puts this run's frames at PTS 0 while a
 		// bitmap subtitle packet can keep its title timestamp. Reset both
@@ -1592,8 +1909,13 @@ func planVideo(s runSpec, v *core.StreamInfo) videoPlan {
 				subScale = "setpts=PTS-STARTPTS," + subScale
 			}
 		}
-		graph = fmt.Sprintf("%s%s[base];[0:%d]%s[sub];[base][sub]overlay=eof_action=pass,%s[vout]",
-			in, pre, sub.Index, subScale, strings.Join(post, ","))
+		overlay := "overlay=eof_action=pass," + strings.Join(post, ",")
+		if bitmapHW {
+			overlay = bitmapOverlay
+			subScale += bitmapUpload
+		}
+		graph = fmt.Sprintf("%s%s[base];[0:%d]%s[sub];[base][sub]%s[vout]",
+			in, pre, sub.Index, subScale, overlay)
 	case burn && s.Features.hasFilter("subtitles"):
 		src := s.Input
 		opt := ""

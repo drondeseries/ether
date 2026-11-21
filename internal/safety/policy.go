@@ -20,6 +20,7 @@ import (
 	"github.com/braedonsaunders/ether/internal/contentrating"
 	"github.com/braedonsaunders/ether/internal/core"
 	"github.com/braedonsaunders/ether/internal/store"
+	"github.com/braedonsaunders/ether/internal/viewerpolicy"
 )
 
 func init() {
@@ -31,10 +32,11 @@ func init() {
 // record (core.User.StreamLimit, core.User.MaxContentRating), which every
 // protocol already reads.
 type Policy struct {
-	BlockedGenres   []string `json:"blockedGenres"`
-	BlockedKeywords []string `json:"blockedKeywords"`
-	RemoteDisabled  bool     `json:"remoteDisabled"`
-	MaxBitrateKbps  int      `json:"maxBitrateKbps"`
+	Bedtime         *core.Bedtime `json:"bedtime,omitempty"`
+	BlockedGenres   []string      `json:"blockedGenres"`
+	BlockedKeywords []string      `json:"blockedKeywords"`
+	RemoteDisabled  bool          `json:"remoteDisabled"`
+	MaxBitrateKbps  int           `json:"maxBitrateKbps"`
 	// AllowedHours is empty for any time, otherwise hours 0..23 in Timezone.
 	AllowedHours []int  `json:"allowedHours"`
 	Timezone     string `json:"timezone"`
@@ -60,6 +62,21 @@ type Service struct {
 
 	playbackMu    sync.Mutex
 	playbackEpoch map[int64]playbackConfirm
+
+	onPut atomic.Pointer[func(int64, Policy)]
+}
+
+// SetOnPut installs an optional non-blocking observer notified when a viewer's
+// safety policy is saved.
+func (s *Service) SetOnPut(fn func(viewerID int64, p Policy)) {
+	if s == nil {
+		return
+	}
+	if fn == nil {
+		s.onPut.Store(nil)
+		return
+	}
+	s.onPut.Store(&fn)
 }
 
 // Generation changes when a viewer's safety policy is saved.
@@ -134,6 +151,7 @@ func (s *Service) Get(id int64) Policy {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	p := s.policies[id]
+	p.Bedtime = cloneBedtime(p.Bedtime)
 	p.AllowedHours = append([]int(nil), p.AllowedHours...)
 	p.BlockedGenres = append([]string(nil), p.BlockedGenres...)
 	p.BlockedKeywords = append([]string(nil), p.BlockedKeywords...)
@@ -142,6 +160,9 @@ func (s *Service) Get(id int64) Policy {
 
 // Validate reports why p cannot be stored, if it cannot.
 func (p Policy) Validate() error {
+	if err := validateBedtime(p.Bedtime); err != nil {
+		return err
+	}
 	if p.MaxBitrateKbps < 0 {
 		return fmt.Errorf("invalid viewer or bitrate")
 	}
@@ -160,11 +181,23 @@ func (p Policy) Validate() error {
 
 func (s *Service) Put(ctx context.Context, id int64, p Policy) error {
 	// Cache an independent snapshot, just as Get returns one to callers.
+	p.Bedtime = cloneBedtime(p.Bedtime)
 	p.AllowedHours = append([]int(nil), p.AllowedHours...)
 	p.BlockedGenres = append([]string(nil), p.BlockedGenres...)
 	p.BlockedKeywords = append([]string(nil), p.BlockedKeywords...)
 	if id == 0 {
 		return fmt.Errorf("invalid viewer or bitrate")
+	}
+	if p.Bedtime != nil {
+		if p.Bedtime.WakeTime == "" {
+			p.Bedtime.WakeTime = "06:00"
+		}
+		if p.Bedtime.Timezone != "" {
+			p.Timezone = p.Bedtime.Timezone
+		} else {
+			p.Bedtime.Timezone = p.Timezone
+		}
+		p.AllowedHours = nil
 	}
 	if err := p.Validate(); err != nil {
 		return err
@@ -173,7 +206,18 @@ func (s *Service) Put(ctx context.Context, id int64, p Policy) error {
 	if err != nil {
 		return err
 	}
-	if _, err = s.db.ExecContext(ctx, `INSERT INTO safety_policies(user_id,policy) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET policy=excluded.policy`, id, string(raw)); err != nil {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, `INSERT INTO safety_policies(user_id,policy) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET policy=excluded.policy`, id, string(raw)); err != nil {
+		return err
+	}
+	if err = viewerpolicy.AddInputs(ctx, s.db, tx, viewerpolicy.SourceSafety, PolicyInputs(p)); err != nil {
+		return err
+	}
+	if err = tx.Commit(); err != nil {
 		return err
 	}
 	s.mu.Lock()
@@ -184,7 +228,51 @@ func (s *Service) Put(ctx context.Context, id int64, p Policy) error {
 	iv := s.inval
 	s.invalMu.Unlock()
 	iv.Notify(strconv.FormatInt(id, 10))
+	if fn := s.onPut.Load(); fn != nil && *fn != nil {
+		(*fn)(id, p)
+	}
 	return nil
+}
+
+// PolicyInputs lists the catalogue facts p reads. An episode inherits its
+// show's keywords while it has none of its own, so the set's emptiness
+// counts as well as each blocked value (Inputs.Field records both).
+func PolicyInputs(p Policy) viewerpolicy.Inputs {
+	in := viewerpolicy.Inputs{}
+	if len(p.BlockedGenres) > 0 {
+		in.Field("genre", p.BlockedGenres...)
+	}
+	if len(p.BlockedKeywords) > 0 {
+		in.Field("keyword", p.BlockedKeywords...)
+	}
+	return in
+}
+
+// ReadPolicyInputs is the safety source of a viewer-policy inputs rebuild.
+func ReadPolicyInputs(ctx context.Context, tx *sql.Tx) (viewerpolicy.Inputs, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT policy FROM safety_policies`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	in := viewerpolicy.Inputs{}
+	for rows.Next() {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
+			return nil, err
+		}
+		var p Policy
+		if json.Unmarshal([]byte(raw), &p) != nil {
+			// Unreadable: whatever it blocks, treat both facets as read.
+			in.Field("genre", "\x00")
+			in.Field("keyword", "\x00")
+			continue
+		}
+		for k := range PolicyInputs(p) {
+			in[k] = struct{}{}
+		}
+	}
+	return in, rows.Err()
 }
 
 // SetCatalogPolicy installs viewer-aware direct and discovery catalogue policies during construction.
@@ -193,10 +281,43 @@ func (s *Service) SetCatalogPolicy(direct, browse func(*core.User, *core.Title) 
 	s.catalogBrowseAllowed = browse
 }
 
+// TitleFacts is what Allowed reads of a title beyond its row for u: the
+// genres and keywords u's policy blocks. Ratings and collections are on the
+// row. The catalogue policy installed by SetCatalogPolicy is the
+// catalogue's to state (core.SearchCandidates).
+func (s *Service) TitleFacts(u *core.User) core.TitleFacts {
+	if u == nil {
+		return 0
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	p := s.policies[u.ID]
+	var facts core.TitleFacts
+	if len(p.BlockedGenres) > 0 {
+		facts |= core.FactGenres
+	}
+	if len(p.BlockedKeywords) > 0 {
+		facts |= core.FactKeywords
+	}
+	return facts
+}
+
 func (s *Service) Allowed(u *core.User, t *core.Title) bool {
 	if s.catalogAllowed != nil && !s.catalogAllowed(u, t) {
 		return false
 	}
+	return s.PolicyAllowed(u, t)
+}
+
+// SetMaxRating is a no-op denial on a standalone safety service; host-side
+// rating mutation is authorized and persisted through the app's ViewerPolicy.
+func (s *Service) SetMaxRating(context.Context, *core.User, string) error {
+	return core.ErrUnauthorized
+}
+
+// PolicyAllowed evaluates mandatory safety and share restrictions for u without
+// consulting catalogue visibility rules.
+func (s *Service) PolicyAllowed(u *core.User, t *core.Title) bool {
 	if t == nil || t.Adult {
 		return false
 	}
@@ -225,7 +346,8 @@ func AllowedWithPolicy(u *core.User, t *core.Title, p Policy) bool {
 	if u == nil {
 		return true
 	}
-	if contentrating.Exceeds(t.ContentRating, u.MaxContentRating) {
+	enf := contentrating.EffectiveEnforcement(t.EnforcementRating, t.ContentRating, t.Adult, t.Keywords)
+	if contentrating.EnforceExceeds(enf, u.MaxContentRating) {
 		return false
 	}
 	blocked := func(values, bans []string) bool {
@@ -244,8 +366,8 @@ func (s *Service) CanPlay(u *core.User, remote bool, now time.Time) bool {
 	return CanPlayWithPolicy(u, s.ForUser(u), remote, now)
 }
 
-// CanPlayWithPolicy evaluates the same playback rules against an owned policy
-// snapshot. It does not establish freshness or an authorization interval.
+// CanPlayWithPolicy checks restrictions that also apply to a running item.
+// Time windows are checked only by ConfirmAdmission, so an item can finish.
 func CanPlayWithPolicy(u *core.User, p Policy, remote bool, now time.Time) bool {
 	if u == nil {
 		return false
@@ -253,23 +375,7 @@ func CanPlayWithPolicy(u *core.User, p Policy, remote bool, now time.Time) bool 
 	if remote && p.RemoteDisabled {
 		return false
 	}
-	if len(p.AllowedHours) == 0 {
-		return true
-	}
-	loc := time.UTC
-	if p.Timezone != "" {
-		var err error
-		loc, err = time.LoadLocation(p.Timezone)
-		if err != nil {
-			return false
-		}
-	}
-	for _, h := range p.AllowedHours {
-		if now.In(loc).Hour() == h {
-			return true
-		}
-	}
-	return false
+	return true
 }
 
 // PolicyInTx reads the durable policy row. A missing row is unrestricted.
@@ -304,13 +410,16 @@ type Preset struct {
 
 func KidsPreset(age string) Preset {
 	rating := "PG"
+	bedtime := "20:00"
 	switch age {
 	case "preschool":
 		rating = "TV-Y"
+		bedtime = "19:00"
 	case "teens":
 		rating = "PG-13"
+		bedtime = "22:00"
 	}
-	return Preset{MaxContentRating: rating, Policy: Policy{BlockedKeywords: []string{"pornography", "erotic movie"}}}
+	return Preset{MaxContentRating: rating, Policy: Policy{Bedtime: &core.Bedtime{Time: bedtime, WakeTime: "06:00"}, BlockedKeywords: []string{"pornography", "erotic movie"}}}
 }
 func (s *Service) Handler() http.Handler {
 	m := http.NewServeMux()
@@ -392,7 +501,7 @@ func (s *Service) UserPolicy(u *core.User) *core.User {
 		return nil
 	}
 	out := *u
-	out.AllowedSections = append([]int(nil), u.AllowedSections...)
+	out.AllowedLibraries = append([]core.LibraryID(nil), u.AllowedLibraries...)
 	return &out
 }
 func (s *Service) BitrateLimit(u *core.User) int { return s.ForUser(u).MaxBitrateKbps }
@@ -403,7 +512,7 @@ func (s *Service) Restricted(u *core.User) bool {
 	}
 	p := s.ForUser(u)
 	share := s.shareFor(u)
-	return u.MaxContentRating != "" || len(u.AllowedSections) > 0 || len(p.BlockedGenres) > 0 || len(p.BlockedKeywords) > 0 ||
+	return p.Bedtime != nil || len(p.AllowedHours) > 0 || u.MaxContentRating != "" || len(u.AllowedLibraries) > 0 || len(p.BlockedGenres) > 0 || len(p.BlockedKeywords) > 0 ||
 		share.FilterMovies != "" || share.FilterTelevision != ""
 }
 

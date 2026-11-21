@@ -3,6 +3,7 @@ package app
 import (
 	"github.com/braedonsaunders/ether/internal/core"
 	"testing"
+	"time"
 )
 
 func TestOwnerSessionDetails(t *testing.T) {
@@ -17,5 +18,38 @@ func TestOwnerSessionDetails(t *testing.T) {
 	got = ownerSessionDetails(p)
 	if got.OutputVideo != got.SourceVideo || got.OutputAudio != got.SourceAudio {
 		t.Fatalf("copy: %+v", got)
+	}
+}
+
+func TestOwnerSessionBitrateIsSourceNotDeliverySpeed(t *testing.T) {
+	burst := &core.PlaySession{Decision: core.DecisionDirectPlay, SpeedBps: 44_625_000, Info: core.MediaInfo{Container: "mkv", Size: 4_500_000_000, Duration: 2 * time.Hour}}
+	if got := ownerSessionDetails(burst).BitrateKbps; got != 5000 {
+		t.Fatalf("direct play bitrate = %d kbps, want 5000 from size/duration", got)
+	}
+	probed := &core.PlaySession{Decision: core.DecisionDirectPlay, Info: core.MediaInfo{BitrateKbps: 12000, Size: 1, Duration: time.Hour}}
+	if got := ownerSessionDetails(probed).BitrateKbps; got != 12000 {
+		t.Fatalf("probed bitrate = %d kbps, want 12000", got)
+	}
+	idle := &core.PlaySession{Decision: core.DecisionDirectPlay, Info: core.MediaInfo{BitrateKbps: 8000}}
+	if got := ownerSessionDetails(idle).BitrateKbps; got != 8000 {
+		t.Fatalf("idle buffer bitrate = %d kbps, want 8000", got)
+	}
+}
+
+func TestOwnerSessionDirectPlayAudioFallback(t *testing.T) {
+	p := &core.PlaySession{
+		Decision: core.DecisionDirectPlay,
+		Info: core.MediaInfo{
+			Container: "mkv",
+			Streams: []core.StreamInfo{
+				{Index: 0, Type: "video", Codec: "hevc", Height: 2160, ColorTransfer: "smpte2084"},
+				{Index: 1, Type: "audio", Codec: "aac", Channels: 2},
+				{Index: 2, Type: "audio", Codec: "truehd", Channels: 8, ChannelLayout: "7.1", Default: true},
+			},
+		},
+	}
+	got := ownerSessionDetails(p)
+	if got.SourceAudio != "TRUEHD 7.1" || got.OutputAudio != "TRUEHD 7.1" {
+		t.Fatalf("direct play audio fallback: got source=%q output=%q, want TRUEHD 7.1", got.SourceAudio, got.OutputAudio)
 	}
 }

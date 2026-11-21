@@ -2,16 +2,24 @@ package app
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"math"
+	"net"
+	"os"
 	"reflect"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/braedonsaunders/ether/internal/admin"
 	"github.com/braedonsaunders/ether/internal/config"
 	"github.com/braedonsaunders/ether/internal/frontend"
+	"github.com/braedonsaunders/ether/internal/frontends/vela"
+	"github.com/braedonsaunders/ether/internal/remote"
 )
 
 type frontendStreamCountsKey struct{}
@@ -25,17 +33,62 @@ type frontendControl struct {
 	registry     *frontend.Registry
 	listeners    *frontendListeners
 	config       *config.Store
+	db           *sql.DB
 	mu           sync.Mutex
 	applied      map[frontend.Protocol]listenerSettings
 	clientCount  func(context.Context, frontend.Protocol) (int, bool)
 	streamCounts func(context.Context) (map[frontend.Protocol]int, bool)
 	sharedStatus func(frontend.Protocol, *frontend.Status)
+	portChanged  func()
 }
 type listenerSettings struct{ Port, Discovery any }
 
 func newFrontendControl(r *frontend.Registry, c *config.Store) *frontendControl {
 	return &frontendControl{registry: r, listeners: newFrontendListeners(r), config: c, applied: make(map[frontend.Protocol]listenerSettings)}
 }
+
+func (f *frontendControl) UploadVelaWordmark(ctx context.Context, r io.Reader) (admin.VelaWordmark, error) {
+	wm, err := vela.UploadWordmark(ctx, f.db, r)
+	if err != nil {
+		var valErr *vela.WordmarkValidationError
+		switch {
+		case errors.Is(err, vela.ErrWordmarkTooLarge):
+			return admin.VelaWordmark{}, admin.ErrVelaWordmarkTooLarge
+		case errors.As(err, &valErr):
+			return admin.VelaWordmark{}, &admin.VelaWordmarkValidationError{Message: valErr.Message}
+		default:
+			return admin.VelaWordmark{}, err
+		}
+	}
+	return admin.VelaWordmark{
+		URL:    wm.URL,
+		Width:  wm.Width,
+		Height: wm.Height,
+		Digest: wm.Digest,
+	}, nil
+}
+
+func (f *frontendControl) UploadVelaIcon(ctx context.Context, r io.Reader) (admin.VelaAppIcon, error) {
+	icon, err := vela.UploadAppIcon(ctx, f.db, r)
+	if err != nil {
+		var valErr *vela.AppIconValidationError
+		switch {
+		case errors.Is(err, vela.ErrAppIconTooLarge):
+			return admin.VelaAppIcon{}, admin.ErrVelaAppIconTooLarge
+		case errors.As(err, &valErr):
+			return admin.VelaAppIcon{}, &admin.VelaAppIconValidationError{Message: valErr.Message}
+		default:
+			return admin.VelaAppIcon{}, err
+		}
+	}
+	return admin.VelaAppIcon{
+		URL:    icon.URL,
+		Width:  icon.Width,
+		Height: icon.Height,
+		Digest: icon.Digest,
+	}, nil
+}
+
 func (f *frontendControl) descriptor(id frontend.Protocol) (frontend.Descriptor, bool) {
 	for _, d := range f.registry.Descriptors() {
 		if d.ID == id {
@@ -54,10 +107,7 @@ func (f *frontendControl) List(ctx context.Context) ([]admin.FrontendInfo, error
 	}
 	out := make([]admin.FrontendInfo, 0)
 	for _, d := range f.registry.Descriptors() {
-		enabled := cfg.Frontends[string(d.ID)].Enabled
-		if cfg.Frontends == nil && d.ID == "plex" {
-			enabled = true
-		}
+		enabled := frontendDesired(cfg, d.ID)
 		status := f.listeners.status(ctx, d.ID)
 		if f.sharedStatus != nil {
 			f.sharedStatus(d.ID, &status)
@@ -76,7 +126,7 @@ func (f *frontendControl) List(ctx context.Context) ([]admin.FrontendInfo, error
 	return out, nil
 }
 
-// Household order for the setup chooser and the Apps page.
+// Household order for the setup chooser and the Apps page; protocol names are UI identities.
 func frontendRank(id frontend.Protocol) int {
 	switch id {
 	case "plex":
@@ -104,12 +154,18 @@ func (f *frontendControl) Settings(_ context.Context, id frontend.Protocol) (fro
 		return nil, frontend.ErrNotRegistered
 	}
 	cfg := f.config.Read()
-	if id == "plex" {
+	if frontendHostPolicy(id).MainListener {
 		return frontend.Settings{"port": float64(cfg.Server.Port)}, nil
 	}
 	settings := frontend.Settings{}
 	for k, v := range cfg.Frontends[string(id)].Settings {
 		settings[k] = v
+	}
+	if id == "vela" {
+		settings = vela.NormalizeSettings(settings)
+	}
+	if publicURL := strings.TrimSpace(cfg.Frontends[string(id)].PublicURL); publicURL != "" {
+		settings["publicUrl"] = publicURL
 	}
 	if port := cfg.FrontendPorts[string(id)]; port > 0 {
 		settings["port"] = float64(port)
@@ -138,37 +194,102 @@ func validateFrontendSettings(s frontend.Settings, protocolValidator bool) error
 	}
 	return nil
 }
-func (f *frontendControl) PutSettings(_ context.Context, id frontend.Protocol, s frontend.Settings) error {
-	if _, ok := f.descriptor(id); !ok {
+func (f *frontendControl) PutSettings(ctx context.Context, id frontend.Protocol, s frontend.Settings) error {
+	descriptor, ok := f.descriptor(id)
+	if !ok {
 		return frontend.ErrNotRegistered
 	}
 	s = withoutServerName(s)
-	supported, err := f.registry.ValidateSettings(id, s)
+	// publicUrl is a host-owned setting stored on config.Frontend, like the
+	// port; keep it out of the protocol's own settings and validation. Plex
+	// does not take one (it keeps Plex.CustomURLs), so leave it in place
+	// there and let the Plex branch below reject it.
+	publicURL, hasPublicURL := "", false
+	if frontendHostPolicy(id).PublicURL {
+		var err error
+		s, publicURL, hasPublicURL, err = extractPublicURL(s)
+		if err != nil {
+			return err
+		}
+	}
+	// The LAN viewer is host-owned, independent of a plugin's settings schema.
+	protocolSettings := s
+	if descriptor.Auth == "none_lan" {
+		protocolSettings = make(frontend.Settings, len(s))
+		for key, value := range s {
+			if key == "viewerId" {
+				n, ok := value.(float64)
+				if !ok || math.IsNaN(n) || math.IsInf(n, 0) || n < 1 || n > 9007199254740991 || math.Trunc(n) != n {
+					return errors.New("invalid viewerId")
+				}
+				continue
+			}
+			protocolSettings[key] = value
+		}
+	}
+	supported, err := f.registry.ValidateSettings(id, protocolSettings)
 	if err != nil {
 		return err
 	}
-	if err := validateFrontendSettings(s, supported); err != nil {
+	if err := validateFrontendSettings(protocolSettings, supported); err != nil {
 		return err
 	}
-	if id == "plex" {
+	if id == "vela" {
+		s = vela.NormalizeSettings(s)
+	}
+	if frontendHostPolicy(id).MainListener {
 		for key := range s {
 			if key != "port" {
 				return fmt.Errorf("unsupported Plex setting %s", key)
 			}
 		}
-		return f.config.Update(func(c *config.Config) error {
+		if os.Getenv("ETHER_PORT") != "" {
+			return errors.New("ETHER_PORT controls the listening port")
+		}
+		oldPort := f.config.Get().Server.Port
+		if port, ok := s["port"].(float64); ok && int(port) != oldPort {
+			ln, err := net.Listen("tcp", net.JoinHostPort(f.config.Get().Server.BindAddress, strconv.Itoa(int(port))))
+			if err != nil {
+				return fmt.Errorf("listening port is unavailable: %w", err)
+			}
+			ln.Close()
+		}
+		err := f.config.Update(func(c *config.Config) error {
 			if port, ok := s["port"].(float64); ok {
 				c.Server.Port = int(port)
+				c.Server.PortExplicit = true
 			}
 			return nil
 		})
+		if err == nil && oldPort != f.config.Get().Server.Port && f.portChanged != nil {
+			f.portChanged()
+		}
+		return err
 	}
-	return f.config.Update(func(c *config.Config) error {
+	err = f.config.Update(func(c *config.Config) error {
 		if c.Frontends == nil {
 			c.Frontends = map[string]config.Frontend{}
-			c.Frontends["plex"] = config.Frontend{Enabled: true}
+			c.Frontends["plex"] = config.Frontend{Enabled: true} // Preserve the default main-listener registration.
 		}
 		v := c.Frontends[string(id)]
+		if id == "vela" && vela.AppearanceChanged(v.Settings, s) {
+			if v.AppearanceRevision >= 9007199254740991 {
+				return errors.New("appearance revision exhausted")
+			}
+			v.AppearanceRevision++
+		}
+		if id == "vela" && vela.CapabilitiesChanged(v.Settings, s) {
+			if v.CapabilitiesRevision >= 9007199254740991 {
+				return errors.New("capabilities revision exhausted")
+			}
+			v.CapabilitiesRevision++
+		}
+		// Only a present publicUrl changes the stored address; a settings
+		// save that never heard of it must not clear the owner's address.
+		// A present empty value clears it.
+		if hasPublicURL {
+			v.PublicURL = publicURL
+		}
 		v.Settings = make(map[string]any, len(s))
 		for k, val := range s {
 			if k != "port" {
@@ -186,6 +307,11 @@ func (f *frontendControl) PutSettings(_ context.Context, id frontend.Protocol, s
 		c.Frontends[string(id)] = v
 		return nil
 	})
+	if err == nil && id == "vela" && f.db != nil {
+		vela.PruneWordmarks(ctx, f.db, s)
+		vela.PruneAppIcons(ctx, f.db, s)
+	}
+	return err
 }
 func (f *frontendControl) Toggle(_ context.Context, id frontend.Protocol, enabled bool) error {
 	if _, ok := f.descriptor(id); !ok {
@@ -194,8 +320,8 @@ func (f *frontendControl) Toggle(_ context.Context, id frontend.Protocol, enable
 	return f.config.Update(func(c *config.Config) error {
 		if c.Frontends == nil {
 			c.Frontends = map[string]config.Frontend{}
-			if id != "plex" {
-				c.Frontends["plex"] = config.Frontend{Enabled: true}
+			if !frontendHostPolicy(id).MainListener {
+				c.Frontends["plex"] = config.Frontend{Enabled: true} // Preserve the default main-listener registration.
 			}
 		}
 		v := c.Frontends[string(id)]
@@ -210,10 +336,7 @@ func (f *frontendControl) Reconcile(ctx context.Context, c config.Config) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, d := range f.registry.Descriptors() {
-		desired := c.Frontends[string(d.ID)].Enabled
-		if c.Frontends == nil && d.ID == "plex" {
-			desired = true
-		}
+		desired := frontendDesired(c, d.ID)
 		settings := c.Frontends[string(d.ID)].Settings
 		current := listenerSettings{Port: c.FrontendPorts[string(d.ID)], Discovery: settings["discovery"]}
 		_, mounted := f.registry.Instance(d.ID)
@@ -233,6 +356,35 @@ func (f *frontendControl) Reconcile(ctx context.Context, c config.Config) {
 	}
 }
 
+// extractPublicURL removes publicUrl from the settings and returns its
+// normalized value (empty clears the stored address). Present reports
+// whether the key was there at all.
+func extractPublicURL(s frontend.Settings) (out frontend.Settings, value string, present bool, err error) {
+	raw, present := s["publicUrl"]
+	if !present {
+		return s, "", false, nil
+	}
+	text, ok := raw.(string)
+	if !ok {
+		return s, "", true, errors.New("invalid public address")
+	}
+	text = strings.TrimSpace(text)
+	if text != "" {
+		c, parseErr := remote.ParseCustomURL(text)
+		if parseErr != nil {
+			return s, "", true, errors.New("invalid public address")
+		}
+		text = strings.TrimRight(c.URI, "/")
+	}
+	out = make(frontend.Settings, len(s))
+	for k, v := range s {
+		if k != "publicUrl" {
+			out[k] = v
+		}
+	}
+	return out, text, true, nil
+}
+
 func withoutServerName(s frontend.Settings) frontend.Settings {
 	if _, ok := s["serverName"]; !ok {
 		return s
@@ -247,3 +399,18 @@ func withoutServerName(s frontend.Settings) frontend.Settings {
 }
 
 var _ admin.FrontendAdmin = (*frontendControl)(nil)
+var _ admin.VelaWordmarkUploader = (*frontendControl)(nil)
+
+// frontendDesired reports whether an app should be served. An explicit
+// entry wins. Without one, main-listener apps are on for an install that
+// never chose its apps, and Vela, Ether's own app, is on unless the owner
+// turned it off.
+func frontendDesired(c config.Config, id frontend.Protocol) bool {
+	if fe, ok := c.Frontends[string(id)]; ok {
+		return fe.Enabled
+	}
+	if id == "vela" {
+		return true
+	}
+	return c.Frontends == nil && frontendHostPolicy(id).MainListener
+}

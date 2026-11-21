@@ -59,7 +59,7 @@ func (c *Client) recent(ctx context.Context, offset, limit int) ([]core.Release,
 		c.feedMode = mode
 	}
 	q := url.Values{"t": {"search"}, "extended": {"1"}, "offset": {strconv.Itoa(max(0, offset))}, "limit": {strconv.Itoa(min(100, max(1, limit)))}}
-	id := c.generalIdentity()
+	id := c.clientIdentity()
 	if c.feedMode.unfiltered && offset == 0 && c.now().Sub(c.feedMode.checked) >= filteredRecheck {
 		// An unfiltered feed lists every category (books, music, …), so it
 		// takes several pages to cover what one filtered page covers. A

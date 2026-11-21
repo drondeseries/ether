@@ -173,6 +173,9 @@ func TestUnverifiedPlayRecordedInHistory(t *testing.T) {
 	if _, err := s.Resolve(ctx, core.ResolveRequest{Title: matrixTitle(), Client: webCaps()}); err != nil {
 		t.Fatal(err)
 	}
+	if err := s.flushBookkeeping(ctx); err != nil {
+		t.Fatal(err)
+	}
 	recs, _, err := s.History(ctx, HistoryFilter{})
 	if err != nil || len(recs) != 1 {
 		t.Fatalf("history %v %v", recs, err)

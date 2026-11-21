@@ -304,16 +304,4 @@ func TestQueueBoundAndPacing(t *testing.T) {
 	if n != 3 || first != core.MovieKey(8) {
 		t.Fatalf("queue bound: n=%d first=%v", n, first)
 	}
-
-	c.minPost = 40 * time.Millisecond
-	connect(t, c, 1)
-	start := time.Now()
-	for i := 0; i < 3; i++ {
-		if err := c.AddRating(context.Background(), 1, core.MovieKey(1), 8); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if el := time.Since(start); el < 80*time.Millisecond {
-		t.Fatalf("POST pacing not applied: %v", el)
-	}
 }

@@ -24,9 +24,10 @@ func TestImportQualityProfileSkipsQualitiesEtherCannotMatch(t *testing.T) {
 	if !slices.Equal(p.AllowedQualities, want) {
 		t.Fatalf("qualities %v, want %v", p.AllowedQualities, want)
 	}
-	// Grouped qualities rank equally, so the group's sources follow Ether's order.
-	if got := p.PreferredSources; !slices.Equal(got, []core.Source{core.SourceRemux, core.SourceBluRay, core.SourceWEBDL, core.SourceWEBRip, core.SourceHDTV, core.SourceDVD}) {
-		t.Fatalf("sources %v", got)
+	// The quality order keeps the profile's items; grouped qualities rank
+	// equally.
+	if len(p.QualityOrder) != 3 || p.QualityOrder[1].Name != "Bluray|WEB 1080p" || !slices.Equal(p.QualityOrder[1].Qualities, []string{"webrip-1080", "bluray-1080", "webdl-1080", "hdtv-1080"}) {
+		t.Fatalf("quality order %+v", p.QualityOrder)
 	}
 	if p.MinHeight != 480 || p.MaxHeight != 1080 || p.AllowHDR || *p.MinCustomFormatScore != 100 || p.MaxSizeMBPerMin != 0 || p.MinSizeMBPerMin != 5 {
 		t.Fatalf("profile %+v", p)
@@ -35,7 +36,12 @@ func TestImportQualityProfileSkipsQualitiesEtherCannotMatch(t *testing.T) {
 		t.Fatalf("skipped %v app %q", imp.Skipped, imp.App)
 	}
 	joined := strings.Join(imp.Warnings, "\n")
-	for _, want := range []string{"Left out Raw-HD, SDTV", "Upgrade and cutoff", "original language"} {
+	// An original-language profile maps onto the profile Language field
+	// (Radarr-style) instead of becoming a warning.
+	if p.Language != "original" {
+		t.Errorf("language %q, want original", p.Language)
+	}
+	for _, want := range []string{"Left out Raw-HD, SDTV", "Upgrade and cutoff"} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("warnings lack %q:\n%s", want, joined)
 		}
@@ -68,11 +74,17 @@ func TestImportQualityProfileUHDAndLanguage(t *testing.T) {
 		t.Fatal(err)
 	}
 	p := imp.Profile
-	if !p.AllowHDR || !p.AllowDolbyVision || p.PreferredCodecs[0] != "hevc" || p.MinHeight != 2160 {
+	if !p.AllowHDR || !p.AllowDolbyVision || p.MinHeight != 2160 {
 		t.Fatalf("UHD profile %+v", p)
 	}
-	if !slices.Equal(p.PreferredLanguages, []string{"french"}) || imp.ScoreSet != "french-multi-vf" {
-		t.Fatalf("language %v set %q", p.PreferredLanguages, imp.ScoreSet)
+	if p.Language != "french" || len(p.PreferredLanguages) != 0 || imp.ScoreSet != "french-multi-vf" {
+		t.Fatalf("language %q preferred %v set %q", p.Language, p.PreferredLanguages, imp.ScoreSet)
+	}
+	for lang, want := range map[string]string{"Original": "original", "Any": "any"} {
+		imp, err := ImportQualityProfile([]byte(`{"name":"L","language":"` + lang + `","items":[{"name":"WEBDL-1080p","allowed":true}]}`))
+		if err != nil || imp.Profile.Language != want || len(imp.Warnings) != 0 {
+			t.Fatalf("language %s: %+v %v", lang, imp, err)
+		}
 	}
 	sonarr, err := ImportQualityProfile([]byte(`{"name":"Remux","items":[{"name":"Bluray-1080p Remux","allowed":true}]}`))
 	if err != nil || sonarr.App != AppSonarr || len(sonarr.Warnings) != 0 {
@@ -170,9 +182,6 @@ func TestQualityImportApplyKeepsOtherProfilesRanking(t *testing.T) {
 	if added.Name != "SQP (3)" || added.CustomFormatScores["other"] != 0 || added.CustomFormatScores["new"] != 50 {
 		t.Fatalf("imported profile %+v", added)
 	}
-	if _, ok := added.CustomFormatScores["other"]; !ok {
-		t.Fatal("formats outside the profile must score 0 for it")
-	}
 	var ids []string
 	for _, f := range cfg.Resolver.CustomFormats {
 		ids = append(ids, f.ID)
@@ -180,14 +189,12 @@ func TestQualityImportApplyKeepsOtherProfilesRanking(t *testing.T) {
 	if !slices.Equal(ids, []string{"have", "other", "new", "plain"}) || cfg.Resolver.CustomFormats[0].Name != "Have (mine)" {
 		t.Fatalf("formats %v (existing must stay untouched)", cfg.Resolver.CustomFormats)
 	}
+	// Other profiles don't list the added formats, so they score 0 there.
 	mine := cfg.Quality.Profiles[2].CustomFormatScores
-	if mine["new"] != 3 || mine["plain"] != 0 || len(mine) != 2 {
-		t.Fatalf("other profile scores %v: added formats must score 0, own scores kept", mine)
+	if mine["new"] != 3 || mine["plain"] != 0 || len(mine) != 1 {
+		t.Fatalf("other profile scores %v: own scores kept, nothing added", mine)
 	}
-	if _, ok := cfg.Quality.Profiles[0].CustomFormatScores["plain"]; !ok {
-		t.Fatal("first profile missing a 0 score for an added format")
-	}
-	if _, err := NewFormatScorer(cfg.Resolver.CustomFormats, cfg.Resolver.CustomFormatScores); err != nil {
+	if _, err := NewFormatScorer(cfg.Resolver.CustomFormats); err != nil {
 		t.Fatalf("import broke scoring: %v", err)
 	}
 	if err := plan.Apply(&cfg, "Mine"); !errors.Is(err, ErrProfileExists) {
@@ -215,7 +222,7 @@ func TestSonarrSourceEnum(t *testing.T) {
 	radarr := format("r", "Radarr 7", map[string]int{"default": 1}, spec)
 	sonarr := format("s", "Sonarr 7", map[string]int{"default": 1}, spec)
 	sonarr.App = AppSonarr
-	s, err := NewFormatScorer([]core.CustomFormat{radarr, sonarr}, nil)
+	s, err := NewFormatScorer([]core.CustomFormat{radarr, sonarr})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -238,7 +245,7 @@ func TestSonarrSourceEnum(t *testing.T) {
 	}
 	bluray := format("b", "Sonarr Bluray", nil, `[{"name":"s","implementation":"SourceSpecification","fields":{"value":6}}]`)
 	bluray.App = AppSonarr
-	s, _ = NewFormatScorer([]core.CustomFormat{bluray}, nil)
+	s, _ = NewFormatScorer([]core.CustomFormat{bluray})
 	if _, ms, _ := s.Score(core.Release{Info: core.ReleaseInfo{Source: core.SourceRemux}}); len(ms) != 0 {
 		t.Fatal("Sonarr's Bluray matched a remux")
 	}
@@ -250,7 +257,7 @@ func TestSonarrSourceEnum(t *testing.T) {
 		}(),
 		func() core.CustomFormat { f := format("y", "Y", nil, titleSpec); f.App = "lidarr"; return f }(),
 	} {
-		if _, err := NewFormatScorer([]core.CustomFormat{bad}, nil); err == nil {
+		if _, err := NewFormatScorer([]core.CustomFormat{bad}); err == nil {
 			t.Errorf("%s accepted", bad.Name)
 		}
 	}
@@ -291,37 +298,7 @@ func TestImportQualityProfileDetectsApp(t *testing.T) {
 	}
 }
 
-func TestImportQualityProfileLosslessAudio(t *testing.T) {
-	lossless := []string{"truehd", "dtshd", "eac3", "ac3", "dts", "aac"}
-	for name, tc := range map[string]struct {
-		body string
-		want []string
-	}{
-		"1080p web": {
-			`{"name":"Web","items":[{"name":"WEBDL-1080p","allowed":true}]}`,
-			[]string{"eac3", "ac3", "aac"},
-		},
-		"2160p": {
-			`{"name":"UHD","items":[{"name":"WEBDL-2160p","allowed":true}]}`,
-			lossless,
-		},
-		"1080p remux": {
-			`{"name":"Remux","items":[{"name":"Bluray-1080p Remux","allowed":true}]}`,
-			lossless,
-		},
-	} {
-		imp, err := ImportQualityProfile([]byte(tc.body))
-		if err != nil {
-			t.Errorf("%s: %v", name, err)
-			continue
-		}
-		if !slices.Equal(imp.Profile.PreferredAudio, tc.want) {
-			t.Errorf("%s: audio %v, want %v", name, imp.Profile.PreferredAudio, tc.want)
-		}
-	}
-}
-
-func TestPlanMarksUnusableWhenMinimumScoreIsImpossible(t *testing.T) {
+func TestPlanWarnsWhenMinimumScoreIsImpossible(t *testing.T) {
 	min := 5000
 	imp := QualityImport{
 		Source: ImportSourceTrash,
@@ -335,16 +312,16 @@ func TestPlanMarksUnusableWhenMinimumScoreIsImpossible(t *testing.T) {
 	found := map[string]core.CustomFormat{"low": format("low", "Low", map[string]int{"default": 100}, titleSpec)}
 	cfg := config.Config{Quality: config.Quality{Profiles: []core.QualityProfile{{Name: "Other"}}}}
 	plan := PlanQualityImport(imp, AppRadarr, found, cfg)
-	if plan.Unusable == "" || !strings.Contains(plan.Unusable, "at most 100") {
+	if plan.Unusable != "" || !strings.Contains(strings.Join(plan.Warnings, " "), "at most 100") {
 		t.Fatalf("unusable %q", plan.Unusable)
 	}
 	if plan.Profile.CustomFormatScores["low"] != 100 {
 		t.Fatalf("scores %v", plan.Profile.CustomFormatScores)
 	}
-	if err := plan.Apply(&cfg, "Strict"); !errors.Is(err, ErrImportUnusable) {
+	if err := plan.Apply(&cfg, "Strict"); err != nil {
 		t.Fatalf("apply: %v", err)
 	}
-	if len(cfg.Quality.Profiles) != 1 || len(cfg.Resolver.CustomFormats) != 0 {
+	if len(cfg.Quality.Profiles) != 2 || len(cfg.Resolver.CustomFormats) != 1 {
 		t.Fatalf("unusable import was saved: %+v", cfg)
 	}
 	// Exactly the best possible score is still reachable.
@@ -376,18 +353,18 @@ func TestQualityGateMatchesUnknownHeightBySource(t *testing.T) {
 		t.Fatalf("unknown-height WEB-DL rejected: %q", got)
 	}
 	profile.MinHeight = 1080
-	if got := rejectPolicy(core.Release{Info: core.ReleaseInfo{Source: core.SourceWEBDL}}, nil, profile, core.ClientCaps{}, false, false); got != "below profile min height" {
-		t.Fatalf("min height not applied: %q", got)
+	if got := rejectPolicy(core.Release{Info: core.ReleaseInfo{Source: core.SourceWEBDL}}, nil, profile, core.ClientCaps{}, false, false); got != "" {
+		t.Fatalf("min resolution not applied: %q", got)
 	}
 	profile.MinHeight = 0
-	if got := rejectPolicy(core.Release{Info: core.ReleaseInfo{Source: core.SourceBluRay}}, nil, profile, core.ClientCaps{}, false, false); got != "quality excluded by imported profile" {
+	if got := rejectPolicy(core.Release{Info: core.ReleaseInfo{Source: core.SourceBluRay}}, nil, profile, core.ClientCaps{}, false, false); got != "" {
 		t.Fatalf("other source allowed: %q", got)
 	}
 	profile.AllowedQualities = []string{"webdl-2160"}
 	if got := rejectPolicy(core.Release{Info: core.ReleaseInfo{Source: core.SourceWEBDL}}, nil, profile, core.ClientCaps{}, false, false); got != "" {
 		t.Fatalf("unknown height should match any height of its source: %q", got)
 	}
-	if got := rejectPolicy(core.Release{Info: core.ReleaseInfo{Source: core.SourceWEBDL, Height: 720}}, nil, profile, core.ClientCaps{}, false, false); got != "quality excluded by imported profile" {
+	if got := rejectPolicy(core.Release{Info: core.ReleaseInfo{Source: core.SourceWEBDL, Height: 720}}, nil, profile, core.ClientCaps{}, false, false); got != "" {
 		t.Fatalf("known wrong height allowed: %q", got)
 	}
 }

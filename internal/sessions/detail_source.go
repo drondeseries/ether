@@ -96,7 +96,7 @@ func (b *Broker) resolveDetailSource(ctx context.Context, scope frontend.Version
 	if lookup == nil {
 		lookup = b.deps.Lookup
 	}
-	title, err := lookup(ctx, viewer, scope.Device, out.item)
+	title, err := lookup(core.WithLiveApp(ctx, string(scope.Protocol)), viewer, scope.Device, out.item)
 	if err != nil || title == nil || title.Key != out.item || (!title.Released.IsZero() && title.Released.After(b.deps.Now())) {
 		return detailSourceRecord{}, core.ErrNotFound
 	}

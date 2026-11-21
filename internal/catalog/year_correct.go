@@ -155,8 +155,15 @@ func (c *Catalog) waitMovieYearRetry(ctx context.Context, d time.Duration) bool 
 
 func (c *Catalog) setYearProgress(fn func(*MovieYearProgress)) {
 	c.yearMu.Lock()
+	prev := c.yearState
 	fn(&c.yearState)
+	cur := c.yearState
 	c.yearMu.Unlock()
+	if cur.Running != prev.Running || cur.Finished != prev.Finished || cur.LastError != prev.LastError {
+		c.notifyStatus(false)
+	} else if cur != prev {
+		c.notifyStatus(true)
+	}
 }
 
 func (c *Catalog) noteYearError(ctx context.Context, err error) {
@@ -167,24 +174,72 @@ func (c *Catalog) noteYearError(ctx context.Context, err error) {
 	c.setYearProgress(func(p *MovieYearProgress) { p.LastError = err.Error() })
 }
 
-func (c *Catalog) movieYearProgress(ctx context.Context) MovieYearProgress {
+// movieYearProgressFrom is the correction's progress with pending, the
+// movies still unmarked as read with the dashboard's counts.
+func (c *Catalog) movieYearProgressFrom(pending int) MovieYearProgress {
 	c.yearMu.RLock()
 	p := c.yearState
 	c.yearMu.RUnlock()
 	if !p.Running && p.Finished && p.Pending == 0 {
 		return p
 	}
-	n, err := c.countPendingMovieYears(ctx)
-	if err == nil {
-		p.Pending = n
-	}
+	p.Pending = pending
 	return p
 }
 
+// countPendingMovieYears counts movies whose year is still to correct, from
+// catalog_stats_tally rather than the movies themselves.
 func (c *Catalog) countPendingMovieYears(ctx context.Context) (int, error) {
 	var n int
-	err := c.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM catalog_titles WHERE type='movie' AND year_source=''`).Scan(&n)
+	err := c.db.QueryRowContext(ctx, `SELECT CAST(COALESCE(SUM(n),0) AS BIGINT) FROM (SELECT n FROM catalog_stats_tally WHERE kind='movie' AND year_pending=1
+ UNION ALL SELECT d FROM catalog_stats_tally_delta WHERE kind='movie' AND year_pending=1) s`).Scan(&n)
 	return n, err
+}
+
+// updateMovieYearsChunked runs one UPDATE of the pending movies
+// (year_source=”). While at most yearChunk movies are pending it is the
+// single statement it always was. On a large upgrade sweep it runs in
+// key-ordered windows of yearChunk pending movies, one statement (one
+// write transaction) per window, so the sweep yields the writer between
+// windows instead of holding it for every pending movie at once (#407).
+// update takes the window as `AND key>? AND key<=?` appended here. The
+// predicates it is used with only shrink as rows are written (year_source
+// leaves ”), so no window needs a second pass.
+const yearChunk = 5000
+
+func (c *Catalog) updateMovieYearsChunked(ctx context.Context, pending int, update string, args ...any) (int64, error) {
+	if pending <= yearChunk {
+		res, err := c.db.ExecContext(ctx, update, args...)
+		if err != nil {
+			return 0, err
+		}
+		return res.RowsAffected()
+	}
+	var total int64
+	last := int64(-1 << 62)
+	for {
+		var next sql.NullInt64
+		var window int
+		if err := c.db.QueryRowContext(ctx, `SELECT MAX(key), COUNT(*) FROM (SELECT key FROM catalog_titles WHERE type='movie' AND year_source='' AND key>? ORDER BY key LIMIT ?) s`, last, yearChunk).Scan(&next, &window); err != nil {
+			return total, err
+		}
+		if !next.Valid {
+			return total, nil
+		}
+		res, err := c.db.ExecContext(ctx, update+` AND key>? AND key<=?`, append(append([]any{}, args...), last, next.Int64)...)
+		if err != nil {
+			return total, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return total, err
+		}
+		total += n
+		if window < yearChunk {
+			return total, nil
+		}
+		last = next.Int64
+	}
 }
 
 // rederiveStoredMovieYears applies a primary date that is already stored.
@@ -193,7 +248,8 @@ func (c *Catalog) countPendingMovieYears(ctx context.Context) (int, error) {
 // date before 1970. Detailed rows are left queued: their released_ts may
 // be a later theatrical date, and the primary date was not kept.
 func (c *Catalog) rederiveStoredMovieYears(ctx context.Context) (int, error) {
-	if pending, err := c.countPendingMovieYears(ctx); err == nil && pending == 0 {
+	pending, perr := c.countPendingMovieYears(ctx)
+	if perr == nil && pending == 0 {
 		return 0, nil
 	}
 	yearOf := func(column string) string {
@@ -203,20 +259,12 @@ func (c *Catalog) rederiveStoredMovieYears(ctx context.Context) (int, error) {
 		return `CAST(strftime('%Y', ` + column + `, 'unixepoch') AS INTEGER)`
 	}
 	total := 0
-	res, err := c.db.ExecContext(ctx, `UPDATE catalog_titles SET primary_released_ts=released_ts, year=`+yearOf("released_ts")+`, year_source=? WHERE type='movie' AND year_source='' AND detail=0 AND released_ts<>0`, yearSourcePrimary)
-	if err != nil {
-		return 0, err
-	}
-	n, err := res.RowsAffected()
+	n, err := c.updateMovieYearsChunked(ctx, pending, `UPDATE catalog_titles SET primary_released_ts=released_ts, year=`+yearOf("released_ts")+`, year_source=? WHERE type='movie' AND year_source='' AND detail=0 AND released_ts<>0`, yearSourcePrimary)
 	if err != nil {
 		return 0, err
 	}
 	total += int(n)
-	res, err = c.db.ExecContext(ctx, `UPDATE catalog_titles SET year=`+yearOf("primary_released_ts")+`, year_source=? WHERE type='movie' AND year_source='' AND primary_released_ts<>0`, yearSourcePrimary)
-	if err != nil {
-		return total, err
-	}
-	n, err = res.RowsAffected()
+	n, err = c.updateMovieYearsChunked(ctx, pending, `UPDATE catalog_titles SET year=`+yearOf("primary_released_ts")+`, year_source=? WHERE type='movie' AND year_source='' AND primary_released_ts<>0`, yearSourcePrimary)
 	if err != nil {
 		return total, err
 	}
@@ -232,15 +280,15 @@ func (c *Catalog) rederiveStoredMovieYears(ctx context.Context) (int, error) {
 // primary release, or a type-1 premiere late the previous year, can fall in
 // the other calendar year. No type-1 date is stored on its own.
 func (c *Catalog) settleUnchangedMovieYears(ctx context.Context) error {
-	if pending, err := c.countPendingMovieYears(ctx); err == nil && pending == 0 {
+	pending, perr := c.countPendingMovieYears(ctx)
+	if perr == nil && pending == 0 {
 		return nil
 	}
 	month := movieReleaseMonthSQL(store.DialectOf(c.db))
-	_, err := c.db.ExecContext(ctx, `UPDATE catalog_titles SET year_source=? WHERE type='movie' AND year_source='' AND released_ts=0`, yearSourceNone)
-	if err != nil {
+	if _, err := c.updateMovieYearsChunked(ctx, pending, `UPDATE catalog_titles SET year_source=? WHERE type='movie' AND year_source='' AND released_ts=0`, yearSourceNone); err != nil {
 		return err
 	}
-	_, err = c.db.ExecContext(ctx, `UPDATE catalog_titles SET year_source=? WHERE type='movie' AND year_source='' AND NOT (detail=1 AND released_ts<>0 AND `+month+` BETWEEN 1 AND 3)`, yearSourceReleased)
+	_, err := c.updateMovieYearsChunked(ctx, pending, `UPDATE catalog_titles SET year_source=? WHERE type='movie' AND year_source='' AND NOT (detail=1 AND released_ts<>0 AND `+month+` BETWEEN 1 AND 3)`, yearSourceReleased)
 	return err
 }
 
@@ -263,22 +311,93 @@ func movieYearMightDiffer(t core.Title) bool {
 
 // kickMovieYears starts a year refresh for movies on screen. It does not
 // wait, and it does not fetch a movie whose stored month cannot change the year.
+//
+// Almost every movie on screen was corrected long ago. One read for the
+// page finds those still unmarked; a fetch per candidate would start up to
+// yearFetchSlots goroutines on every page view, each holding a connection
+// for a point read, past the idle pool and so opening new connections.
 func (c *Catalog) kickMovieYears(items []core.Title) {
 	if c == nil {
 		return
 	}
+	var keys []any
 	for _, t := range items {
-		if !movieYearMightDiffer(t) {
-			continue
-		}
-		if c.yearAhead == nil || c.yearInflightN.Load() >= yearFetchSlots {
-			c.enqueueMovieYear(t.Key)
-			continue
-		}
-		if !c.startYearFetch(context.Background(), t.Key) {
-			c.enqueueMovieYear(t.Key)
+		if movieYearMightDiffer(t) {
+			keys = append(keys, int64(t.Key))
 		}
 	}
+	if len(keys) == 0 || c.yearPaused() {
+		// TMDB is unavailable or has no key: a fetch would fail at once.
+		// The correction loop resumes the backlog after the pause.
+		return
+	}
+	// Every listing and title read lands here. One goroutine at a time
+	// reads the keys gathered so far: a goroutine per call held a
+	// connection each, and a burst of them (a Home build browsing every
+	// genre) opened connections past the idle pool, every one parsing the
+	// whole schema while the requests beside it waited.
+	c.yearKickMu.Lock()
+	if len(c.yearKickKeys) < yearKickBacklog {
+		c.yearKickKeys = append(c.yearKickKeys, keys...)
+	}
+	if c.yearKickBusy {
+		c.yearKickMu.Unlock()
+		return
+	}
+	c.yearKickBusy = true
+	c.yearKickMu.Unlock()
+	go func() {
+		for {
+			c.yearKickMu.Lock()
+			batch := c.yearKickKeys
+			c.yearKickKeys = nil
+			if len(batch) == 0 {
+				c.yearKickBusy = false
+				c.yearKickMu.Unlock()
+				return
+			}
+			c.yearKickMu.Unlock()
+			for start := 0; start < len(batch); start += 500 {
+				c.checkMovieYears(batch[start:min(start+500, len(batch))])
+			}
+		}
+	}()
+}
+
+// yearKickBacklog bounds the keys waiting for kickMovieYears' reader. Keys
+// past it are dropped: a title seen again is kicked again, and the
+// correction loop covers the backlog.
+const yearKickBacklog = 4000
+
+// checkMovieYears starts or queues a year fetch for keys whose stored
+// movie year may be a premiere-date year.
+func (c *Catalog) checkMovieYears(keys []any) {
+	// Only the key is a predicate: with type or year_source in the
+	// WHERE clause SQLite's planner may walk a type index (every movie)
+	// instead of seeking the page's keys. The rest is decided here.
+	rows, err := c.db.QueryContext(context.Background(), `SELECT key, type, year_source, detail, released_ts FROM catalog_titles WHERE key IN (`+placeholders(len(keys))+`)`, keys...)
+	if err != nil {
+		return
+	}
+	var pending []core.RatingKey
+	for rows.Next() {
+		var key, released int64
+		var typ, source string
+		var detail int
+		if rows.Scan(&key, &typ, &source, &detail, &released) == nil && typ == string(core.TypeMovie) && source == "" && detail == 1 && released != 0 {
+			pending = append(pending, core.RatingKey(key))
+		}
+	}
+	rows.Close()
+	for _, key := range pending {
+		if c.yearAhead == nil || c.yearInflightN.Load() >= yearFetchSlots || !c.startYearFetch(context.Background(), key) {
+			c.enqueueMovieYear(key)
+		}
+	}
+}
+
+func (c *Catalog) yearPaused() bool {
+	return c.yearPauseUntil.Load() > c.now().UnixNano()
 }
 
 func (c *Catalog) enqueueMovieYear(key core.RatingKey) {

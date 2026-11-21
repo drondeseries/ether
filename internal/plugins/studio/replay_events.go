@@ -1,8 +1,10 @@
 package studio
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -396,6 +398,7 @@ type dryRunHost struct {
 	grants        plugins.Grants
 	secrets       map[string]string
 	kv            map[string][]byte
+	badges        map[string]map[string][]string
 	deps          ReplayDeps
 	writes        []RecordedWrite
 	notifications []RecordedNotification
@@ -511,6 +514,101 @@ func (h *dryRunHost) CallHost(ctx context.Context, name string, raw json.RawMess
 			keys = []string{}
 		}
 		return marshalResult(keys)
+
+	case "kv.usage":
+		h.mu.Lock()
+		var used int64
+		for _, v := range h.kv {
+			used += int64(len(v))
+		}
+		keys := int64(len(h.kv))
+		h.mu.Unlock()
+		return marshalResult(plugins.KVUsage{
+			Bytes:      used + keys*plugins.KVKeyChargeBytes,
+			Keys:       keys,
+			QuotaBytes: plugins.KVQuotaBytes,
+			QuotaKeys:  plugins.KVQuotaKeys,
+		})
+	case "badges.set":
+		var entries []plugins.BadgeEntry
+		if len(args) > 1 && len(args[1]) > 0 && string(args[1]) != "null" {
+			if err := json.Unmarshal(args[1], &entries); err != nil {
+				return nil, &wasm.Fault{Code: "bad_arguments", Message: "badges.set takes (setKey, entries[])"}
+			}
+		}
+		norm, err := plugins.ValidateBadgeSetCall(h.manifest, str(0), entries)
+		if err != nil {
+			if errors.Is(err, plugins.ErrPermissionDenied) {
+				return nil, wasm.Forbidden(err.Error())
+			}
+			return nil, &wasm.Fault{Code: string(wasm.StatusInvalidInput), Message: err.Error()}
+		}
+		rawEntries, _ := json.Marshal(norm)
+		h.mu.Lock()
+		if h.badges == nil {
+			h.badges = map[string]map[string][]string{}
+		}
+		if h.badges[str(0)] == nil {
+			h.badges[str(0)] = map[string][]string{}
+		}
+		for _, e := range norm {
+			tmdbK, imdbK := plugins.ExternalBadgeKeys(e.Title)
+			k := tmdbK
+			if k == "" {
+				k = imdbK
+			}
+			if len(e.Labels) == 0 {
+				delete(h.badges[str(0)], k)
+			} else {
+				h.badges[str(0)][k] = e.Labels
+			}
+		}
+		h.writes = append(h.writes, RecordedWrite{Op: "badges.set", Target: str(0), Value: rawEntries})
+		h.mu.Unlock()
+		return json.RawMessage("null"), nil
+
+	case "badges.clear":
+		if err := plugins.ValidateBadgeClearCall(h.manifest, str(0)); err != nil {
+			if errors.Is(err, plugins.ErrPermissionDenied) {
+				return nil, wasm.Forbidden(err.Error())
+			}
+			return nil, &wasm.Fault{Code: string(wasm.StatusInvalidInput), Message: err.Error()}
+		}
+		h.mu.Lock()
+		delete(h.badges, str(0))
+		h.writes = append(h.writes, RecordedWrite{Op: "badges.clear", Target: str(0)})
+		h.mu.Unlock()
+		return json.RawMessage("null"), nil
+
+	case "badges.usage":
+		if !h.manifest.HasCapability(plugins.CapPosterBadges) {
+			return nil, wasm.Forbidden("poster_badges capability is required")
+		}
+		h.mu.Lock()
+		distinct := map[string]bool{}
+		for _, setMap := range h.badges {
+			for k := range setMap {
+				distinct[k] = true
+			}
+		}
+		h.mu.Unlock()
+		return marshalResult(plugins.BadgeUsage{Titles: int64(len(distinct)), QuotaTitles: plugins.PosterBadgeQuotaTitles})
+
+	case "events.publish":
+		payload := json.RawMessage(`{}`)
+		if len(args) > 1 && len(bytes.TrimSpace(args[1])) > 0 && string(bytes.TrimSpace(args[1])) != "null" {
+			payload = args[1]
+		}
+		if _, _, err := plugins.ValidatePublishEventCall(h.manifest, str(0), payload); err != nil {
+			if errors.Is(err, plugins.ErrPermissionDenied) {
+				return nil, wasm.Forbidden(err.Error())
+			}
+			return nil, &wasm.Fault{Code: string(wasm.StatusInvalidInput), Message: err.Error()}
+		}
+		h.mu.Lock()
+		h.writes = append(h.writes, RecordedWrite{Op: "events.publish", Target: str(0), Value: payload})
+		h.mu.Unlock()
+		return json.RawMessage("null"), nil
 
 	case "secret.get":
 		secName := str(0)

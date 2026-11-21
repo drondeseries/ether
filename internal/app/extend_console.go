@@ -60,13 +60,16 @@ func consolePages() []consolePage {
 		}},
 		{id: "viewers", label: T("Viewers"), icon: "Users", order: 30, meta: extend.PageMeta{
 			Route: "/viewers", InNav: true, Mobile: true,
-			Keywords: T("users friends accounts people"),
+			Keywords: T("users friends accounts people watchlist monitoring"),
 		}},
-		{id: "catalog", label: T("Catalog"), icon: "Library", order: 10, meta: extend.PageMeta{
-			Route: "/catalog", NavGroup: extend.NavGroupLibrary, InNav: true,
-			Keywords: T("catalogue movies shows browse search library"),
+		{id: "libraries", label: T("Libraries"), icon: "Library", order: 10, meta: extend.PageMeta{
+			Route: "/libraries", NavGroup: extend.NavGroupLibrary, InNav: true,
+			Keywords: T("catalogue catalog movies shows browse search library libraries"),
 			Sections: []extend.PageSection{
-				section("settings", T("Catalog settings"), T("tmdb language region popularity new releases playable digital")),
+				section("1/rules", T("Movies · Rules"), T("hide show rules movie exclusions visibility")),
+				section("1/settings", T("Movies · Settings"), T("tmdb language region popularity new releases playable digital")),
+				section("2/rules", T("TV Shows · Rules"), T("hide show rules tv exclusions visibility")),
+				section("2/settings", T("TV Shows · Settings"), T("tmdb language region popularity new releases episodes")),
 			},
 		}},
 		{id: "collections", label: T("Collections"), icon: "Layers", order: 20, meta: extend.PageMeta{
@@ -81,7 +84,6 @@ func consolePages() []consolePage {
 			Route: "/livetv", NavGroup: extend.NavGroupLibrary, InNav: true,
 			Sections: []extend.PageSection{
 				section("channels", T("Channels"), T("virtual channel")),
-				section("sources", T("IPTV sources"), T("m3u xmltv playlist")),
 				section("guide", T("Guide"), T("epg schedule")),
 				section("looks", T("Looks"), T("on air graphics brand reels")),
 			},
@@ -108,6 +110,7 @@ func consolePages() []consolePage {
 			Sections: []extend.PageSection{
 				section("debrid", T("Debrid"), T("real-debrid realdebrid torbox alldebrid premiumize debrid-link debridlink offcloud torrent cached")),
 				section("usenet", T("Usenet"), T("nntp backfill connections")),
+				section("iptv", T("IPTV"), T("m3u xmltv playlist")),
 				section("indexers", T("Indexers"), T("newznab torznab torrent built-in sites definitions cardigann flaresolverr prowlarr stremio addon budget api")),
 				section("stats", T("Stats"), T("quota price plan cost success speed plays failover")),
 			},
@@ -166,8 +169,10 @@ func consolePages() []consolePage {
 				section("overview", T("Integrations"), T("status tmdb debrid prowlarr ratings")),
 				section("trakt", T("Trakt"), T("sync history")),
 				section("simkl", T("Simkl"), T("simkl sync history")),
+				section("mdblist", T("MDBList"), T("mdblist sync history")),
 				section("llm", T("Language model"), T("llm ollama openai recaps search")),
 				section("opensubtitles", T("OpenSubtitles"), T("subtitles")),
+				section("subdl", T("SubDL"), T("subtitles")),
 			},
 		}},
 		{id: "plugins", label: T("Plugins"), icon: "Puzzle", order: 40, meta: extend.PageMeta{
@@ -180,6 +185,14 @@ func consolePages() []consolePage {
 				section("channels", T("Channels"), T("email discord webhook push alerts watchlist")),
 				section("report", T("Weekly report"), T("newsletter digest")),
 				section("deliveries", T("Delivery history"), extend.Text{}),
+			},
+		}},
+		{id: "flows", label: T("Flows"), icon: "Workflow", order: 55, meta: extend.PageMeta{
+			Route: "/flows", NavGroup: extend.NavGroupServer, InNav: true,
+			Keywords: T("automations automation workflows triggers actions events rules alerts"),
+			Sections: []extend.PageSection{
+				section("templates", T("Templates"), T("recipes starter tautulli kill stream newsletter")),
+				section("runs", T("Runs"), T("history trace test dry run")),
 			},
 		}},
 		{id: "cluster", label: T("Cluster"), icon: "Boxes", order: 60, meta: extend.PageMeta{
@@ -233,6 +246,8 @@ func consoleCommands() []extend.Descriptor {
 			Route: "/collections/new", Keywords: T("create")}},
 		{id: "new-notification-channel", label: T("New notification channel"), order: 60, meta: extend.CommandMeta{
 			Route: "/notifications/channels", Keywords: T("alert")}},
+		{id: "new-flow", label: T("New flow"), order: 65, meta: extend.CommandMeta{
+			Route: "/flows/new", Keywords: T("automation workflow create")}},
 		{id: "back-up-now", label: T("Back up now"), order: 70, meta: extend.CommandMeta{
 			Route: "/maintenance/backups", Keywords: T("backup snapshot")}},
 		// Ask Ether suggestions (WS6): the label is the suggestion text.
@@ -288,6 +303,14 @@ func consoleIntegrations() []extend.Descriptor {
 				Flag: "enabled", RequiredField: "clientId",
 				Adds: []extend.Text{T("Watch history")},
 			}},
+		{id: "mdblist", label: T("MDBList"), order: 21,
+			hint: T("Sync watch history with MDBList. Each viewer pastes their own API key."),
+			meta: extend.IntegrationMeta{
+				Category: "watch-tracking", Logo: "mdblist", Connect: "custom", Form: "mdblist",
+				Tab: "mdblist", ConfigKey: "mdblist", Endpoint: "mdblist",
+				Flag: "enabled",
+				Adds: []extend.Text{T("Watch history")},
+			}},
 		{id: "ratings", label: T("OMDb and MDBList"), order: 90,
 			hint: T("IMDb, Rotten Tomatoes and other rating badges."),
 			meta: extend.IntegrationMeta{
@@ -300,6 +323,14 @@ func consoleIntegrations() []extend.Descriptor {
 			meta: extend.IntegrationMeta{
 				Category: "playback-extras", Logo: "opensubtitles", Connect: "fields",
 				Tab: "opensubtitles", ConfigKey: "openSubtitles", Endpoint: "opensubtitles", Test: "opensubtitles",
+				Flag: "enabled", ReadyField: "apiKey",
+				Adds: []extend.Text{T("Subtitles")},
+			}},
+		{id: "subdl", label: T("SubDL"), order: 11,
+			hint: T("Fetch subtitles from SubDL when a release doesn't include them."),
+			meta: extend.IntegrationMeta{
+				Category: "playback-extras", Logo: "subdl", Connect: "fields",
+				Tab: "subdl", ConfigKey: "subdl", Endpoint: "subdl", Test: "subdl",
 				Flag: "enabled", ReadyField: "apiKey",
 				Adds: []extend.Text{T("Subtitles")},
 			}},

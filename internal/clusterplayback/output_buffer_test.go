@@ -38,7 +38,7 @@ func outputFixture(t *testing.T) (*bufferedSession, []byte) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := &Runtime{o: Options{OutputBuffer: b, MaxSegmentBytes: int64(len(data) * 2)}, outputScratch: make(chan struct{}, 1), executions: map[string]*execution{}}
+	r := &Runtime{o: Options{SurfacePolicy: testSessionPolicy, Delivery: testDeliveryPolicy(), OutputBuffer: b, MaxSegmentBytes: int64(len(data) * 2)}, outputScratch: make(chan struct{}, 1), executions: map[string]*execution{}}
 	db := openFixtureDB(t)
 	ledger, err := placement.New(db, placement.Options{MaxSessions: 16, MaxLease: time.Minute, LockTimeout: fixtureSQLBudget()}, outputRetirementVerifier{})
 	if err != nil {
@@ -80,7 +80,7 @@ func outputResponse(data []byte) func(http.ResponseWriter, *http.Request) remote
 	}
 }
 func TestOutputBufferContiguousAndImmutable(t *testing.T) {
-	s, data := outputFixture(t)
+	s, _ := outputFixture(t)
 	// Real synthetic lab output has 96 unbounded H.264 PES packets.
 	compressed, err := os.ReadFile("../playbackbuffer/testdata/lab-unbounded.ts.gz")
 	if err != nil {
@@ -90,7 +90,7 @@ func TestOutputBufferContiguousAndImmutable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	data, err = io.ReadAll(reader)
+	data, err := io.ReadAll(reader)
 	if err != nil {
 		t.Fatal(err)
 	}

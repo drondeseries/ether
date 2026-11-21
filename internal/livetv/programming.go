@@ -89,10 +89,19 @@ func programmingItems(sources []ProgramSource, fallback []Item, c Channel, day t
 	}
 	var parts [][]Item
 	var weights []int
+	shareTotal := 0
 	for _, s := range sources {
-		items := append([]Item(nil), s.Items...)
-		if len(s.Sources) > 0 {
-			items = programmingItems(s.Sources, items, c, day, b)
+		shareTotal += min(max(s.Weight, 1), 100)
+	}
+	for _, s := range sources {
+		var items []Item
+		if s.Kind == "lineup" {
+			items = lineupDay(s, c, day, b, float64(min(max(s.Weight, 1), 100))/float64(shareTotal))
+		} else {
+			items = append([]Item(nil), s.Items...)
+			if len(s.Sources) > 0 {
+				items = programmingItems(s.Sources, items, c, day, b)
+			}
 		}
 		if s.Order == "shuffle" {
 			items = shuffleItems(items, c.Seed, day.Unix()+int64Hash(s.ID))
@@ -320,9 +329,20 @@ func effectiveBlockLook(base, override *ChannelLook) *ChannelLook {
 		}
 		look.Ident = base.Ident
 		look.UpNext = base.UpNext
-		look.Tonight = base.Tonight
+		if look.Tonight == nil {
+			look.Tonight = base.Tonight
+		}
 		look.OffAir = base.OffAir
 		look.Bug = base.Bug
+		if look.BeforeBreak == nil && base.BeforeBreak != nil {
+			look.BeforeBreak = append([]string(nil), base.BeforeBreak...)
+		}
+		if look.AfterBreak == nil && base.AfterBreak != nil {
+			look.AfterBreak = append([]string(nil), base.AfterBreak...)
+		}
+		if look.BetweenProgrammes == nil && base.BetweenProgrammes != nil {
+			look.BetweenProgrammes = append([]string(nil), base.BetweenProgrammes...)
+		}
 		assets := map[string]string{}
 		for k, v := range base.MomentAssets {
 			assets[k] = v

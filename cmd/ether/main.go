@@ -3,6 +3,7 @@
 //
 //	ether                         run (in the foreground, or under the OS service manager)
 //	ether --spike movie.mp4 ...   run the spike: serve local files as a library
+//	ether healthcheck [--data-dir DIR]
 //	ether service install|uninstall|start|stop|restart|status [--data-dir DIR]
 //	ether cluster init|token|join ...  (see cluster.go)
 //	ether plugin new|check|test|pack|dev|publish ...  (see plugin.go)
@@ -48,6 +49,9 @@ func main() {
 	logLevel := fs.String("log-level", "", "debug, info, warn or error (default from config)")
 
 	_ = fs.Parse(os.Args[1:])
+	if fs.Arg(0) == "healthcheck" {
+		os.Exit(runHealthcheck(fs.Args()[1:], *dataDir, os.Stdout, os.Stderr))
+	}
 	if fs.Arg(0) == "cluster" {
 		os.Exit(runCluster(fs.Args()[1:], *dataDir, os.Stdout, os.Stderr))
 	}
@@ -78,14 +82,16 @@ func main() {
 		return
 	}
 
-	logger := setupLogging(*dataDir, logLevelFor(*logLevel, *dataDir))
+	level := new(slog.LevelVar)
+	level.Set(logLevelFor(*logLevel, *dataDir))
+	logger := setupLogging(*dataDir, level)
 	run := func(ctx context.Context) error {
 		exe, err := os.Executable()
 		if err != nil {
 			return err
 		}
 		return app.Serve(ctx, app.Options{
-			DataDir: *dataDir, Logger: logger, Spike: *spike, SpikeFiles: fs.Args(),
+			DataDir: *dataDir, Logger: logger, LogLevel: level, Spike: *spike, SpikeFiles: fs.Args(),
 			NotificationExecutable: exe,
 		})
 	}
@@ -130,7 +136,7 @@ func logLevelFor(flagLevel, dataDir string) slog.Level {
 // (unrecovered panics, "fatal error:" crashes) at <dataDir>/logs/crash.log.
 // Under a Windows service stderr goes nowhere and launchd never rotates
 // it, so the files are the durable record. Failures degrade to stderr.
-func setupLogging(dataDir string, level slog.Level) *slog.Logger {
+func setupLogging(dataDir string, level slog.Leveler) *slog.Logger {
 	logDir := filepath.Join(dataDir, "logs")
 	var out io.Writer = os.Stderr
 	lw, fileErr := logfile.Open(filepath.Join(logDir, "ether.log"), logfile.DefaultMaxSize, logfile.DefaultKeep)

@@ -11,7 +11,7 @@ func scorecardVariants(ctx context.Context, a *App, v *core.Viewer, t *core.Titl
 	if vs, ok := labMediaVariants(a.opts.DataDir, t); ok {
 		return vs, nil
 	}
-	req := core.ResolveRequest{Title: t, User: v, Client: caps}
+	req := core.ResolveRequest{Title: t, User: a.withEffectiveAudioLanguages(ctx, v), Client: caps}
 	// After a play, Auto is named after the release that played (the one a
 	// resume opens), as Plex shows it.
 	if a.playback != nil && v != nil && v.ID > 0 {
@@ -19,5 +19,9 @@ func scorecardVariants(ctx context.Context, a *App, v *core.Viewer, t *core.Titl
 			req.PlayedRelease = played
 		}
 	}
-	return a.resolver.Variants(ctx, req, 4)
+	variants, err := a.resolver.Variants(ctx, req, core.MaxVariants)
+	if err == nil && a.playback != nil {
+		variants = a.playback.WithCachedVariantInfo(ctx, v, t, variants)
+	}
+	return variants, err
 }

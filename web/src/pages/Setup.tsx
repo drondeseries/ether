@@ -12,7 +12,7 @@ import {
 } from "@braedonsaunders/appkit-ui";
 import { Check, ExternalLink, KeyRound, Newspaper, Plus, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { useAppOptional } from "../app-context";
 import { RestartButton } from "../components/RestartDrawer";
 import { EtherMark } from "../components/brand";
@@ -38,7 +38,7 @@ import { loadLocale, localized, rememberLocale, t, tn, tx } from "../i18n";
 import { api, apiFetch, newId, setToken } from "../lib/api";
 import { formatBytes } from "../lib/format";
 import type { DebridProvider, DiskInfo, EtherConfig, Indexer, UsenetProvider } from "../lib/types";
-import { appLabel, appPurpose, appRank } from "./apps/catalog";
+import { appInstalled, appLabel, appPurpose, appRank } from "./apps/catalog";
 import { claimFailureMessage } from "./apps/plex-account";
 import { CachePresetCards, cachePresetKey, presetForFreeBytes } from "./cache/presets";
 import { ProwlarrImport } from "../components/ProwlarrImport";
@@ -46,6 +46,7 @@ import { DEBRID_KINDS } from "./sources/Debrid";
 import { DEBRID_TOKEN_URL } from "./sources/cards";
 import { addonUrlHasDebridKey, isStremio, normalizeAddonUrl } from "./sources/Indexers";
 import { LanguageStep } from "./setup/LanguageStep";
+import { StarterBundlesCard } from "./setup/StarterBundlesCard";
 import { SetupReady, connectDevicePath } from "./setup/SetupReady";
 export { connectDevicePath };
 import {
@@ -121,11 +122,14 @@ function storedStep(): number {
 }
 
 export function appCatalog(
-  list: { descriptor: { id: string; name: string } }[] | null,
+  list:
+    { descriptor: { id: string; name: string }; status?: { webPlayerReady?: boolean } }[] | null,
 ): SetupApp[] {
   const rows = (
     list?.length
-      ? list.map((item) => ({ id: item.descriptor.id, name: item.descriptor.name }))
+      ? list
+          .filter(appInstalled)
+          .map((item) => ({ id: item.descriptor.id, name: item.descriptor.name }))
       : FALLBACK_APPS
   )
     .slice()
@@ -402,6 +406,9 @@ export function canAdvance(
 
 export default function Setup() {
   const navigate = useNavigate();
+  const [params] = useSearchParams();
+  const resumePending = useRef(params.get("resume") === "1");
+  const [finishReview, setFinishReview] = useState(false);
   const app = useAppOptional();
   const [cfg, setCfg] = useState<EtherConfig | null>(null);
   const [languageChoice, setLanguageChoice] = useState<HouseholdLanguage | null>(null);
@@ -450,16 +457,6 @@ export default function Setup() {
           .catch(() => {});
       })
       .catch(() => {});
-    api
-      .setupStatus()
-      .then((s) => {
-        const catalog = s.steps.find((x) => x.id === "catalog");
-        setTmdbBundled(Boolean(catalog?.complete));
-        setCacheVolume(s.cacheVolume ?? "");
-        setServerSteps(Object.fromEntries(s.steps.map((step) => [step.id, step.complete])));
-        if (s.setupComplete && s.cacheRestartRequired) setCacheRestartRequired(true);
-      })
-      .catch(() => {});
   }, []);
   const [optTests, setOptTests] = useState<Record<string, TestState>>({});
   const [pin, setPin] = useState<{ id: string; code: string; authUrl: string } | null>(null);
@@ -491,10 +488,13 @@ export default function Setup() {
   const load = useCallback(() => {
     Promise.all([
       api.getConfig(),
-      apiFetch<{ descriptor: { id: string; name: string } }[]>("/frontends").catch(() => null),
+      api.setupStatus(),
+      apiFetch<
+        { descriptor: { id: string; name: string }; status?: { webPlayerReady?: boolean } }[]
+      >("/frontends").catch(() => null),
       apiFetch<Partial<StreamRules>>("/stream-preferences/0").catch(() => ({})),
     ])
-      .then(([c, list, rules]) => {
+      .then(([c, status, list, rules]) => {
         const catalog = appCatalog(list);
         setApps(catalog);
         setFrontends(
@@ -523,6 +523,24 @@ export default function Setup() {
               .filter((ix) => ix.id && ix.url.trim())
               .map((ix) => [ix.id, ix.url.trim()]),
           );
+        }
+        const catalogStep = status.steps.find((item) => item.id === "catalog");
+        setTmdbBundled(Boolean(catalogStep?.complete));
+        setCacheVolume(status.cacheVolume ?? "");
+        setServerSteps(Object.fromEntries(status.steps.map((item) => [item.id, item.complete])));
+        if (status.setupComplete && status.cacheRestartRequired) setCacheRestartRequired(true);
+        if (resumePending.current) {
+          // Server status is authoritative; a stored wizard position can be stale.
+          const missing = status.steps.find((item) => item.required && !item.complete);
+          if (missing) {
+            const id = missing.id === "plex" ? "account" : missing.id;
+            const next = wizardSteps(true).findIndex((item) => item.id === id);
+            if (next < 0) throw new Error(t("Finish the remaining setup step in Settings."));
+            setStep(next);
+          } else {
+            setFinishReview(true);
+          }
+          resumePending.current = false;
         }
         setCfg(c);
         setPinDone(Boolean(c.plex.token));
@@ -774,7 +792,7 @@ export default function Setup() {
             size="md"
             context={t("Restarting puts your new cache folder to work.")}
           />
-          <Button variant="outline" onClick={() => navigate("/cache")}>
+          <Button className="px-4 py-2" variant="outline" onClick={() => navigate("/cache")}>
             {t("Open cache settings")}
           </Button>
         </div>
@@ -807,6 +825,12 @@ export default function Setup() {
   const hasDebrid = debrid.some((d) => d.enabled);
   const hasUsenet = providers.some((p) => p.enabled);
   const newIndexerType: IndexerType = hasDebrid && !hasUsenet ? "stremio" : "newznab";
+  const alreadySetUp = Boolean(app?.boot.setupComplete || cfg.setupComplete);
+  const exitSetup = () => {
+    sessionStorage.removeItem(SETUP_STEP_KEY);
+    sessionStorage.removeItem("ether.setup.skipped");
+    navigate("/server");
+  };
 
   const next = async (opts?: { force?: boolean }) => {
     setSaving(true);
@@ -908,18 +932,58 @@ export default function Setup() {
       />
     );
 
+  if (finishReview)
+    return (
+      <div className="mx-auto w-full max-w-2xl space-y-4 p-6">
+        <EtherMark size={40} />
+        <h1 className="text-xl font-semibold">{t("Everything is set up")}</h1>
+        <p>{t("Finish setup to leave setup mode. Your settings are saved.")}</p>
+        <MutationError error={error} />
+        <div className="flex flex-wrap gap-2">
+          <Button
+            disabled={saving}
+            onClick={async () => {
+              setSaving(true);
+              setError(null);
+              try {
+                await finish(false);
+              } catch (e) {
+                setError(e);
+              } finally {
+                setSaving(false);
+              }
+            }}
+          >
+            {t("Finish setup")}
+          </Button>
+          {alreadySetUp ? (
+            <Button variant="outline" disabled={saving} onClick={exitSetup}>
+              {t("Exit setup")}
+            </Button>
+          ) : null}
+        </div>
+      </div>
+    );
+
   return (
     <WizardLayout
       header={
         <div>
-          <div className="flex items-center gap-3">
-            <EtherMark size={32} />
-            <div>
-              <h1 className="text-lg font-semibold text-fg">{t("Set up Ether")}</h1>
-              <p className="text-sm text-fg-muted">
-                {t("Complete the steps below to set up your household.")}
-              </p>
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-3">
+              <EtherMark size={32} />
+              <div>
+                <h1 className="text-lg font-semibold text-fg">{t("Set up Ether")}</h1>
+                <p className="text-sm text-fg-muted">
+                  {t("Complete the steps below to set up your household.")}
+                </p>
+              </div>
             </div>
+            {alreadySetUp ? (
+              <Button variant="outline" size="sm" disabled={saving} onClick={exitSetup}>
+                {t("Exit setup")}
+              </Button>
+            ) : null}
           </div>
           <ol className="mt-4 flex gap-1.5" aria-label={t("Setup progress")}>
             {steps.map((s, i) => {
@@ -972,6 +1036,7 @@ export default function Setup() {
         <div className="flex flex-col gap-1">
           <div className="flex items-center gap-3">
             <Button
+              className="px-4 py-2"
               variant="ghost"
               disabled={step === 0 || saving}
               onClick={() => setStep(step - 1)}
@@ -989,7 +1054,7 @@ export default function Setup() {
             ) : null}
             <span className="flex-1" />
             <Button
-              className="shrink-0"
+              className="px-4 py-2 shrink-0"
               disabled={!advanceOk || saving}
               onClick={() => void next()}
             >
@@ -1003,6 +1068,7 @@ export default function Setup() {
           {(stepId === "sources" || stepId === "indexers" || stepId === "catalog") && !advanceOk ? (
             <div className="text-right">
               <Button
+                className="px-4 py-2"
                 variant="link"
                 disabled={saving || (!localDone && !plexSigned)}
                 onClick={() => void next({ force: true })}
@@ -1165,6 +1231,7 @@ export default function Setup() {
               </p>
               <div className="flex flex-wrap items-center gap-3 text-sm text-fg-muted">
                 <Button
+                  className="px-4 py-2"
                   variant="outline"
                   size="sm"
                   onClick={() => window.open(pin.authUrl, "_blank", "noopener,noreferrer")}
@@ -1185,7 +1252,7 @@ export default function Setup() {
               ) : null}
             </div>
           ) : (
-            <Button disabled={saving} onClick={() => void startPin()}>
+            <Button className="px-4 py-2" disabled={saving} onClick={() => void startPin()}>
               {plexSigned ? t("Reconnect") : t("Sign in to plex.tv")}
             </Button>
           )}
@@ -1193,12 +1260,22 @@ export default function Setup() {
             <p className="text-sm text-fg-muted">{claimMsg}</p>
           ) : null}
           {plexSigned && (!cfg.plex.claimed || claimFailed) && !pin ? (
-            <Button variant="outline" disabled={saving} onClick={() => void claimServer()}>
+            <Button
+              className="px-4 py-2"
+              variant="outline"
+              disabled={saving}
+              onClick={() => void claimServer()}
+            >
               {t("Claim server")}
             </Button>
           ) : null}
           <div className="flex flex-wrap gap-3">
-            <Button variant="outline" disabled={saving} onClick={() => setPlexLater(true)}>
+            <Button
+              className="px-4 py-2"
+              variant="outline"
+              disabled={saving}
+              onClick={() => setPlexLater(true)}
+            >
               {t("Connect Plex later")}
             </Button>
           </div>
@@ -1280,6 +1357,7 @@ export default function Setup() {
                         onTest={() => void runTest("debrid", d.id, () => api.testDebrid(d))}
                       />
                       <Button
+                        className="px-4 py-2"
                         variant="ghost"
                         size="sm"
                         onClick={() => setDebrid(debrid.filter((_, j) => j !== i))}
@@ -1290,7 +1368,11 @@ export default function Setup() {
                   </div>
                 </fieldset>
               ))}
-              <Button variant="outline" onClick={() => setDebrid([...debrid, blankDebrid()])}>
+              <Button
+                className="px-4 py-2"
+                variant="outline"
+                onClick={() => setDebrid([...debrid, blankDebrid()])}
+              >
                 <Plus size={15} /> {t("Add debrid account")}
               </Button>
             </SourceChoice>
@@ -1396,6 +1478,7 @@ export default function Setup() {
                     onTest={() => void runTest("provider", p.id, () => api.testUsenet(p))}
                   />
                   <Button
+                    className="px-4 py-2"
                     variant="ghost"
                     size="sm"
                     onClick={() => setProviders(providers.filter((_, j) => j !== i))}
@@ -1405,7 +1488,11 @@ export default function Setup() {
                 </div>
               </fieldset>
             ))}
-            <Button variant="outline" onClick={() => setProviders([...providers, blankProvider()])}>
+            <Button
+              className="px-4 py-2"
+              variant="outline"
+              onClick={() => setProviders([...providers, blankProvider()])}
+            >
               <Plus size={15} /> {t("Add provider")}
             </Button>
           </SourceChoice>
@@ -1482,6 +1569,7 @@ export default function Setup() {
                     <Check size={14} className="text-primary" />
                     {t("Done")}
                     <Button
+                      className="px-4 py-2"
                       variant="link"
                       size="sm"
                       onClick={() => setEditingIndexers((open) => ({ ...open, [ix.id]: true }))}
@@ -1593,6 +1681,7 @@ export default function Setup() {
                       }
                     />
                     <Button
+                      className="px-4 py-2"
                       variant="ghost"
                       size="sm"
                       onClick={() => setIndexers(indexers.filter((_, j) => j !== i))}
@@ -1605,6 +1694,7 @@ export default function Setup() {
             );
           })}
           <Button
+            className="px-4 py-2"
             variant="outline"
             onClick={() => setIndexers([...indexers, blankIndexer(newIndexerType)])}
           >
@@ -1640,11 +1730,16 @@ export default function Setup() {
                   setCfg({ ...cfg, cache: { ...cfg.cache, dir: e.currentTarget.value } })
                 }
               />
-              <Button variant="outline" onClick={() => refreshDisk(cfg.cache.dir)}>
+              <Button
+                className="px-4 py-2"
+                variant="outline"
+                onClick={() => refreshDisk(cfg.cache.dir)}
+              >
                 {t("Check space")}
               </Button>
               {cacheVolume && cfg.cache.dir !== cacheVolume ? (
                 <Button
+                  className="px-4 py-2"
                   variant="outline"
                   onClick={() => {
                     setCfg({ ...cfg, cache: { ...cfg.cache, dir: cacheVolume } });
@@ -1729,6 +1824,7 @@ export default function Setup() {
               </div>
             </Field>
           </section>
+          <StarterBundlesCard />
           <p className="text-sm text-fg-muted">
             {tn(
               cfg.catalog.tmdbKey.trim() && cfg.catalog.tmdbKey !== "••••"
@@ -1759,7 +1855,7 @@ export default function Setup() {
       ) : null}
       {stepId === "language" ? (
         <p className="pt-2 text-center text-xs text-fg-muted">
-          <Button variant="link" onClick={() => navigate("/cluster")}>
+          <Button className="px-4 py-2" variant="link" onClick={() => navigate("/cluster")}>
             {t("Join a cluster instead")}
           </Button>
         </p>

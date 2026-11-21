@@ -9,8 +9,8 @@ import (
 )
 
 // Surfaces. Home is "what to watch right now": short, high-confidence,
-// context-aware and mixed. Movies → Recommended explores film taste
-// through lenses; TV Shows → Recommended is series-centric. Every row kind
+// context-aware and mixed. Movie libraries → Recommended explore film taste
+// through lenses; TV libraries → Recommended are series-centric. Every row kind
 // declares the surfaces it belongs to by default, with a prior weight per
 // surface, and the surfaces it can ever fit (kinds.go). The bandit learns
 // per (surface, kind) and falls back to the kind's evidence while a
@@ -28,7 +28,7 @@ const (
 	groupShows       = "shows"
 	groupHousehold   = "household"
 	groupCollections = "collections"
-	groupPlex        = "plex"
+	groupPlex        = "plex" // Persisted Home Designer group identity.
 )
 
 var allSurfaces = []string{surfHome, surfMovies, surfShows}
@@ -68,6 +68,11 @@ func surfaceKey(surface, kind string) string { return surface + "|" + kind }
 // surface is the assembly's surface name.
 func (a *assembly) surface() string { return sectionName(a.section) }
 
+// layoutTarget is the assembly's layout page ("home" or "library:<id>").
+func (a *assembly) layoutTarget() string {
+	return layoutTargetForMedia(a.section, a.hc.SectionID)
+}
+
 // surfaceWeight is the row's prior weight on this surface; 0 = not a
 // default member. Owner collection rows carry their own targeting
 // (ownerCandidate) and weigh 1 wherever they arrive.
@@ -80,8 +85,8 @@ func (a *assembly) surfaceWeight(c *candRow) float64 {
 
 // admit decides whether a candidate row may appear on this surface and
 // with which prior weight: default members; new viewers' cold-start
-// section rows on Home; and any row an owner policy names explicitly for
-// this page, wherever the row fits.
+// section rows on Home; and any row an owner policy names explicitly (or
+// sets Always) for this page, wherever the row fits.
 func (a *assembly) admit(c *candRow, hubID string, newViewer bool) (float64, bool) {
 	if w := a.surfaceWeight(c); w > 0 {
 		return w, true
@@ -89,7 +94,7 @@ func (a *assembly) admit(c *candRow, hubID string, newViewer bool) (float64, boo
 	if a.section == "" && newViewer && c.coldHome {
 		return 1, true
 	}
-	if a.ownerPlaced(c, hubID) && fitsSurface(c.kind, a.surface()) {
+	if (a.ownerPlaced(c, hubID) || a.ownerAlways(c, hubID)) && fitsSurface(c.kind, a.surface()) {
 		return 1, true
 	}
 	return 0, false
@@ -102,8 +107,20 @@ func (a *assembly) ownerPlaced(c *candRow, hubID string) bool {
 	if a.layout == nil {
 		return false
 	}
-	p, _ := effectiveHomePolicy(*a.layout, a.user.ID, a.surface(), core.HomeRow{HubID: hubID, Kind: c.kind})
+	target := a.layoutTarget()
+	p, _ := effectiveHomePolicy(*a.layout, a.user.ID, target, core.HomeRow{HubID: hubID, Kind: c.kind})
 	return p != nil && p.Status != "off" && !strings.ContainsAny(p.Row, "*?[")
+}
+
+// ownerAlways reports whether an active layout policy sets Status "always"
+// for this row on this page (including glob patterns).
+func (a *assembly) ownerAlways(c *candRow, hubID string) bool {
+	if a.layout == nil {
+		return false
+	}
+	target := a.layoutTarget()
+	p, _ := effectiveHomePolicy(*a.layout, a.user.ID, target, core.HomeRow{HubID: hubID, Kind: c.kind})
+	return p != nil && p.Status == "always" && whenMatches(p.When, a.hc) && weekEligible(a.user.ID, p.Row, a.hc, p.MaxDaysPerWeek)
 }
 
 // surfacePriorStrength is how many row-days of the kind-level estimate a
@@ -155,8 +172,8 @@ func (a *assembly) banditRate(c *candRow, rng *rand.Rand) float64 {
 	return rate
 }
 
-// sectionBoost replaces the Home's editorial priors on a Movies or TV
-// Shows page: the lenses lead there, popularity rows follow.
+// sectionBoost replaces the Home's editorial priors on a library Recommended
+// page: the lenses lead there, popularity rows follow.
 func sectionBoost(kind string) float64 {
 	switch kind {
 	case KindNewSeasons:

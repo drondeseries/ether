@@ -3,10 +3,17 @@ import type {
   CollectionPreview,
   CollectionSpec,
   CollectionTemplate,
+  CollectionTemplateBundle,
+  CollectionTemplateBundleApplyResult,
+  CollectionTemplateBundlePreview,
   FacetName,
   FacetValue,
   HomeLayout,
   LayoutDoc,
+  LibraryLayoutDoc,
+  LayoutPage,
+  TargetSchedule,
+  ViewerLibraryPage,
   LayoutImpactResult,
   PreviewContext,
   LookupKind,
@@ -17,6 +24,7 @@ import type {
   TasteProfile,
   TitleCard,
   TitleDetail,
+  TitleLibraryStatus,
   Viewer,
   ViewerDetail,
   ViewerHome,
@@ -39,7 +47,6 @@ import type {
   EtherUser,
   FieldError,
   CatalogEntry,
-  IdentityPreset,
   Indexer,
   LLMModel,
   LLMProvider,
@@ -47,6 +54,7 @@ import type {
   QualityAnswer,
   QualityClient,
   QualityQuestion,
+  RequestPreview,
   SiteDefinition,
   SiteTestResult,
   SiteTestStatus,
@@ -128,6 +136,14 @@ try {
 // Keep the current tab's explicit sign-in/sign-out authoritative in that case.
 let sessionToken = "";
 let sessionOnly = false;
+const tokenListeners = new Set<(token: string) => void>();
+
+export function onTokenChange(fn: (token: string) => void): () => void {
+  tokenListeners.add(fn);
+  return () => {
+    tokenListeners.delete(fn);
+  };
+}
 
 export function getToken(): string {
   if (sessionOnly) return sessionToken;
@@ -139,6 +155,7 @@ export function getToken(): string {
   return sessionToken;
 }
 export function setToken(token: string): void {
+  const prev = getToken();
   sessionToken = token;
   try {
     if (token) localStorage.setItem(TOKEN_KEY, token);
@@ -146,6 +163,15 @@ export function setToken(token: string): void {
     sessionOnly = false;
   } catch {
     sessionOnly = true;
+  }
+  if (token !== prev) {
+    for (const fn of [...tokenListeners]) {
+      try {
+        fn(token);
+      } catch {
+        // Ignore listener errors so credential storage always succeeds.
+      }
+    }
   }
 }
 
@@ -254,7 +280,9 @@ export function routeApiImagesThroughFetch(on: boolean): void {
 
 /** True when an image URL must be fetched with headers rather than put in an <img>. */
 export function imageNeedsFetch(src: string | null | undefined): boolean {
-  return Boolean(src && src.startsWith(API_BASE) && (routeImagesThroughFetch || getToken()));
+  if (!src) return false;
+  if (routeImagesThroughFetch && src.startsWith("/vela/v0/branding/")) return true;
+  return Boolean(src.startsWith(API_BASE) && (routeImagesThroughFetch || getToken()));
 }
 
 /** Fetch an authenticated console image, keeping the response headers. */
@@ -319,13 +347,14 @@ export const api = {
   pinStart: () => post<{ id: string; code: string; authUrl: string }>("/plex/pin"),
   pinPoll: (id: string) => apiFetch<{ done: boolean }>(`/plex/pin/${encodeURIComponent(id)}`),
   claim: () => post<{ ok: boolean }>("/plex/claim"),
+  syncPlexFriends: () => post<{ ok: boolean }>("/plex/friends/sync"),
 
   // ---- Config ---------------------------------------------------------------
   getConfig: async () => (await apiFetch<{ config: EtherConfig }>("/config")).config,
   putConfig: async (config: EtherConfig) =>
     (await put<{ config: EtherConfig }>("/config", config)).config,
   getSection: <T>(section: string) =>
-    apiFetch<{ section: string; value: T; presets?: IdentityPreset[] }>(`/config/${section}`),
+    apiFetch<{ section: string; value: T; defaultUserAgent?: string }>(`/config/${section}`),
   putSection: (section: string, value: unknown) =>
     put<{ section: string; value: unknown }>(`/config/${section}`, value),
 
@@ -338,11 +367,13 @@ export const api = {
   // ---- Integration tests ----------------------------------------------------
   testUsenet: (p: UsenetProvider) => post<TestResult>("/test/usenet", p),
   testIndexer: (ix: Indexer) => post<TestResult>("/test/indexer", ix),
+  previewIndexer: (ix: Indexer) => post<RequestPreview>("/indexer/preview", ix),
   testDebrid: (p: DebridProvider) => post<TestResult>("/test/debrid", p),
   testTMDB: (key: string) => post<TestResult>("/test/tmdb", { key }),
   testIntroDB: (apiKey: string) => post<TestResult>("/test/introdb", { apiKey }),
   testOpenSubtitles: (cfg: EtherConfig["openSubtitles"]) =>
     post<TestResult>("/test/opensubtitles", cfg),
+  testSubDL: (cfg: EtherConfig["subdl"]) => post<TestResult>("/test/subdl", cfg),
   testLLM: (cfg: EtherConfig["llm"]) => post<TestResult>("/test/llm", cfg),
   llmProviders: async () =>
     (await apiFetch<{ providers: LLMProvider[] }>("/llm/providers")).providers,
@@ -417,6 +448,7 @@ export const api = {
   checkUpdates: () => post<UpdateStatus>("/updates/check", {}),
   updateStatus: () => apiFetch<UpdateStatus>("/updates/"),
   updateNow: (force = false) => post<UpdateStatus>("/updates/apply", { force }),
+  dismissInstalledUpdate: () => post<UpdateStatus>("/updates/dismiss-installed", {}),
 
   // ---- Cluster ---------------------------------------------------------------------
   clusterSetupStatus: (signal?: AbortSignal) =>
@@ -473,12 +505,27 @@ export const api = {
   templates: async () =>
     (await apiFetch<{ templates: CollectionTemplate[] | null }>("/collections/templates"))
       .templates ?? [],
+  templateBundles: async () =>
+    (
+      await apiFetch<{ bundles: CollectionTemplateBundle[] | null }>(
+        "/collections/template-bundles",
+      )
+    ).bundles ?? [],
+  previewTemplateBundle: (id: string) =>
+    post<CollectionTemplateBundlePreview>(
+      `/collections/template-bundles/${encodeURIComponent(id)}/preview`,
+    ),
+  applyTemplateBundle: (id: string) =>
+    post<CollectionTemplateBundleApplyResult>(
+      `/collections/template-bundles/${encodeURIComponent(id)}/apply`,
+    ),
   artworkUrl: (id: string, w: number, version?: string) =>
     `${API_BASE}/collections/${encodeURIComponent(id)}/artwork${qs({ w, v: version })}`,
 
   // ---- Catalogue helpers ---------------------------------------------------------
   browseCatalog: (
     params: {
+      libraryId?: number;
       noTotal?: string;
       cursor?: string;
       after?: string;
@@ -507,11 +554,18 @@ export const api = {
       hasMore?: boolean;
       nextCursor?: string;
     }>(`/catalog/browse${qs(params)}`, { signal }),
-  searchCatalog: async (q: string, type?: string, limit = 24, signal?: AbortSignal) =>
+  searchCatalog: async (
+    q: string,
+    type?: string,
+    limit = 24,
+    signal?: AbortSignal,
+    all?: boolean,
+  ) =>
     (
-      await apiFetch<{ items: TitleCard[] | null }>(`/catalog/search${qs({ q, type, limit })}`, {
-        signal,
-      })
+      await apiFetch<{ items: TitleCard[] | null }>(
+        `/catalog/search${qs({ q, type, limit, all: all ? 1 : undefined })}`,
+        { signal },
+      )
     ).items ?? [],
   facets: async (type: string, facet: FacetName) =>
     (await apiFetch<{ values: FacetValue[] | null }>(`/catalog/facets${qs({ type, facet })}`))
@@ -524,6 +578,12 @@ export const api = {
       )
     ).results ?? [],
   title: (key: string) => apiFetch<TitleDetail>(`/catalog/title/${encodeURIComponent(key)}`),
+  titleLibrary: (key: string, signal?: AbortSignal) =>
+    apiFetch<TitleLibraryStatus>(`/catalog/title/${encodeURIComponent(key)}/library`, { signal }),
+  includeTitle: (key: string) =>
+    put<TitleLibraryStatus>(`/catalog/title/${encodeURIComponent(key)}/library`, {}),
+  removeIncludedTitle: (key: string) =>
+    send<TitleLibraryStatus>("DELETE", `/catalog/title/${encodeURIComponent(key)}/library`),
 
   // ---- Viewers -------------------------------------------------------------------
   viewers: async () => (await apiFetch<{ viewers: Viewer[] | null }>("/viewers")).viewers ?? [],
@@ -538,9 +598,21 @@ export const api = {
   ) => apiFetch<ViewerHome>(`/viewers/${id}/home${qs(ctx)}`, { signal }),
   refreshViewer: (id: number) => post<null>(`/viewers/${id}/refresh`),
 
-  // ---- Home Designer -----------------------------------------------------------
+  // ---- Home Designer & Library Recommended rows -------------------------------
   layout: () => apiFetch<LayoutDoc>("/layout"),
   putLayout: (layout: HomeLayout) => put<LayoutDoc>("/layout", { layout }),
+  libraryLayout: (id: number, signal?: AbortSignal) =>
+    apiFetch<LibraryLayoutDoc>(`/layout/libraries/${id}`, { signal }),
+  putLibraryLayout: (
+    id: number,
+    body: {
+      page?: LayoutPage;
+      viewerPages?: ViewerLibraryPage[];
+      collectionSchedules?: Record<string, TargetSchedule | null>;
+    },
+  ) => put<LibraryLayoutDoc>(`/layout/libraries/${id}`, body),
+  deleteLibraryLayout: (id: number) =>
+    apiFetch<LibraryLayoutDoc>(`/layout/libraries/${id}`, { method: "DELETE" }),
   /** The Plex Home a viewer (null = the typical viewer) gets with a draft layout (omitted = saved). */
   previewLayout: (
     body: PreviewContext & { viewerId: number | null; layout?: HomeLayout; count?: number },

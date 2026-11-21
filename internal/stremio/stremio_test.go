@@ -528,7 +528,7 @@ func TestHonestUserAgentAndRefusal(t *testing.T) {
 	}))
 	defer srv.Close()
 	err := NewService(nil).Test(t.Context(), config.Indexer{URL: srv.URL + "/" + secret + "/manifest.json"})
-	if ua != userAgent || !strings.HasPrefix(ua, "Ether ") {
+	if ua != userAgent() || !strings.HasPrefix(ua, "Ether/") {
 		t.Fatalf("user agent %q", ua)
 	}
 	if err == nil || !strings.Contains(err.Error(), "refused Ether") || strings.Contains(err.Error(), secret) {

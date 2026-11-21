@@ -7,8 +7,8 @@ it.each([
   "Simkl",
   "Language model",
   "OpenSubtitles",
+  "SubDL",
   "TheIntroDB",
-  "TMDB",
   "OMDb and MDBList",
   "PostersPlus",
   "XRDB",
@@ -22,6 +22,7 @@ it.each([
     f.state.config.simkl = { enabled: false, clientId: "", clientSecret: "" };
     f.state.config.llm.enabled = false;
     f.state.config.openSubtitles.enabled = false;
+    f.state.config.subdl.enabled = false;
     f.state.config.markers = { theIntroDb: false, apiKey: "" };
   });
   const toggle =
@@ -42,6 +43,7 @@ it.each([
     Simkl: "simkl",
     "Language model": "llm",
     OpenSubtitles: "opensubtitles",
+    SubDL: "subdl",
     TheIntroDB: "introdb",
     TMDB: "tmdb",
     "OMDb and MDBList": "ratings",
@@ -57,6 +59,7 @@ it.each([
     f.state.config.simkl = { enabled: true, clientId: "", clientSecret: "" };
     f.state.config.llm.enabled = true;
     f.state.config.openSubtitles.enabled = true;
+    f.state.config.subdl = { enabled: true, apiKey: "" };
     f.state.config.markers = { theIntroDb: true, apiKey: "" };
     f.state.config.posters = {
       version: 1,
@@ -112,15 +115,56 @@ it("turns TheIntroDB lookups on from its card switch", async () => {
   expect(fake.state.config.markers?.apiKey).toBe("intro-key");
 });
 
-it("keeps configured TMDB required and opens Manage in the shared drawer", async () => {
+it("keeps configured TMDB available and opens its settings tab", async () => {
   const { fake } = renderApp("/services/overview", {}, (f) => {
     f.state.config.catalog.tmdbKey = "[configured]";
   });
   const manage = await screen.findByRole("button", { name: "Manage TMDB" });
   expect(screen.queryByRole("switch", { name: "TMDB enabled" })).toBeNull();
   fireEvent.click(manage);
-  const drawer = await screen.findByRole("dialog");
-  expect(within(drawer).getByLabelText("TMDB API key")).toHaveValue("[configured]");
-  expect(within(drawer).getByRole("button", { name: "Test TMDB key" })).toBeInTheDocument();
+  await screen.findByRole("tab", { name: "TMDB", selected: true });
+  expect(screen.getByLabelText("TMDB API key")).toHaveValue("[configured]");
+  expect(screen.getByRole("button", { name: "Test TMDB key" })).toBeInTheDocument();
   expect(fake.state.config.catalog.tmdbKey).toBe("[configured]");
+});
+
+it("enables and disables MDBList and Ratings from /services/overview", async () => {
+  const { fake } = renderApp("/services/overview", {}, (f) => {
+    f.state.config.mdblist = { enabled: false };
+  });
+
+  // Enable MDBList via overview card switch -> setup dialog -> Save and enable -> PUT /ether/api/config/mdblist, then toggle off and back on.
+  const mdbSwitch = await screen.findByRole("switch", { name: "MDBList enabled" });
+  await waitFor(() => expect(mdbSwitch).toBeEnabled());
+  fireEvent.click(mdbSwitch);
+  const mdbDialog = await screen.findByRole("dialog");
+  fireEvent.click(within(mdbDialog).getByRole("button", { name: "Save and enable" }));
+  await waitFor(() => expect(fake.state.config.mdblist?.enabled).toBe(true));
+  fireEvent.click(screen.getByRole("switch", { name: "MDBList enabled" }));
+  await waitFor(() => expect(fake.state.config.mdblist?.enabled).toBe(false));
+
+  // Enable OMDb and MDBList (Ratings) via setup dialog -> Save and enable, then toggle off cleanly.
+  const ratingsSwitch = await screen.findByRole("switch", { name: "OMDb and MDBList enabled" });
+  await waitFor(() => expect(ratingsSwitch).toBeEnabled());
+  fireEvent.click(ratingsSwitch);
+  const ratingsDialog = await screen.findByRole("dialog");
+  fireEvent.change(within(ratingsDialog).getByLabelText(/API key/i), {
+    target: { value: "ratings-key" },
+  });
+  fireEvent.click(within(ratingsDialog).getByRole("button", { name: "Save and enable" }));
+  await waitFor(() =>
+    expect(screen.getByRole("switch", { name: "OMDb and MDBList enabled" })).toBeChecked(),
+  );
+  fireEvent.click(screen.getByRole("switch", { name: "OMDb and MDBList enabled" }));
+  await waitFor(() =>
+    expect(screen.getByRole("switch", { name: "OMDb and MDBList enabled" })).not.toBeChecked(),
+  );
+});
+
+it("opens MDBList setup drawer when routed to /services/mdblist while disabled", async () => {
+  renderApp("/services/mdblist", {}, (f) => {
+    f.state.config.mdblist = { enabled: false };
+  });
+  const dialog = await screen.findByRole("dialog");
+  expect(within(dialog).getByRole("button", { name: "Save and enable" })).toBeInTheDocument();
 });

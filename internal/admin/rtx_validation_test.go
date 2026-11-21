@@ -40,3 +40,23 @@ func TestRTXVideoConfigValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestVideoTranscodingConfigValidation(t *testing.T) {
+	for _, valid := range []string{"", "on", "off"} {
+		cfg := config.Defaults(t.TempDir())
+		cfg.Transcode.VideoTranscoding = valid
+		for _, e := range admin.ValidateConfig(cfg) {
+			if e.Field == "transcode.videoTranscoding" {
+				t.Fatalf("valid value %q rejected: %v", valid, e)
+			}
+		}
+	}
+	cfg := config.Defaults(t.TempDir())
+	cfg.Transcode.VideoTranscoding = "sometimes"
+	for _, e := range admin.ValidateConfig(cfg) {
+		if e.Field == "transcode.videoTranscoding" {
+			return
+		}
+	}
+	t.Fatal("invalid transcode.videoTranscoding value was accepted")
+}

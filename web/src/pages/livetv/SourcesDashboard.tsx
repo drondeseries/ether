@@ -15,6 +15,7 @@ import {
   type LiveUsage,
   type Source,
 } from "./model";
+import { StabilityPanel } from "./stability";
 
 const DAY = 24 * 60 * MINUTE;
 
@@ -130,6 +131,8 @@ export function SourcesDashboard({
         />
       </KpiRow>
 
+      <StabilityPanel />
+
       {list.map((s) => (
         <SourcePanel
           key={s.id}
@@ -179,6 +182,7 @@ function SourcePanel({
       title={
         <span className="flex min-w-0 items-center gap-2">
           <span className="truncate">{s.name}</span>
+          {s.disabled ? <Badge>{t("Disabled")}</Badge> : null}
           <Badge variant={status.variant}>{status.label}</Badge>
           {s.auth?.type === "xtream" ? (
             <Badge variant="secondary">{t("Xtream Codes")}</Badge>

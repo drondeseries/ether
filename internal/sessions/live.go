@@ -24,12 +24,31 @@ type LiveMediaBackend interface {
 	TuneMedia(context.Context, *core.Viewer, string, core.ClientCaps, string) (string, *core.MediaInfo, error)
 }
 
+// DirectLiveBackend optionally supports tuning direct-URL live streams (such as
+// plugin library live tabs) without registering a Live TV channel.
+type DirectLiveBackend interface {
+	LiveBackend
+	DirectAllowed(context.Context, *core.Viewer, *frontend.DirectLiveTarget) error
+	TuneDirect(context.Context, *core.Viewer, *frontend.DirectLiveTarget, core.ClientCaps, string) (string, *core.MediaInfo, error)
+}
+
 func (b *Broker) planLive(ctx context.Context, req frontend.PlanRequest, viewer *core.Viewer) (frontend.PlayPlan, error) {
 	if b.deps.Live == nil {
 		return frontend.PlayPlan{}, core.ErrNotAvailable
 	}
-	if err := b.deps.Live.Allowed(ctx, viewer, req.Channel); err != nil {
-		return frontend.PlayPlan{}, err
+	liveCtx := core.WithLiveApp(ctx, string(req.Protocol))
+	if req.DirectLive != nil {
+		db, ok := b.deps.Live.(DirectLiveBackend)
+		if !ok {
+			return frontend.PlayPlan{}, core.ErrNotAvailable
+		}
+		if err := db.DirectAllowed(liveCtx, viewer, req.DirectLive); err != nil {
+			return frontend.PlayPlan{}, err
+		}
+	} else {
+		if err := b.deps.Live.Allowed(liveCtx, viewer, req.Channel); err != nil {
+			return frontend.PlayPlan{}, err
+		}
 	}
 	if req.Intent.AllowTranscoding != nil && !*req.Intent.AllowTranscoding {
 		return frontend.PlayPlan{}, core.ErrNotAvailable
@@ -57,26 +76,51 @@ func (b *Broker) openLive(ctx context.Context, req frontend.OpenRequest, p broke
 	if b.deps.Live == nil {
 		return frontend.Session{}, core.ErrNotAvailable
 	}
-	if err := b.deps.Live.Allowed(ctx, viewer, p.request.Channel); err != nil {
-		return frontend.Session{}, err
+	ctx = core.WithLiveApp(ctx, string(req.Protocol))
+	var liveID string
+	var tunedMedia *core.MediaInfo
+	var err error
+	var directRef *frontend.DirectLiveTarget
+	if p.request.DirectLive != nil {
+		db, ok := b.deps.Live.(DirectLiveBackend)
+		if !ok {
+			return frontend.Session{}, core.ErrNotAvailable
+		}
+		if err = db.DirectAllowed(ctx, viewer, p.request.DirectLive); err != nil {
+			return frontend.Session{}, err
+		}
+		liveID, tunedMedia, err = db.TuneDirect(ctx, viewer, p.request.DirectLive, p.request.Caps, p.request.Intent.ClientSessionID)
+		if err != nil {
+			return frontend.Session{}, capacityError(err)
+		}
+		// Retain only non-secret identity fields for ongoing policy re-checks.
+		directRef = &frontend.DirectLiveTarget{
+			LibraryID: p.request.DirectLive.LibraryID,
+			Tab:       p.request.DirectLive.Tab,
+			ItemID:    p.request.DirectLive.ItemID,
+			Title:     p.request.DirectLive.Title,
+		}
+	} else {
+		if err = b.deps.Live.Allowed(ctx, viewer, p.request.Channel); err != nil {
+			return frontend.Session{}, err
+		}
+		if mb, ok := b.deps.Live.(LiveMediaBackend); ok {
+			liveID, tunedMedia, err = mb.TuneMedia(ctx, viewer, p.request.Channel, p.request.Caps, p.request.Intent.ClientSessionID)
+		} else {
+			liveID, err = b.deps.Live.Tune(ctx, viewer, p.request.Channel, p.request.Caps, p.request.Intent.ClientSessionID)
+		}
+		if err != nil {
+			return frontend.Session{}, capacityError(err)
+		}
 	}
 	id, err := sessionID(req.Protocol)
 	if err != nil {
+		_ = b.deps.Live.Stop(ctx, viewer, liveID)
 		return frontend.Session{}, err
-	}
-	var liveID string
-	var tunedMedia *core.MediaInfo
-	if mb, ok := b.deps.Live.(LiveMediaBackend); ok {
-		liveID, tunedMedia, err = mb.TuneMedia(ctx, viewer, p.request.Channel, p.request.Caps, p.request.Intent.ClientSessionID)
-	} else {
-		liveID, err = b.deps.Live.Tune(ctx, viewer, p.request.Channel, p.request.Caps, p.request.Intent.ClientSessionID)
-	}
-	if err != nil {
-		return frontend.Session{}, capacityError(err)
 	}
 	liveMedia := normalizeLiveMedia(tunedMedia)
 	grant := rand.Text()
-	session := frontend.Session{ID: id, MediaPath: "/sessions/media/" + id + "/" + grant + "/live/index.m3u8", Protocol: req.Protocol, ViewerID: viewer.ID, Device: p.request.Device, Channel: p.request.Channel, Media: &liveMedia, StartedAt: b.deps.Now()}
+	session := frontend.Session{ID: id, MediaPath: "/sessions/media/" + id + "/" + grant + "/live/index.m3u8", Protocol: req.Protocol, ViewerID: viewer.ID, Device: p.request.Device, Channel: p.request.Channel, Media: &liveMedia, StartedAt: b.deps.Now(), PlayMethod: "Transcode"}
 	if req.Protocol == "silo" {
 		session.ClientSessionID = p.request.Intent.ClientSessionID
 	}
@@ -84,8 +128,8 @@ func (b *Broker) openLive(ctx context.Context, req frontend.OpenRequest, p broke
 		_ = b.deps.Live.Stop(ctx, viewer, liveID)
 		return frontend.Session{}, err
 	}
-	s := &brokerSession{public: copySession(session), grant: grant, playID: liveID, clientID: p.request.Caps.ClientID, caps: p.request.Caps, opts: p.request.Intent.Options, decision: p.decision, live: true}
-	if b.cluster != nil && session.Protocol != "plex" {
+	s := &brokerSession{public: copySession(session), grant: grant, playID: liveID, clientID: p.request.Caps.ClientID, caps: p.request.Caps, opts: p.request.Intent.Options, decision: p.decision, live: true, directLive: directRef}
+	if b.cluster != nil && !b.policy(session.Protocol).ExternalAdmission {
 		if err := b.cluster.store.put(ctx, session, liveID, *viewer, b.deps.Now()); err != nil {
 			_ = b.deps.Live.Stop(ctx, viewer, liveID)
 			return frontend.Session{}, err
@@ -188,4 +232,21 @@ func normalizeLiveMedia(in *core.MediaInfo) core.MediaInfo {
 	}
 	out.Streams = kept
 	return out
+}
+
+// LiveWindow forwards a previously authorized session's existing output clock.
+func (b *Broker) LiveWindow(ctx context.Context, id string) (frontend.LiveWindow, error) {
+	b.mu.Lock()
+	s := b.sessions[id]
+	if s == nil || !s.live || b.closed {
+		b.mu.Unlock()
+		return frontend.LiveWindow{}, core.ErrNotAvailable
+	}
+	playID := s.playID
+	b.mu.Unlock()
+	reader, ok := b.deps.Live.(frontend.LiveWindowReader)
+	if !ok {
+		return frontend.LiveWindow{}, core.ErrNotAvailable
+	}
+	return reader.LiveWindow(ctx, playID)
 }

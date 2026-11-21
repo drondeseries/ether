@@ -1,7 +1,7 @@
 import { AgentPanel, type AgentMessage } from "@braedonsaunders/appkit-ai/react";
 import { Badge, Button, Dialog, toast } from "@braedonsaunders/appkit-ui";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ArrowLeft, Film, LayoutTemplate, Sparkles, Tv } from "lucide-react";
+import { ArrowLeft, Film, LayoutTemplate, Library, Sparkles, Tv } from "lucide-react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { Segmented } from "../../components/fields";
 import { Workspace } from "../../components/workspace";
@@ -15,7 +15,7 @@ import { apiFetch, apiStream, errorMessage } from "../../lib/api";
 import { PluginView } from "../../viewspec/PluginView";
 import { formatDateTime } from "../../lib/format";
 import { invalidateRegistry } from "../../lib/extend";
-import { PermissionSheet } from "./PermissionSheet";
+import { PermissionSheet, RuntimeLimitsCard } from "./PermissionSheet";
 import { StudioActions } from "./StudioActions";
 import { CodeStudio, ReferenceButton } from "./CodeStudio";
 import { CodeHome } from "./CodeHome";
@@ -275,7 +275,7 @@ export default function Studio() {
 type StudioMode = "ai" | "code";
 
 /** Templates whose data shows in Ether's own surfaces while drafting. */
-const NATIVE_PREVIEW = new Set(["channels", "video_source", "addon"]);
+const NATIVE_PREVIEW = new Set(["channels", "video_source", "addon", "content_kind"]);
 
 /** Chat and Code are two views of the same Studio and the same draft. */
 function ModeSwitch({ mode, onMode }: { mode: StudioMode; onMode: (m: StudioMode) => void }) {
@@ -296,6 +296,17 @@ function ModeSwitch({ mode, onMode }: { mode: StudioMode; onMode: (m: StudioMode
 }
 
 const STARTERS = [
+  {
+    template: "content_kind",
+    icon: Library,
+    title: () => t("A new library"),
+    description: () =>
+      t(
+        "Your own library of books, audio, photos or anything else, beside Movies and TV Shows in every app.",
+      ),
+    prompt: () =>
+      t("Build a library of field recordings, grouped into albums of tracks, from my source"),
+  },
   {
     template: "channels",
     icon: Tv,
@@ -493,6 +504,7 @@ function LiveWorkspace({
   const [installing, setInstalling] = useState<InstallPreview | null>(null);
   const [grantViewers, setGrantViewers] = useState<number[]>([]);
   const [grantFolders, setGrantFolders] = useState<string[]>([]);
+  const [grantOperatorHosts, setGrantOperatorHosts] = useState<string[]>([]);
   const [installBusy, setInstallBusy] = useState(false);
   const [installError, setInstallError] = useState("");
   const openInstall = async () => {
@@ -500,6 +512,7 @@ function LiveWorkspace({
     setInstallError("");
     setGrantViewers([]);
     setGrantFolders([]);
+    setGrantOperatorHosts([]);
     try {
       const r = await apiFetch<{ preview: InstallPreview }>(
         `/plugins/studio/projects/${encodeURIComponent(project.id)}/install/preview`,
@@ -520,7 +533,11 @@ function LiveWorkspace({
         {
           method: "POST",
           body: JSON.stringify({
-            grants: { viewers: grantViewers, folders: grantFolders },
+            grants: {
+              viewers: grantViewers,
+              folders: grantFolders,
+              operatorHosts: installing.needsOperatorHosts ? grantOperatorHosts : undefined,
+            },
             acceptAddedPermissions: true,
             asCopy,
           }),
@@ -749,15 +766,23 @@ function LiveWorkspace({
                   )
                 : t("The saved draft becomes a real plugin on this server.")}
             </p>
+            <RuntimeLimitsCard
+              limits={installing.runtimeLimits}
+              requested={installing.manifest.ether?.runtime?.limits}
+            />
             <PermissionSheet
               permissions={installing.permissions}
               verified={installing.verified}
               needsViewers={installing.needsViewers}
               needsFolders={installing.needsFolders}
+              needsOperatorHosts={installing.needsOperatorHosts}
               viewers={grantViewers}
               onChangeViewers={setGrantViewers}
               folders={grantFolders}
               onChangeFolders={setGrantFolders}
+              operatorHosts={grantOperatorHosts}
+              pendingOperatorHosts={installing.pendingOperatorHosts}
+              onChangeOperatorHosts={setGrantOperatorHosts}
               addedPermissions={installing.addedPermissions}
               ownDraft
             />

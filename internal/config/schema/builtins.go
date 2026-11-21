@@ -14,10 +14,8 @@ func Builtins() []Builtin {
 	return []Builtin{
 		// SERVER
 		{ID: "server", ConfigKey: "server", Label: extend.T("What viewers see"), Schema: Schema{Groups: []Group{
-			{ID: "identity", Title: extend.T("What viewers see"), Description: extend.T("The names apps show for this server and its libraries."), Fields: []Field{
+			{ID: "identity", Title: extend.T("What viewers see"), Description: extend.T("The name apps show for this server."), Fields: []Field{
 				{Key: "friendlyName", Label: extend.T("Server name"), Kind: KindText, Help: extend.T("How the server appears in apps.")},
-				{Key: "moviesLibraryName", Label: extend.T("Movies library name"), Kind: KindText, Help: extend.T("Name shown in Plex. A rename inside Plex does not stick.")},
-				{Key: "tvShowsLibraryName", Label: extend.T("TV Shows library name"), Kind: KindText, Help: extend.T("Name shown in Plex. A rename inside Plex does not stick.")},
 			}},
 			{ID: "connect", Title: extend.T("How apps connect"), Description: extend.T("The address apps use to reach this computer."), Fields: []Field{
 				{Key: "port", Label: extend.T("Port"), Kind: KindNumber, Help: extend.T("Plex apps expect 32400. A restart is needed after changing it."), Min: F(1), Max: F(65535), Step: F(1)},
@@ -25,7 +23,7 @@ func Builtins() []Builtin {
 				{Key: "bindAddress", Label: extend.T("Listen address"), Kind: KindText, Help: extend.T("0.0.0.0 listens on every network interface.")},
 				{Key: "machineIdentifier", Label: extend.T("Machine identifier"), Kind: KindReadonly, Help: extend.T("Generated on first run; never changes.")},
 				{Key: "webFrameOrigins", Label: extend.T("Sites that may embed this page"), Kind: KindList, Help: extend.T("Exact addresses allowed to frame the owner page. Empty means nowhere."), Placeholder: "https://home.example.com"},
-				{Key: "trustedProxyCIDRs", Label: extend.T("Trusted proxy networks"), Kind: KindList, Help: extend.T("Networks whose forwarding headers Ether trusts. Empty trusts none."), Placeholder: "10.0.0.0/8"},
+				{Key: "trustedProxyCIDRs", Label: extend.T("Trusted reverse proxies"), Kind: KindList, Help: extend.T("IP addresses or CIDR ranges of reverse proxies on other machines (such as Caddy or Nginx) whose forwarded client IP headers Ether should trust. Proxies on this computer are already trusted."), Placeholder: "192.168.1.5, 10.0.0.0/8"},
 				{Key: "logLevel", Label: extend.T("Log level"), Kind: KindSelect, Options: []Option{{Value: "debug", Label: extend.T("Debug")}, {Value: "info", Label: extend.T("Info")}, {Value: "warn", Label: extend.T("Warnings")}, {Value: "error", Label: extend.T("Errors only")}}},
 			}},
 			{ID: "streams", Title: extend.T("Who can watch at once"), Description: extend.T("Leave these at the defaults unless too many people are watching at the same time."), Fields: []Field{}, More: []Field{
@@ -40,7 +38,7 @@ func Builtins() []Builtin {
 			}, More: []Field{
 				{Key: "useUpnp", Label: extend.T("Map the port automatically (UPnP)"), Kind: KindBool, Help: extend.T("Asks your router to forward the port.")},
 				{Key: "publicPort", Label: extend.T("Public port"), Kind: KindNumber, Help: extend.T("The port forwarded on your router. 0 uses the server port."), Min: F(0), Max: F(65535), Step: F(1)},
-				{Key: "publicHost", Label: extend.T("Public host name"), Kind: KindText, Help: extend.T("Optional. Leave empty to detect your public address.")},
+				{Key: "publicHost", Label: extend.T("Public host name"), Kind: KindText, Help: extend.T("Optional. Enter a name like plex.example.com, or the full https:// address of your reverse proxy. Leave empty to detect your public address.")},
 				{Key: "customUrls", Label: extend.T("Custom server URLs"), Kind: KindList, Help: extend.T("Extra addresses Plex apps should try, comma-separated."), Placeholder: "https://ether.example.com:443"},
 			}},
 			{ID: "secure", Title: extend.T("Secure connections"), Description: extend.T("How Plex apps encrypt the connection to this server."), Fields: []Field{
@@ -48,6 +46,9 @@ func Builtins() []Builtin {
 			}, More: []Field{
 				{Key: "certFile", Label: extend.T("Certificate file"), Kind: KindText, Help: extend.T("Leave empty to use the plex.direct certificate Ether manages."), Wide: true},
 				{Key: "keyFile", Label: extend.T("Key file"), Kind: KindText, Help: extend.T("The private key that matches the certificate file."), Wide: true},
+			}},
+			{ID: "delivery", Title: extend.T("Media delivery"), Description: extend.T("How a direct play reaches the player."), Fields: []Field{
+				{Key: "delivery", Label: extend.T("Delivery"), Kind: KindSelect, Help: extend.T("Relay is the default. Redirect gives eligible Plex players a temporary TorBox file URL that they can use until it expires. Ether cannot measure bytes delivered directly by TorBox."), Options: []Option{{Value: "relay", Label: extend.T("Relay through Ether")}, {Value: "redirect", Label: extend.T("Redirect to the provider")}}},
 			}},
 			{ID: "compatibility", Title: extend.T("Compatibility"), Fields: []Field{
 				{Key: "trackLatestVersion", Label: extend.T("Report the latest public PMS version"), Kind: KindBool, Help: extend.T("Off reports the version Ether is verified against. Plex enables features by server version.")},
@@ -89,6 +90,8 @@ func Builtins() []Builtin {
 		{ID: "playVersions", ConfigKey: "resolver", Label: extend.T("Versions in the app"), Schema: Schema{Groups: []Group{
 			{Title: extend.T("Versions in the app"), Description: extend.T("Extra copies of the same picture, after Auto."), Fields: []Field{
 				{Key: "sameQualityAlternatives", Label: extend.T("Same-quality versions to offer"), Kind: KindNumber, Help: extend.T("Listed after Auto in the app's version menu."), Min: F(0), Max: F(3), Step: F(1)},
+				{Key: "alternativesPerResolution", Label: extend.T("Offer alternatives at every resolution"), Kind: KindBool, Help: extend.T("Apply the alternatives count to each available resolution, up to seven versions total. Auto stays first; profile and device limits still apply.")},
+				{Key: "alternativesPerSource", Label: extend.T("Offer each source at every resolution"), Kind: KindBool, Help: extend.T("Keep one WEB-DL, Blu-ray and Remux choice at each resolution in Play Version when available. Auto still follows your profile.")},
 				{Key: "offerHigherVersions", Label: extend.T("Offer higher versions"), Kind: KindBool, Help: extend.T("Version menus can list releases taller than the profile. Off keeps the ceiling you set. HDR and file-size limits still apply.")},
 			}},
 		}}},
@@ -112,6 +115,7 @@ func Builtins() []Builtin {
 		// TRANSCODE
 		{ID: "transcode", ConfigKey: "transcode", Label: extend.T("Converting for the app"), Schema: Schema{Groups: []Group{
 			{ID: "convert", Title: extend.T("Converting for the app"), Description: extend.T("Ether plays the file directly when the app can. It converts the video on this computer only when it has to."), Fields: []Field{
+				{Key: "videoTranscoding", Label: extend.T("Video transcoding"), Kind: KindSelect, Help: extend.T("Turn off to never re-encode video for movies and shows. Direct play, remuxing, and audio or subtitle conversion still work. Live TV is unaffected."), Options: []Option{{Value: "on", Label: extend.T("On")}, {Value: "off", Label: extend.T("Off")}}},
 				{Key: "hwAccel", Label: extend.T("Hardware acceleration"), Kind: KindSelect, Help: extend.T("Automatic uses this computer's graphics chip when an app can't play the file as-is. Choose Off only if converted video looks wrong."), Options: []Option{{Value: "auto", Label: extend.T("Automatic")}, {Value: "none", Label: extend.T("Off (software)")}, {Value: "videotoolbox", Label: extend.Text{Source: "VideoToolbox (Apple)"}}, {Value: "nvenc", Label: extend.Text{Source: "NVENC (NVIDIA)"}}, {Value: "qsv", Label: extend.Text{Source: "Quick Sync (Intel)"}}, {Value: "vaapi", Label: extend.Text{Source: "VA-API (Linux)"}}}},
 			}, More: []Field{
 				{Key: "vaapiDevice", Label: extend.T("VA-API device"), Kind: KindText, Help: extend.T("Linux graphics device, for example /dev/dri/renderD128. Leave empty unless converted video fails to start.")},
@@ -152,12 +156,13 @@ func Builtins() []Builtin {
 				{Key: "apiKey", Label: extend.T("API key"), Kind: KindSecret},
 				{Key: "username", Label: extend.T("Username"), Kind: KindText},
 				{Key: "password", Label: extend.T("Password"), Kind: KindSecret},
+				{Key: "automaticPreferred", Label: extend.T("Download a subtitle automatically when playback starts"), Kind: KindBool, Help: extend.T("When a viewer's subtitle setting asks for subtitles and none in their language is available, Ether downloads one once the video starts playing. Uses one OpenSubtitles download per title per viewer, so standard accounts may run out sooner.")},
 			}},
 		}}},
 		// UPDATES
 		{ID: "updates", ConfigKey: "updates", Label: extend.T("Release channel"), Schema: Schema{Groups: []Group{
 			{Title: extend.T("Release channel"), Fields: []Field{
-				{Key: "enabled", Label: extend.T("Check for updates"), Kind: KindBool, Help: extend.T("Checks the signed release feed once a day.")},
+				{Key: "enabled", Label: extend.T("Check for updates"), Kind: KindBool, Help: extend.T("Checks the signed release feed every few hours.")},
 				{Key: "channel", Label: extend.T("Channel"), Kind: KindSelect, Options: []Option{{Value: "stable", Label: extend.T("Stable")}, {Value: "beta", Label: extend.T("Beta")}}},
 				{Key: "autoUpdate", Label: extend.T("Install updates automatically"), Kind: KindBool, Help: extend.T("Installs during the maintenance window, once nobody is watching.")},
 			}, More: []Field{
@@ -179,6 +184,8 @@ func Builtins() []Builtin {
 			{Title: extend.T("Chapters and skip markers"), Fields: []Field{
 				{Key: "theIntroDb", Label: extend.T("Look up intro and credits markers"), Kind: KindBool, Help: extend.T("Use the public TheIntroDB lookup, cached per episode and runtime.")},
 				{Key: "apiKey", Label: extend.T("Optional TheIntroDB key"), Kind: KindSecret},
+				{Key: "skipDb", Label: extend.T("Also look up SkipDB"), Kind: KindBool, Help: extend.T("Add the open SkipDB lookup as a second source, cached per episode and runtime.")},
+				{Key: "skipDbApiKey", Label: extend.T("Optional SkipDB key"), Kind: KindSecret, Help: extend.T("Reading SkipDB is open; a key only raises its rate limit.")},
 			}},
 		}}},
 		// DEBRID
@@ -199,7 +206,7 @@ func Builtins() []Builtin {
 				{Key: "enabled", Label: extend.T("Allow downloads"), Kind: KindBool},
 				{Key: "allowFriends", Label: extend.T("Friends can download"), Kind: KindBool, Help: extend.T("Off lets only you download. A viewer's access policy can still allow or deny it.")},
 			}, More: []Field{
-				{Key: "maxHeight", Label: extend.T("Highest resolution"), Kind: KindNumber, Help: extend.T("Downloads are capped at this height. 0 uses 1080p."), Min: F(0), Step: F(1), Unit: extend.Text{Source: "p"}},
+				{Key: "maxHeight", Label: extend.T("Highest resolution"), Kind: KindNumber, Help: extend.T("Downloads are capped at this resolution. 0 uses 1080p."), Min: F(0), Step: F(1), Unit: extend.Text{Source: "p"}},
 				{Key: "maxConcurrent", Label: extend.T("Downloads at once"), Kind: KindNumber, Help: extend.T("Across the whole server. 0 uses 2."), Min: F(0), Step: F(1)},
 				{Key: "maxConcurrentPerUser", Label: extend.T("Downloads at once per viewer"), Kind: KindNumber, Help: extend.T("0 uses 1."), Min: F(0), Step: F(1)},
 				{Key: "diskBudgetBytes", Label: extend.T("Temporary disk space"), Kind: KindBytes, Help: extend.T("Maximum space for prepared downloads. Set to 0 to use the default limit of 20 GiB."), Unit: extend.Text{Source: "GiB"}},
@@ -230,10 +237,8 @@ func Builtins() []Builtin {
 		}}},
 		// clusterServerGroups()
 		{ID: "serverCluster", ConfigKey: "server", Label: extend.T("What viewers see"), Schema: Schema{Groups: []Group{
-			{ID: "identity", Title: extend.T("What viewers see"), Description: extend.T("The names apps show for this server and its libraries."), Fields: []Field{
+			{ID: "identity", Title: extend.T("What viewers see"), Description: extend.T("The name apps show for this server."), Fields: []Field{
 				{Key: "friendlyName", Label: extend.T("Server name"), Kind: KindText, Help: extend.T("How the server appears in apps.")},
-				{Key: "moviesLibraryName", Label: extend.T("Movies library name"), Kind: KindText, Help: extend.T("Name shown in Plex. A rename inside Plex does not stick.")},
-				{Key: "tvShowsLibraryName", Label: extend.T("TV Shows library name"), Kind: KindText, Help: extend.T("Name shown in Plex. A rename inside Plex does not stick.")},
 			}},
 			{ID: "connect", Title: extend.T("How apps connect"), Description: extend.T("The address apps use to reach this computer."), Fields: []Field{}, More: []Field{
 				{Key: "webFrameOrigins", Label: extend.T("Sites that may embed this page"), Kind: KindList, Help: extend.T("Exact addresses allowed to frame the owner page. Empty means nowhere."), Placeholder: "https://home.example.com"},
@@ -247,7 +252,7 @@ func Builtins() []Builtin {
 			}, More: []Field{
 				{Key: "bindAddress", Label: extend.T("Listen address"), Kind: KindText, Help: extend.T("0.0.0.0 listens on every network interface.")},
 				{Key: "machineIdentifier", Label: extend.T("Machine identifier"), Kind: KindReadonly, Help: extend.T("Generated on first run; never changes.")},
-				{Key: "trustedProxyCIDRs", Label: extend.T("Trusted proxy networks"), Kind: KindList, Help: extend.T("Networks whose forwarding headers Ether trusts. Empty trusts none."), Placeholder: "10.0.0.0/8"},
+				{Key: "trustedProxyCIDRs", Label: extend.T("Trusted reverse proxies"), Kind: KindList, Help: extend.T("IP addresses or CIDR ranges of reverse proxies on other machines (such as Caddy or Nginx) whose forwarded client IP headers Ether should trust. Proxies on this computer are already trusted."), Placeholder: "192.168.1.5, 10.0.0.0/8"},
 				{Key: "logLevel", Label: extend.T("Log level"), Kind: KindSelect, Options: []Option{{Value: "debug", Label: extend.T("Debug")}, {Value: "info", Label: extend.T("Info")}, {Value: "warn", Label: extend.T("Warnings")}, {Value: "error", Label: extend.T("Errors only")}}},
 				{Key: "clusterWeight", Label: extend.T("Node weight"), Kind: KindNumber, Help: extend.T("This computer's share of each provider's connections and request limits, relative to the others. 2 gets twice the share of a computer at 1; 0 means 1."), Min: F(0), Max: F(100), Step: F(1)},
 			}},

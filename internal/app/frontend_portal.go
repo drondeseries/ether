@@ -43,6 +43,11 @@ func (r *frontendRuntime) surfaceURL(ctx context.Context, id frontend.Protocol, 
 		cfg = r.app.cfg.Get()
 		trusted = r.app.trustedProxyPrefixes()
 	}
+	// An app with its own public address is reached at that address as-is,
+	// not at the Plex custom URL with this app's prefix appended.
+	if base, ok := frontendPublicOrigin(cfg, string(id)); ok {
+		return strings.TrimRight(base, "/"), nil
+	}
 	if base, ok := configuredOrigin(cfg, r.mainPort()); ok {
 		if len(shared) > 0 {
 			if resolved, err := surfaceSharedAddress(strings.TrimRight(base, "/")+"/ether/me", shared); err == nil {
@@ -270,6 +275,15 @@ func (r *frontendRuntime) viewerPortalSecureURL(ctx context.Context, req *http.R
 	return portalSecureAddress(ctx, ip, host, port, interfaces, connections)
 }
 
+// frontendPublicOrigin returns the app's own public address when the owner
+// set a valid one. Plex never uses it: Plex apps use Plex.CustomURLs.
+func frontendPublicOrigin(cfg config.Config, id string) (string, bool) {
+	if id == "plex" {
+		return "", false
+	}
+	return parseConfiguredURL(cfg.Frontends[id].PublicURL)
+}
+
 func configuredOrigin(cfg config.Config, defaultPort string) (string, bool) {
 	for _, raw := range cfg.Plex.CustomURLs {
 		if base, ok := parseConfiguredURL(raw); ok {
@@ -282,7 +296,7 @@ func configuredOrigin(cfg config.Config, defaultPort string) (string, bool) {
 				return base, true
 			}
 		} else {
-			h, p := host, ""
+			var h, p string
 			if sh, sp, err := net.SplitHostPort(host); err == nil {
 				h, p = strings.Trim(sh, "[]"), sp
 			} else {
@@ -420,27 +434,7 @@ func usableRequestHost(host string, fromProxyOrConfig bool) bool {
 }
 
 func portalProxyTrusted(r *http.Request, trusted []netip.Prefix) bool {
-	if r == nil {
-		return false
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		host = r.RemoteAddr
-	}
-	peer, err := netip.ParseAddr(strings.Trim(host, "[]"))
-	if err != nil {
-		return false
-	}
-	peer = peer.Unmap()
-	if peer.IsLoopback() {
-		return true
-	}
-	for _, p := range trusted {
-		if p.Contains(peer) {
-			return true
-		}
-	}
-	return false
+	return identity.TrustedPeer(r, trusted...)
 }
 
 func portalForwardedHost(r *http.Request) string {
@@ -588,4 +582,36 @@ func portalPublicAddress(ctx context.Context, connections []remote.Connection) (
 		return u.String(), nil
 	}
 	return "", errors.New("public address unavailable")
+}
+
+// secureOrigins reads the same published snapshot as Plex resources. It does
+// no reachability probes and never upgrades an untrusted request hostname.
+func (r *frontendRuntime) secureOrigins(ctx context.Context, req *http.Request) []string {
+	if r.app == nil {
+		return nil
+	}
+	var connections []remote.Connection
+	if r.app.registrar != nil {
+		connections = r.app.registrar.Status().Connections
+	}
+	var out []string
+	seen := map[string]bool{}
+	peer, _ := r.app.frontendClientIP(req)
+	for _, local := range []bool{identity.LAN(peer), !identity.LAN(peer)} {
+		for _, c := range connections {
+			if c.Local != local {
+				continue
+			}
+			u, err := url.Parse(c.URI)
+			if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
+				continue
+			}
+			origin := "https://" + u.Host
+			if !seen[origin] {
+				out = append(out, origin)
+				seen[origin] = true
+			}
+		}
+	}
+	return out
 }

@@ -5,8 +5,10 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
-	"github.com/braedonsaunders/ether/internal/core"
 	"time"
+
+	"github.com/braedonsaunders/ether/internal/config"
+	"github.com/braedonsaunders/ether/internal/core"
 )
 
 type visibilityEntry struct {
@@ -14,9 +16,9 @@ type visibilityEntry struct {
 	visible bool
 }
 
-// A short local memo keeps repeated Plex artwork/list requests inexpensive.
-// New observations and invalidations clear it immediately. Other cluster nodes
-// see changes within fifteen seconds, without a provider request.
+// A short local memo keeps repeated artwork/shelf checks inexpensive while
+// browse/rows/search query availability_gate directly in SQL. Opening a gate
+// clears this memo immediately.
 func (s *Service) FilterDiscovery(ctx context.Context, items []core.Title) []core.Title {
 	if len(items) == 0 {
 		return items
@@ -37,9 +39,7 @@ func (s *Service) filterDiscoverySnapshot(ctx context.Context, items []core.Titl
 	keys := make(map[core.RatingKey]string)
 	allowed := map[core.RatingKey]bool{}
 	var pending []core.Title
-	policy := fmt.Sprintf("%s:%+v", input.policy, input.availability)
-	feeds := []byte(fmt.Sprintf("%+v", input.feeds))
-	sets := s.answeredSets(input)
+	policy := fmt.Sprintf("%s:%s:%+v", input.gatePolicy, input.policy, input.availability)
 	s.visibilityMu.Lock()
 	revision := s.visibilityRevision
 	for _, t := range items {
@@ -47,17 +47,11 @@ func (s *Service) filterDiscoverySnapshot(ctx context.Context, items []core.Titl
 			allowed[t.Key] = true
 			continue
 		}
-		// A title the last hidden set judged reads that answer, so a hub
-		// shows exactly what the library pages exclude.
-		if h := sets[t.Type]; h != nil && h.covered[t.Key] {
-			allowed[t.Key] = !h.hidden[t.Key]
-			continue
-		}
 		if _, seen := keys[t.Key]; seen {
 			continue
 		}
 		raw, _ := json.Marshal(t)
-		key := fmt.Sprintf("%s:%x:%x", policy, sha256.Sum256(feeds), sha256.Sum256(raw))
+		key := fmt.Sprintf("%s:%x", policy, sha256.Sum256(raw))
 		keys[t.Key] = key
 		if e, ok := s.visibilityCache[key]; ok && now.Sub(e.at) < 15*time.Second && !now.Before(e.at) {
 			allowed[t.Key] = e.visible
@@ -89,6 +83,7 @@ func (s *Service) filterDiscoverySnapshot(ctx context.Context, items []core.Titl
 	}
 	return out
 }
+
 func (s *Service) clearVisibility() {
 	s.visibilityMu.Lock()
 	s.visibilityRevision++
@@ -104,24 +99,19 @@ func (s *Service) FilterDiscoveryCurrent(ctx context.Context, items []core.Title
 	return s.filterDiscovery(context.WithValue(ctx, currentPolicyKey{}, true), items, s.discoverySnapshot())
 }
 
-// answeredSets returns the hidden sets that exist and answer for input's
-// settings, refreshing stale ones as a library page would. It never
-// creates a set: a row before the first refresh judges its own page.
-func (s *Service) answeredSets(input discoverySnapshot) map[core.MediaType]*hiddenSet {
-	out := map[core.MediaType]*hiddenSet{}
-	for kind, typ := range map[string]core.MediaType{hiddenMovies: core.TypeMovie, hiddenShows: core.TypeShow} {
-		if kind == hiddenMovies && input.availability.DisableMovieEvidenceGate {
-			continue
+// JudgedOnFacts returns, for one request, whether FilterDiscovery judges a
+// title on its facts: one inside the evidence window, whose releases are
+// matched against its names, genres, keywords, countries and directors. A
+// caller holding partial titles passes those in full.
+func (s *Service) JudgedOnFacts(ctx context.Context) func(core.Title) bool {
+	snap := s.snapshotFor(ctx)
+	return func(t core.Title) bool {
+		// Digital-mode movies use indexed home-date evidence exclusively.
+		// Their genres, names and credits cannot affect this decision. Old
+		// read-only schemas still run the legacy release matcher.
+		if s.hasGateTable && t.Type == core.TypeMovie && snap.availability.ModeFor(hiddenMovies) == config.ModeDigital {
+			return false
 		}
-		s.visibilityMu.Lock()
-		_, exists := s.hiddenSets[kind]
-		s.visibilityMu.Unlock()
-		if !exists {
-			continue
-		}
-		if h := s.currentHidden(kind, input); h != nil && h.key == hiddenKey(kind, input) {
-			out[typ] = h
-		}
+		return !snap.upcomingMovie(t) && evidenceWindow(t, snap.now, snap.availability)
 	}
-	return out
 }

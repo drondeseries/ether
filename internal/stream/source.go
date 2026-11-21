@@ -21,13 +21,14 @@ const backSlack = 1 << 20
 
 // cursor follows one sequential reader.
 type cursor struct {
-	requestBegin int64 // foreground start; next includes bytes still being read
-	next         int64 // offset after the last byte read
-	window       int64 // current read-ahead window
-	frontier     int64 // read-ahead scheduled up to here
-	used         time.Time
-	verifying    bool // one archive-layout verification per cursor
-	blocked      bool // failed verification waits for a new foreground read
+	requestBegin   int64 // foreground start; next includes bytes still being read
+	next           int64 // offset after the last byte read
+	window         int64 // current read-ahead window
+	frontier       int64 // read-ahead scheduled up to here
+	used           time.Time
+	verifying      bool // one archive-layout verification per cursor
+	blocked        bool // failed verification waits for a new foreground read
+	backoffBlocked bool // paused during provider backoff; resumes once active read succeeds
 
 	// Playback read-ahead (playahead.go).
 	consumed int64 // sequential bytes this reader has read
@@ -36,6 +37,9 @@ type cursor struct {
 
 // source implements core.MediaSource.
 type source struct {
+	healthyOnce             sync.Once
+	liveStart, missingStart uint64
+
 	recovery  repairObserver
 	bulk      *bulkReader
 	e         *Engine
@@ -62,9 +66,12 @@ type source struct {
 	lastRead    atomic.Int64  // UnixNano of the last demand read
 	playWake    chan struct{} // coalesced wakeups of the playback read-ahead loop
 	playRunning bool          // protected by mu
+
+	meter deliveryMeter // network delivery for this source (delivery.go)
 }
 
 func newSource(e *Engine, rel *release, p *plan, releaseID string) *source {
+
 	ctx, cancel := context.WithCancel(e.ctx)
 	e.active.Add(1)
 	s := &source{
@@ -73,12 +80,15 @@ func newSource(e *Engine, rel *release, p *plan, releaseID string) *source {
 		fo:     fetchOpts{cacheID: releaseID},
 		ctx:    ctx,
 		cancel: cancel,
-		raSem:  make(chan struct{}, e.opts.ReadAheadParallel),
+		raSem:  make(chan struct{}, maxAdaptiveParallel),
 
 		playWake: make(chan struct{}, 1),
 	}
 	s.fo.repairProgress = s.reportRepair
+	s.meter.owner = s
+	s.fo.meter = &s.meter
 	s.bulk.fo = s.fo
+	e.sources.Store(s, struct{}{})
 	return s
 }
 
@@ -97,6 +107,7 @@ func (s *source) Close() error {
 	s.mu.Unlock()
 	s.cancel()
 	s.raWG.Wait()
+	s.e.sources.Delete(s)
 	s.e.active.Add(-1)
 	s.e.release(s.rel)
 	return nil
@@ -172,7 +183,11 @@ func (s *source) readAtWithPriority(parent context.Context, p []byte, off int64,
 		s.readAhead(off, int64(len(want)))
 	}
 
-	ctx, cancel := context.WithTimeout(core.WithStreamKey(parent, s), s.e.opts.ReadTimeout)
+	baseCtx := core.WithStreamKey(parent, s)
+	if prio == core.PriorityLive && !core.IsBackgroundCheck(parent) && parent.Value(healthWorkKey{}) != true && s.e.opts.BackoffHold > 0 {
+		baseCtx = withBackoffHold(baseCtx, time.Now().Add(s.e.opts.BackoffHold))
+	}
+	ctx, cancel := context.WithTimeout(baseCtx, s.e.opts.ReadTimeout)
 	stop := context.AfterFunc(s.ctx, cancel)
 	defer stop()
 	defer cancel()
@@ -187,6 +202,31 @@ func (s *source) readAtWithPriority(parent context.Context, p []byte, off int64,
 		}
 		return n, err
 	}
+	if cb := s.e.opts.OnHealthy; cb != nil && prio == core.PriorityLive && n > 0 && s.rel.liveArticles.Load() > s.liveStart && !core.IsBackgroundCheck(parent) {
+		s.healthyOnce.Do(func() {
+			e := s.e
+			r := s.rel
+			e.mu.Lock()
+			defer e.mu.Unlock()
+			if !e.closed {
+				e.wg.Go(func() {
+					r.feedbackMu.Lock()
+					defer r.feedbackMu.Unlock()
+					if r.missingEpoch.Load() == s.missingStart {
+						cb(r.feedbackID)
+					}
+				})
+			}
+		})
+	}
+	if ahead && n > 0 {
+		s.clearBackoffBlocked(off, int64(n))
+		if s.playRate.Load() > 0 {
+			// The first foreground read teaches perFetchBps; widen the cursor
+			// window and schedule additional adaptive concurrency immediately.
+			s.growPlayingWindow(off, int64(n))
+		}
+	}
 	if n < len(p) {
 		return n, io.EOF
 	}
@@ -195,12 +235,23 @@ func (s *source) readAtWithPriority(parent context.Context, p []byte, off int64,
 
 // read fills p (within the video) at off.
 func (s *source) read(ctx context.Context, p []byte, off int64, prio core.Priority) (int, error) {
-	return s.readWithDamageRecovery(ctx, p, off, prio)
+	n, err := s.readWithDamageRecovery(ctx, p, off, prio)
+	if len(s.plan.spans) > 0 && n > 0 {
+		// A multi-clip Blu-ray feature gets one continuous timeline.
+		raw := func(dst []byte, from int64) (int, error) { return s.readWithDamageRecovery(ctx, dst, from, prio) }
+		if rerr := remux(s.plan.spans, p[:n], off, raw); rerr != nil {
+			return 0, rerr // p holds timestamps only partly rewritten
+		}
+	}
+	return n, err
 }
 
 // readPlan reads video bytes through the plan's layout, verifying volumes
 // before serving from them.
 func readPlan(ctx context.Context, e *Engine, rel *release, p *plan, buf []byte, off int64, prio core.Priority, fo fetchOpts) (int, error) {
+	if len(p.sub) > 0 {
+		return readSub(ctx, e, rel, p, buf, off, prio, fo)
+	}
 	if p.encrypted != nil {
 		return readEncryptedPlan(ctx, e, rel, p, buf, off, prio, fo)
 	}
@@ -263,6 +314,17 @@ func speculate(ctx context.Context, e *Engine, rel *release, p *plan, pcs []piec
 	return func() { cancel(); wg.Wait() }
 }
 
+func (s *source) windowBudget(n int64) (partSize, windowCap int64) {
+	opts := s.e.opts
+	partSize = s.rel.partSize.Load()
+	if partSize <= 0 {
+		partSize = 716800
+	}
+	windowCap = min(opts.ReadAheadMax, opts.HotBufferBytes/2,
+		max(int64(0), opts.HotBufferBytes-n-2*partSize))
+	return partSize, windowCap
+}
+
 // readAhead updates the reader cursors and schedules background fetches
 // ahead of a sequential reader.
 func (s *source) readAhead(off, n int64) {
@@ -273,12 +335,10 @@ func (s *source) readAhead(off, n int64) {
 	// decoded cache. Reserve half the cache for demand reads, and account for
 	// whole articles straddling the read/window boundaries. Otherwise a small
 	// cache can evict prefetched bytes before the player ever consumes them.
-	partSize := s.rel.partSize.Load()
-	if partSize <= 0 {
-		partSize = 716800
-	}
-	windowCap := min(opts.ReadAheadMax, opts.HotBufferBytes/2,
-		max(int64(0), opts.HotBufferBytes-n-2*partSize))
+	partSize, windowCap := s.windowBudget(n)
+	rate := s.playRate.Load()
+	s.lastRead.Store(now.UnixNano())
+	targetLimit := s.raLimit()
 
 	s.mu.Lock()
 	if s.closed {
@@ -297,6 +357,9 @@ func (s *source) readAhead(off, n int64) {
 		if s.e.repairOptions().Enabled {
 			initial = max(initial, 32<<20)
 		}
+		if rate > 0 {
+			initial = max(initial, min(opts.ReadAheadMax, max(2*rate, 2*int64(targetLimit)*partSize)))
+		}
 		c = &cursor{next: end, window: min(initial, windowCap), frontier: end, consumed: n}
 		if len(s.cursors) < maxCursors {
 			s.cursors = append(s.cursors, c)
@@ -314,17 +377,66 @@ func (s *source) readAhead(off, n int64) {
 			// Sequential progress: grow the window with the bytes consumed.
 			c.window = min(windowCap, c.window+2*(end-c.next))
 			c.consumed += end - c.next
+			if rate > 0 || c.consumed >= playMinConsumed {
+				// A playing reader's window must hold every fetch the
+				// adaptive concurrency allows, twice over.
+				c.window = max(c.window, min(windowCap, 2*int64(targetLimit)*partSize))
+			}
 		}
 		c.next = max(c.next, end)
 	}
 	c.requestBegin = off
 	c.window = min(c.window, windowCap)
 	c.used = now
-	s.lastRead.Store(now.UnixNano())
 	c.blocked = false // a new demand read permits retrying a failed layout check
+	c.backoffBlocked = false
 	s.mu.Unlock()
 	s.kickReadAhead()
 	s.kickPlayAhead()
+}
+
+func (s *source) clearBackoffBlocked(off, n int64) {
+	end := off + n
+	cleared := false
+	s.mu.Lock()
+	if !s.closed {
+		for _, cur := range s.cursors {
+			if cur.backoffBlocked && (cur.requestBegin == off || (end >= cur.next-backSlack && end <= cur.next+cur.window)) {
+				cur.backoffBlocked = false
+				cleared = true
+			}
+		}
+	}
+	s.mu.Unlock()
+	if cleared {
+		s.kickReadAhead()
+	}
+}
+
+// growPlayingWindow expands an active cursor's window once completed fetches
+// raise raLimit, so adaptive read-ahead fans out without waiting for the next
+// foreground ReadAt.
+func (s *source) growPlayingWindow(off, n int64) {
+	partSize, windowCap := s.windowBudget(n)
+	wantWindow := min(windowCap, 2*int64(s.raLimit())*partSize)
+	end := off + n
+	grew := false
+	s.mu.Lock()
+	if !s.closed {
+		for _, cur := range s.cursors {
+			if cur.requestBegin == off || (end >= cur.next-backSlack && end <= cur.next+cur.window) {
+				if wantWindow > cur.window {
+					cur.window = wantWindow
+					grew = true
+				}
+				break
+			}
+		}
+	}
+	s.mu.Unlock()
+	if grew {
+		s.kickReadAhead()
+	}
 }
 
 // kickReadAhead coalesces wakeups into one source-local scheduler. Workers add
@@ -367,7 +479,7 @@ func (s *source) pumpReadAhead() {
 					break
 				}
 			}
-			if !present || s.closed || c.blocked || c.verifying {
+			if !present || s.closed || c.blocked || c.backoffBlocked || c.verifying {
 				s.mu.Unlock()
 				continue
 			}
@@ -398,7 +510,7 @@ func (s *source) cursorWindow(c *cursor) (int64, int64, bool) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed || c.blocked {
+	if s.closed || c.blocked || c.backoffBlocked {
 		return 0, 0, false
 	}
 	for _, current := range s.cursors {
@@ -422,7 +534,7 @@ func (s *source) repairNeeded(c *cursor, begin, end int64) bool {
 	}
 	for _, current := range s.cursors {
 		if current == c {
-			return !c.blocked && end > c.requestBegin && begin < min(c.next+c.window, s.plan.size)
+			return !c.blocked && !c.backoffBlocked && end > c.requestBegin && begin < min(c.next+c.window, s.plan.size)
 		}
 	}
 	return false
@@ -437,8 +549,11 @@ func (s *source) scheduleCursor(from, to int64, c *cursor) int64 {
 		}
 		if !s.plan.isVerified(pc.vol) {
 			// A failed verification must not become a self-sustaining retry
-			// loop. Only a later foreground read unblocks this cursor.
+			// loop. Non-backoff failures wait for a new foreground demand
+			// read; provider backoff pauses read-ahead without poisoning the
+			// active read and resumes as soon as demand succeeds.
 			vol := pc.vol
+			volOff := from + pc.bufOff
 			if c != nil {
 				s.mu.Lock()
 				c.verifying = true
@@ -449,7 +564,14 @@ func (s *source) scheduleCursor(from, to int64, c *cursor) int64 {
 				if c != nil {
 					s.mu.Lock()
 					c.verifying = false
-					c.blocked = err != nil
+					if err != nil {
+						if s.e.isProviderBackoff(err) {
+							c.backoffBlocked = true
+							c.frontier = min(c.frontier, volOff)
+						} else {
+							c.blocked = true
+						}
+					}
 					s.mu.Unlock()
 				}
 				return err == nil
@@ -459,7 +581,7 @@ func (s *source) scheduleCursor(from, to int64, c *cursor) int64 {
 				c.verifying = false
 				s.mu.Unlock()
 			}
-			return from + pc.bufOff
+			return volOff
 		}
 		for _, i := range pf.slotsFor(pc.off, pc.n) {
 			begin, end, _ := pf.rangeOf(i)
@@ -486,8 +608,15 @@ func (s *source) scheduleCursor(from, to int64, c *cursor) int64 {
 					return s.repairNeeded(c, inner, innerEnd)
 				}
 				_, err := s.e.segment(s.ctx, s.rel, pf, i, core.PriorityReadahead, fo)
-				if err != nil && s.ctx.Err() == nil && !isMissing(err) {
-					s.e.log.Debug("read-ahead fetch failed", "name", s.plan.name, "part", i+1, "err", err)
+				if err != nil {
+					if c != nil && s.e.isProviderBackoff(err) {
+						s.mu.Lock()
+						c.backoffBlocked = true
+						c.frontier = min(c.frontier, inner)
+						s.mu.Unlock()
+					} else if s.ctx.Err() == nil && !isMissing(err) {
+						s.e.log.Debug("read-ahead fetch failed", "name", s.plan.name, "part", i+1, "err", err)
+					}
 				}
 				return err == nil
 			})
@@ -507,6 +636,11 @@ func (s *source) scheduleCursor(from, to int64, c *cursor) int64 {
 // Close is waiting for them (Add must not race Wait, and a worker must not
 // outlive the release reference Close drops).
 func (s *source) startRA(fn func() bool) bool {
+	// Only the scheduling pump starts workers, so the length check is exact
+	// enough: workers only ever leave.
+	if len(s.raSem) >= s.raLimit() {
+		return false
+	}
 	select {
 	case s.raSem <- struct{}{}:
 	default:
@@ -533,11 +667,12 @@ func (s *source) startRA(fn func() bool) bool {
 
 // prefetchRange warms a byte range of the video into the segment cache.
 func (e *Engine) prefetchRange(ctx context.Context, rel *release, p *plan, releaseID string, offset, length int64) error {
-	return e.prefetchRangeN(ctx, rel, p, releaseID, offset, length, e.opts.PrefetchParallel)
+	return e.prefetchRangeN(ctx, rel, p, releaseID, offset, length, e.opts.PrefetchParallel, nil)
 }
 
-// prefetchRangeN is prefetchRange with up to parallel concurrent fetches.
-func (e *Engine) prefetchRangeN(ctx context.Context, rel *release, p *plan, releaseID string, offset, length int64, parallel int) error {
+// prefetchRangeN is prefetchRange with up to parallel concurrent fetches;
+// meter, when set, accounts them to a playing source.
+func (e *Engine) prefetchRangeN(ctx context.Context, rel *release, p *plan, releaseID string, offset, length int64, parallel int, meter *deliveryMeter) error {
 	if offset < 0 {
 		offset = 0
 	}
@@ -547,7 +682,7 @@ func (e *Engine) prefetchRangeN(ctx context.Context, rel *release, p *plan, rele
 	if length > p.size-offset {
 		length = p.size - offset
 	}
-	fo := fetchOpts{cacheID: releaseID, noHot: e.cache != nil && releaseID != ""}
+	fo := fetchOpts{cacheID: releaseID, noHot: e.cache != nil && releaseID != "", meter: meter}
 	if err := p.ensure(ctx, verifier{e: e, prio: core.PriorityPrefetch, fo: fo}, volsOf(p.fetchPieces(offset, length))); err != nil {
 		return err
 	}

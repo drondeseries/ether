@@ -182,15 +182,31 @@ func StripReasoning(content string) string {
 	return strings.TrimSpace(content)
 }
 
+// defaultChatMaxTokens bounds one reply when the caller set no budget.
+// It must always be sent: some routers (OpenRouter via a proxy) size an
+// unbounded request at the model's full output limit and drop every
+// provider that cannot serve it (#649). It matches the Anthropic bound
+// the same features already run under.
+const defaultChatMaxTokens = 4096
+
+// useMaxCompletionTokens reports whether the endpoint takes the reply
+// budget as max_completion_tokens (OpenAI and its reasoning models)
+// rather than the legacy max_tokens.
+func useMaxCompletionTokens(cfg config.LLM) bool {
+	p, _ := cfg.Endpoint()
+	return p.ID == "openai" || strings.HasPrefix(cfg.Model, "gpt-5") || strings.HasPrefix(cfg.Model, "o1") || strings.HasPrefix(cfg.Model, "o3") || strings.HasPrefix(cfg.Model, "o4")
+}
+
 func (c *Client) chatOnce(ctx context.Context, base string, cfg config.LLM, msgs []Message, jsonMode, temp bool) (string, int, error) {
 	cr := chatRequest{Model: cfg.Model, Messages: msgs}
-	if budget, ok := ctx.Value(chatBudgetKey{}).(int); ok {
-		p, _ := cfg.Endpoint()
-		if p.ID == "openai" || strings.HasPrefix(cfg.Model, "gpt-5") || strings.HasPrefix(cfg.Model, "o1") || strings.HasPrefix(cfg.Model, "o3") || strings.HasPrefix(cfg.Model, "o4") {
-			cr.MaxCompletionTokens = budget
-		} else {
-			cr.MaxTokens = budget
-		}
+	budget := defaultChatMaxTokens
+	if b, ok := ctx.Value(chatBudgetKey{}).(int); ok {
+		budget = b
+	}
+	if useMaxCompletionTokens(cfg) {
+		cr.MaxCompletionTokens = budget
+	} else {
+		cr.MaxTokens = budget
 	}
 	if temp {
 		t := temperature

@@ -35,11 +35,21 @@ func (m *Manager) PlaybackProgress(userID int64, clientID string, key core.Ratin
 	now := m.now()
 	for _, s := range sessions {
 		s.mu.Lock()
-		s.viewerPosition = max(0, position)
+		prevState := s.viewerState
+		prevPausedAt := s.pausedAt
+		prevPos := s.viewerPosition
+		prevProgressAt := s.lastProgressAt
+		stateChanged := s.viewerAt.IsZero() || s.viewerState != state
+		newPos := max(0, position)
+		s.viewerPosition = newPos
 		s.viewerAt = time.Now()
-		s.viewerState = state
-		if measuredProtocol(s.caps.Protocol) {
-			s.exp.observe(now, reportsBuffering(s.caps.Protocol), max(0, position), state)
+		s.lastProgressAt = now
+		s.setViewerStateLocked(state, now)
+		if state == "paused" || state == "stopped" {
+			s.invalidateDirectRetryLocked()
+		}
+		if !s.caps.NoPlaybackTelemetry {
+			s.exp.observe(now, !s.caps.InferBuffering, newPos, state)
 		}
 		if state == "playing" || state == "paused" {
 			s.lastActive = now
@@ -52,6 +62,13 @@ func (m *Manager) PlaybackProgress(userID int64, clientID string, key core.Ratin
 			pausedRelease = s.cur.releaseID()
 		}
 		s.mu.Unlock()
+		m.observeViewerVersionChoice(s, newPos, state, prevState)
+		m.observeProgressDomainEvents(s, prevState, prevPausedAt, prevPos, prevProgressAt, state, newPos, now)
+		m.noteTimelineStall(s, now)
+		m.observeTimelineStall(s, now)
+		if stateChanged {
+			m.emitEvent("progress", s, nil)
+		}
 		m.startSubtitleCheck(s)
 		m.noteCause(pausedRelease, core.CacheCausePaused)
 		m.maintainReserve(s, position, state)

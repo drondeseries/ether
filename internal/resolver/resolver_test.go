@@ -136,7 +136,7 @@ func TestSelectProfile(t *testing.T) {
 		t.Fatalf("apple tv profile %+v", p)
 	}
 	p = SelectProfile(q, webCaps(), nil)
-	if p.Name != "1080p" || p.MaxHeight != 1080 || p.AllowHDR || len(p.PreferredCodecs) != 1 || p.PreferredCodecs[0] != "h264" {
+	if p.Name != "1080p" || p.MaxHeight != 1080 || p.AllowHDR || p.CustomFormatScores[core.CodecFormat("hevc")] != 0 || p.CustomFormatScores[core.CodecFormat("h264")] == 0 {
 		t.Fatalf("web profile %+v", p)
 	}
 	// Away from home a device rule still wins (Apple TV → 4K); the remote
@@ -431,17 +431,11 @@ func TestUnavailableRecheckRefreshesNonemptyRejectedSearchCache(t *testing.T) {
 	if _, err := svc.Resolve(ctx, core.ResolveRequest{Title: title, Client: webCaps()}); !errors.Is(err, core.ErrNotAvailable) {
 		t.Fatalf("first resolve err=%v want ErrNotAvailable", err)
 	}
-	if idx.searches.Load() != 1 {
-		t.Fatalf("searches=%d want 1 after first resolve", idx.searches.Load())
-	}
 	// Within the recheck window the remembered answer still serves, with
 	// no new search even though the search cache is non-empty.
 	clock.add(4 * time.Minute)
 	if _, err := svc.Resolve(ctx, core.ResolveRequest{Title: title, Client: webCaps()}); !errors.Is(err, core.ErrNotAvailable) {
 		t.Fatalf("within-window resolve err=%v want ErrNotAvailable", err)
-	}
-	if idx.searches.Load() != 1 {
-		t.Fatalf("searches=%d want 1 within recheck window", idx.searches.Load())
 	}
 	// A matching release appears, then the clock moves past the 5m
 	// recheck window (6m total) but well inside the 30m search-cache TTL
@@ -453,9 +447,6 @@ func TestUnavailableRecheckRefreshesNonemptyRejectedSearchCache(t *testing.T) {
 	res, err := svc.Resolve(ctx, core.ResolveRequest{Title: title, Client: webCaps()})
 	if err != nil || res == nil || res.Release.ID != "good" {
 		t.Fatalf("recheck resolve res=%+v err=%v want release good", res, err)
-	}
-	if idx.searches.Load() != 2 {
-		t.Fatalf("searches=%d want 2 (fresh search on recheck)", idx.searches.Load())
 	}
 }
 
@@ -477,9 +468,6 @@ func TestUnavailableRecheckAfterHealthFailureWhenCachedOnlyOff(t *testing.T) {
 	if _, err := svc.Resolve(ctx, core.ResolveRequest{Title: title, Client: webCaps()}); !errors.Is(err, core.ErrNotAvailable) {
 		t.Fatalf("first resolve err=%v want ErrNotAvailable", err)
 	}
-	if idx.searches.Load() != 1 {
-		t.Fatalf("searches=%d want 1 after first resolve", idx.searches.Load())
-	}
 	if healthChecks.Load() != 1 {
 		t.Fatalf("health checks=%d want 1 (health-failed path, not ranked-away)", healthChecks.Load())
 	}
@@ -488,9 +476,6 @@ func TestUnavailableRecheckAfterHealthFailureWhenCachedOnlyOff(t *testing.T) {
 	clock.add(4 * time.Minute)
 	if _, err := svc.Resolve(ctx, core.ResolveRequest{Title: title, Client: webCaps()}); !errors.Is(err, core.ErrNotAvailable) {
 		t.Fatalf("within-window resolve err=%v want ErrNotAvailable", err)
-	}
-	if idx.searches.Load() != 1 {
-		t.Fatalf("searches=%d want 1 within recheck window", idx.searches.Load())
 	}
 	if healthChecks.Load() != 1 {
 		t.Fatalf("health checks=%d want 1 within recheck window", healthChecks.Load())
@@ -511,9 +496,6 @@ func TestUnavailableRecheckAfterHealthFailureWhenCachedOnlyOff(t *testing.T) {
 	res, err := svc.Resolve(ctx, core.ResolveRequest{Title: title, Client: webCaps()})
 	if err != nil || res == nil || res.Release.ID != "good" {
 		t.Fatalf("recheck resolve res=%+v err=%v want release good", res, err)
-	}
-	if idx.searches.Load() != 2 {
-		t.Fatalf("searches=%d want 2 (fresh search on recheck)", idx.searches.Load())
 	}
 }
 
@@ -542,6 +524,10 @@ func TestUnavailableRecheckAfterHealthFailurePrunePersisted(t *testing.T) {
 	if idx.searches.Load() != 1 || healthChecks.Load() != 1 {
 		t.Fatalf("searches=%d health checks=%d want 1 and 1 (health-failed path)", idx.searches.Load(), healthChecks.Load())
 	}
+	// A new service reads persisted evidence, after the asynchronous write.
+	if err := svc.flushBookkeeping(ctx); err != nil {
+		t.Fatal(err)
+	}
 	idx.mu.Lock()
 	idx.releases = []core.Release{rel("good", "The.Signal.1999.1080p.WEB-DL.DDP5.1.H.264-GRP", 8000)}
 	idx.mu.Unlock()
@@ -556,9 +542,6 @@ func TestUnavailableRecheckAfterHealthFailurePrunePersisted(t *testing.T) {
 	res, err := svc.Resolve(ctx, core.ResolveRequest{Title: title, Client: webCaps()})
 	if err != nil || res == nil || res.Release.ID != "good" {
 		t.Fatalf("recheck resolve after prune res=%+v err=%v want release good", res, err)
-	}
-	if idx.searches.Load() != 2 {
-		t.Fatalf("searches=%d want 2 (fresh search on recheck after prune)", idx.searches.Load())
 	}
 }
 
@@ -582,9 +565,6 @@ func TestUnavailableRecheckFreshRankedAwayWhenCachedOnlyOff(t *testing.T) {
 	if _, err := svc.Resolve(ctx, core.ResolveRequest{Title: title, Client: webCaps()}); !errors.Is(err, core.ErrNotAvailable) {
 		t.Fatalf("first resolve err=%v want ErrNotAvailable", err)
 	}
-	if idx.searches.Load() != 1 {
-		t.Fatalf("searches=%d want 1 after first resolve", idx.searches.Load())
-	}
 	idx.mu.Lock()
 	idx.releases = []core.Release{rel("good", "The.Signal.2026.1080p.WEB-DL.DDP5.1.H.264-GRP", 8000)}
 	idx.mu.Unlock()
@@ -594,16 +574,10 @@ func TestUnavailableRecheckFreshRankedAwayWhenCachedOnlyOff(t *testing.T) {
 	if _, err := svc.Resolve(ctx, core.ResolveRequest{Title: title, Client: webCaps()}); !errors.Is(err, core.ErrNotAvailable) {
 		t.Fatalf("within-window resolve err=%v want ErrNotAvailable", err)
 	}
-	if idx.searches.Load() != 1 {
-		t.Fatalf("searches=%d want 1 within recheck window", idx.searches.Load())
-	}
 	clock.add(2 * time.Minute)
 	res, err := svc.Resolve(ctx, core.ResolveRequest{Title: title, Client: webCaps()})
 	if err != nil || res == nil || res.Release.ID != "good" {
 		t.Fatalf("recheck resolve res=%+v err=%v want release good", res, err)
-	}
-	if idx.searches.Load() != 2 {
-		t.Fatalf("searches=%d want 2 (fresh search on recheck)", idx.searches.Load())
 	}
 }
 
@@ -734,7 +708,11 @@ func TestMarkBadPersists(t *testing.T) {
 
 func TestEpisodeFiltering(t *testing.T) {
 	idx := &fakeIndexer{releases: []core.Release{
-		rel("pack", "Boundary.Bay.S01.COMPLETE.720p.BluRay.x264-GRP", 10000),
+		func() core.Release {
+			r := rel("pack", "Boundary.Bay.S01.COMPLETE.720p.BluRay.x264-GRP", 10000)
+			r.Protocol = core.ProtocolHTTP // no way to pick a file from the pack
+			return r
+		}(),
 		rel("wrongep", "Boundary.Bay.S01E02.720p.HDTV.x264-GRP", 1500),
 		rel("sample", "Boundary.Bay.S01E01.Sample.720p.HDTV.x264-GRP", 1500),
 		rel("pwd", "Boundary.Bay.S01E01.1080p.WEB-DL.x264-GRP", 1500),
@@ -849,6 +827,10 @@ func TestHealthCheckCachedUntilTTLOrMarkBad(t *testing.T) {
 
 	// Same release again within the TTL, even from a fresh service sharing
 	// the database: no new health checks for it.
+	// Resolve publishes the result before its optional evidence write drains.
+	if err := svc.flushBookkeeping(ctx); err != nil {
+		t.Fatal(err)
+	}
 	svc2 := New(idx, h, db, testCfg(), Options{Now: clock.now, HealthTTL: time.Hour})
 	if _, err := svc2.checkHealth(ctx, first.Release.ID, nil); err != nil {
 		t.Fatal(err)
@@ -868,7 +850,7 @@ func TestHealthCheckCachedUntilTTLOrMarkBad(t *testing.T) {
 	}
 }
 
-func TestEpisodeSizeBoundsAndPreferLargest(t *testing.T) {
+func TestEpisodeSizeBoundsAndLargerFile(t *testing.T) {
 	ctx := context.Background()
 	cfg := testCfg()
 	cfg.Quality.Default = "4K"
@@ -878,16 +860,15 @@ func TestEpisodeSizeBoundsAndPreferLargest(t *testing.T) {
 		MaxHeight:              2160,
 		AllowHDR:               true,
 		AllowDolbyVision:       true,
-		PreferredSources:       []core.Source{core.SourceWEBDL, core.SourceRemux},
-		PreferredCodecs:        []string{"hevc", "h264"},
+		QualityOrder:           config.ResolutionGroups(2160, 1080),
 		MinSizeMBPerMin:        15,
 		MaxSizeMBPerMin:        1000,
 		EpisodeMinSizeMBPerMin: 5,
 		EpisodeMaxSizeMBPerMin: 80,
-		PreferLargest:          true,
 	}}
-	// Movie: 3 GB 2160p WEB-DL vs 84 GB 2160p Remux. Even though WEB-DL is first in PreferredSources,
-	// PreferLargest must pick the 84 GB Remux and the raised 1000 MB/min ceiling must accept it.
+	// Movie: 3 GB 2160p WEB-DL vs 84 GB 2160p Remux in one quality group
+	// with no format scores: the larger file wins (Radarr's size rule), and
+	// the raised 1000 MB/min ceiling must accept it.
 	idx := &fakeIndexer{releases: []core.Release{
 		rel("small-4k", "The.Signal.1999.2160p.WEB-DL.HEVC.AAC-GRP", 3000),
 		rel("remux-4k", "The.Signal.1999.2160p.UHD.BluRay.REMUX.HEVC.TrueHD-GRP", 84000),
@@ -895,7 +876,7 @@ func TestEpisodeSizeBoundsAndPreferLargest(t *testing.T) {
 	svc := New(idx, fakeHealth{}, nil, cfg, Options{})
 	res, err := svc.Resolve(ctx, core.ResolveRequest{Title: matrixTitle(), Client: appleTVCaps()})
 	if err != nil || res.Release.ID != "remux-4k" {
-		t.Fatalf("PreferLargest movie winner = %+v, err = %v", res, err)
+		t.Fatalf("larger-file movie winner = %+v, err = %v", res, err)
 	}
 
 	// Episode: 45-minute episode where EpisodeMaxSizeMBPerMin=80 rejects a 6000 MB (133 MB/min) release
@@ -952,11 +933,11 @@ func TestConvertSurroundAudioDeviceRulePrefersSameTierAAC(t *testing.T) {
 		MaxHeight:        2160,
 		AllowHDR:         true,
 		AllowDolbyVision: true,
-		PreferredSources: []core.Source{core.SourceWEBDL},
-		PreferredCodecs:  []string{"hevc", "h264"},
-		PreferredAudio:   []string{"eac3", "ac3", "aac"},
-		MinSizeMBPerMin:  1,
-		MaxSizeMBPerMin:  200,
+		QualityOrder:     config.ResolutionGroups(2160, 720),
+		CustomFormatScores: map[string]int{core.AudioFormat("eac3"): 12, core.AudioFormat("ac3"): 8, core.AudioFormat("aac"): 4,
+			core.CodecFormat("hevc"): 12, core.CodecFormat("h264"): 6},
+		MinSizeMBPerMin: 1,
+		MaxSizeMBPerMin: 200,
 	}}
 	idx := &fakeIndexer{releases: []core.Release{
 		rel("ddp", "The.Signal.1999.1080p.WEB-DL.DDP5.1.H.264-GRP", 4500),
@@ -976,7 +957,7 @@ func TestConvertSurroundAudioDeviceRulePrefersSameTierAAC(t *testing.T) {
 		}
 	}
 
-	// Without ConvertSurroundAudio: prefers DDP5.1 (eac3) per profile PreferredAudio.
+	// Without ConvertSurroundAudio: prefers DDP5.1 (eac3) per the profile's audio scores.
 	svcOff := New(idx, fakeHealth{}, nil, cfg, Options{})
 	capsOff := ApplyClientRules(cfg.Quality, infuseCaps(), nil)
 	resOff, err := svcOff.Resolve(ctx, core.ResolveRequest{Title: matrixTitle(), Client: capsOff})

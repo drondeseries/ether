@@ -5,6 +5,7 @@ import (
 	"hash/fnv"
 	"math/rand/v2"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/braedonsaunders/ether/internal/core"
@@ -84,9 +85,7 @@ func (s *Service) Run(ctx context.Context) {
 // RunDue rebuilds every collection that is due and returns how many were
 // built.
 func (s *Service) RunDue(ctx context.Context) int {
-	if err := s.seedLibraryDefaults(ctx); err != nil && ctx.Err() == nil {
-		s.log.Warn("collections: default facets", "err", err)
-	}
+	s.repairMemberTiers(ctx)
 	rows, err := s.loadRows(ctx)
 	if err != nil {
 		s.log.Warn("collections: scheduler", "err", err)
@@ -96,6 +95,11 @@ func (s *Service) RunDue(ctx context.Context) int {
 	for _, row := range rows {
 		if ctx.Err() != nil {
 			break
+		}
+		if strings.HasPrefix(row.slug, "plugin:") {
+			if _, ok := s.kindRegistry().Lookup(row.slug); !ok {
+				continue
+			}
 		}
 		if !row.builtin && row.owner > 0 && len(row.spec.Sources) == 1 && row.spec.Sources[0].Kind == "titles" && len(row.spec.Sources[0].Keys) == 0 {
 			_, _ = s.db.ExecContext(ctx, `DELETE FROM collections_specs WHERE id=? AND builtin=0`, row.id)

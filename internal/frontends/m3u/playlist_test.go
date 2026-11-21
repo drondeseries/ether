@@ -16,13 +16,16 @@ import (
 
 func TestPlaylistEscapesChannelMetadataAndRejectsUnsafeURLs(t *testing.T) {
 	var out bytes.Buffer
-	err := writePlaylist(&out, []playlistEntry{{ID: "channel\"\n#EXTINF:bad", Name: "News\r\nInjected", StreamURL: "https://ether.example/m3u/scoped"}})
+	err := writePlaylist(&out, []playlistEntry{{ID: "channel\"\n#EXTINF:bad", Name: "News\r\nInjected", Group: "News\"\r\nWeather", StreamURL: "https://ether.example/m3u/scoped"}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	lines := strings.Split(strings.TrimSuffix(out.String(), "\n"), "\n")
 	if len(lines) != 3 || lines[2] != "https://ether.example/m3u/scoped" || strings.Contains(lines[1], "\r") {
 		t.Fatalf("unexpected playlist: %q", out.String())
+	}
+	if !strings.Contains(lines[1], `group-title="News   Weather"`) {
+		t.Fatalf("group not escaped: %s", lines[1])
 	}
 	for _, bad := range []string{"https://ether.example/a\nhttp://evil.example", "https://user:pass@ether.example/a", "file:///tmp/media", "/relative"} {
 		out.Reset()
@@ -51,7 +54,7 @@ func TestPlaylistContainsOnlyViewerChannelsAndScopedMediaURLs(t *testing.T) {
 			if viewer.ID != 7 {
 				t.Fatal("wrong viewer")
 			}
-			return []frontend.LiveChannel{{ID: "allowed", Name: "News", Images: []frontend.Image{{}}}}, nil
+			return []frontend.LiveChannel{{ID: "allowed", Name: "News", Group: "Provider Raw", Groups: []frontend.LiveGroup{{ID: "owners-news", Name: "World News"}}, Images: []frontend.Image{{}}}}, nil
 		}},
 		ImageGrants: frontendtest.ImageGrants{IssueFunc: func(_ context.Context, req frontend.ImageGrantRequest) (string, error) {
 			if req.Credential != "grant" || req.Channel != "allowed" {
@@ -79,7 +82,7 @@ func TestPlaylistContainsOnlyViewerChannelsAndScopedMediaURLs(t *testing.T) {
 		if w.Code != tc.status {
 			t.Fatalf("status %d: %s", w.Code, w.Body.String())
 		}
-		if tc.status == 200 && (strings.Contains(w.Body.String(), "grant") || !strings.Contains(w.Body.String(), `tvg-id="allowed"`) || !strings.Contains(w.Body.String(), "https://ether.example/m3u/sessions/lineup/opaque/YWxsb3dlZA/live/index.m3u8")) {
+		if tc.status == 200 && (strings.Contains(w.Body.String(), "grant") || !strings.Contains(w.Body.String(), `tvg-id="allowed"`) || !strings.Contains(w.Body.String(), `group-title="World News"`) || strings.Contains(w.Body.String(), "Provider Raw") || !strings.Contains(w.Body.String(), "https://ether.example/m3u/sessions/lineup/opaque/YWxsb3dlZA/live/index.m3u8")) {
 			t.Fatalf("playlist %q", w.Body.String())
 		}
 	}

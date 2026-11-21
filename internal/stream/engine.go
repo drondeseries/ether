@@ -33,11 +33,21 @@ import (
 	"github.com/braedonsaunders/ether/internal/config"
 	"github.com/braedonsaunders/ether/internal/core"
 	"github.com/braedonsaunders/ether/internal/nzb"
+	"github.com/braedonsaunders/ether/internal/vault"
 )
+
+// DefaultBackoffHold bounds how long an active client byte-range read waits
+// for a Usenet provider to leave backoff before failing.
+const DefaultBackoffHold = 45 * time.Second
 
 // Options tune the engine. Zero values take the defaults noted.
 type Options struct {
-	Repair config.Repair
+	// WantLayout skips background discovery for releases that cannot save layouts.
+	WantLayout func(releaseID string) bool
+	OnLayout   func(releaseID string, l vault.Layout)
+	OnMissing  func(releaseID string)
+	OnHealthy  func(releaseID string)
+	Repair     config.Repair
 	// HotBufferBytes bounds decoded segments kept in memory across all
 	// sources (default 256 MiB).
 	HotBufferBytes int64
@@ -63,6 +73,10 @@ type Options struct {
 	OpenParallel int
 	// ReadTimeout bounds one ReadAt (default 90 s); ReadAt has no context.
 	ReadTimeout time.Duration
+	// BackoffHold bounds how long an active live ReadAt holds when every
+	// provider able to serve an article is backing off (default 45 s,
+	// capped at 45 s; negative disables holding).
+	BackoffHold time.Duration
 	// MaxReleases is how many parsed release indexes are kept for reuse
 	// (default 32). Releases with open sources are never dropped.
 	MaxReleases int
@@ -115,6 +129,11 @@ func (o Options) withDefaults() Options {
 	}
 	if o.ReadTimeout <= 0 {
 		o.ReadTimeout = 90 * time.Second
+	}
+	if o.BackoffHold == 0 {
+		o.BackoffHold = DefaultBackoffHold
+	} else if o.BackoffHold > DefaultBackoffHold {
+		o.BackoffHold = DefaultBackoffHold
 	}
 	return o
 }
@@ -172,6 +191,7 @@ type Engine struct {
 	repairSummaryBytes atomic.Int64
 
 	fetcher    core.ArticleFetcher
+	statTrust  *engineStatTrust
 	cache      core.SegmentCache
 	opts       Options
 	log        *slog.Logger
@@ -194,6 +214,7 @@ type Engine struct {
 
 	playAhead   atomic.Int64 // time.Duration of playback read-ahead; 0 = off
 	playSources sync.Map     // *source -> struct{}: sources running a playback read-ahead loop
+	sources     sync.Map     // *source -> struct{}: open sources (fair share of connections)
 
 	par2Loaded, par2Failed, par2Skipped, par2Named, par2Saved, par2Verified, par2Mismatches atomic.Int64
 }
@@ -241,6 +262,7 @@ func New(fetcher core.ArticleFetcher, cache core.SegmentCache, opts Options, log
 		repairGate:    make(chan struct{}, 1),
 		repairPersist: make(chan struct{}, 1),
 		fetcher:       fetcher,
+		statTrust:     newEngineStatTrust(time.Now),
 		cache:         cache,
 		opts:          opts,
 		log:           logger.With("component", "stream"),
@@ -312,6 +334,11 @@ func (e *Engine) Open(ctx context.Context, releaseID string, nzbData []byte) (co
 	if err != nil {
 		return nil, err
 	}
+	return e.openRelease(ctx, releaseID, releaseID, rel)
+}
+
+func (e *Engine) openRelease(ctx context.Context, releaseID, feedbackID string, rel *release) (core.MediaSource, error) {
+	liveStart, missingStart := rel.liveArticles.Load(), rel.missingEpoch.Load()
 	// The plan probe is the cold-start head of line: its reads are one stream.
 	p, err := rel.ensurePlan(core.WithStreamKey(ctx, rel), core.PriorityLive, releaseID)
 	if err != nil {
@@ -335,7 +362,25 @@ func (e *Engine) Open(ctx context.Context, releaseID string, nzbData []byte) (co
 		}
 		cancel()
 	}
-	return newSource(e, rel, p, releaseID), nil
+	if cb := e.opts.OnLayout; cb != nil && !p.restored && (e.opts.WantLayout == nil || e.opts.WantLayout(feedbackID)) {
+		p.report.Do(func() {
+			e.mu.Lock()
+			defer e.mu.Unlock()
+			if e.closed {
+				return
+			}
+			rel.refs++
+			e.wg.Go(func() {
+				defer e.release(rel)
+				if l := p.vaultLayout(e.ctx, releaseID); l != nil && e.ctx.Err() == nil {
+					cb(feedbackID, *l)
+				}
+			})
+		})
+	}
+	src := newSource(e, rel, p, releaseID)
+	src.liveStart, src.missingStart = liveStart, missingStart
+	return src, nil
 }
 
 // Prefetch warms [offset, offset+length) of the main video into the
@@ -361,21 +406,32 @@ func (e *Engine) Prefetch(ctx context.Context, releaseID string, nzbData []byte,
 func (e *Engine) acquire(nzbData []byte) (*release, error) {
 	sum := sha256.Sum256(nzbData)
 	digest := hex.EncodeToString(sum[:12])
-	e.mu.Lock()
-	if el, ok := e.releases[digest]; ok {
-		rel := el.Value.(*release)
-		rel.refs++
-		e.relLRU.MoveToFront(el)
-		e.mu.Unlock()
+	if rel := e.cachedRelease(digest); rel != nil {
 		return rel, nil
 	}
-	e.mu.Unlock()
 
 	doc, err := nzb.Parse(nzbData)
 	if err != nil {
 		return nil, err
 	}
-	rel := newRelease(e, digest, doc)
+	return e.retainRelease(newRelease(e, digest, doc)), nil
+}
+
+func (e *Engine) cachedRelease(digest string) *release {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	el := e.releases[digest]
+	if el == nil {
+		return nil
+	}
+	r := el.Value.(*release)
+	r.refs++
+	e.relLRU.MoveToFront(el)
+	return r
+}
+
+func (e *Engine) retainRelease(rel *release) *release {
+	digest := rel.digest
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -383,12 +439,12 @@ func (e *Engine) acquire(nzbData []byte) (*release, error) {
 		other := el.Value.(*release)
 		other.refs++
 		e.relLRU.MoveToFront(el)
-		return other, nil
+		return other
 	}
 	rel.refs = 1
 	e.releases[digest] = e.relLRU.PushFront(rel)
 	e.trimReleasesLocked()
-	return rel, nil
+	return rel
 }
 
 func (e *Engine) release(rel *release) {

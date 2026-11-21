@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/braedonsaunders/ether/internal/admin"
 	"github.com/braedonsaunders/ether/internal/backup"
 	"github.com/braedonsaunders/ether/internal/config"
 	"github.com/braedonsaunders/ether/internal/plextv"
@@ -92,9 +93,9 @@ func waitPhase(t *testing.T, base string, phase startup.Phase) (startup.Status, 
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
-	st, raw := fetchStatus(t, base)
+	_, raw := fetchStatus(t, base)
 	t.Fatalf("phase %q never reached; last %s", phase, raw)
-	return st, raw
+	return startup.Status{}, raw
 }
 
 // A clustered node whose PostgreSQL server is down answers only its
@@ -121,14 +122,23 @@ func TestServeShowsWaitingForTheDatabase(t *testing.T) {
 			t.Fatalf("GET %s while waiting: %d %v", path, resp.StatusCode, resp.Header)
 		}
 	}
-	// The console itself loads, so it can render the status page.
+	// The console route bypasses startup.Gate (no Retry-After gate error),
+	// serving the built SPA shell or the unbuilt source-checkout placeholder.
 	resp, err := http.Get(base + "/ether/")
 	if err != nil {
 		t.Fatal(err)
 	}
+	body, err := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if resp.StatusCode == http.StatusServiceUnavailable {
-		t.Fatalf("console shell: %d", resp.StatusCode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if admin.ConsoleBuilt() {
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("console shell: %d", resp.StatusCode)
+		}
+	} else if resp.StatusCode != http.StatusServiceUnavailable || resp.Header.Get("Retry-After") != "" || !strings.Contains(string(body), "Ether console is not built") {
+		t.Fatalf("unbuilt console shell: %d headers=%v body=%s", resp.StatusCode, resp.Header, body)
 	}
 	if err := stop(); err != nil && !errors.Is(err, context.Canceled) {
 		t.Logf("Serve returned %v", err)
@@ -140,7 +150,6 @@ func TestServeShowsWaitingForTheDatabase(t *testing.T) {
 func writeBundle(t *testing.T, dataDir string, edit ...func(*config.Config)) string {
 	t.Helper()
 	src := t.TempDir()
-	store.SeedTestDataDir(t, src)
 	db, err := store.Open(context.Background(), src)
 	if err != nil {
 		t.Fatal(err)
@@ -347,7 +356,6 @@ func newOpsApp(t *testing.T) *App {
 	if err := cfg.Update(func(c *config.Config) error { c.Transcode.FFmpegPath = "/not-installed/ffmpeg"; return nil }); err != nil {
 		t.Fatal(err)
 	}
-	store.SeedTestDataDir(t, dir)
 	a, err := New(context.Background(), Options{DataDir: dir, Logger: quietLog()})
 	if err != nil {
 		t.Fatal(err)

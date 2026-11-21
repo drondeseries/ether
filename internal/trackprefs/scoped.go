@@ -47,6 +47,14 @@ func (s *Service) PutScoped(ctx context.Context, user int64, scope, id string, v
 	if user <= 0 || (scope != "device" && scope != "series" && scope != "library") || id == "" || len(id) > 128 || strings.ContainsAny(id, "\x00\r\n") {
 		return errors.New("invalid scoped track preference")
 	}
+	if value.AudioLanguages != nil {
+		canon := canonicalLanguages(*value.AudioLanguages)
+		value.AudioLanguages = &canon
+	}
+	if value.SubtitleLanguages != nil {
+		canon := canonicalLanguages(*value.SubtitleLanguages)
+		value.SubtitleLanguages = &canon
+	}
 	check := Default()
 	if value.AudioLanguages != nil {
 		check.AudioLanguages = *value.AudioLanguages
@@ -138,7 +146,7 @@ func (s *Service) PutScoped(ctx context.Context, user int64, scope, id string, v
 func (s *Service) ScopedRules(ctx context.Context, user int64, scope Scope) (Rules, bool, error) {
 	r, sources, err := s.ScopedRulesWithSources(ctx, user, scope)
 	for _, source := range sources {
-		if source != "profile" && source != "plex" {
+		if source == "device" || source == "series" || source == "library" {
 			return r, true, err
 		}
 	}
@@ -159,16 +167,16 @@ func (s *Service) ScopedRulesWithSources(ctx context.Context, user int64, scope 
 		return r, nil, err
 	}
 	sources := map[string]string{}
-	if s.options.PlexLayer != nil && user > 0 {
-		if layer, ok := s.options.PlexLayer(ctx, user); ok {
+	if s.options.AccountLayer != nil && user > 0 {
+		if layer, ok := s.options.AccountLayer(ctx, user); ok {
 			if layer.AutoSelectAudio && layer.AudioLanguage != "" {
-				sources["audio"] = "plex"
+				sources["audio"] = layer.Source
 			}
 			if layer.SubtitleLanguage != "" {
-				sources["subtitle"] = "plex"
+				sources["subtitle"] = layer.Source
 			}
 			if layer.SubtitleMode != "" {
-				sources["subtitle_mode"] = "plex"
+				sources["subtitle_mode"] = layer.Source
 			}
 		}
 	}

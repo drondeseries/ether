@@ -16,7 +16,7 @@ import (
 // suspended (Windows) it stops ffmpeg instead and restarts it at the next
 // missing segment in time.
 func (s *Session) throttleLocked() {
-	if s.m.opts.maxAhead <= 0 || s.info.Duration <= 0 {
+	if (s.m.opts.maxAhead <= 0 && !s.speculative) || s.info.Duration <= 0 {
 		return
 	}
 	limit := s.aheadLimit()
@@ -94,6 +94,17 @@ func (s *Session) leadOverLocked(r *run) bool {
 
 // aheadLimit is how many segments ffmpeg may run ahead of the player.
 func (s *Session) aheadLimit() int {
+	if s.speculative {
+		return 2
+	}
+	// Encoders compete at normal priority while playback needs media. Once
+	// four segments are ready the reversible pause/resume throttle yields
+	// the CPU until only two remain. Renicing a running child back from 5
+	// to 0 requires privileges on Unix; never strand playback at nice 5.
+	// Copies retain the owner's larger read-ahead and background priority.
+	if !s.liveInput && !s.decision.VideoCopy {
+		return 4
+	}
 	limit := int(s.m.opts.maxAhead / s.segDur)
 	if limit < 4 {
 		limit = 4
@@ -154,11 +165,38 @@ func (s *Session) startRunLocked(seg int, bigProbe bool) error {
 	if s.closed {
 		return errors.New("transcode: session closed")
 	}
+	if s.headerRecovering {
+		return nil
+	}
 	if s.inputFailed {
 		return errInputExhausted
 	}
+
 	s.encoder.decisionEncoding(!s.decision.VideoCopy)
-	s.stopRunLocked()
+	// Keep a delivered rendition alive while a replacement starts at the exact
+	// requested segment. A second switch retires the preceding overlap first.
+	s.stopHandoffLocked()
+	overlap := !s.serialRungs && s.cur != nil && !s.cur.finished && !s.cur.stopped && s.cur.track != s.wantTrack && len(s.rungs) > 1 && !s.liveInput && !s.cur.rtx
+	if overlap {
+		s.handoff = s.cur
+		s.handoffAt = time.Now()
+		s.cur = nil
+		if s.handoff.paused {
+			if s.handoff.proc.Resume() == nil {
+				s.handoff.paused = false
+			}
+		}
+	} else {
+		s.stopRunLocked()
+	}
+	started := false
+	defer func() {
+		if !started && s.cur == nil && s.handoff != nil {
+			s.cur = s.handoff
+			s.handoff = nil
+		}
+	}()
+
 	// This start replaces any throttle resume. Clear it before waiting on
 	// the old process: a collector can take the lock during that wait and
 	// would otherwise start the old lead as a second run.
@@ -226,15 +264,22 @@ func (s *Session) startRunLocked(seg int, bigProbe bool) error {
 	}
 	rp := s.runPlanLocked(seg)
 	s.prepareRTXRunLocked(&rp, seg)
-	if s.softSubtitleStream != nil && enhancementSelected(rp.decision) {
+	if (s.softSubtitleStream != nil || len(s.textSubtitleStreams) > 0) && enhancementSelected(rp.decision) {
 		// The native enhancement process cannot expose a second output from
 		// its input. Use the regular encoder for this session's selected track.
 		s.fallbackRTXLocked("selected soft subtitle requires a shared encoder output", seg)
 		rp.decision = s.trackDecisionLocked(s.wantTrack)
 	}
+	if !s.liveInput && s.info.Video() != nil && !rp.decision.VideoCopy && s.m != nil && s.m.VideoTranscodingOff() {
+		return ErrVideoTranscodingDisabled
+	}
+	s.boundHLSRateLocked(&rp)
 	s.seekRampSeg = -1
 	rampClock := len(s.rungs) <= 1 && s.plan != nil && s.plan.rampSegs > 0
 	spec := runSpec{
+		SoftwareDecode:       s.softwareDecode,
+		HealTimestamps:       s.healTimestamps,
+		CopyOrigin:           s.copyOrigin,
 		AuthoredTimeline:     len(s.rungs) > 1 || (s.plan != nil && s.plan.rampSegs > 0),
 		RampClock:            rampClock,
 		SilenceAudio:         s.silenceAudio,
@@ -242,6 +287,7 @@ func (s *Session) startRunLocked(seg int, bigProbe bool) error {
 		RTXTimeline:          s.rtxTimeline,
 		AudioGainDB:          s.audioMatch.gain,
 		LiveInput:            s.liveInput,
+		LiveFromBacklog:      s.liveFromBacklog,
 		LoopInput:            s.loopInput,
 		InputHeaders:         s.inputHeaders,
 		Input:                s.input,
@@ -272,6 +318,16 @@ func (s *Session) startRunLocked(seg int, bigProbe bool) error {
 		spec.SoftSubtitlePath, pathErr = filepath.Abs(filepath.Join(s.dir, fmt.Sprintf("subtitle-%d.ass", s.runSeq)))
 		if pathErr != nil {
 			return pathErr
+		}
+	}
+	spec.TextSubtitlePaths = make(map[int]string)
+	for _, index := range s.textSubtitleStreams {
+		if track := findStream(s.info, index, "subtitle"); track != nil && !track.External && IsTextSubtitle(track.Codec) {
+			path, err := filepath.Abs(filepath.Join(s.dir, fmt.Sprintf("text-%d-%d.ass", index, s.runSeq)))
+			if err != nil {
+				return err
+			}
+			spec.TextSubtitlePaths[index] = path
 		}
 	}
 	if s.liveInput {
@@ -387,7 +443,11 @@ func (s *Session) startRunLocked(seg int, bigProbe bool) error {
 		r.progressMu.Lock()
 		r.progress = p
 		r.progressMu.Unlock()
-		if time.Since(lastLog) > 15*time.Second {
+		interval := 15 * time.Second
+		if s.traceOn() {
+			interval = time.Second
+		}
+		if time.Since(lastLog) > interval {
 			lastLog = time.Now()
 			runLog.Debug("ffmpeg progress", "outTime", p.OutTime, "speed", p.Speed, "fps", p.FPS)
 		}
@@ -414,6 +474,7 @@ func (s *Session) startRunLocked(seg int, bigProbe bool) error {
 		if reserveErr != nil {
 			r.watchWork.finish()
 			r.stopWork.finish()
+			work[2].finish()
 			return reserveErr
 		}
 		hintWork = reserved[0]
@@ -421,6 +482,10 @@ func (s *Session) startRunLocked(seg int, bigProbe bool) error {
 	starting := make(chan struct{})
 	s.starting = starting
 	rtxConfig, runDir, inputLease := s.rtxConfig, s.dir, s.inputLease
+	var stopping <-chan struct{}
+	if s.encoder != nil {
+		stopping = s.encoder.cancel
+	}
 	hint := s.m.opts.onRunStart
 	hintEnd := spec.Start + 2*s.segDur
 	s.mu.Unlock()
@@ -432,6 +497,11 @@ func (s *Session) startRunLocked(seg int, bigProbe bool) error {
 		err = graphFailure(spec)
 	}
 	if err == nil {
+		if needsCopyKeyframe(spec) {
+			probeCtx, cancelProbe := stopContext(stopping)
+			spec.SeekFrom, spec.HasSeekFrom = s.m.copyKeyframeBefore(probeCtx, spec)
+			cancelProbe()
+		}
 		args = buildArgs(spec)
 		r.spec = spec
 		err = os.MkdirAll(spec.Dir, 0o755)
@@ -464,9 +534,9 @@ func (s *Session) startRunLocked(seg int, bigProbe bool) error {
 		}
 	}
 	if err == nil && proc == nil {
-		proc, err = s.m.runner.Start(Command{Path: s.m.ffmpeg, Args: args, Dir: runDir, Stdout: stdout, Stderr: stderr})
+		proc, err = s.m.runner.Start(Command{Path: s.m.ffmpeg, Args: args, Dir: runDir, Stdout: stdout, Stderr: stderr, Background: !s.liveInput && spec.Decision.VideoCopy})
 	}
-	s.encoder.fenceProcess(proc)
+	s.encoder.fenceProcess(proc, work[2])
 	err = redactScopedCommandError(err, spec)
 	s.mu.Lock()
 	if s.starting == starting {
@@ -506,16 +576,18 @@ func (s *Session) startRunLocked(seg int, bigProbe bool) error {
 		s.decision.Enhancement.State = "starting"
 		s.decision.Enhancement.Reason = "waiting for enhanced segments from NVEncC/NGX"
 	}
+	s.preparationLocked("encoder-start", r.track)
 	r.proc = proc
 	s.cur = r
+	started = true
 	// A previous run's EOF does not bound the replacement. The copy of a
 	// short title can finish before a governor clamp restarts at an earlier
 	// segment, and a DASH seek can end on an empty trailing fragment. The
 	// new run publishes its own end.
 	s.endSeg = -1
 	s.deliveredCount = 0
-	runLog.Info("ffmpeg started", "segment", seg, "at", spec.Start, "kind", s.decision.Kind,
-		"videoCopy", s.decision.VideoCopy, "audioCopy", s.decision.AudioCopy, "hw", r.hw)
+	runLog.Info("ffmpeg started", "segment", seg, "at", spec.Start, "track", r.track, "kind", spec.Decision.Kind,
+		"videoCopy", spec.Decision.VideoCopy, "audioCopy", spec.Decision.AudioCopy, "hw", r.hw)
 	if s.traceOn() {
 		if cause == "" {
 			cause = "unspecified"
@@ -548,17 +620,27 @@ func (s *Session) chunkedLocked(d core.Decision) bool {
 	if s.liveInput || s.isDASH() || s.plan == nil || s.info.Video() == nil {
 		return false
 	}
-	return s.plan.Keyframed() || d.VideoCopy || s.copyFallback || s.container == ContainerMatroska
+	return s.plan.shortOpening || s.plan.Keyframed() || d.VideoCopy || s.copyFallback || s.container == ContainerMatroska
 }
 
 // stopRunLocked detaches the current run immediately. Process reaping happens
 // outside the session lock and is included in Close's watcher barrier.
 func (s *Session) stopRunLocked() {
+	s.stopHandoffLocked()
+	s.stopCurrentRunLocked()
+}
+
+func (s *Session) stopCurrentRunLocked() {
 	reason := s.traceStop
 	s.traceStop = ""
 	r := s.cur
 	if r == nil {
 		return
+	}
+	if r.finished {
+		for _, path := range r.spec.TextSubtitlePaths {
+			s.removals.remove(path)
+		}
 	}
 	if r.finished && r.spec.SoftSubtitlePath != "" {
 		s.removals.remove(r.spec.SoftSubtitlePath)
@@ -581,14 +663,15 @@ func (s *Session) stopRunLocked() {
 		s.reaping = reaped
 		stopWork := r.stopWork
 		r.stopWork = nil
+		proc := r.proc
 		s.watchers.Add(1)
 		go func() {
 			defer stopWork.finish()
 			defer s.watchers.Done()
 			defer close(reaped)
-			r.proc.Stop()
+			proc.Stop()
 			if stopWork != nil {
-				<-r.proc.Done()
+				<-proc.Done()
 			}
 			if previous != nil {
 				<-previous
@@ -644,4 +727,41 @@ func (s *Session) noteEncoder(started bool, args []string) {
 		return
 	}
 	s.m.opts.onEncoder(s.id, started, strings.Join(redactedRTXArgs(args), " "))
+}
+
+// stopHandoffLocked uses the normal owned stop/reaping path. Close therefore
+// drains both processes and their readers through the same lifetime barrier.
+func (s *Session) stopHandoffLocked() {
+	if s.handoff == nil {
+		return
+	}
+	current := s.cur
+	s.cur = s.handoff
+	s.handoff = nil
+	s.stopCurrentRunLocked()
+	s.cur = current
+}
+
+func (s *Session) advanceHandoffLocked(r *run) {
+	if s.handoff == nil {
+		return
+	}
+	if s.cur == r && r.produced > 0 && r.track >= 0 && r.track < len(s.done) && s.done[r.track][r.startSeg] {
+		s.stopHandoffLocked()
+		return
+	}
+	// A failed replacement cannot hold two processes indefinitely. Bound
+	// overlap to five seconds and the same small read-ahead as normal playback.
+	if time.Since(s.handoffAt) > 5*time.Second {
+		s.stopHandoffLocked()
+		return
+	}
+	old := s.handoff
+	if !old.paused && old.maxDone-s.lastReq > s.aheadLimit() {
+		if old.proc.Pause() == nil {
+			old.paused = true
+		} else {
+			s.stopHandoffLocked()
+		}
+	}
 }

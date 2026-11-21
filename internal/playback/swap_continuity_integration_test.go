@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -101,11 +102,33 @@ func TestOfflineBufferedSwapKeepsDecodableContiguousOutput(t *testing.T) {
 	fetch := func(n int) []byte {
 		t.Helper()
 		w := httptest.NewRecorder()
-		hs.ServeSegment(w, httptest.NewRequest(http.MethodGet, "/segment", nil).WithContext(ctx), n)
+		playlist := httptest.NewRecorder()
+		hs.ServePlaylist(playlist, httptest.NewRequest(http.MethodGet, "/index.m3u8", nil))
+		name := ""
+		for _, line := range strings.Split(playlist.Body.String(), "\n") {
+			if index, ok := transcode.ParseSegmentName(line); ok && index == n {
+				name = line
+				break
+			}
+		}
+		if name == "" {
+			t.Fatalf("playlist missing segment %d", n)
+		}
+		hs.ServeSegment(w, httptest.NewRequest(http.MethodGet, "/"+name, nil).WithContext(ctx), n)
 		if w.Code != http.StatusOK || w.Body.Len() == 0 {
 			t.Fatalf("segment %d status %d bytes %d", n, w.Code, w.Body.Len())
 		}
-		return append([]byte(nil), w.Body.Bytes()...)
+		// A fetch that waited for the encoder is committed early with MPEG-TS
+		// null packets (transcode segment padding); the same segment served
+		// from disk later has none. Compare and assemble the media itself.
+		body := w.Body.Bytes()
+		for len(body) >= 188 && body[0] == 0x47 && body[1]&0x1f == 0x1f && body[2] == 0xff {
+			body = body[188:]
+		}
+		if len(body) == 0 {
+			t.Fatalf("segment %d carried only padding", n)
+		}
+		return append([]byte(nil), body...)
 	}
 	first := fetch(0)
 	second := fetch(1)

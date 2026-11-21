@@ -37,6 +37,7 @@ import {
   Tags,
   Tv,
   Users,
+  Workflow,
 } from "lucide-react";
 import {
   forwardRef,
@@ -63,10 +64,12 @@ import {
 } from "react-router-dom";
 import { AppProvider, useApp } from "./app-context";
 import { hasExemptDiagnostic } from "./lib/health";
+import { useMediaQuery } from "./lib/hooks";
 import { t, tn } from "./i18n";
 import { I18nProvider, LanguagePicker } from "./i18n/react";
 import { Brand, BrandSplash, EtherMark } from "./components/brand";
 import { CommandSearch } from "./components/CommandSearch";
+import { WatchButton } from "./components/WatchButton";
 import { AskEther } from "./components/agent/AskEther";
 import { Drawer } from "./components/Drawer";
 import { ErrorPanel } from "./components/feedback";
@@ -89,9 +92,10 @@ import Home from "./pages/Home";
 import Login from "./pages/Login";
 import Startup, { isStarting } from "./pages/Startup";
 
+const loadDesigner = () => import("./pages/designer/Designer");
 const CollectionsGallery = lazy(() => import("./pages/collections/Gallery"));
 const CollectionEditor = lazy(() => import("./pages/collections/Editor"));
-const Designer = lazy(() => import("./pages/designer/Designer"));
+const Designer = lazy(loadDesigner);
 const ViewersList = lazy(() => import("./pages/viewers/ViewersList"));
 const ViewerProfile = lazy(() => import("./pages/viewers/ViewerProfile"));
 const settingsPage = <K extends keyof typeof import("./pages/settings/pages")>(name: K) =>
@@ -104,14 +108,16 @@ const ClusterPage = settingsPage("ClusterPage");
 const Setup = lazy(() => import("./pages/Setup"));
 const Activity = lazy(() => import("./pages/activity/Activity"));
 const Notifications = lazy(() => import("./pages/notifications/Notifications"));
+const Flows = lazy(() => import("./pages/flows/Flows"));
 const LiveTV = lazy(() => import("./pages/livetv/LiveTV"));
 const Calendar = lazy(() => import("./pages/calendar/Calendar"));
-const Catalog = lazy(() => import("./pages/catalog/Catalog"));
+const Libraries = lazy(() => import("./pages/libraries/Libraries"));
 const Metadata = lazy(() => import("./pages/metadata/Metadata"));
 const Sources = lazy(() => import("./pages/sources/Sources"));
 const Quality = lazy(() => import("./pages/releases/Releases"));
 const Cache = lazy(() => import("./pages/cache/Cache"));
 const Playback = lazy(() => import("./pages/playback/Playback"));
+const DeveloperReference = lazy(() => import("./pages/plugins/DeveloperReference"));
 const Plugins = lazy(() => import("./pages/plugins/Plugins"));
 const Studio = lazy(() => import("./pages/plugins/Studio"));
 const PluginPage = lazy(() => import("./viewspec/PluginPage"));
@@ -153,6 +159,7 @@ const NAV_ICONS = {
   Bell,
   Boxes,
   LifeBuoy,
+  Workflow,
 } as const;
 
 function navIcon(icon: string | undefined): ReactNode {
@@ -167,7 +174,7 @@ function navIcon(icon: string | undefined): ReactNode {
 /** Sidebar groups in display order; the top group has no heading. */
 const NAV_GROUPS: { key: string; label: () => string }[] = [
   { key: "", label: () => "" },
-  { key: "library", label: () => t("Library") },
+  { key: "library", label: () => t("Content") },
   { key: "streaming", label: () => t("Streaming") },
   { key: "server", label: () => t("Server") },
 ];
@@ -237,9 +244,15 @@ export function buildNavigation(descriptors: Descriptor[]): SidebarNavGroup[] {
   return groups.filter((g) => g.items.length > 0);
 }
 
-function HealthIndicator() {
+/** AppShell owns the mobile menu state internally; its header close button dismisses it. */
+function closeMobileDrawer(el: HTMLElement | null) {
+  el?.closest('[role="dialog"]')?.querySelector<HTMLButtonElement>("header button")?.click();
+}
+
+function HealthIndicator({ mobile = false }: { mobile?: boolean } = {}) {
   const { health, overall, dashboard, dashboardError, boot } = useApp();
   const [open, setOpen] = useState(false);
+  const triggerRef = useRef<HTMLButtonElement>(null);
   // Before setup finishes, unconfigured sources and an unclaimed server are
   // expected, not problems: show progress instead of a red verdict.
   const settingUp = !boot.setupComplete;
@@ -264,22 +277,29 @@ function HealthIndicator() {
     <Popover
       open={open}
       onOpenChange={setOpen}
+      side={mobile ? "top" : "bottom"}
+      align={mobile ? "start" : "end"}
       trigger={
         <button
+          ref={triggerRef}
           type="button"
           onClick={() => setOpen((o) => !o)}
           aria-label={t("Server health: {status}", { status: label })}
-          className="inline-flex h-9 items-center gap-2 rounded-md px-2.5 text-sm text-fg-muted transition-colors hover:bg-surface-hover hover:text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+          className={
+            mobile
+              ? "inline-flex h-9 min-w-0 items-center gap-2 rounded-md px-2 text-sm text-fg-muted transition-colors hover:bg-surface-hover hover:text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+              : "inline-flex h-9 items-center gap-2 rounded-md px-2.5 text-sm text-fg-muted transition-colors hover:bg-surface-hover hover:text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+          }
         >
           <StatusDot
             level={settingUp || gettingStarted ? "unknown" : overall === "off" ? "ok" : overall}
             pulse
           />
-          <span className="hidden md:inline">{label}</span>
+          <span className={mobile ? "truncate" : "hidden md:inline"}>{label}</span>
         </button>
       }
     >
-      <div className="w-80 p-1">
+      <div className="w-80 max-w-[calc(100vw-2rem)] p-1">
         <p className="px-2 pb-2 pt-1 text-xs font-semibold uppercase tracking-wider text-fg-subtle">
           {t("Server health")}
         </p>
@@ -300,7 +320,10 @@ function HealthIndicator() {
             <li key={h.id}>
               <Link
                 to={h.href}
-                onClick={() => setOpen(false)}
+                onClick={() => {
+                  setOpen(false);
+                  if (mobile) closeMobileDrawer(triggerRef.current);
+                }}
                 className="flex items-start gap-2.5 rounded-md px-2 py-1.5 hover:bg-surface-hover"
               >
                 <StatusDot level={h.level} className="mt-1.5" />
@@ -356,6 +379,7 @@ function CollectionsLayout() {
 /** Collection Studio opens over the persistent library as a record drawer. */
 function CollectionDrawer({ fresh = false }: { fresh?: boolean }) {
   const { close } = useOutletContext<{ close: () => void }>();
+  const { id } = useParams();
   const [search] = useSearchParams();
   return (
     <Drawer
@@ -365,7 +389,7 @@ function CollectionDrawer({ fresh = false }: { fresh?: boolean }) {
       size="2xl"
       bodyClassName="flex min-h-0 flex-1 flex-col overflow-hidden p-0"
     >
-      {fresh ? <CollectionEditor key={search.get("draft") ?? "new"} /> : <CollectionEditor />}
+      <CollectionEditor key={fresh ? (search.get("draft") ?? "new") : `edit:${id ?? ""}`} />
     </Drawer>
   );
 }
@@ -403,13 +427,14 @@ const BUILTIN_PAGES: Record<
   },
   livetv: { element: <LiveTV />, suffix: "/:tab?" },
   calendar: { element: <Calendar />, suffix: "/:view?" },
-  catalog: { element: <Catalog />, suffix: "/:tab?" },
+  libraries: { element: <Libraries />, suffix: "/*" },
   metadata: { element: <Metadata />, suffix: "/:tab?" },
-  sources: { element: <Sources />, suffix: "/:tab?" },
+  sources: { element: <Sources />, suffix: "/:tab?/:section?" },
   releases: { element: <Quality />, suffix: "/:tab?" },
   cache: { element: <Cache />, suffix: "/:tab?" },
   playback: { element: <Playback />, suffix: "/:tab?/:section?" },
   notifications: { element: <Notifications />, suffix: "/:tab?" },
+  flows: { element: <Flows />, suffix: "/*" },
   general: { element: <GeneralPage /> },
   apps: { element: <Apps />, suffix: "/:tab?/:section?" },
   integrations: { element: <ServicesPage />, suffix: "/:tab?" },
@@ -417,27 +442,65 @@ const BUILTIN_PAGES: Record<
   maintenance: { element: <MaintenancePage />, suffix: "/:tab?/:backupTab?" },
 };
 
+/** Old catalogue bookmarks land in the matching library, query intact (one release). */
+function CatalogRedirect() {
+  const location = useLocation();
+  const params = new URLSearchParams(location.search);
+  const id = params.get("type") === "show" ? 2 : 1;
+  return <Navigate to={`/libraries/${id}${location.search}`} replace />;
+}
+
 function Shell() {
   const { boot } = useApp();
   const ownerPath = useOwnerViewerPath();
   const location = useLocation();
+  const isDesktop = useMediaQuery("(min-width: 1024px)");
+  const wideSearch = useMediaQuery("(min-width: 640px)");
+  const firstRunSetupRef = useRef(false);
+  if (location.pathname !== "/setup") {
+    firstRunSetupRef.current = false;
+  } else if (!boot.setupComplete) {
+    firstRunSetupRef.current = true;
+  }
+  const hideSetupNav = location.pathname === "/setup" && firstRunSetupRef.current;
   const {
     descriptors: navDescriptors,
     loading: registryLoading,
     error: registryError,
     reload: reloadRegistry,
-  } = useRegistry<PageMeta>("page", "navItem");
+  } = useRegistry<PageMeta>("page", "navItem", "command");
   const remoteSession = boot.authRequired && Boolean(getToken());
   const version = versionLabel(boot.version);
   const serverName = boot.serverName?.trim() || "Ether";
+  const signOut = () => {
+    // End the session on the server too, so a copy cannot outlive
+    // sign-out; leave the browser either way.
+    void api
+      .signOut()
+      .catch(() => undefined)
+      .finally(() => {
+        setToken("");
+        window.location.reload();
+      });
+  };
+  const themeLabels = {
+    label: t("Theme"),
+    light: t("Light"),
+    dark: t("Dark"),
+    system: t("System"),
+    current: (mode: string) =>
+      t("Theme: {mode}", {
+        // AppKit passes the already-translated option label.
+        mode:
+          ({ light: t("Light"), dark: t("Dark"), system: t("System") } as Record<string, string>)[
+            mode
+          ] ?? mode,
+      }),
+  };
   return (
-    <div
-      className={
-        location.pathname === "/setup" ? "ether-shell ether-setup contents" : "ether-shell contents"
-      }
-    >
+    <div className={hideSetupNav ? "ether-shell ether-setup contents" : "ether-shell contents"}>
       <AppShell
-        groups={location.pathname === "/setup" ? [] : buildNavigation(navDescriptors)}
+        groups={hideSetupNav ? [] : buildNavigation(navDescriptors)}
         pathname={location.pathname}
         navigationMode="sidebar"
         linkRender={linkRender}
@@ -450,66 +513,107 @@ function Shell() {
             <Brand />
           </Link>
         }
-        headerMiddle={<CommandSearch />}
-        header={
-          <>
+        headerMiddle={
+          wideSearch ? (
+            <CommandSearch />
+          ) : hideSetupNav ? (
             <span
-              className="inline-flex h-9 min-w-0 max-w-[9rem] items-center gap-1.5 rounded-md px-2.5 text-sm text-fg-muted sm:max-w-[14rem]"
+              className="inline-flex min-w-0 max-w-full items-center gap-2 py-1 text-sm font-medium text-fg"
               title={serverName}
             >
-              <Server size={15} className="shrink-0" aria-hidden />
-              <span className="hidden truncate sm:inline">{serverName}</span>
+              <EtherMark size={22} />
+              <span className="truncate">{serverName}</span>
             </span>
-            <HealthIndicator />
-            <AskEther />
-            <ThemeToggle
-              collapsed
-              labels={{
-                label: t("Theme"),
-                light: t("Light"),
-                dark: t("Dark"),
-                system: t("System"),
-                current: (mode) =>
-                  t("Theme: {mode}", {
-                    // AppKit passes the already-translated option label.
-                    mode:
-                      (
-                        { light: t("Light"), dark: t("Dark"), system: t("System") } as Record<
-                          string,
-                          string
-                        >
-                      )[mode] ?? mode,
-                  }),
-              }}
-            />
+          ) : (
             <Link
-              to={ownerPath}
-              aria-label={t("Your account")}
-              className="inline-flex h-9 items-center gap-2 rounded-md px-2.5 text-sm text-fg-muted transition-colors hover:bg-surface-hover hover:text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+              to="/"
+              className="inline-flex min-w-0 max-w-full items-center gap-2 rounded-md py-1 text-sm font-medium text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+              title={serverName}
             >
-              <UserRound size={15} />
-              <span className="hidden sm:inline">{t("Your account")}</span>
+              <EtherMark size={22} />
+              <span className="truncate">{serverName}</span>
             </Link>
-            {remoteSession ? (
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => {
-                  // End the session on the server too, so a copy cannot outlive
-                  // sign-out; leave the browser either way.
-                  void api
-                    .signOut()
-                    .catch(() => undefined)
-                    .finally(() => {
-                      setToken("");
-                      window.location.reload();
-                    });
-                }}
+          )
+        }
+        header={
+          isDesktop ? (
+            <>
+              <span
+                className="inline-flex h-9 min-w-0 max-w-[9rem] items-center gap-1.5 rounded-md px-2.5 text-sm text-fg-muted sm:max-w-[14rem]"
+                title={serverName}
               >
-                <LogOut size={15} /> <span className="hidden sm:inline">{t("Sign out")}</span>
-              </Button>
-            ) : null}
-          </>
+                <Server size={15} className="shrink-0" aria-hidden />
+                <span className="hidden truncate sm:inline">{serverName}</span>
+              </span>
+              <HealthIndicator />
+              <WatchButton />
+              <AskEther />
+              <ThemeToggle collapsed labels={themeLabels} />
+              <Link
+                to={ownerPath}
+                aria-label={t("Your account")}
+                className="inline-flex h-9 items-center gap-2 rounded-md px-2.5 text-sm text-fg-muted transition-colors hover:bg-surface-hover hover:text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+              >
+                <UserRound size={15} />
+                <span className="hidden sm:inline">{t("Your account")}</span>
+              </Link>
+              {remoteSession ? (
+                <Button variant="ghost" size="sm" onClick={signOut}>
+                  <LogOut size={15} /> <span className="hidden sm:inline">{t("Sign out")}</span>
+                </Button>
+              ) : null}
+            </>
+          ) : (
+            <>
+              {wideSearch ? (
+                <span
+                  className="inline-flex h-9 min-w-0 max-w-[14rem] items-center gap-1.5 rounded-md px-2.5 text-sm text-fg-muted"
+                  title={serverName}
+                >
+                  <Server size={15} className="shrink-0" aria-hidden />
+                  <span className="truncate">{serverName}</span>
+                </span>
+              ) : (
+                <CommandSearch compact />
+              )}
+              <AskEther />
+            </>
+          )
+        }
+        mobileFooter={
+          isDesktop ? undefined : (
+            <div className="flex w-full flex-col gap-2 pb-[env(safe-area-inset-bottom)]">
+              <div className="-mx-2 flex flex-wrap items-center justify-between gap-1">
+                <HealthIndicator mobile />
+                <WatchButton popoverSide="top" />
+              </div>
+              <div className="-mx-2 flex flex-wrap items-center justify-between gap-1 border-t border-border-subtle pt-2">
+                <Link
+                  to={ownerPath}
+                  aria-label={t("Your account")}
+                  onClick={(e) => closeMobileDrawer(e.currentTarget)}
+                  className="inline-flex h-9 items-center gap-2 rounded-md px-2 text-sm text-fg-muted transition-colors hover:bg-surface-hover hover:text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+                >
+                  <UserRound size={15} />
+                  <span>{t("Your account")}</span>
+                </Link>
+                {remoteSession ? (
+                  <Button variant="ghost" size="sm" onClick={signOut}>
+                    <LogOut size={15} /> <span>{t("Sign out")}</span>
+                  </Button>
+                ) : null}
+              </div>
+              <div className="flex items-center justify-between gap-2 border-t border-border-subtle pt-2">
+                <p className="min-w-0 truncate text-xs text-fg-subtle" title={version}>
+                  {version}
+                </p>
+                <div className="-mr-1 flex shrink-0 items-center gap-1">
+                  <LanguagePicker className="h-8 shrink-0 px-2 text-xs" />
+                  <ThemeToggle collapsed labels={themeLabels} />
+                </div>
+              </div>
+            </div>
+          )
         }
         sidebarFooter={
           <div className="flex min-w-0 items-center justify-between gap-2">
@@ -543,9 +647,13 @@ function Shell() {
             <Routes>
               <Route path="/setup" element={<Setup />} />
               <Route path="/mcp/authorize" element={<McpAuthorize />} />
+              <Route path="/plugins/reference/:topic?" element={<DeveloperReference />} />
               <Route path="/plugins/studio" element={<Studio />} />
               <Route path="/plugins/:tab?/*" element={<Plugins />} />
               <Route path="/p/:plugin/:page/*" element={<PluginPage />} />
+              {registryLoading && navDescriptors.length === 0 ? (
+                <Route key="home" path="/home" element={BUILTIN_PAGES.home!.element} />
+              ) : null}
               {navDescriptors
                 .filter((d) => d.kind === "page" && d.owner === BUILTIN && d.meta?.route)
                 .flatMap((d) => {
@@ -575,6 +683,7 @@ function Shell() {
                     )),
                   ];
                 })}
+              <Route path="/catalog" element={<CatalogRedirect />} />
               <Route
                 path="*"
                 element={
@@ -602,7 +711,7 @@ function ViewerById() {
   return <ViewerProfile />;
 }
 
-function Gate({ onReady }: { onReady: (animation?: boolean) => void }) {
+function Gate({ onReady }: { onReady: (animation?: boolean, version?: string) => void }) {
   const [boot, setBoot] = useState<Bootstrap | null>(null);
   const [error, setError] = useState<unknown>(null);
   const [unlocked, setUnlocked] = useState(false);
@@ -611,7 +720,7 @@ function Gate({ onReady }: { onReady: (animation?: boolean) => void }) {
     try {
       const next = await api.bootstrap();
       setBoot(next);
-      onReady(next.startupAnimation !== false);
+      onReady(next.startupAnimation !== false, next.version);
       setError(null);
     } catch (e) {
       setError(e);
@@ -688,6 +797,7 @@ const Me = lazy(() => import("./pages/me/Me"));
 export default function App() {
   const location = useLocation();
   const [ready, setReady] = useState(false);
+  const [bootVersion, setBootVersion] = useState<string | null>(null);
   // Decided at page open from the last known server value, so the splash's
   // minimum time runs from load (not from bootstrap) and never flashes on a
   // server that turned it off. The server's answer can only hide it.
@@ -698,7 +808,12 @@ export default function App() {
       return true;
     }
   });
-  const onReady = useCallback((enabled?: boolean) => {
+  useEffect(() => {
+    if (location.pathname === "/home" || location.pathname.startsWith("/home/")) {
+      void loadDesigner();
+    }
+  }, [location.pathname]);
+  const onReady = useCallback((enabled?: boolean, version?: string) => {
     if (enabled !== undefined) {
       try {
         localStorage.setItem("ether.startupAnimation", String(enabled));
@@ -707,6 +822,7 @@ export default function App() {
       }
       if (!enabled) setAnimation(false);
     }
+    if (version) setBootVersion(version);
     setReady(true);
   }, []);
   return (
@@ -724,7 +840,7 @@ export default function App() {
               )}
             </Chrome>
             {location.pathname !== "/me" && animation ? <BrandSplash ready={ready} /> : null}
-            <UpdateReady />
+            <UpdateReady bootVersion={bootVersion} />
             <Toaster richColors closeButton position="bottom-right" />
           </UiLinkProvider>
         </ThemeProvider>

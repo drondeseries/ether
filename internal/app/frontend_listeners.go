@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -40,7 +41,9 @@ type runningFrontend struct {
 	listeners       []net.Listener
 	announcers      []frontend.Announcer
 	warnings        []string
-	busyPort        string
+	busyPort        int
+	actualPort      int
+	busyPortHolder  string
 	prefixes        []string
 	sharedPrefixes  []string
 	sharedDiscovery bool
@@ -117,7 +120,13 @@ func (m *frontendListeners) start(ctx context.Context, id frontend.Protocol) err
 		_, requestedPort, requestedErr := net.SplitHostPort(spec.Address)
 		_, actualPort, actualErr := net.SplitHostPort(ln.Addr().String())
 		if requestedErr == nil && actualErr == nil && requestedPort != "0" && requestedPort != actualPort {
-			run.busyPort = requestedPort
+			reqNum, reqParseErr := strconv.Atoi(requestedPort)
+			actNum, actParseErr := strconv.Atoi(actualPort)
+			if reqParseErr == nil && actParseErr == nil {
+				run.busyPort = reqNum
+				run.actualPort = actNum
+				run.busyPortHolder = lookupPortHolder(reqNum)
+			}
 		}
 		handler := m.observe(id, inst.Handler())
 		if handler == nil {
@@ -150,7 +159,7 @@ func (m *frontendListeners) start(ctx context.Context, id frontend.Protocol) err
 				next.ServeHTTP(w, r)
 			})
 		}
-		run.servers = append(run.servers, &http.Server{Handler: handler, ReadHeaderTimeout: 30 * time.Second, IdleTimeout: 120 * time.Second})
+		run.servers = append(run.servers, &http.Server{Handler: handler, ConnContext: sockerr.WithConn, ReadHeaderTimeout: 30 * time.Second, IdleTimeout: 120 * time.Second})
 	}
 	if err == nil {
 		for _, a := range inst.Discovery() {
@@ -280,8 +289,11 @@ func (m *frontendListeners) status(ctx context.Context, id frontend.Protocol) fr
 			}
 		}
 		st.Warnings = append(st.Warnings, run.warnings...)
-		if run.busyPort != "" {
-			st.Warnings = append(st.Warnings, busyPortWarning(run.busyPort, st.ConnectURLs))
+		if run.busyPort > 0 {
+			st.BusyPort = run.busyPort
+			st.ActualPort = run.actualPort
+			st.BusyPortHolder = run.busyPortHolder
+			st.Warnings = append(st.Warnings, busyPortWarning(strconv.Itoa(run.busyPort), st.ConnectURLs))
 		}
 		if run.sharedDiscovery && m.discovery != nil {
 			if err := m.discovery.error(); err != nil {
@@ -397,30 +409,30 @@ func reachableScore(raw string) int {
 	if err != nil || u.Host == "" {
 		return -1
 	}
+	score := 15
 	ip := net.ParseIP(u.Hostname())
-	if ip == nil {
-		if strings.EqualFold(u.Hostname(), "localhost") {
-			return 0
-		}
-		return 70
-	}
-	if ip.IsLoopback() {
+	switch {
+	case ip == nil && strings.EqualFold(u.Hostname(), "localhost"):
 		return 0
+	case ip == nil:
+		score = 70
+	case ip.IsLoopback():
+		return 0
+	case ip.To4() != nil && ip.To4()[0] == 192 && ip.To4()[1] == 168:
+		score = 80
+	case ip.IsPrivate() && ip.To4() != nil:
+		score = 40
+	case ip.To4() == nil:
+		score = 10
 	}
-	if v4 := ip.To4(); v4 != nil && v4[0] == 192 && v4[1] == 168 {
-		return 80
+	if u.Path != "" && u.Path != "/" && score > 0 {
+		score -= 5
 	}
-	if ip.IsPrivate() {
-		return 40
-	}
-	if ip.To4() == nil {
-		return 10
-	}
-	return 15
+	return score
 }
 
 // connectionURLs converts actual bound addresses into LAN URLs, avoiding
-// loopback and unspecified addresses that another device cannot reach.
+// loopback, unspecified, and family-mismatched addresses that another device cannot reach.
 func connectionURLs(address, prefix string, interfaces []net.Addr) []string {
 	host, port, err := net.SplitHostPort(address)
 	if err != nil {
@@ -428,12 +440,17 @@ func connectionURLs(address, prefix string, interfaces []net.Addr) []string {
 	}
 	var hosts []string
 	ip := net.ParseIP(host)
+	v4Only := strings.TrimSpace(host) == "0.0.0.0"
 	if ip != nil && ip.IsUnspecified() {
 		for _, item := range interfaces {
-			ip, _, err := net.ParseCIDR(item.String())
-			if err == nil && !ip.IsLoopback() && !ip.IsUnspecified() && !ip.IsLinkLocalUnicast() {
-				hosts = append(hosts, ip.String())
+			ifaceIP, _, err := net.ParseCIDR(item.String())
+			if err != nil || ifaceIP.IsLoopback() || ifaceIP.IsUnspecified() || ifaceIP.IsLinkLocalUnicast() {
+				continue
 			}
+			if v4Only && ifaceIP.To4() == nil {
+				continue
+			}
+			hosts = append(hosts, ifaceIP.String())
 		}
 	} else if host != "" && host != "localhost" && (ip == nil || !ip.IsLoopback()) {
 		hosts = append(hosts, host)
@@ -448,6 +465,9 @@ func connectionURLs(address, prefix string, interfaces []net.Addr) []string {
 			out = append(out, value)
 		}
 	}
+	sort.SliceStable(out, func(i, j int) bool {
+		return reachableScore(out[i]) > reachableScore(out[j])
+	})
 	return out
 }
 

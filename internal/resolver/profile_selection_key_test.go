@@ -17,17 +17,15 @@ func TestSelectProfileSelectionKeyIsPreClamp(t *testing.T) {
 		return config.Quality{
 			Default: "Main",
 			Profiles: []core.QualityProfile{{
-				Name:             "Main",
-				MaxHeight:        maxHeight,
-				MinHeight:        720,
-				AllowHDR:         true,
-				AllowDolbyVision: true,
-				PreferredSources: []core.Source{core.SourceWEBDL},
-				PreferredCodecs:  []string{"hevc", "h264"},
-				PreferredAudio:   []string{"eac3", "aac"},
-				MinSizeMBPerMin:  5,
-				MaxSizeMBPerMin:  150,
-				ReleaseRules:     rules,
+				Name:               "Main",
+				MaxHeight:          maxHeight,
+				MinHeight:          720,
+				AllowHDR:           true,
+				AllowDolbyVision:   true,
+				CustomFormatScores: map[string]int{core.AudioFormat("eac3"): 8, core.AudioFormat("aac"): 4},
+				MinSizeMBPerMin:    5,
+				MaxSizeMBPerMin:    150,
+				ReleaseRules:       rules,
 			}},
 		}
 	}
@@ -49,12 +47,25 @@ func TestSelectProfileSelectionKeyIsPreClamp(t *testing.T) {
 	}
 	// Editing any other selection field (audio here) also changes it.
 	q := mkQuality(2160, nil)
-	q.Profiles[0].PreferredAudio = []string{"aac"}
+	q.Profiles[0].CustomFormatScores = map[string]int{core.AudioFormat("aac"): 4}
 	if edited := SelectProfile(q, tv, nil); edited.SelectionKey == pTV.SelectionKey {
 		t.Fatalf("audio edit kept SelectionKey %q", edited.SelectionKey)
 	}
 	rules := []core.ReleaseRule{{ID: "g", Name: "Group", Action: "prefer", Conditions: []core.ReleaseCondition{{Field: "group", Operator: "equals", Value: "SPARKS"}}}}
 	if edited := SelectProfile(mkQuality(2160, rules), tv, nil); edited.SelectionKey == pTV.SelectionKey {
 		t.Fatal("adding release rules kept the selection key")
+	}
+	// The profile language and the minimum custom format score are part
+	// of the definition too.
+	q = mkQuality(2160, nil)
+	q.Profiles[0].Language = "en"
+	if edited := SelectProfile(q, tv, nil); edited.SelectionKey == pTV.SelectionKey {
+		t.Fatal("language edit kept the selection key")
+	}
+	q = mkQuality(2160, nil)
+	minScore := 100
+	q.Profiles[0].MinCustomFormatScore = &minScore
+	if edited := SelectProfile(q, tv, nil); edited.SelectionKey == pTV.SelectionKey {
+		t.Fatal("minimum score edit kept the selection key")
 	}
 }

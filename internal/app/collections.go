@@ -1,13 +1,17 @@
 package app
 
 import (
+	"net/http"
 	"path/filepath"
 
 	"github.com/braedonsaunders/ether/internal/artwork"
 	"github.com/braedonsaunders/ether/internal/collections"
 	"github.com/braedonsaunders/ether/internal/config"
+	"github.com/braedonsaunders/ether/internal/httpclient"
 	"github.com/braedonsaunders/ether/internal/llm"
 )
+
+var testImagesHTTP *http.Client
 
 // collectionOptions wires the collection engine: TMDB for sources and
 // lookups, the image store and poster renderer, catalogue/Trakt settings,
@@ -16,11 +20,14 @@ import (
 func (a *App) collectionOptions(cfg config.Config) []collections.Option {
 	dataDir := a.opts.DataDir
 	a.images = artwork.NewImages(artwork.ImagesOptions{
-		Dir:      filepath.Join(dataDir, "cache", "images"),
-		ImageURL: a.tmdb.ImageURLFunc(),
-		Logger:   a.log.With("component", "images"),
-		Posters:  func() config.Posters { return a.cfg.Read().Posters },
+		Dir:        filepath.Join(dataDir, "cache", "images"),
+		HTTPClient: testImagesHTTP,
+		ImageURL:   a.tmdb.ImageURLFunc(),
+		Logger:     a.log.With("component", "images"),
+		Posters:    func() config.Posters { return a.cfg.Read().Posters },
+		Now:        parityClock(),
 	})
+	a.closers = append(a.closers, a.images.Close)
 	renderer := artwork.NewRenderer(a.images, filepath.Join(dataDir, "cache", "posters"), a.log.With("component", "artwork"))
 	chat := llm.NewClient(llm.ClientOptions{Config: cfg.LLM, Logger: a.log.With("component", "llm")})
 	a.cfg.Subscribe(func(c config.Config) { chat.UpdateConfig(c.LLM) })
@@ -31,6 +38,7 @@ func (a *App) collectionOptions(cfg config.Config) []collections.Option {
 		collections.WithTraktConfig(func() config.Trakt { return a.cfg.Read().Trakt }),
 		collections.WithSealer(a.cfg),
 		collections.WithLLM(chat),
-		collections.WithUserAgent("Ether/" + a.opts.Version + " (+https://github.com/braedonsaunders/ether)"),
+		collections.WithUserAgent(httpclient.FormatUserAgent(a.opts.Version)),
+		collections.WithOnRebuilt(a.onCollectionRebuilt),
 	}, parityCollectionOptions()...)
 }

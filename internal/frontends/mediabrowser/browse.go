@@ -3,6 +3,7 @@ package mediabrowser
 import (
 	"errors"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -54,9 +55,65 @@ func (i *instance) userDataDTO(id string, st frontend.WatchStatus) map[string]an
 	}
 	return data
 }
+
+// mbItemType is the MediaBrowser item type for a title: the type the owning
+// plugin kind's presentation declares for its level (MusicArtist, MusicAlbum,
+// Audio, AudioBook, Book, PhotoAlbum, Photo) when it declares one, else the
+// video projection movie/show/season/episode titles have always carried.
+func mbItemType(t frontend.Title) string {
+	if t.MBItemType != "" {
+		return t.MBItemType
+	}
+	return map[frontend.MediaType]string{"movie": "Movie", "show": "Series", "season": "Season", "episode": "Episode", "boxset": "BoxSet"}[t.Type]
+}
+
+// mbDeclaredNonVideo reports whether the title's declared MediaBrowser type
+// sits outside the video family, so video-shaped fields (SeriesId, SeasonId,
+// a Video MediaType) must not be stamped on it.
+func mbDeclaredNonVideo(t frontend.Title) bool {
+	switch t.MBItemType {
+	case "", "Movie", "Series", "Season", "Episode":
+		return false
+	}
+	return true
+}
+
+// mbIsFolder follows the declared type's place in the MediaBrowser model:
+// artists, albums and photo albums hold children; tracks, books and photos
+// do not. Undeclared titles keep the projected show/season rule.
+func mbIsFolder(t frontend.Title) bool {
+	switch t.MBItemType {
+	case "Series", "Season", "MusicArtist", "MusicAlbum", "PhotoAlbum":
+		return true
+	case "Movie", "Episode", "Audio", "AudioBook", "Book", "Photo":
+		return false
+	}
+	return t.Type == "show" || t.Type == "season" || t.Type == "boxset"
+}
+
+// mbMediaType is the MediaBrowser MediaType a leaf item carries: Audio for
+// tracks and audiobooks, Book for books, Photo for photos, Video for the
+// movie/episode leaves that have always carried it. Containers carry none.
+func mbMediaType(t frontend.Title) (string, bool) {
+	switch t.MBItemType {
+	case "Audio", "AudioBook":
+		return "Audio", true
+	case "Book":
+		return "Book", true
+	case "Photo":
+		return "Photo", true
+	case "Series", "Season", "MusicArtist", "MusicAlbum", "PhotoAlbum":
+		return "", false
+	}
+	if t.Type == "movie" || t.Type == "episode" {
+		return "Video", true
+	}
+	return "", false
+}
+
 func (i *instance) itemDTO(t frontend.Title, state frontend.WatchStatus) map[string]any {
-	kind := map[frontend.MediaType]string{"movie": "Movie", "show": "Series", "season": "Season", "episode": "Episode"}[t.Type]
-	m := map[string]any{"Id": ids.RatingKeyGUID(t.Key), "Name": t.Title, "Type": kind, "LocationType": "FileSystem", "IsFolder": t.Type == "show" || t.Type == "season", "Overview": t.Summary, "ProductionYear": t.Year, "RunTimeTicks": t.Runtime.Nanoseconds() / 100, "UserData": i.userDataDTO(ids.RatingKeyGUID(t.Key), state)}
+	kind := mbItemType(t)
+	m := map[string]any{"Id": ids.RatingKeyGUID(t.Key), "Name": t.Title, "Type": kind, "LocationType": "FileSystem", "IsFolder": mbIsFolder(t), "Overview": t.Summary, "ProductionYear": t.Year, "RunTimeTicks": t.Runtime.Nanoseconds() / 100, "UserData": i.userDataDTO(ids.RatingKeyGUID(t.Key), state)}
 	if added := t.DateAdded(time.Now()); !added.IsZero() {
 		m["DateCreated"] = wireTime(added)
 	}
@@ -108,21 +165,27 @@ func (i *instance) itemDTO(t frontend.Title, state frontend.WatchStatus) map[str
 	if t.Tagline != "" {
 		m["Taglines"] = []string{t.Tagline}
 	}
-	if t.Type == "movie" || t.Type == "episode" {
-		m["MediaType"] = "Video"
+	if mediaType, ok := mbMediaType(t); ok {
+		m["MediaType"] = mediaType
 	}
 	attachParentIdentity(m, t)
 	if i.protocol == "emby" {
 		i.embyItemDTO(m, t, state)
 		// Movies and shows belong to their configured library. Episodes and
-		// seasons already name the season or series that contains them.
+		// seasons already name the season or series that contains them. A
+		// declared non-video root (a music artist, a book) names its own
+		// plugin library instead of a built-in section.
 		if _, ok := m["ParentId"]; !ok {
 			section := int64(0)
-			switch t.Type {
-			case "movie":
-				section = 1
-			case "show":
-				section = 2
+			if mbDeclaredNonVideo(t) && t.LibraryID != 0 {
+				section = int64(t.LibraryID)
+			} else {
+				switch t.Type {
+				case "movie":
+					section = 1
+				case "show":
+					section = 2
+				}
 			}
 			if section != 0 {
 				if id, err := ids.GUID(ids.View, section); err == nil {
@@ -150,6 +213,31 @@ func (i *instance) markUnreleased(item map[string]any, title frontend.Title) {
 	delete(item, "MediaStreams")
 }
 
+// mediaBrowserCollectionType picks the Jellyfin/Emby CollectionType for a view.
+// A plugin library carries its declared MediaBrowser collection type in
+// View.Native (music, audiobooks, books, photos, homevideos, …); a built-in or
+// host-synthesised view names the type in View.Type. The remaining values are
+// the Jellyfin/Emby closed set.
+func mediaBrowserCollectionType(view frontend.View) string {
+	if view.Native != "" {
+		return view.Native
+	}
+	switch view.Type {
+	case "show", "tvshows":
+		return "tvshows"
+	case "music":
+		return "music"
+	case "livetv":
+		return "livetv"
+	case "homevideos":
+		return "homevideos"
+	case "books", "audiobooks", "photos", "musicvideos", "boxsets", "mixed":
+		return string(view.Type)
+	default:
+		return "movies"
+	}
+}
+
 // collectionFolder is one library view. The id is the view GUID, not a title.
 func (i *instance) collectionFolder(r *http.Request, v *frontend.Viewer, view frontend.View) (map[string]any, bool) {
 	viewNum, e := ids.ParseDecimal(view.ID)
@@ -160,13 +248,7 @@ func (i *instance) collectionFolder(r *http.Request, v *frontend.Viewer, view fr
 	if e != nil {
 		return nil, false
 	}
-	kind := "movies"
-	switch view.Type {
-	case "show":
-		kind = "tvshows"
-	case "livetv":
-		kind = "livetv"
-	}
+	kind := mediaBrowserCollectionType(view)
 	item := map[string]any{"Id": viewID, "Name": view.Name, "Type": "CollectionFolder", "CollectionType": kind, "IsFolder": true, "ServerId": i.info.ID, "SortName": view.Name, "DisplayPreferencesId": viewID, "CanDelete": false, "CanDownload": false, "ProviderIds": map[string]string{}}
 	if i.protocol == "emby" {
 		i.embyViewDTO(item)
@@ -193,6 +275,14 @@ func (i *instance) writeCollectionFolder(w http.ResponseWriter, r *http.Request,
 	}
 	if i.protocol == "jellyfin" && viewNum == 0 {
 		i.writeUserRoot(w, r, v)
+		return
+	}
+	if viewNum == collectionsViewNumber {
+		if folder, ok := i.collectionsFolder(r, v); ok {
+			i.replyItems(w, r, folder)
+		} else {
+			http.NotFound(w, r)
+		}
 		return
 	}
 	if ids.PersonalView(viewNum) {
@@ -265,6 +355,9 @@ func (i *instance) browseRoutes() error {
 				items = append(items, item)
 			}
 		}
+		if folder, ok := i.collectionsFolder(r, v); ok {
+			items = append(items, folder)
+		}
 		items = i.prependPersonalViews(r, v, items)
 		i.replyItems(w, r, i.queryResult(items, len(items), 0))
 	}
@@ -293,14 +386,38 @@ func (i *instance) browseRoutes() error {
 			if series != 0 {
 				titles, err = i.seriesNextUp(r, v, series)
 				if err != nil {
-					http.Error(w, "Unavailable", 503)
+					// Jellyfin never fails Next Up; some clients (Roku) exit on
+					// an error here, so answer an empty row and log it (#421).
+					i.logRowFailure(purpose, err)
+					titles = nil
+				}
+			} else if activity, ok := i.host.Experience.(frontend.NextUpActivity); purpose == frontend.RowNextUp && ok {
+				offset, limit := queryInt(r, "StartIndex", 0), queryInt(r, "Limit", 50)
+				if offset > 500 || limit > 500 || offset > 500-limit {
+					http.Error(w, "Unsupported page", http.StatusBadRequest)
 					return
 				}
+				if limit != 0 {
+					titles, err = activity.NextUp(r.Context(), v, device(r), offset+limit)
+					if err != nil {
+						i.logRowFailure(purpose, err)
+						titles = nil
+					}
+				}
 			} else {
-				rows, err := i.host.Experience.Rows(r.Context(), frontend.RowRequest{Viewer: v, Device: device(r), Placement: frontend.PlacementHome, Purpose: purpose, Limit: queryInt(r, "Limit", 0)})
-				if err != nil {
-					http.Error(w, "Unavailable", 503)
+				offset, limit := queryInt(r, "StartIndex", 0), queryInt(r, "Limit", 50)
+				if offset > 500 || limit > 500 || offset > 500-limit {
+					http.Error(w, "Unsupported page", http.StatusBadRequest)
 					return
+				}
+				if limit == 0 {
+					i.replyItems(w, r, i.queryResult([]any{}, 0, offset))
+					return
+				}
+				rows, err := i.host.Experience.Rows(r.Context(), frontend.RowRequest{Viewer: v, Device: device(r), Placement: frontend.PlacementHome, Purpose: purpose, Limit: max(50, offset+limit)})
+				if err != nil {
+					i.logRowFailure(purpose, err)
+					rows = nil
 				}
 				for _, row := range rows {
 					if row.Purpose != purpose {
@@ -357,8 +474,8 @@ func (i *instance) browseRoutes() error {
 			}
 			state, err := i.host.Experience.UserData(r.Context(), v, keys)
 			if err != nil {
-				http.Error(w, "Unavailable", 503)
-				return
+				i.logRowFailure(purpose, err)
+				state = map[frontend.RatingKey]frontend.WatchStatus{}
 			}
 			items := make([]any, 0, len(page))
 			images := i.gridListImages(r, page)
@@ -368,6 +485,7 @@ func (i *instance) browseRoutes() error {
 				r = i.withPageEditions(r, v, keys)
 			}
 			i.fillSeriesTitles(r, v, page)
+			i.prefetchParentArtwork(r, page)
 			for _, title := range page {
 				if purpose == frontend.RowNextUp && title.Type == "episode" && i.host.Experience != nil {
 					if stored, ok := i.storedListTitle(r, v, title.Key); ok && stored.Type == "episode" {
@@ -394,6 +512,7 @@ func (i *instance) browseRoutes() error {
 				for key, value := range images[title.Key] {
 					item[key] = value
 				}
+				previewRowArtwork(r, item)
 				i.shapeJellyfinItem(r, v, item, title)
 				i.jellyfinSeasonListFields(r, item, title)
 				i.applyListedRatings(item, ratingFacts, title.Key)
@@ -436,26 +555,32 @@ func (i *instance) browseRoutes() error {
 		versionID := ""
 		releaseID := ""
 		if err != nil {
-			scope, e := i.versionScope(r, v)
-			if e != nil || i.host.VersionHandles == nil {
+			if i.host.VersionHandles != nil {
+				if scope, e := i.versionScope(r, v); e == nil {
+					if target, e := i.host.VersionHandles.Resolve(i.identityContext(r), scope, wireID); e == nil && target.Item != 0 {
+						key, versionID, releaseID, err = target.Item, wireID, target.Release, nil
+					}
+				}
+			}
+			if err != nil {
+				if i.writePersonItem(w, r, v, wireID) {
+					return
+				}
 				http.NotFound(w, r)
 				return
 			}
-			target, e := i.host.VersionHandles.Resolve(i.identityContext(r), scope, wireID)
-			if e != nil || target.Item == 0 {
-				http.NotFound(w, r)
-				return
-			}
-			key, versionID, releaseID = target.Item, wireID, target.Release
 		}
 		if i.host.Experience == nil {
 			http.Error(w, "Unavailable", 503)
 			return
 		}
-		d, err := i.host.Experience.Item(i.identityContext(r), frontend.ItemRequest{Viewer: v, Device: device(r), Key: key})
+		d, err := i.host.Experience.Item(frontend.WithColdDetail(i.identityContext(r), key), frontend.ItemRequest{Viewer: v, Device: device(r), Key: key})
 		if err != nil {
 			http.NotFound(w, r)
 			return
+		}
+		if d.Collection == nil && d.Playlist == nil && versionID == "" && (d.Title.Type == "movie" || d.Title.Type == "episode") {
+			i.warmDetail(r, v, key)
 		}
 		if d.Collection != nil || d.Playlist != nil {
 			dto, ok := i.containerDTO(d, key)
@@ -500,53 +625,14 @@ func (i *instance) browseRoutes() error {
 			dto["EnableMediaSourceDisplay"] = false
 		}
 		if len(d.Versions) > 0 || d.Title.Type == "movie" || d.Title.Type == "episode" {
-			sources := make([]any, 0, len(d.Versions))
-			scope, scopeErr := i.versionScope(r, v)
-			needDefault := scopeErr != nil || len(d.Versions) == 0
-			for _, version := range d.Versions {
-				if releaseID != "" && version.ID != releaseID {
-					continue
-				}
-				if scopeErr != nil {
-					break
-				}
-				handle, e := i.host.VersionHandles.Issue(i.identityContext(r), scope, key, version.ID)
-				if e != nil || handle == "" {
-					needDefault = true
-					continue
-				}
-				source := i.detailMediaSourceDTO(handle, version.Media)
-				source["Name"] = version.Name
-				i.versionSourceFacts(source, version)
-				plan := frontend.PlanRequest{Viewer: v, Device: scope.Device, Protocol: i.protocol, Item: key, Version: handle, Caps: scope.Caps, Intent: frontend.PlayIntent{Estimate: true, ExactVersion: true, Options: frontend.DecideOptions{DirectPlay: true}}}
-				if path := i.lazySourceURL(r, token, plan); path != "" {
-					source["Path"] = path
-				}
-				if i.protocol == "jellyfin" {
-					offerJellyfinStatic(source, frontend.DecideOptions{DirectPlay: true, DirectStream: true})
-				}
-				i.mediaSourceDialect(source)
-				if i.protocol == "emby" {
-					i.embyMediaSourceDTO(source, ids.RatingKeyGUID(d.Title.Key), version.Media)
-				}
-				if i.protocol == "jellyfin" {
-					i.jellyfinMediaSourceDTO(source, version.Media, false)
-					if name, _ := source["Name"].(string); name == "" {
-						if itemName, ok := dto["Name"].(string); ok && itemName != "" {
-							source["Name"] = itemName
-						}
-					}
-				}
-				sources = append(sources, source)
-			}
-			if needDefault {
-				sources = append(sources, i.defaultMediaSource(r, v, token, key))
-			}
-			if len(sources) > 0 {
+			// No explicit release was requested: when the ranked release
+			// variants are available, list Auto then the variants. Otherwise
+			// keep the edition/default shape exactly as before.
+			if sources := i.detailSources(r, v, token, d, dto, key, releaseID); sources != nil {
 				dto["MediaSources"] = sources
-			}
-			if i.protocol == "jellyfin" {
-				dto["EnableMediaSourceDisplay"] = len(sources) > 1
+				if i.protocol == "jellyfin" {
+					dto["EnableMediaSourceDisplay"] = len(sources) > 1
+				}
 			}
 		}
 		shown := d.Versions
@@ -604,7 +690,7 @@ func (i *instance) browseRoutes() error {
 	endpoints := []struct {
 		path    string
 		handler http.HandlerFunc
-	}{{"/UserViews", views}, {"/Users/{userId}/Views", views}, {"/Items/Latest", func(w http.ResponseWriter, r *http.Request) { i.libraryActivity(w, r, true) }}, {"/Users/{userId}/Items/Latest", func(w http.ResponseWriter, r *http.Request) { i.libraryActivity(w, r, true) }}, {"/UserItems/Resume", func(w http.ResponseWriter, r *http.Request) { i.libraryActivity(w, r, false) }}, {"/Users/{userId}/Items/Resume", func(w http.ResponseWriter, r *http.Request) { i.libraryActivity(w, r, false) }}, {"/Shows/NextUp", rowHandler(frontend.RowNextUp, false)}, {"/Items", i.items}, {"/Users/{userId}/Items", i.items}, {"/Items/{id}/Similar", i.similar}, {"/Items/{id}/Ancestors", i.ancestors}, {"/Items/{id}/LocalTrailers", i.localTrailers}, {"/Items/{id}/SpecialFeatures", i.specialFeatures}, {"/Users/{userId}/Items/{id}/LocalTrailers", i.localTrailers}, {"/Users/{userId}/Items/{id}/SpecialFeatures", i.specialFeatures}, {"/Items/{id}/Intros", i.intros}, {"/Users/{userId}/Items/{id}/Intros", i.intros}, {"/Search/Hints", i.search}, {"/Genres", i.facets("genre")}, {"/Studios", i.facets("studio")}, {"/Persons", i.facets("person")}, {"/Shows/{id}/Seasons", i.children}, {"/Shows/{id}/Episodes", i.episodes}, {"/Items/{id}", detail}, {"/Users/{userId}/Items/{id}", detail}}
+	}{{"/UserViews", views}, {"/Users/{userId}/Views", views}, {"/Items/Latest", func(w http.ResponseWriter, r *http.Request) { i.libraryActivity(w, r, true) }}, {"/Users/{userId}/Items/Latest", func(w http.ResponseWriter, r *http.Request) { i.libraryActivity(w, r, true) }}, {"/UserItems/Resume", func(w http.ResponseWriter, r *http.Request) { i.libraryActivity(w, r, false) }}, {"/Users/{userId}/Items/Resume", func(w http.ResponseWriter, r *http.Request) { i.libraryActivity(w, r, false) }}, {"/Shows/NextUp", rowHandler(frontend.RowNextUp, false)}, {"/Items", i.items}, {"/Users/{userId}/Items", i.items}, {"/Items/{id}/Similar", i.similar}, {"/Items/{id}/Collections", i.itemCollections}, {"/Items/{id}/Ancestors", i.ancestors}, {"/Items/{id}/LocalTrailers", i.localTrailers}, {"/Items/{id}/SpecialFeatures", i.specialFeatures}, {"/Users/{userId}/Items/{id}/LocalTrailers", i.localTrailers}, {"/Users/{userId}/Items/{id}/SpecialFeatures", i.specialFeatures}, {"/Items/{id}/Intros", i.intros}, {"/Users/{userId}/Items/{id}/Intros", i.intros}, {"/Search/Hints", i.search}, {"/Genres", i.facets("genre")}, {"/Studios", i.facets("studio")}, {"/Persons", i.facets("person")}, {"/Shows/{id}/Seasons", i.children}, {"/Shows/{id}/Episodes", i.episodes}, {"/Shows//Episodes", i.episodes}, {"/Items/{id}", detail}, {"/Users/{userId}/Items/{id}", detail}}
 	for _, e := range endpoints {
 		if err := add("GET", e.path, e.handler); err != nil {
 			return err
@@ -613,23 +699,21 @@ func (i *instance) browseRoutes() error {
 	if err := add("GET", "/UserViews/GroupingOptions", i.groupingOptions); err != nil {
 		return err
 	}
-	root := func(w http.ResponseWriter, r *http.Request) {
-		if i.protocol != "jellyfin" {
-			http.NotFound(w, r)
-			return
+	if i.protocol == "jellyfin" {
+		root := func(w http.ResponseWriter, r *http.Request) {
+			v, _, err := i.viewer(r)
+			if err != nil || v == nil {
+				http.Error(w, "Unauthorized", 401)
+				return
+			}
+			i.writeUserRoot(w, r, v)
 		}
-		v, _, err := i.viewer(r)
-		if err != nil || v == nil {
-			http.Error(w, "Unauthorized", 401)
-			return
+		if err := add("GET", "/Items/Root", root); err != nil {
+			return err
 		}
-		i.writeUserRoot(w, r, v)
-	}
-	if err := add("GET", "/Items/Root", root); err != nil {
-		return err
-	}
-	if err := add("GET", "/Users/{userId}/Items/Root", root); err != nil {
-		return err
+		if err := add("GET", "/Users/{userId}/Items/Root", root); err != nil {
+			return err
+		}
 	}
 	if err := add("GET", "/Movies/Recommendations", func(w http.ResponseWriter, r *http.Request) { i.recommendations(w, r, "movie") }); err != nil {
 		return err
@@ -653,12 +737,18 @@ func itemQuery(r *http.Request) frontend.ItemQuery {
 	}
 	if values := route.Query(r.URL.Query(), "SortOrder"); len(values) == 1 {
 		q.Desc = strings.EqualFold(values[0], "Descending")
+	} else if q.Sort == frontend.SortPlayed {
+		// DatePlayed reads as most-recently-played first unless asked
+		// otherwise: the play history a client's "Played" row wants.
+		q.Desc = true
 	}
 
 	q.Recursive = queryBool(r, "Recursive", false)
 	for _, value := range route.Query(r.URL.Query(), "IncludeItemTypes") {
 		for _, typ := range strings.Split(value, ",") {
-			switch strings.ToLower(strings.TrimSpace(typ)) {
+			name := strings.ToLower(strings.TrimSpace(typ))
+			switch name {
+			case "":
 			case "movie":
 				q.Types = append(q.Types, "movie")
 			case "series":
@@ -667,16 +757,33 @@ func itemQuery(r *http.Request) frontend.ItemQuery {
 				q.Types = append(q.Types, "season")
 			case "episode":
 				q.Types = append(q.Types, "episode")
+			default:
+				// A kind the catalogue does not hold. Remember it so the
+				// listing can answer empty instead of dropping the filter and
+				// returning every type (Moonfin's Favorites screen, #405).
+				q.UnservedTypes = append(q.UnservedTypes, name)
 			}
 		}
 	}
+	for _, value := range route.Query(r.URL.Query(), "ExcludeItemTypes") {
+		for _, typ := range splitCSV(value) {
+			name := strings.ToLower(typ)
+			if name == "series" {
+				name = "show"
+			}
+			q.ExcludedTypes = append(q.ExcludedTypes, frontend.MediaType(name))
+		}
+	}
+
 	if values := route.Query(r.URL.Query(), "Genres"); len(values) == 1 && values[0] != "" {
 		q.Filter.Genres = splitCSV(values[0])
 	}
-	if values := route.Query(r.URL.Query(), "Years"); len(values) == 1 {
-		if year, e := strconv.Atoi(values[0]); e == nil {
-			q.Filter.YearFrom = year
-			q.Filter.YearTo = year
+	queryYears(&q, route.Query(r.URL.Query(), "Years"))
+	for name, op := range map[string]string{"MinPremiereDate": ">=", "MaxPremiereDate": "<="} {
+		if values := route.Query(r.URL.Query(), name); len(values) == 1 {
+			if df, ok := premiereDateFilter(op, values[0]); ok {
+				q.Filter.ReleasedFilters = append(q.Filter.ReleasedFilters, df)
+			}
 		}
 	}
 	if values := route.Query(r.URL.Query(), "MinCommunityRating"); len(values) == 1 {
@@ -693,6 +800,13 @@ func itemQuery(r *http.Request) frontend.ItemQuery {
 		names := splitCSV(values[0])
 		if len(names) == 1 {
 			q.Filter.Studio = names[0]
+		}
+	}
+	// The alphabet jump: NameStartsWith=B for a letter, NameLessThan=A
+	// for "#", NameStartsWithOrGreater=B to start the list there.
+	for name, bound := range map[string]*string{"NameStartsWith": &q.Filter.NameStartsWith, "NameStartsWithOrGreater": &q.Filter.NameStartsWithOrGreater, "NameLessThan": &q.Filter.NameLessThan} {
+		if values := route.Query(r.URL.Query(), name); len(values) == 1 {
+			*bound = values[0]
 		}
 	}
 	if values := route.Query(r.URL.Query(), "SearchTerm"); len(values) == 1 {
@@ -741,6 +855,9 @@ func (i *instance) pageWithVersion(w http.ResponseWriter, r *http.Request, v *fr
 }
 
 func (i *instance) pageWithCount(w http.ResponseWriter, r *http.Request, v *frontend.Viewer, page frontend.Page, offset int, anchor frontend.RatingKey, version string, count *bool) {
+	i.pageWithExtra(w, r, v, page, offset, anchor, version, count, nil)
+}
+func (i *instance) pageWithExtra(w http.ResponseWriter, r *http.Request, v *frontend.Viewer, page frontend.Page, offset int, anchor frontend.RatingKey, version string, count *bool, extra []any) {
 	r = withJellyfinListFiles(withBrowseMemo(withListMediaEstimate(withSeriesStudioCache(r))))
 	keys := make([]frontend.RatingKey, 0, len(page.Items))
 	for _, title := range page.Items {
@@ -748,14 +865,22 @@ func (i *instance) pageWithCount(w http.ResponseWriter, r *http.Request, v *fron
 	}
 	state, err := i.host.Experience.UserData(r.Context(), v, keys)
 	if err != nil {
-		http.Error(w, "Unavailable", 503)
-		return
+		// Watch state is decoration on a browse page. A transient store
+		// failure (SQLite writer contention turned whole /Items pages
+		// into 503s, #614) must not fail browsing: serve the page with
+		// unwatched defaults and log it, as Next Up already does.
+		if i.host.Log != nil {
+			i.host.Log.Warn("jellyfin page user data unavailable", "err", err)
+		}
+		state = map[frontend.RatingKey]frontend.WatchStatus{}
 	}
 	items := make([]any, 0, len(page.Items))
 	images := i.gridListImages(r, page.Items)
+	i.prefetchParentArtwork(r, page.Items)
 	ratingFacts := i.pageRatingFacts(r, v, page.Items)
 	paths := i.virtualPaths(r, v, keys)
 	r = i.pageEditions(r, v, keys)
+	r = i.noteLocalUnplayedCounts(r, v, page.Items)
 	i.fillSeriesTitles(r, v, page.Items)
 	for _, title := range page.Items {
 		editions := i.jellyfinEditions(r, v, title)
@@ -771,9 +896,11 @@ func (i *instance) pageWithCount(w http.ResponseWriter, r *http.Request, v *fron
 				for key, value := range images[title.Key] {
 					item[key] = value
 				}
+				previewRowArtwork(r, item)
 				i.shapeJellyfinItem(r, v, item, title)
 				i.jellyfinListFacts(r, item, title)
 				i.jellyfinListFields(r, item, title)
+				i.embyListFields(r, item)
 				i.markUnreleased(item, title)
 				i.applyListedRatings(item, ratingFacts, title.Key)
 				items = append(items, item)
@@ -797,13 +924,16 @@ func (i *instance) pageWithCount(w http.ResponseWriter, r *http.Request, v *fron
 		for key, value := range images[title.Key] {
 			item[key] = value
 		}
+		previewRowArtwork(r, item)
 		i.shapeJellyfinItem(r, v, item, title)
 		i.jellyfinListFacts(r, item, title)
 		i.jellyfinListFields(r, item, title)
+		i.embyListFields(r, item)
 		i.markUnreleased(item, title)
 		i.applyListedRatings(item, ratingFacts, title.Key)
 		items = append(items, item)
 	}
+	items = append(extra, items...)
 	total := page.Total + len(items) - len(page.Items)
 	if total < len(items) {
 		total = len(items)
@@ -836,7 +966,7 @@ func (i *instance) children(w http.ResponseWriter, r *http.Request) {
 	if len(route.Query(r.URL.Query(), "Limit")) == 0 {
 		q.Limit = showChildPageMax
 	}
-	page, err := i.host.Experience.Children(r.Context(), v, device(r), key, q)
+	page, err := i.host.Experience.Children(frontend.WithColdDetail(r.Context(), key), v, device(r), key, q)
 	if err != nil {
 		http.Error(w, "Unavailable", 503)
 		return
@@ -846,6 +976,7 @@ func (i *instance) children(w http.ResponseWriter, r *http.Request) {
 }
 
 func (i *instance) search(w http.ResponseWriter, r *http.Request) {
+	r = r.WithContext(frontend.WithSearchMemo(r.Context()))
 	v, _, err := i.viewer(r)
 	if err != nil || v == nil {
 		http.Error(w, "Unauthorized", 401)
@@ -861,24 +992,79 @@ func (i *instance) search(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := itemQuery(r)
-	result, err := i.host.Experience.Search(r.Context(), v, device(r), terms[0], q)
+	if only, excluded := personTypesOnly(q); only {
+		if excluded {
+			i.replyItems(w, r, map[string]any{"SearchHints": []any{}, "TotalRecordCount": 0})
+			return
+		}
+		if _, ok := i.host.Experience.(frontend.PeopleReader); ok {
+			hints, total, e := i.personSearchHints(r, v, terms[0], q.Offset, q.Limit)
+			if e != nil {
+				i.logFacetFailure("person", e)
+				i.replyItems(w, r, map[string]any{"SearchHints": []any{}, "TotalRecordCount": 0})
+				return
+			}
+			i.replyItems(w, r, map[string]any{"SearchHints": hints, "TotalRecordCount": total})
+			return
+		}
+	}
+	_, token, _ := i.viewer(r)
+	live, e := i.liveSearchItems(r, v, token, terms[0])
+	if e != nil {
+		http.Error(w, "Unavailable", 503)
+		return
+	}
+	extra := paging.Slice(live, q.Offset, q.Limit)
+	catalogQuery := q
+	catalogQuery.Offset = max(0, q.Offset-len(live))
+	catalogQuery.Limit = max(1, q.Limit-len(extra))
+	result, err := i.searchPage(r, v, terms[0], catalogQuery)
 	if err != nil {
 		http.Error(w, "Unavailable", 503)
 		return
 	}
-	hints := make([]any, 0, len(result.Page.Items))
-	for _, t := range result.Page.Items {
+	room := max(0, q.Limit-len(extra))
+	var personHints []any
+	personTotal := 0
+	if q.Offset == 0 && room > 0 && len(q.Types) == 0 && len(q.UnservedTypes) == 0 && !personExcluded(q) {
+		if _, ok := i.host.Experience.(frontend.PeopleReader); ok {
+			pLimit := min(4, max(1, room/3))
+			if room == 1 && len(result.Page.Items) > 0 && result.Page.Items[0].SearchScore >= 0.96 {
+				pLimit = 0
+			}
+			if pLimit > 0 {
+				if ph, pt, pe := i.personSearchHints(r, v, terms[0], 0, pLimit); pe == nil {
+					personHints, personTotal = ph, pt
+				}
+			}
+		}
+	}
+	if len(result.Page.Items) > room {
+		result.Page.Items = result.Page.Items[:room]
+	}
+	titleHints := make([]any, 0, len(result.Page.Items))
+	exactPrefix := 0
+	// Hints carry the poster grant as PrimaryImageTag, as Jellyfin's do;
+	// without it clients draw every result as a blank card.
+	images := i.gridListImages(r, result.Page.Items)
+	for idx, t := range result.Page.Items {
+		if idx == exactPrefix && t.SearchScore >= 0.96 {
+			exactPrefix++
+		}
 		id := ids.RatingKeyGUID(t.Key)
-		kind := map[frontend.MediaType]string{"movie": "Movie", "show": "Series", "season": "Season", "episode": "Episode"}[t.Type]
-		hint := map[string]any{"Id": id, "ItemId": id, "Name": t.Title, "Type": kind, "ProductionYear": t.Year, "IsFolder": t.Type == "show" || t.Type == "season"}
+		kind := mbItemType(t)
+		hint := map[string]any{"Id": id, "ItemId": id, "Name": t.Title, "Type": kind, "ProductionYear": t.Year, "IsFolder": mbIsFolder(t)}
+		if tags, ok := images[t.Key]["ImageTags"].(map[string]string); ok && tags["Primary"] != "" {
+			hint["PrimaryImageTag"] = tags["Primary"]
+		}
 		if i.protocol == "jellyfin" {
-			if t.Type == "movie" || t.Type == "episode" {
-				hint["MediaType"] = "Video"
+			if mediaType, ok := mbMediaType(t); ok {
+				hint["MediaType"] = mediaType
 			}
 			if t.Runtime > 0 {
 				hint["RunTimeTicks"] = t.Runtime.Nanoseconds() / 100
 			}
-			if t.Type == "episode" {
+			if t.Type == "episode" && !mbDeclaredNonVideo(t) {
 				hint["IndexNumber"] = t.Episode
 				hint["ParentIndexNumber"] = t.Season
 				if t.ShowTitle != "" {
@@ -886,15 +1072,35 @@ func (i *instance) search(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-		hints = append(hints, hint)
+		titleHints = append(titleHints, hint)
 	}
-	i.replyItems(w, r, map[string]any{"SearchHints": hints, "TotalRecordCount": result.Page.Total})
+	hints := titleHints
+	if len(personHints) > 0 {
+		hints = make([]any, 0, len(titleHints)+len(personHints))
+		hints = append(hints, titleHints[:exactPrefix]...)
+		hints = append(hints, personHints...)
+		hints = append(hints, titleHints[exactPrefix:]...)
+		if len(hints) > room {
+			hints = hints[:room]
+		}
+	}
+
+	for _, raw := range extra {
+		if dto, ok := raw.(map[string]any); ok {
+			dto["ItemId"] = dto["Id"]
+		}
+	}
+	hints = append(extra, hints...)
+	i.replyItems(w, r, map[string]any{"SearchHints": hints, "TotalRecordCount": result.Page.Total + len(live) + personTotal})
 }
 
 func (i *instance) items(w http.ResponseWriter, r *http.Request) {
 	v, _, err := i.viewer(r)
 	if err != nil || v == nil {
 		http.Error(w, "Unauthorized", 401)
+		return
+	}
+	if i.writeLiveSearchItems(w, r, v) {
 		return
 	}
 	if liveChannelTypesOnly(r) {
@@ -906,8 +1112,20 @@ func (i *instance) items(w http.ResponseWriter, r *http.Request) {
 	if i.writeLiveItemsByID(w, r, v) {
 		return
 	}
+	if parent := route.Query(r.URL.Query(), "ParentId"); len(parent) == 1 && i.liveTVEnabled() {
+		// Opening the Live TV folder (Jellyfin Web's Live TV library) browses
+		// its channels; without this the folder 404'd while /LiveTv/Channels
+		// worked. Answer the same channel list.
+		if n, e := ids.ParseGUID(ids.View, parent[0]); e == nil && n == liveTVViewNumber {
+			i.writeLiveChannelItems(w, r, v)
+			return
+		}
+	}
 	if i.host.Experience == nil {
 		http.Error(w, "Unavailable", 503)
+		return
+	}
+	if i.writeItemsByID(w, r, v) {
 		return
 	}
 	parent := route.Query(r.URL.Query(), "ParentId")
@@ -916,6 +1134,12 @@ func (i *instance) items(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := itemQuery(r)
+	if len(parent) == 1 {
+		if n, e := ids.ParseGUID(ids.View, parent[0]); e == nil && n == collectionsViewNumber {
+			i.writeBoxSets(w, r, v, q)
+			return
+		}
+	}
 	switch requestedSpecialItems(r) {
 	case specialBoxSets:
 		i.writeBoxSets(w, r, v, q)
@@ -934,16 +1158,43 @@ func (i *instance) items(w http.ResponseWriter, r *http.Request) {
 	}
 	var page frontend.Page
 	if search := q.Filter.Query; search != "" && i.searchableParent(parent) {
+		if q.Favorite == nil {
+			if only, excluded := personTypesOnly(q); only {
+				if excluded {
+					jsonReply(w, i.queryResult([]any{}, 0, q.Offset))
+					return
+				}
+				if _, ok := i.host.Experience.(frontend.PeopleReader); ok {
+					i.searchPersons(w, r, v, search)
+					return
+				}
+			}
+		}
 		// /Items?searchTerm= is how Jellyfin and Emby apps search. Answer it
 		// from the title index with a bounded window, not a library walk
 		// filtered by name.
 		q.Filter.Query = ""
-		result, e := i.host.Experience.Search(r.Context(), v, device(r), search, q)
+		_, token, _ := i.viewer(r)
+		live, e := i.liveSearchItems(r, v, token, search)
 		if e != nil {
 			http.Error(w, "Unavailable", 503)
 			return
 		}
-		i.page(w, r, v, result.Page, q.Offset)
+		extra := paging.Slice(live, q.Offset, q.Limit)
+		catalogQuery := q
+		catalogQuery.Offset = max(0, q.Offset-len(live))
+		catalogQuery.Limit = max(1, q.Limit-len(extra))
+		result, e := i.searchPage(r, v, search, catalogQuery)
+		if e != nil {
+			http.Error(w, "Unavailable", 503)
+			return
+		}
+		room := max(0, q.Limit-len(extra))
+		if len(result.Page.Items) > room {
+			result.Page.Items = result.Page.Items[:room]
+		}
+		result.Page.Total += len(live) - len(extra)
+		i.pageWithExtra(w, r, v, result.Page, q.Offset, 0, "", nil, extra)
 		return
 	}
 	if len(parent) == 0 || parent[0] == "" {
@@ -955,6 +1206,18 @@ func (i *instance) items(w http.ResponseWriter, r *http.Request) {
 		page, err = i.host.Experience.LibraryItems(r.Context(), v, device(r), ids.Decimal(id), q)
 	} else if key, e := ids.ParseRatingKeyGUID(parent[0]); e == nil {
 		page, err = i.host.Experience.Children(r.Context(), v, device(r), key, q)
+		if key.Kind() == frontend.KindCollection && err == nil {
+			detail, e := i.host.Experience.Item(r.Context(), frontend.ItemRequest{Viewer: v, Device: device(r), Key: key})
+			if e == nil && detail.Collection != nil && detail.Collection.RankedTop10 {
+				if q.Offset >= 10 {
+					page.Items = nil
+				} else {
+					page.Items = page.Items[:min(len(page.Items), 10-q.Offset)]
+				}
+				page.Total = min(page.Total, 10)
+				r = withRankedRow(r, true, page.Items, q.Offset)
+			}
+		}
 	} else {
 		http.NotFound(w, r)
 		return
@@ -968,6 +1231,57 @@ func (i *instance) items(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	i.page(w, r, v, page, q.Offset)
+}
+
+// itemCollections answers /Items/{id}/Collections, which Jellyfin Web asks on
+// every detail page. Ether's collections are not offered here yet, so the
+// answer is the empty result real Jellyfin gives an item in no collection.
+func (i *instance) itemCollections(w http.ResponseWriter, r *http.Request) {
+	v, _, err := i.viewer(r)
+	if err != nil || v == nil {
+		http.Error(w, "Unauthorized", 401)
+		return
+	}
+	i.replyItems(w, r, i.queryResult([]any{}, 0, queryInt(r, "StartIndex", 0)))
+}
+
+// maxItemsByID bounds one /Items?Ids= lookup; apps send a screen's worth.
+const maxItemsByID = 200
+
+// writeItemsByID answers /Items?Ids=a,b,c with exactly those titles, in the
+// order asked, each through the viewer's own item authorization. Apps fetch
+// an item page, a queue or a SyncPlay playlist this way (Streamyfin, Findroid,
+// Jellyfin Web); without it the filter was dropped and the whole library came
+// back, so the app opened the first title of the library instead. Ids that
+// are not titles, or that this viewer may not see, are left out.
+func (i *instance) writeItemsByID(w http.ResponseWriter, r *http.Request, v *frontend.Viewer) bool {
+	values := route.Query(r.URL.Query(), "Ids")
+	if len(values) == 0 {
+		return false
+	}
+	var keys []frontend.RatingKey
+	seen := map[frontend.RatingKey]bool{}
+	for _, value := range values {
+		for _, id := range strings.Split(value, ",") {
+			key, err := ids.ParseRatingKeyGUID(strings.TrimSpace(id))
+			if err != nil || seen[key] || len(keys) >= maxItemsByID {
+				continue
+			}
+			seen[key] = true
+			keys = append(keys, key)
+		}
+	}
+	page := frontend.Page{Items: make([]frontend.Title, 0, len(keys))}
+	for _, key := range keys {
+		detail, err := i.host.Experience.Item(r.Context(), frontend.ItemRequest{Viewer: v, Device: device(r), Key: key})
+		if err != nil {
+			continue
+		}
+		page.Items = append(page.Items, detail.Title)
+	}
+	page.Total = len(page.Items)
+	i.page(w, r, v, page, 0)
+	return true
 }
 
 // searchableParent reports whether a search may use the title index: no
@@ -1010,6 +1324,14 @@ func (i *instance) ancestors(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Unauthorized", 401)
 		return
 	}
+	if _, err := ids.ParseGUID(ids.Channel, r.PathValue("id")); err == nil && i.liveTVEnabled() {
+		if _, err := i.host.LiveTV.ResolveChannelGUID(r.Context(), v, r.PathValue("id")); err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		jsonReply(w, []any{})
+		return
+	}
 	if i.host.Experience == nil {
 		http.Error(w, "Unavailable", 503)
 		return
@@ -1030,8 +1352,10 @@ func (i *instance) ancestors(w http.ResponseWriter, r *http.Request) {
 	}
 	state, err := i.host.Experience.UserData(r.Context(), v, keys)
 	if err != nil {
-		http.Error(w, "Unavailable", 503)
-		return
+		if i.host.Log != nil {
+			i.host.Log.Warn("jellyfin ancestors user data unavailable", "err", err)
+		}
+		state = map[frontend.RatingKey]frontend.WatchStatus{}
 	}
 	items := make([]any, 0, len(titles))
 	paths := i.virtualPaths(r, v, keys)
@@ -1079,7 +1403,22 @@ func (i *instance) episodes(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Unavailable", 503)
 		return
 	}
-	key, err := ids.ParseRatingKeyGUID(r.PathValue("id"))
+	// Roku's typed screen node can supply an empty showID. Use only its
+	// explicit episode anchor, never a library search, to recover the parent.
+	showID := r.PathValue("id")
+	if showID == "" {
+		anchors := route.Query(r.URL.Query(), "StartItemId")
+		if len(anchors) == 1 {
+			if anchor, e := ids.ParseRatingKeyGUID(anchors[0]); e == nil && anchor.Kind() == frontend.KindEpisode {
+				showID = ids.RatingKeyGUID(frontend.ShowKey(anchor.TMDB()))
+			}
+		}
+		if showID == "" {
+			i.page(w, r, v, frontend.Page{}, 0)
+			return
+		}
+	}
+	key, err := ids.ParseRatingKeyGUID(showID)
 	if err != nil {
 		http.NotFound(w, r)
 		return
@@ -1117,7 +1456,11 @@ func (i *instance) episodes(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Bad Request", 400)
 		return
 	}
-	page, err := i.host.Experience.Children(r.Context(), v, device(r), key, q)
+	requested := key
+	if q.Season != nil {
+		requested = frontend.SeasonKey(key.TMDB(), *q.Season)
+	}
+	page, err := i.host.Experience.Children(frontend.WithColdDetail(r.Context(), requested), v, device(r), key, q)
 	if err != nil {
 		if errors.Is(err, frontend.ErrNotFound) {
 			http.NotFound(w, r)
@@ -1127,4 +1470,52 @@ func (i *instance) episodes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	i.pageWithVersion(w, r, v, page, q.Offset, q.StartAt, version)
+}
+
+// queryYears reads Years, which Jellyfin and Emby send as a comma list
+// (a decade is Years=1990,1991,...,1999). A consecutive run is a year
+// range; any other set of years is a list.
+func queryYears(q *frontend.ItemQuery, values []string) {
+	var years []int
+	for _, value := range values {
+		for _, part := range splitCSV(value) {
+			if year, err := strconv.Atoi(part); err == nil && year > 0 {
+				years = append(years, year)
+			}
+		}
+	}
+	if len(years) == 0 {
+		return
+	}
+	slices.Sort(years)
+	years = slices.Compact(years)
+	if years[len(years)-1]-years[0] == len(years)-1 {
+		q.Filter.YearFrom, q.Filter.YearTo = years[0], years[len(years)-1]
+		return
+	}
+	q.Filter.Years = years
+}
+
+// premiereDateFilter is MinPremiereDate (op ">=") or MaxPremiereDate
+// ("<="): an ISO 8601 instant, or a date, which MaxPremiereDate takes
+// through the end of the day.
+func premiereDateFilter(op, raw string) (frontend.DateFilter, bool) {
+	raw = strings.TrimSpace(raw)
+	if tm, err := time.Parse("2006-01-02", raw); err == nil {
+		return frontend.DateFilter{Op: op, Unix: tm.Unix(), SpanDay: true}, true
+	}
+	for _, layout := range []string{time.RFC3339Nano, "2006-01-02T15:04:05.9999999", "2006-01-02T15:04:05"} {
+		if tm, err := time.Parse(layout, raw); err == nil {
+			return frontend.DateFilter{Op: op, Unix: tm.UTC().Unix()}, true
+		}
+	}
+	return frontend.DateFilter{}, false
+}
+
+// logRowFailure records a home row that could not be built; the client is
+// answered an empty row instead of an error (#421).
+func (i *instance) logRowFailure(purpose frontend.RowPurpose, err error) {
+	if i.host.Log != nil {
+		i.host.Log.Warn("jellyfin row unavailable", "purpose", purpose, "err", err)
+	}
 }

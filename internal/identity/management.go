@@ -41,17 +41,20 @@ func (l *Local) UpsertPassword(ctx context.Context, viewerID int64, username, pa
 }
 
 type GrantInfo struct {
-	Hash     string `json:"hash"`
-	Surface  string `json:"surface"`
-	DeviceID string `json:"deviceId"`
-	Client   string `json:"client"`
-	Product  string `json:"product"`
-	Version  string `json:"version"`
-	LastUsed int64  `json:"lastUsed"`
+	XtreamUsername    string `json:"xtreamUsername,omitempty"`
+	XtreamStreamLimit int    `json:"xtreamStreamLimit,omitempty"`
+	RevealAvailable   bool   `json:"revealAvailable,omitempty"`
+	Hash              string `json:"hash"`
+	Surface           string `json:"surface"`
+	DeviceID          string `json:"deviceId"`
+	Client            string `json:"client"`
+	Product           string `json:"product"`
+	Version           string `json:"version"`
+	LastUsed          int64  `json:"lastUsed"`
 }
 
 func (g *Grants) List(ctx context.Context, viewerID int64) ([]GrantInfo, error) {
-	rows, err := g.db.QueryContext(ctx, `SELECT hash,surface,device_id,client,product,version,last_used FROM identity_grants WHERE viewer_id=? AND revoked=0 AND expires>? ORDER BY last_used DESC`, viewerID, g.now().UnixMilli())
+	rows, err := g.db.QueryContext(ctx, `SELECT hash,surface,device_id,client,product,version,last_used,COALESCE(xtream_username,''),xtream_stream_limit,(xtream_password<>'') FROM identity_grants WHERE viewer_id=? AND revoked=0 AND expires>? ORDER BY last_used DESC`, viewerID, g.now().UnixMilli())
 	if err != nil {
 		return nil, err
 	}
@@ -59,7 +62,7 @@ func (g *Grants) List(ctx context.Context, viewerID int64) ([]GrantInfo, error) 
 	result := []GrantInfo{}
 	for rows.Next() {
 		var v GrantInfo
-		if err = rows.Scan(&v.Hash, &v.Surface, &v.DeviceID, &v.Client, &v.Product, &v.Version, &v.LastUsed); err != nil {
+		if err = rows.Scan(&v.Hash, &v.Surface, &v.DeviceID, &v.Client, &v.Product, &v.Version, &v.LastUsed, &v.XtreamUsername, &v.XtreamStreamLimit, &v.RevealAvailable); err != nil {
 			return nil, err
 		}
 		result = append(result, v)
@@ -69,11 +72,12 @@ func (g *Grants) List(ctx context.Context, viewerID int64) ([]GrantInfo, error) 
 
 // LinkPlex records an already verified Plex identity. A provider subject may
 // belong to only one viewer; conflicts never move it between viewers.
-func (l *Local) LinkPlex(ctx context.Context, viewerID, plexID int64, display string) error {
-	if viewerID <= 0 || plexID <= 0 {
+// LinkPlex links an external account subject; it does not select frontend behavior.
+func (l *Local) LinkPlex(ctx context.Context, viewerID, subjectID int64, display string) error {
+	if viewerID <= 0 || subjectID <= 0 {
 		return core.ErrUnauthorized
 	}
-	subject := strconv.FormatInt(plexID, 10)
+	subject := strconv.FormatInt(subjectID, 10)
 	_, err := l.db.ExecContext(ctx, `INSERT INTO identity_links(viewer_id,provider,subject,display,verified_at) SELECT ?,'plex',?,?,? WHERE EXISTS(SELECT 1 FROM auth_users WHERE id=? AND origin<>'dlna_guest') ON CONFLICT(provider,subject) DO NOTHING`, viewerID, subject, display, time.Now().Unix(), viewerID)
 	if err != nil {
 		return err

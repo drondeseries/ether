@@ -17,6 +17,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import http.server
+import inspect
 import json
 import logging
 import os
@@ -30,10 +31,13 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, TypedDict, Union
 
 TUNNEL_PROTOCOL = "ether-tunnel-v1"
 DEFAULT_MAX_CHUNK_BYTES = 64 * 1024
+MAX_KIND_VISIBLE_IDS = 500
+HEADER_VIEWER_TOKEN = "X-Ether-Viewer-Token"
+HEADER_IDEMPOTENCY_KEY = "X-Ether-Idempotency-Key"
 
 ALLOWED_SETTING_KINDS = frozenset(
     {
@@ -341,8 +345,311 @@ class _KVClient:
         res = self._call("GET", f"/ether/plugin-host/kv{q}")
         return list(res.get("keys", [])) if isinstance(res, dict) else []
 
+    def usage(self) -> Dict[str, int]:
+        res = self._call("GET", "/ether/plugin-host/kv-usage")
+        return dict(res) if isinstance(res, dict) else {}
+
+
+MAX_POSTER_BADGE_SETS = 4
+MAX_BADGE_ENTRIES_PER_CALL = 500
+MAX_BADGE_LABELS_PER_TITLE = 3
+MAX_BADGE_LABEL_LEN = 16
+POSTER_BADGE_QUOTA_TITLES = 200_000
+
+_BADGE_SET_KEY_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+_BADGE_LABEL_RE = re.compile(r"^[A-Z0-9 +&'./-]+$")
+_IMDB_BADGE_RE = re.compile(r"^tt[0-9]{1,12}$")
+
+
+class PosterBadgeSetMeta(TypedDict, total=False):
+    key: str
+    label: str
+    description: str
+
+
+class BadgeTitleRef(TypedDict, total=False):
+    type: str
+    tmdb: int
+    imdb: str
+
+
+class BadgeEntry(TypedDict):
+    title: BadgeTitleRef
+    labels: List[str]
+
+
+class BadgeUsage(TypedDict):
+    titles: int
+    quotaTitles: int
+
+
+def _check_badge_set_key(set_key: str) -> str:
+    if not isinstance(set_key, str) or not _BADGE_SET_KEY_RE.match(set_key):
+        raise ValueError("badge set key must match ^[a-z][a-z0-9_]{0,31}$")
+    return set_key
+
+
+def _normalize_badge_label(raw: str) -> str:
+    if not isinstance(raw, str):
+        raise ValueError("badge label must be a string")
+    upper = "".join(chr(ord(ch) - 32) if "a" <= ch <= "z" else ch for ch in raw)
+    if (
+        len(upper) < 1
+        or len(upper) > MAX_BADGE_LABEL_LEN
+        or not upper.strip()
+        or not _BADGE_LABEL_RE.match(upper)
+    ):
+        raise ValueError(
+            f"badge label must be 1..{MAX_BADGE_LABEL_LEN} characters from [A-Z0-9 +&'./-]"
+        )
+    return upper
+
+
+def _resolve_badge_title_key(
+    title: Dict[str, Any],
+    catalog_store: Dict[str, Dict[str, Any]],
+) -> str:
+    if not isinstance(title, dict):
+        raise ValueError("badge title must be an object")
+    t_type = title.get("type")
+    if t_type not in ("movie", "show"):
+        raise ValueError('badge title.type must be "movie" or "show"')
+    tmdb_raw = title.get("tmdb")
+    tmdb = 0
+    if tmdb_raw is not None:
+        if isinstance(tmdb_raw, bool) or not isinstance(tmdb_raw, int) or tmdb_raw <= 0:
+            raise ValueError("badge title.tmdb must be a positive integer")
+        tmdb = tmdb_raw
+    imdb_raw = title.get("imdb")
+    imdb = ""
+    if imdb_raw is not None and imdb_raw != "":
+        if not isinstance(imdb_raw, str):
+            raise ValueError("badge title.imdb must be a string")
+        norm = imdb_raw.strip().lower()
+        if not _IMDB_BADGE_RE.match(norm):
+            raise ValueError("badge title.imdb must match tt<digits>")
+        imdb = norm
+    if tmdb == 0 and not imdb:
+        raise ValueError("badge title requires tmdb or imdb")
+    if tmdb > 0:
+        for item in catalog_store.values():
+            if item.get("type") == t_type and item.get("tmdbId") == tmdb:
+                return str(item.get("id"))
+    if imdb:
+        for item in catalog_store.values():
+            if item.get("type") == t_type and str(item.get("imdbId") or "").lower() == imdb:
+                return str(item.get("id"))
+    return f"tmdb:{t_type}:{tmdb}" if tmdb > 0 else f"imdb:{t_type}:{imdb}"
+
+
+def _count_distinct_badge_titles(store: Dict[str, Dict[str, List[str]]]) -> int:
+    seen = set()
+    for set_map in store.values():
+        seen.update(set_map.keys())
+    return len(seen)
+
+
+class _BadgesClient:
+    def __init__(self, call_fn: Callable[..., Any]) -> None:
+        self._call = call_fn
+
+    def set(self, set_key: str, entries: List[BadgeEntry]) -> None:
+        encoded = urllib.parse.quote(str(set_key), safe="")
+        self._call("PUT", f"/ether/plugin-host/badges/{encoded}", {"entries": list(entries)})
+
+    def clear(self, set_key: str) -> None:
+        encoded = urllib.parse.quote(str(set_key), safe="")
+        self._call("DELETE", f"/ether/plugin-host/badges/{encoded}")
+
+    def usage(self) -> BadgeUsage:
+        res = self._call("GET", "/ether/plugin-host/badges-usage")
+        if not isinstance(res, dict):
+            return {"titles": 0, "quotaTitles": 0}
+        return {
+            "titles": int(res.get("titles", 0)),
+            "quotaTitles": int(res.get("quotaTitles", 0)),
+        }
+
+
+MIN_DATA_READ_BYTES = 8 * 1024 * 1024
+MAX_DATA_READ_BYTES = 512 * 1024 * 1024
+MAX_ARCHIVE_READ_ITEMS = 4096
+
+
+class RuntimeLimits(TypedDict, total=False):
+    fetchBytes: int
+    archiveMemberBytes: int
+    archiveExpandedBytes: int
+    archiveMembers: int
+    maxItems: int
+    memoryBytes: int
+    readBytes: int
+    deadline: str
+    unitBudget: int
+    poolSize: int
+
+
+class DataRange(TypedDict):
+    offset: int
+    length: int
+
+
+class ArchiveReadItem(TypedDict):
+    member: int
+    offset: int
+    length: int
+
+
+class ArchiveReadResult(TypedDict):
+    index: int
+    member: int
+    size: int
+    body: bytes
+
+
+class ArchiveMember(TypedDict, total=False):
+    index: int
+    name: str
+    size: int
+    unsafe: bool
+    unsafeReason: str
+
+
+class ArchiveExtractOptions(TypedDict, total=False):
+    libraryKey: str
+    name: str
+
+
+class ArchiveExtractResult(TypedDict):
+    ref: str
+    size: int
+    sha1: str
+    md5: str
+    crc32: str
+
+
+class RasterizeOptions(TypedDict, total=False):
+    width: int
+    height: int
+    format: str
+
+
+class RasterizeResult(TypedDict):
+    blob: str
+    contentType: str
+    width: int
+    height: int
+    size: int
+
+
+def _check_rasterize_options(options: Optional[RasterizeOptions]) -> Optional[Dict[str, Any]]:
+    if options is None:
+        return None
+    out: Dict[str, Any] = dict(options)
+    for dim in (out.get("width"), out.get("height")):
+        if dim is not None and (isinstance(dim, bool) or not isinstance(dim, int) or dim < 0 or dim > 2048):
+            raise ValueError("cache.rasterize width and height must be within 0..2048")
+    fmt = out.get("format")
+    if fmt is not None and fmt not in ("png", "jpeg"):
+        raise ValueError("cache.rasterize format must be png or jpeg")
+    return out
+
+
+def _check_data_range(data_range: Dict[str, Any], max_bytes: int = MAX_DATA_READ_BYTES) -> Dict[str, int]:
+    offset = data_range.get("offset")
+    length = data_range.get("length")
+    if (
+        isinstance(offset, bool)
+        or isinstance(length, bool)
+        or not isinstance(offset, int)
+        or not isinstance(length, int)
+        or offset < 0
+        or offset > (1 << 60)
+        or length <= 0
+        or length > max_bytes
+    ):
+        raise ValueError(f"Data range needs nonnegative offset and length 1..{max_bytes}")
+    return {"offset": offset, "length": length}
+
+
+def _check_archive_reads(reads: List[ArchiveReadItem], max_bytes: int = MAX_DATA_READ_BYTES) -> List[Dict[str, int]]:
+    if not isinstance(reads, list) or len(reads) == 0 or len(reads) > MAX_ARCHIVE_READ_ITEMS:
+        raise ValueError(f"archive.read takes 1..{MAX_ARCHIVE_READ_ITEMS} reads")
+    normalized: List[Dict[str, int]] = []
+    total = 0
+    for item in reads:
+        member = item.get("member")
+        if isinstance(member, bool) or not isinstance(member, int) or member < 0:
+            raise ValueError("archive.read member index must be a nonnegative integer")
+        rng = _check_data_range(item, max_bytes=max_bytes)
+        total += rng["length"]
+        if total > max_bytes:
+            raise ValueError(f"archive.read requested bytes exceed per-call readBytes limit ({max_bytes})")
+        normalized.append({"member": member, "offset": rng["offset"], "length": rng["length"]})
+    return normalized
+
+
+class _RuntimeClient:
+    def __init__(self, call_json: Callable[..., Any]) -> None:
+        self._call = call_json
+
+    def limits(self) -> RuntimeLimits:
+        res = self._call("GET", "/ether/plugin-host/limits")
+        return dict(res) if isinstance(res, dict) else {}  # type: ignore[return-value]
+
+
+class _ArchiveClient:
+    def __init__(self, call_json: Callable[..., Any]) -> None:
+        self._call = call_json
+
+    def list(self, blob_ref: str) -> List[ArchiveMember]:
+        res = self._call("POST", "/ether/plugin-host/data/archive.list", [str(blob_ref)])
+        return list(res) if isinstance(res, list) else []
+
+    def open(self, blob_ref: str, member: int, data_range: DataRange) -> bytes:  # noqa: A002
+        norm = _check_data_range(data_range)
+        res = self._call("POST", "/ether/plugin-host/data/archive.open", [str(blob_ref), int(member), norm])
+        return base64.b64decode((res or {}).get("bodyBase64") or "")
+
+    def read(self, blob_ref: str, reads: List[ArchiveReadItem]) -> List[ArchiveReadResult]:
+        norm = _check_archive_reads(reads)
+        res = self._call("POST", "/ether/plugin-host/data/archive.read", [str(blob_ref), norm])
+        rows = res if isinstance(res, list) else []
+        return [
+            {
+                "index": int(row["index"]),
+                "member": int(row["member"]),
+                "size": int(row["size"]),
+                "body": base64.b64decode(row.get("bodyBase64") or ""),
+            }
+            for row in rows
+        ]
+
+    def extract(
+        self,
+        blob_ref: str,
+        member: int,
+        options: Optional[ArchiveExtractOptions] = None,
+    ) -> ArchiveExtractResult:
+        args: List[Any] = [str(blob_ref), int(member)]
+        if options is not None:
+            args.append(dict(options))
+        res = self._call("POST", "/ether/plugin-host/data/archive.extract", args)
+        return res if isinstance(res, dict) else {}  # type: ignore[return-value]
+
 
 class _HttpClient:
+    def __init__(self, call_json: Callable[..., Any]) -> None:
+        self._call = call_json
+
+    def hash(self, req: Dict[str, Any]) -> Dict[str, Any]:
+        return self._call("POST", "/ether/plugin-host/data/http.hash", [req])
+
+    def fetch_to_cache(self, req: Dict[str, Any]) -> Dict[str, Any]:
+        return self._call("POST", "/ether/plugin-host/data/http.fetchToCache", [req])
+
+    fetchToCache = fetch_to_cache
+
     def fetch(self, req: Dict[str, Any]) -> Dict[str, Any]:
         method = str(req.get("method") or "GET").upper()
         url = str(req["url"])
@@ -351,7 +658,7 @@ class _HttpClient:
         data = body_str.encode("utf-8") if isinstance(body_str, str) else None
         request = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(request, timeout=15) as resp:
+            with urllib.request.urlopen(request, timeout=min(15, max(0.001, float(req.get("timeoutMs", 15000)) / 1000))) as resp:
                 raw = resp.read().decode("utf-8", errors="replace")
                 out_headers = {k.lower(): v for k, v in resp.headers.items()}
                 return {"status": resp.status, "headers": out_headers, "body": raw}
@@ -403,12 +710,142 @@ class _CollectionsClient:
         self._call("POST", "/ether/plugin-host/collections/upsert", collection)
 
 
+class EventEnumOption(TypedDict, total=False):
+    value: str
+    label: str
+
+
+class EventFieldMeta(TypedDict, total=False):
+    name: str
+    type: str
+    label: str
+    description: str
+    unit: str
+    enum: List[EventEnumOption]
+    pii: bool
+    secret: bool
+    filterable: bool
+    example: Any
+
+
+class PublishedEventMeta(TypedDict, total=False):
+    key: str
+    label: str
+    description: str
+    version: int
+    fields: List[EventFieldMeta]
+
+
+class FlowActionParamMeta(TypedDict, total=False):
+    key: str
+    type: str
+    label: str
+    description: str
+    required: bool
+    secret: bool
+    template: bool
+    default: Any
+    enum: List[EventEnumOption]
+    unit: str
+    picker: str
+
+
+class FlowActionMeta(TypedDict, total=False):
+    key: str
+    label: str
+    description: str
+    icon: str
+    route: str
+    idempotent: bool
+    sideEffect: bool
+    timeout: str
+    params: List[FlowActionParamMeta]
+    outputs: List[EventFieldMeta]
+
+
+class EventCorrelation(TypedDict, total=False):
+    key: str
+    sessionId: str
+    playId: str
+    titleId: str
+    viewerId: int
+    channelId: str
+    sourceId: str
+    pluginId: str
+    deviceId: str
+    libraryId: str
+
+
+class FlowActionRequest(TypedDict, total=False):
+    key: str
+    flowId: str
+    runId: str
+    nodeId: str
+    idempotencyKey: str
+    dryRun: bool
+    params: Dict[str, Any]
+
+
+class FlowActionResponse(TypedDict, total=False):
+    output: Dict[str, Any]
+    branch: str
+
+
+class _EventsClient:
+    def __init__(self, call_json: Callable[..., Any]) -> None:
+        self._call = call_json
+
+    def publish(
+        self,
+        key: str,
+        payload: Optional[Dict[str, Any]] = None,
+        correlation: Optional[EventCorrelation] = None,
+    ) -> None:
+        body: Dict[str, Any] = {
+            "key": str(key),
+            "payload": dict(payload) if payload is not None else {},
+        }
+        if correlation is not None:
+            body["correlation"] = dict(correlation)
+        self._call("POST", "/ether/plugin-host/events/publish", body)
+
+
 class _NotifyClient:
     def __init__(self, call_json: Callable[..., Any]) -> None:
         self._call = call_json
 
     def owner(self, text: str) -> None:
         self._call("POST", "/ether/plugin-host/notify", {"text": str(text)})
+
+
+def _check_part_index(part_index: Optional[int]) -> Optional[int]:
+    if part_index is None:
+        return None
+    if isinstance(part_index, bool) or not isinstance(part_index, int) or part_index < 0:
+        raise ValueError("stream url: part_index must be a non-negative integer")
+    return part_index
+
+
+class _FrontendClient:
+    def __init__(self, call_json: Callable[..., Any]) -> None:
+        self._call = call_json
+
+    def stream_url(
+        self,
+        viewer_id: int,
+        item_ref: str,
+        part_index: Optional[int] = None,
+    ) -> str:
+        checked = _check_part_index(part_index)
+        payload: Dict[str, Any] = {"viewerId": int(viewer_id), "itemRef": str(item_ref)}
+        if checked is not None:
+            payload["partIndex"] = checked
+        result = self._call(
+            "POST",
+            "/ether/plugin-host/frontend/stream-url",
+            payload,
+        )
+        return str((result or {}).get("url") or "")
 
 
 class RemoteHostClient:
@@ -418,18 +855,70 @@ class RemoteHostClient:
         self,
         base_url: Optional[str] = None,
         credential: Optional[str] = None,
+        viewer_token: Optional[str] = None,
     ) -> None:
         raw_base = base_url or os.environ.get("ETHER_HOST_URL") or "http://127.0.0.1:32450"
         self.base_url = raw_base.rstrip("/")
         self.credential = (
             credential if credential is not None else os.environ.get("ETHER_PLUGIN_CREDENTIAL", "")
         )
+        self.viewer_token = (viewer_token or "").strip()
         self.kv = _KVClient(self._call_json)
-        self.http = _HttpClient()
+        self.badges = _BadgesClient(self._call_json)
+        self.http = _HttpClient(self._call_json)
         self.catalog = _CatalogClient(self._call_json)
         self.viewers = _ViewersClient(self._call_json)
         self.collections = _CollectionsClient(self._call_json)
+        self.events = _EventsClient(self._call_json)
         self.notify = _NotifyClient(self._call_json)
+        self.kinds = _KindsClient(self._call_json, lambda: self.viewer_token)
+        self.runtime = _RuntimeClient(self._call_json)
+        self.cache = self._Cache(self)
+        self.archive = _ArchiveClient(self._call_json)
+        self.frontend = _FrontendClient(self._call_json)
+
+    class _Cache:
+        def __init__(self, parent: "RemoteHostClient") -> None:
+            self._p = parent
+
+        def _request(self, method: str, path: str, data: Optional[bytes] = None) -> bytes:
+            req = urllib.request.Request(
+                f"{self._p.base_url}{path}", data=data, method=method,
+                headers={"X-Ether-Plugin-Credential": self._p.credential},
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return resp.read()
+
+        def put(self, library_key: str, name: str, data: bytes) -> str:
+            q = urllib.parse.urlencode({"name": name})
+            raw = self._request("POST", f"/ether/plugin-host/cache/{urllib.parse.quote(library_key)}?{q}", data)
+            return str(json.loads(raw or b"{}").get("blob") or "")
+
+        def open(self, blob_ref: str) -> bytes:  # noqa: A002 - mirrors host naming
+            return self._request("GET", "/ether/plugin-host/cache/" + str(blob_ref).lstrip("/"))
+
+        def read(self, blob_ref: str, data_range: DataRange) -> bytes:
+            norm = _check_data_range(data_range)
+            res = self._p._call_json("POST", "/ether/plugin-host/data/cache.read", [str(blob_ref), norm])
+            return base64.b64decode((res or {}).get("bodyBase64") or "")
+
+        def rasterize(
+            self,
+            library_key: str,
+            name: str,
+            blob_ref: str,
+            options: Optional[RasterizeOptions] = None,
+        ) -> RasterizeResult:
+            args: List[Any] = [str(library_key), str(name), str(blob_ref)]
+            norm = _check_rasterize_options(options)
+            if norm is not None:
+                args.append(norm)
+            res = self._p._call_json("POST", "/ether/plugin-host/data/cache.rasterize", args)
+            return res if isinstance(res, dict) else {}  # type: ignore[return-value]
+
+        def delete(self, blob_ref: str) -> None:
+            encoded = urllib.parse.quote(str(blob_ref), safe=":")
+            self._p._call_json("DELETE", f"/ether/plugin-host/cache/{encoded}")
 
     def _call_json(
         self,
@@ -437,11 +926,16 @@ class RemoteHostClient:
         path: str,
         body: Optional[Any] = None,
         allow_404: bool = False,
+        extra_headers: Optional[Dict[str, str]] = None,
     ) -> Any:
         headers: Dict[str, str] = {
             "X-Ether-Plugin-Credential": self.credential,
             "Accept": "application/json",
         }
+        if extra_headers:
+            for k, v in extra_headers.items():
+                if v:
+                    headers[str(k)] = str(v)
         data: Optional[bytes] = None
         if body is not None:
             headers["Content-Type"] = "application/json"
@@ -453,7 +947,7 @@ class RemoteHostClient:
             method=method,
         )
         try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with urllib.request.urlopen(req, timeout=60) as resp:
                 raw = resp.read().decode("utf-8")
                 return json.loads(raw) if raw else None
         except urllib.error.HTTPError as exc:
@@ -491,8 +985,9 @@ class RemoteHostClient:
 def create_remote_host_client(
     base_url: Optional[str] = None,
     credential: Optional[str] = None,
+    viewer_token: Optional[str] = None,
 ) -> RemoteHostClient:
-    return RemoteHostClient(base_url=base_url, credential=credential)
+    return RemoteHostClient(base_url=base_url, credential=credential, viewer_token=viewer_token)
 
 
 # ---------------------------------------------------------------------------
@@ -522,6 +1017,59 @@ class PluginContext:
 
     def t(self, key: str, params: Optional[Dict[str, Any]] = None) -> str:
         return self.i18n.t(key, params=params, locale=self.locale)
+
+    def stream_url(self, item_ref: str, part_index: Optional[int] = None) -> str:
+        """Mint a scoped Ether stream URL for one of this plugin's own kind
+        items (spec §6.5), or for one zero-based part when part_index is set
+        (#576). The viewer is the one Ether authenticated on this request
+        (X-Ether-Viewer); bytes are served by Ether, not the plugin."""
+        if self.ether is None:
+            raise RuntimeError("stream url: no host service available")
+        checked = _check_part_index(part_index)
+        raw = _get_header(self.headers, "X-Ether-Viewer")
+        try:
+            viewer_id = int(str(raw).strip()) if raw is not None else 0
+        except (TypeError, ValueError):
+            viewer_id = 0
+        if viewer_id <= 0:
+            raise RuntimeError("stream url: no authenticated viewer on this request")
+        if checked is None:
+            return self.ether.frontend.stream_url(viewer_id, str(item_ref))
+        return self.ether.frontend.stream_url(viewer_id, str(item_ref), checked)
+
+    def _viewer_token(self) -> str:
+        raw = _get_header(self.headers, HEADER_VIEWER_TOKEN)
+        return str(raw).strip() if raw is not None else ""
+
+    def kinds_visible(self, kind: str, ids: List[str]) -> List[str]:
+        """Evaluate the library's Rules and viewer access policy for a bounded
+        batch (at most 500) of external IDs in `kind` (#615). Only frontend
+        adapter requests carrying Ether's authenticated viewer token may call it."""
+        if self.ether is None or getattr(self.ether, "kinds", None) is None:
+            raise RuntimeError("kinds.visible: no host service available")
+        tok = self._viewer_token()
+        if not tok:
+            raise RuntimeError("kinds.visible: no authenticated frontend adapter viewer on this request")
+        return self.ether.kinds.visible(str(kind), list(ids), viewer_token=tok)
+
+    def kinds_browse(
+        self,
+        kind: str,
+        query: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Browse or search `kind` with the library's Rules and viewer access
+        policy applied for the requesting frontend-adapter viewer (#615). Only
+        frontend adapter requests carrying Ether's authenticated viewer token
+        may call it."""
+        if self.ether is None or getattr(self.ether, "kinds", None) is None:
+            raise RuntimeError("kinds.browse: no host service available")
+        tok = self._viewer_token()
+        if not tok:
+            raise RuntimeError("kinds.browse: no authenticated frontend adapter viewer on this request")
+        return self.ether.kinds.browse(str(kind), dict(query or {}), viewer_token=tok)
+
+    kindsVisible = kinds_visible
+    kindsBrowse = kinds_browse
 
 
 def _get_header(headers: Optional[Dict[str, Any]], name: str) -> Optional[str]:
@@ -670,6 +1218,7 @@ class PluginInstance:
         )
 
         self._page_routes: Dict[str, str] = {}
+        self._flow_action_routes: Dict[str, str] = {}
         if isinstance(ether_block, dict):
             contributes = ether_block.get("contributes")
             if isinstance(contributes, dict):
@@ -679,6 +1228,9 @@ class PluginInstance:
                 for s in contributes.get("slots") or []:
                     if isinstance(s, dict) and s.get("route") and s.get("key"):
                         self._page_routes[str(s["route"])] = str(s["key"])
+                for fa in contributes.get("flowActions") or []:
+                    if isinstance(fa, dict) and fa.get("route") and fa.get("key"):
+                        self._flow_action_routes[str(fa["route"])] = str(fa["key"])
 
     def get_settings(self) -> Dict[str, Any]:
         return dict(self._current_settings)
@@ -711,7 +1263,12 @@ class PluginInstance:
         locale = str(locale_raw).split(",")[0].strip() or "en"
         pick_token = _get_header(headers, "X-Ether-Pick")
         request_id = _get_header(headers, "X-Ether-Request-ID")
-        host_client = self._host if self._host is not None else create_remote_host_client()
+        viewer_token = _get_header(headers, HEADER_VIEWER_TOKEN)
+        host_client = (
+            self._host
+            if self._host is not None
+            else create_remote_host_client(viewer_token=viewer_token)
+        )
         settings = dict(self._current_settings)
         getter = getattr(host_client, "settings_get", None)
         if callable(getter) and str(req.get("path", "")) != "/ether/configure" and (not isinstance(host_client, RemoteHostClient) or host_client.credential):
@@ -942,6 +1499,32 @@ class PluginInstance:
             input_obj = _parse_json_body(req.get("body"))
             return _ok_response(fn({"action": action_name, "input": input_obj}, ctx))
 
+        if method == "POST":
+            flow_key = self._flow_action_routes.get(path)
+            if not flow_key and path.startswith("/ether/v1/flow-actions/"):
+                flow_key = urllib.parse.unquote(path[len("/ether/v1/flow-actions/") :])
+            if flow_key:
+                fn = self.routes.get("flow_action") or self.routes.get("flowAction")
+                if not fn:
+                    return _error_response(
+                        404, "not_found", "Flow action handler is not registered."
+                    )
+                body_obj = _parse_json_body(req.get("body"))
+                header_idem = _get_header(req.get("headers"), HEADER_IDEMPOTENCY_KEY) or ""
+                params_obj = body_obj.get("params")
+                if not isinstance(params_obj, dict):
+                    params_obj = {}
+                fa_req: FlowActionRequest = {
+                    "key": flow_key,
+                    "flowId": str(body_obj.get("flowId") or ""),
+                    "runId": str(body_obj.get("runId") or ""),
+                    "nodeId": str(body_obj.get("nodeId") or ""),
+                    "idempotencyKey": str(header_idem or body_obj.get("idempotencyKey") or ""),
+                    "dryRun": bool(body_obj.get("dryRun", False)),
+                    "params": params_obj,
+                }
+                return _ok_response(fn(fa_req, ctx))
+
         if method == "POST" and path.startswith("/ether/tool/"):
             fn = self.routes.get("tool")
             if not fn:
@@ -955,7 +1538,10 @@ class PluginInstance:
             if not fn:
                 return _error_response(404, "not_found", "Job handler is not registered.")
             job_name = urllib.parse.unquote(path[len("/ether/job/") :])
-            return _ok_response(fn({"name": job_name}, ctx))
+            return _ok_response(fn({
+                "name": job_name,
+                "continuation": _parse_json_body(req.get("body")).get("continuation"),
+            }, ctx))
 
         if method == "POST" and path == "/ether/rank-key":
             fn = self.routes.get("rank_key") or self.routes.get("rankKey")
@@ -1110,7 +1696,196 @@ class PluginInstance:
                         )
                     )
 
+        kinds_resp = self._dispatch_kinds(method, path, req, ctx)
+        if kinds_resp is not None:
+            return kinds_resp
+
         return _error_response(404, "not_found", f"No route matched {method} {path}.")
+
+    # -- Content kinds (Ether v0.3.8) -------------------------------------
+
+    def on_catalog(self, kind: str, provider: Any) -> None:
+        self._kind_catalog()[kind] = provider
+
+    def on_resolve(self, kind: str, resolver: Any) -> None:
+        self._kind_resolve()[kind] = resolver
+
+    def on_match(self, kind: str, matcher: Any) -> None:
+        self._kind_match()[kind] = matcher
+
+    def on_live(self, kind: str, provider: Any) -> None:
+        self._kind_live()[kind] = provider
+
+    def on_frontend(self, key: str, adapter: Any) -> None:
+        self._kind_frontend()[key] = adapter
+
+    def on_setup_test(self, tester: Any) -> None:
+        self._setup_tester = tester
+
+    onCatalog = on_catalog
+    onResolve = on_resolve
+    onMatch = on_match
+    onLive = on_live
+    onFrontend = on_frontend
+    onSetupTest = on_setup_test
+
+    def _kind_catalog(self) -> Dict[str, Any]:
+        return self.__dict__.setdefault("_catalog_providers", {})
+
+    def _kind_resolve(self) -> Dict[str, Any]:
+        return self.__dict__.setdefault("_kind_resolvers", {})
+
+    def _kind_match(self) -> Dict[str, Any]:
+        return self.__dict__.setdefault("_kind_matchers", {})
+
+    def _kind_live(self) -> Dict[str, Any]:
+        return self.__dict__.setdefault("_kind_live_providers", {})
+
+    def _kind_frontend(self) -> Dict[str, Any]:
+        return self.__dict__.setdefault("_frontend_adapters", {})
+
+    def _dispatch_kinds(
+        self, method: str, path: str, req: Dict[str, Any], ctx: PluginContext
+    ) -> Optional[Dict[str, Any]]:
+        if not path.startswith("/ether/v1/"):
+            return None
+        parts = [urllib.parse.unquote(p) for p in path[len("/ether/v1/"):].split("/")]
+        # Frontend adapters are protocol surfaces (WebDAV, Subsonic, OPDS, ...)
+        # and see every method token. The kind and setup routes stay JSON
+        # GET/POST.
+        if len(parts) >= 2 and parts[0] == "frontend":
+            adapter = self._kind_frontend().get(parts[1])
+            if adapter is None:
+                return _error_response(404, "not_found", f'No frontend adapter is registered for "{parts[1]}".')
+            sub_path = "/" + "/".join(parts[2:])
+            # Rebuild the adapter URL with the original query. The server
+            # flattens repeated keys to the first value, so a query map holds
+            # one value per key.
+            _, query = _parse_url_path_and_query(
+                str(req.get("path") or "/"), req.get("query")
+            )
+            if query:
+                sub_path += "?" + urllib.parse.urlencode(query)
+            handle_fn = adapter.handle
+            try:
+                params = list(inspect.signature(handle_fn).parameters.values())
+                accepts_ctx = any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params) or len(params) >= 5
+            except (TypeError, ValueError):
+                accepts_ctx = False
+            # Exact request bytes ride in bodyBase64 on adapter routes; a
+            # non-JSON body (multipart, form-encoded, binary) is only there.
+            req_body = req.get("body")
+            if req_body is None and isinstance(req.get("bodyBase64"), str):
+                req_body = base64.b64decode(req["bodyBase64"])
+            if accepts_ctx:
+                status, headers, resp_body = handle_fn(method, sub_path, dict(req.get("headers") or {}), req_body or b"", ctx)
+            else:
+                status, headers, resp_body = handle_fn(method, sub_path, dict(req.get("headers") or {}), req_body or b"")
+            # A HEAD reply carries headers only, exactly as a real server would.
+            if method == "HEAD":
+                resp_body = b""
+            return {"status": int(status), "headers": dict(headers or {}), "body": resp_body}
+
+        if method not in ("GET", "POST"):
+            return _error_response(405, "method_not_allowed", "Kind routes use GET or POST.")
+
+        try:
+            body = _parse_json_body(req.get("body"))
+        except Exception:
+            return _error_response(400, "invalid_json", "Request body must be valid JSON.")
+
+        if len(parts) == 3 and parts[0] == "setup" and parts[2] == "test":
+            tester = getattr(self, "_setup_tester", None)
+            if tester is None:
+                return _error_response(404, "not_found", "Setup test handler is not registered.")
+            body.setdefault("step", parts[1])
+            return _ok_response(tester.test_setup(ctx, body))
+
+        if len(parts) < 3 or parts[0] != "kinds":
+            return None
+        kind, tail = parts[1], parts[2:]
+        body = dict(body)
+        body["kind"] = kind
+
+        def page(result: Any) -> Dict[str, Any]:
+            result = dict(result or {})
+            limit = int(body.get("limit") or 200)
+            items = list(result.get("items") or [])
+            if len(items) > limit:
+                items = items[:limit]
+            result["items"] = items
+            if not result.get("nextCursor"):
+                result.pop("nextCursor", None)
+            return _ok_response(result)
+
+        if tail == ["browse"] or tail == ["search"]:
+            provider = self._kind_catalog().get(kind)
+            if provider is None:
+                return _error_response(404, "not_found", f'No catalogue provider is registered for kind "{kind}".')
+            if tail == ["search"]:
+                search = getattr(provider, "search", None)
+                if not callable(search):
+                    return _error_response(501, "not_implemented", "This provider does not search.")
+                return page(search(ctx, body))
+            return page(provider.browse(ctx, body))
+        if tail == ["expand"]:
+            provider = self._kind_catalog().get(kind)
+            expand = getattr(provider, "expand", None) if provider else None
+            if not callable(expand):
+                return _error_response(501, "not_implemented", "This provider does not expand facets.")
+            result = dict(expand(ctx, body) or {})
+            if not result.get("job"):
+                result.setdefault("items", [])
+            return _ok_response(result)
+        if len(tail) == 2 and tail[0] == "items":
+            provider = self._kind_catalog().get(kind)
+            if provider is None:
+                return _error_response(404, "not_found", f'No catalogue provider is registered for kind "{kind}".')
+            return _ok_response(provider.detail(ctx, kind, tail[1]))
+        if tail == ["changes"]:
+            provider = self._kind_catalog().get(kind)
+            changes = getattr(provider, "changes", None) if provider else None
+            if not callable(changes):
+                return _error_response(501, "not_implemented", "This provider has no changes feed.")
+            result = dict(changes(ctx, body) or {})
+            result.setdefault("upserts", [])
+            return _ok_response(result)
+        if tail == ["resolve"]:
+            resolver = self._kind_resolve().get(kind)
+            if resolver is None:
+                return _error_response(404, "not_found", f'No resolver is registered for kind "{kind}".')
+            result = dict(resolver.resolve(ctx, body) or {})
+            result.setdefault("sources", [])
+            return _ok_response(result)
+        if tail == ["live"]:
+            provider = self._kind_live().get(kind)
+            if provider is None:
+                return _error_response(404, "not_found", f'No live provider is registered for kind "{kind}".')
+            result = dict(provider.live(ctx, body) or {})
+            limit = int(body.get("limit") or 50)
+            items = list(result.get("items") or [])
+            if len(items) > limit:
+                items = items[:limit]
+            result["items"] = items
+            if not result.get("nextCursor"):
+                result.pop("nextCursor", None)
+            return _ok_response(result)
+        if tail == ["live", "resolve"]:
+            provider = self._kind_live().get(kind)
+            if provider is None:
+                return _error_response(404, "not_found", f'No live provider is registered for kind "{kind}".')
+            resolve_fn = getattr(provider, "resolve_live", None) or getattr(provider, "resolveLive", None)
+            if not callable(resolve_fn):
+                return _error_response(501, "not_implemented", "This live provider does not resolve live streams.")
+            return _ok_response(dict(resolve_fn(ctx, body) or {}))
+        if tail == ["match"]:
+            matcher = self._kind_match().get(kind)
+            if matcher is None:
+                return _error_response(404, "not_found", f'No matcher is registered for kind "{kind}".')
+            result = dict(matcher.match(ctx, body) or {})
+            result.setdefault("matches", [])
+            return _ok_response(result)
+        return _error_response(404, "not_found", "No kind route matched.")
 
 
 def plugin(
@@ -1342,11 +2117,155 @@ def _ws_recv_frame(sock: socket.socket) -> Tuple[int, bytes]:
     return opcode, bytes(payload)
 
 
+# ---------------------------------------------------------------------------
+# Sidecar pairing (SPEC: sidecars that install like an app)
+# ---------------------------------------------------------------------------
+
+PAIR_EXCHANGE_PATH = "/ether/plugins/pair"
+TUNNEL_PATH = "/ether/plugins/tunnel"
+
+
+class CredentialError(RuntimeError):
+    """Raised when no usable credential can be resolved for a sidecar."""
+
+
+def no_credential_message() -> str:
+    return (
+        "No credential: create a pairing code in Ether (Plugins > this plugin > "
+        "Connect a sidecar) and set ETHER_PAIRING_CODE."
+    )
+
+
+def _server_base(base: str) -> str:
+    base = (base or "").strip()
+    if not base:
+        raise CredentialError("ETHER_URL is not set")
+    parsed = urllib.parse.urlparse(base)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise CredentialError("ETHER_URL must use http or https and include a host")
+    return parsed.scheme + "://" + parsed.netloc
+
+
+def tunnel_url_from_base(base: str) -> str:
+    parsed = urllib.parse.urlparse(_server_base(base))
+    scheme = "wss" if parsed.scheme == "https" else "ws"
+    return f"{scheme}://{parsed.netloc}{TUNNEL_PATH}"
+
+
+def pair_url_from_base(base: str) -> str:
+    return _server_base(base) + PAIR_EXCHANGE_PATH
+
+
+def resolve_state_dir(explicit: str, plugin_id: str) -> str:
+    if (explicit or "").strip():
+        return explicit.strip()
+    data = "/data"
+    if os.path.isdir(data) and os.access(data, os.W_OK):
+        return data
+    config_home = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
+        os.path.expanduser("~"), ".config"
+    )
+    return os.path.join(config_home, "ether-plugins", plugin_id or "plugin")
+
+
+def _credential_file(state_dir: str) -> str:
+    return os.path.join(state_dir, "credential")
+
+
+def read_saved_credential(state_dir: str) -> Optional[str]:
+    try:
+        with open(_credential_file(state_dir), "r", encoding="utf-8") as fh:
+            saved = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    cred = saved.get("credential") if isinstance(saved, dict) else None
+    return str(cred) if cred else None
+
+
+def write_saved_credential(state_dir: str, credential: str, url: str) -> None:
+    os.makedirs(state_dir, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(state_dir, 0o700)
+    except OSError:
+        pass
+    path = _credential_file(state_dir)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"credential": credential, "url": url}, fh)
+    finally:
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+
+
+def clear_saved_credential(state_dir: str) -> None:
+    try:
+        os.remove(_credential_file(state_dir))
+    except OSError:
+        pass
+
+
+def exchange_code(base: str, code: str) -> str:
+    body = json.dumps({"code": code}).encode("utf-8")
+    request = urllib.request.Request(
+        pair_url_from_base(base),
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            payload = json.load(response)
+    except urllib.error.HTTPError as exc:
+        raise CredentialError(
+            f"Pairing code was rejected (HTTP {exc.code})."
+        ) from None
+    except OSError as exc:
+        raise CredentialError(f"Pairing request failed: {exc}") from None
+    credential = payload.get("credential") if isinstance(payload, dict) else None
+    if not credential:
+        raise CredentialError("Pairing response had no credential.")
+    return str(credential)
+
+
+def resolve_credential(
+    plugin_id: str,
+    *,
+    credential: Optional[str] = None,
+    url: Optional[str] = None,
+    code: Optional[str] = None,
+    state_dir: Optional[str] = None,
+) -> Tuple[str, bool, str]:
+    """Applies the startup order: explicit credential, then the saved file, then
+    a one-time pairing code (exchanged and saved). Returns (credential,
+    from_file, state_dir). Never logs the credential or the code."""
+    resolved_dir = resolve_state_dir(state_dir or "", plugin_id)
+    explicit = credential if credential is not None else os.environ.get(
+        "ETHER_PLUGIN_CREDENTIAL", ""
+    )
+    if (explicit or "").strip():
+        return explicit.strip(), False, resolved_dir
+    saved = read_saved_credential(resolved_dir)
+    if saved:
+        return saved, True, resolved_dir
+    resolved_url = url or os.environ.get("ETHER_URL", "")
+    resolved_code = code if code is not None else os.environ.get("ETHER_PAIRING_CODE", "")
+    if (resolved_url or "").strip() and (resolved_code or "").strip():
+        cred = exchange_code(resolved_url, resolved_code.strip())
+        write_saved_credential(resolved_dir, cred, resolved_url)
+        return cred, True, resolved_dir
+    raise CredentialError(no_credential_message())
+
+
 def _serve_tunnel(
     instance: PluginInstance,
     tunnel_url: str,
     credential: str,
     background: bool,
+    from_file: bool = False,
+    saved_dir: Optional[str] = None,
 ) -> ServeHandle:
     parsed = urllib.parse.urlparse(tunnel_url)
     if parsed.scheme not in ("ws", "wss") or not parsed.hostname:
@@ -1389,6 +2308,9 @@ def _serve_tunnel(
     status_line = resp_buf.split(b"\r\n", 1)[0].decode("ascii", errors="replace")
     if " 101 " not in status_line:
         sock.close()
+        if " 401 " in status_line and from_file:
+            clear_saved_credential(saved_dir)
+            raise CredentialError(no_credential_message())
         raise ConnectionError(f"Tunnel handshake rejected: {status_line}")
 
     expected_accept = base64.b64encode(
@@ -1502,14 +2424,34 @@ def serve(
     tunnel_url: Optional[str] = None,
     credential: Optional[str] = None,
     background: bool = True,
+    url: Optional[str] = None,
+    pairing_code: Optional[str] = None,
+    state_dir: Optional[str] = None,
 ) -> ServeHandle:
     resolved_tunnel = tunnel_url or os.environ.get("ETHER_TUNNEL_URL")
+    base = url or os.environ.get("ETHER_URL", "")
+    if not resolved_tunnel and base:
+        resolved_tunnel = tunnel_url_from_base(base)
     resolved_mode = mode or ("tunnel" if resolved_tunnel else "http")
     if resolved_mode == "tunnel":
         if not resolved_tunnel:
-            raise ValueError("Tunnel mode requires tunnel_url or ETHER_TUNNEL_URL.")
-        cred = credential if credential is not None else os.environ.get("ETHER_PLUGIN_CREDENTIAL", "")
-        return _serve_tunnel(instance, resolved_tunnel, cred, background)
+            raise ValueError("Tunnel mode requires tunnel_url, ETHER_TUNNEL_URL or ETHER_URL.")
+        try:
+            cred, from_file, saved_dir = resolve_credential(
+                instance.manifest.get("id", ""),
+                credential=credential,
+                url=base,
+                code=pairing_code or os.environ.get("ETHER_PAIRING_CODE", ""),
+                state_dir=state_dir or os.environ.get("ETHER_PLUGIN_STATE_DIR", ""),
+            )
+        except CredentialError:
+            # A low-level caller may pass only a tunnel URL for testing; the
+            # pairing flow always has ETHER_URL, so the clear line still applies
+            # to real sidecars.
+            if base:
+                raise
+            cred, from_file, saved_dir = "", False, ""
+        return _serve_tunnel(instance, resolved_tunnel, cred, background, from_file, saved_dir)
 
     resolved_host = host or os.environ.get("ETHER_PLUGIN_HOST") or "127.0.0.1"
     resolved_port = (
@@ -1532,13 +2474,18 @@ class MockHostClient:
 
     def __init__(self) -> None:
         self.kv_store: Dict[str, str] = {}
+        self.badges_store: Dict[str, Dict[str, List[str]]] = {}
+        self.badge_quota_titles: int = POSTER_BADGE_QUOTA_TITLES
         self.secrets_store: Dict[str, str] = {}
         self.catalog_store: Dict[str, Dict[str, Any]] = {}
         self.history_store: Dict[int, List[Dict[str, Any]]] = {}
         self.watch_state: Dict[str, bool] = {}
         self.collections_list: List[Dict[str, Any]] = []
+        self.published_events: List[Dict[str, Any]] = []
         self.notifications: List[str] = []
         self.logs: List[Dict[str, Any]] = []
+        self.last_stream_url: Optional[Tuple[int, str]] = None
+        self.last_stream_url_part: Optional[int] = None
         self.http_handler: Callable[[Dict[str, Any]], Dict[str, Any]] = lambda req: {
             "status": 200,
             "headers": {"Content-Type": "application/json"},
@@ -1546,12 +2493,323 @@ class MockHostClient:
         }
 
         self.kv = self._KV(self)
+        self.badges = self._Badges(self)
         self.secret = self._Secret(self)
         self.http = self._Http(self)
         self.catalog = self._Catalog(self)
         self.viewers = self._Viewers(self)
+        self.kind_store: Dict[str, List[Dict[str, Any]]] = {}
+        self.kind_hidden_ids: Dict[str, set] = {}
+        self.kind_policy_filter: Optional[Callable[[str, Dict[str, Any]], bool]] = None
+        self.sources: List[Dict[str, Any]] = []
+        self.blobs: Dict[str, bytes] = {}
+        self.limits: RuntimeLimits = {
+            "memoryBytes": 32 * 1024 * 1024,
+            "readBytes": MIN_DATA_READ_BYTES,
+            "fetchBytes": 8 * 1024 * 1024 * 1024,
+            "archiveMemberBytes": 8 * 1024 * 1024 * 1024,
+            "archiveExpandedBytes": 32 * 1024 * 1024 * 1024,
+            "archiveMembers": 65535,
+            "maxItems": 2_000_000,
+            "deadline": "12h",
+            "poolSize": 2,
+        }
+        self.runtime = self._Runtime(self)
         self.collections = self._Collections(self)
+        self.events = self._Events(self)
         self.notify = self._Notify(self)
+        self.kinds = self._Kinds(self)
+        self.cache = self._Cache(self)
+        self.archive = self._Archive(self)
+        self.frontend = self._Frontend(self)
+
+    class _Runtime:
+        def __init__(self, parent: "MockHostClient") -> None:
+            self._p = parent
+
+        def limits(self) -> RuntimeLimits:
+            return dict(self._p.limits)  # type: ignore[return-value]
+
+    class _Frontend:
+        def __init__(self, parent: "MockHostClient") -> None:
+            self._p = parent
+
+        def stream_url(
+            self,
+            viewer_id: int,
+            item_ref: str,
+            part_index: Optional[int] = None,
+        ) -> str:
+            checked = _check_part_index(part_index)
+            self._p.last_stream_url = (int(viewer_id), str(item_ref))
+            self._p.last_stream_url_part = checked
+            base = f"/ether/v1/kind-media/mock-{int(viewer_id)}"
+            return base if checked is None else f"{base}?part={checked}"
+
+    class _Kinds:
+        def __init__(self, parent: "MockHostClient") -> None:
+            self._p = parent
+
+        def upsert(self, kind: str, items: List[Dict[str, Any]]) -> int:
+            kept = {it.get("id"): it for it in self._p.kind_store.get(kind, [])}
+            for it in items:
+                kept[it.get("id")] = it
+            self._p.kind_store[kind] = list(kept.values())
+            return len(items)
+
+        def delete(self, kind: str, external_ids: List[str]) -> None:
+            drop = set(external_ids)
+            self._p.kind_store[kind] = [it for it in self._p.kind_store.get(kind, []) if it.get("id") not in drop]
+
+        def items(self, kind: str, cursor: str = "", limit: int = 200) -> Dict[str, Any]:
+            all_items = self._p.kind_store.get(kind, [])
+            start = 0
+            if cursor:
+                start = next((i + 1 for i, it in enumerate(all_items) if it.get("id") == cursor), len(all_items))
+            page = all_items[start:start + limit]
+            out: Dict[str, Any] = {"items": page}
+            if page and start + limit < len(all_items):
+                out["nextCursor"] = page[-1].get("id")
+            return out
+
+        def _allowed(self, kind: str, item: Dict[str, Any]) -> bool:
+            hidden = self._p.kind_hidden_ids.get(kind)
+            if hidden and item.get("id") in hidden:
+                return False
+            filt = self._p.kind_policy_filter
+            if filt is not None and not filt(kind, item):
+                return False
+            return True
+
+        def visible(
+            self,
+            kind: str,
+            ids: List[str],
+            viewer_token: Optional[str] = None,
+        ) -> List[str]:
+            if not (viewer_token or "").strip():
+                raise RuntimeError("kinds.visible: no authenticated frontend adapter viewer token on this request")
+            if len(ids) > MAX_KIND_VISIBLE_IDS:
+                raise ValueError(f"kinds.visible: batch larger than {MAX_KIND_VISIBLE_IDS} ids")
+            by_id = {str(it.get("id")): it for it in self._p.kind_store.get(kind, [])}
+            seen: set = set()
+            out: List[str] = []
+            for raw_id in ids:
+                ext_id = str(raw_id)
+                if not ext_id or ext_id in seen:
+                    continue
+                seen.add(ext_id)
+                it = by_id.get(ext_id)
+                if it is None or not self._allowed(kind, it):
+                    continue
+                out.append(ext_id)
+            return out
+
+        def browse(
+            self,
+            kind: str,
+            query: Optional[Dict[str, Any]] = None,
+            viewer_token: Optional[str] = None,
+        ) -> Dict[str, Any]:
+            if not (viewer_token or "").strip():
+                raise RuntimeError("kinds.browse: no authenticated frontend adapter viewer token on this request")
+            q = dict(query or {})
+            limit = int(q.get("limit") or 200)
+            if limit <= 0:
+                limit = 200
+            parent_id = str(q.get("parentId") or "")
+            level = str(q.get("level") or "")
+            needle = str(q.get("query") or "").strip().lower()
+            facets = q.get("facets") if isinstance(q.get("facets"), dict) else {}
+            all_facets = q.get("allFacets") if isinstance(q.get("allFacets"), dict) else {}
+            exclude_facets = q.get("excludeFacets") if isinstance(q.get("excludeFacets"), dict) else {}
+            matched: List[Dict[str, Any]] = []
+            for it in self._p.kind_store.get(kind, []):
+                if not self._allowed(kind, it):
+                    continue
+                if parent_id and str(it.get("parentId") or "") != parent_id:
+                    continue
+                if level and str(it.get("level") or "") != level:
+                    continue
+                if needle:
+                    hay = f"{it.get('title', '')} {it.get('summary', '')}".lower()
+                    if needle not in hay:
+                        continue
+                if facets or all_facets or exclude_facets:
+                    item_fields = it.get("fields") if isinstance(it.get("fields"), dict) else {}
+
+                    def _have(fk: str) -> List[str]:
+                        raw = item_fields.get(fk)
+                        if isinstance(raw, list):
+                            return [str(v).lower() for v in raw]
+                        if raw is not None:
+                            return [str(raw).lower()]
+                        return []
+
+                    ok = True
+                    for fk, want in facets.items():
+                        if want and not any(str(w).lower() in _have(fk) for w in want):
+                            ok = False
+                            break
+                    if ok:
+                        for fk, want in all_facets.items():
+                            if want and not all(str(w).lower() in _have(fk) for w in want):
+                                ok = False
+                                break
+                    if ok:
+                        for fk, want in exclude_facets.items():
+                            if want and any(str(w).lower() in _have(fk) for w in want):
+                                ok = False
+                                break
+                    if not ok:
+                        continue
+                matched.append(it)
+            if q.get("desc"):
+                matched = list(reversed(matched))
+            cursor = str(q.get("cursor") or "")
+            start = 0
+            if cursor:
+                start = next((i + 1 for i, it in enumerate(matched) if it.get("id") == cursor), len(matched))
+            page = matched[start:start + limit]
+            out: Dict[str, Any] = {"items": page}
+            if page and start + limit < len(matched):
+                out["nextCursor"] = page[-1].get("id")
+            return out
+
+        def resolve_sources(self, query: Dict[str, Any]) -> List[Dict[str, Any]]:
+            return list(self._p.sources)
+
+    class _Cache:
+        def __init__(self, parent: "MockHostClient") -> None:
+            self._p = parent
+
+        def put(self, library_key: str, name: str, data: bytes) -> str:
+            ref = "blob:" + hashlib.sha256(data).hexdigest()
+            self._p.blobs[ref] = bytes(data)
+            return ref
+
+        def open(self, blob_ref: str) -> bytes:  # noqa: A002 - mirrors host naming
+            return self._p.blobs[blob_ref]
+
+        def delete(self, blob_ref: str) -> None:
+            self._p.blobs.pop(blob_ref, None)
+
+        def read(self, blob_ref: str, data_range: DataRange) -> bytes:
+            cap = int(self._p.limits.get("readBytes") or MIN_DATA_READ_BYTES)
+            norm = _check_data_range(data_range, max_bytes=cap)
+            raw = self._p.blobs[blob_ref]
+            return raw[norm["offset"] : norm["offset"] + norm["length"]]
+
+        def rasterize(
+            self,
+            library_key: str,
+            name: str,
+            blob_ref: str,
+            options: Optional[RasterizeOptions] = None,
+        ) -> RasterizeResult:
+            _check_rasterize_options(options)
+            _ = self._p.blobs[blob_ref]
+            raise RuntimeError("cache.rasterize is not available in MockHostClient; use a real Ether host to rasterise SVG")
+
+    class _Archive:
+        def __init__(self, parent: "MockHostClient") -> None:
+            self._p = parent
+
+        @staticmethod
+        def _unsafe_reason(name: str) -> str:
+            trimmed = name[:-1] if name.endswith("/") else name
+            if not trimmed or len(name.encode("utf-8")) > 1024:
+                return "empty or oversized member name"
+            if "\x00" in trimmed or "\\" in trimmed or trimmed.startswith("/"):
+                return "non-relative or invalid path separator"
+            parts = trimmed.split("/")
+            if any(p in ("", ".", "..") for p in parts) or (len(parts[0]) >= 2 and parts[0][1] == ":"):
+                return "unsafe archive member path"
+            return ""
+
+        def list(self, blob_ref: str) -> List[ArchiveMember]:
+            import io
+            import zipfile
+
+            out: List[ArchiveMember] = []
+            with zipfile.ZipFile(io.BytesIO(self._p.blobs[blob_ref])) as zf:
+                for idx, info in enumerate(zf.infolist()):
+                    entry: ArchiveMember = {"index": idx, "name": info.filename, "size": info.file_size}
+                    reason = self._unsafe_reason(info.filename)
+                    if reason:
+                        entry["unsafe"] = True
+                        entry["unsafeReason"] = reason
+                    out.append(entry)
+            return out
+
+        def open(self, blob_ref: str, member: int, data_range: DataRange) -> bytes:  # noqa: A002
+            import io
+            import zipfile
+
+            cap = int(self._p.limits.get("readBytes") or MIN_DATA_READ_BYTES)
+            norm = _check_data_range(data_range, max_bytes=cap)
+            with zipfile.ZipFile(io.BytesIO(self._p.blobs[blob_ref])) as zf:
+                infos = zf.infolist()
+                if member < 0 or member >= len(infos):
+                    raise RuntimeError("plugins: archive member index outside range")
+                info = infos[member]
+                if info.is_dir():
+                    raise RuntimeError("plugins: archive member is a directory")
+                data = zf.read(info)
+                if norm["offset"] > len(data):
+                    raise RuntimeError("plugins: archive member offset outside range")
+                return data[norm["offset"] : norm["offset"] + norm["length"]]
+
+        def read(self, blob_ref: str, reads: List[ArchiveReadItem]) -> List[ArchiveReadResult]:
+            import io
+            import zipfile
+
+            cap = int(self._p.limits.get("readBytes") or MIN_DATA_READ_BYTES)
+            norm = _check_archive_reads(reads, max_bytes=cap)
+            out: List[ArchiveReadResult] = []
+            with zipfile.ZipFile(io.BytesIO(self._p.blobs[blob_ref])) as zf:
+                infos = zf.infolist()
+                for idx, item in enumerate(norm):
+                    member = item["member"]
+                    if member < 0 or member >= len(infos):
+                        raise RuntimeError("plugins: archive member index outside range")
+                    info = infos[member]
+                    if info.is_dir():
+                        raise RuntimeError("plugins: archive member is a directory")
+                    data = zf.read(info)
+                    if item["offset"] > len(data):
+                        raise RuntimeError("plugins: archive member offset outside range")
+                    chunk = data[item["offset"] : item["offset"] + item["length"]]
+                    out.append({"index": idx, "member": member, "size": len(chunk), "body": chunk})
+            return out
+
+        def extract(
+            self,
+            blob_ref: str,
+            member: int,
+            options: Optional[ArchiveExtractOptions] = None,
+        ) -> ArchiveExtractResult:
+            import io
+            import zipfile
+            import zlib
+
+            with zipfile.ZipFile(io.BytesIO(self._p.blobs[blob_ref])) as zf:
+                infos = zf.infolist()
+                if member < 0 or member >= len(infos):
+                    raise RuntimeError("plugins: archive member index outside range")
+                info = infos[member]
+                if info.is_dir():
+                    raise RuntimeError("plugins: archive member is a directory")
+                data = zf.read(info)
+            ref = "blob:" + hashlib.sha256(data).hexdigest()
+            self._p.blobs[ref] = data
+            return {
+                "ref": ref,
+                "size": len(data),
+                "sha1": hashlib.sha1(data).hexdigest(),
+                "md5": hashlib.md5(data).hexdigest(),
+                "crc32": f"{zlib.crc32(data) & 0xFFFFFFFF:08x}",
+            }
 
     class _KV:
         def __init__(self, parent: "MockHostClient") -> None:
@@ -1568,6 +2826,72 @@ class MockHostClient:
 
         def list(self, prefix: str = "") -> List[str]:
             return sorted(k for k in self._p.kv_store if k.startswith(prefix))
+
+        def usage(self) -> Dict[str, int]:
+            used = sum(len(v.encode("utf-8")) for v in self._p.kv_store.values())
+            keys = len(self._p.kv_store)
+            return {
+                "bytes": used + keys * 256,
+                "keys": keys,
+                "quotaBytes": 50 * 1024 * 1024,
+                "quotaKeys": 10000,
+            }
+
+    class _Badges:
+        def __init__(self, parent: "MockHostClient") -> None:
+            self._p = parent
+
+        def set(self, set_key: str, entries: List[BadgeEntry]) -> None:
+            _check_badge_set_key(set_key)
+            if not isinstance(entries, list):
+                raise ValueError("badges.set entries must be a list")
+            if len(entries) > MAX_BADGE_ENTRIES_PER_CALL:
+                raise ValueError(
+                    f"badges.set accepts at most {MAX_BADGE_ENTRIES_PER_CALL} entries per call"
+                )
+            next_set = dict(self._p.badges_store.get(set_key, {}))
+            for entry in entries:
+                if not isinstance(entry, dict) or not isinstance(entry.get("labels"), list):
+                    raise ValueError("badge entry labels must be a list")
+                raw_labels = entry["labels"]
+                if len(raw_labels) > MAX_BADGE_LABELS_PER_TITLE:
+                    raise ValueError(
+                        f"badge entry may have at most {MAX_BADGE_LABELS_PER_TITLE} labels per title"
+                    )
+                title_key = _resolve_badge_title_key(entry.get("title"), self._p.catalog_store)
+                if len(raw_labels) == 0:
+                    next_set.pop(title_key, None)
+                    continue
+                deduped: List[str] = []
+                for lbl in raw_labels:
+                    norm = _normalize_badge_label(lbl)
+                    if norm not in deduped:
+                        deduped.append(norm)
+                next_set[title_key] = deduped
+            preview = dict(self._p.badges_store)
+            if next_set:
+                preview[set_key] = next_set
+            else:
+                preview.pop(set_key, None)
+            total_titles = _count_distinct_badge_titles(preview)
+            if total_titles > self._p.badge_quota_titles:
+                raise RuntimeError(
+                    f"poster badge quota exceeded ({total_titles} > {self._p.badge_quota_titles} titles)"
+                )
+            if next_set:
+                self._p.badges_store[set_key] = next_set
+            else:
+                self._p.badges_store.pop(set_key, None)
+
+        def clear(self, set_key: str) -> None:
+            _check_badge_set_key(set_key)
+            self._p.badges_store.pop(set_key, None)
+
+        def usage(self) -> BadgeUsage:
+            return {
+                "titles": _count_distinct_badge_titles(self._p.badges_store),
+                "quotaTitles": self._p.badge_quota_titles,
+            }
 
     class _Secret:
         def __init__(self, parent: "MockHostClient") -> None:
@@ -1618,6 +2942,24 @@ class MockHostClient:
 
         def upsert(self, collection: Dict[str, Any]) -> None:
             self._p.collections_list.append(collection)
+
+    class _Events:
+        def __init__(self, parent: "MockHostClient") -> None:
+            self._p = parent
+
+        def publish(
+            self,
+            key: str,
+            payload: Optional[Dict[str, Any]] = None,
+            correlation: Optional[EventCorrelation] = None,
+        ) -> None:
+            entry: Dict[str, Any] = {
+                "key": str(key),
+                "payload": dict(payload) if payload is not None else {},
+            }
+            if correlation is not None:
+                entry["correlation"] = dict(correlation)
+            self._p.published_events.append(entry)
 
     class _Notify:
         def __init__(self, parent: "MockHostClient") -> None:
@@ -1844,6 +3186,33 @@ class TestHarness:
             }
         )
 
+    def flow_action(
+        self,
+        key: str,
+        req: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        body = dict(req or {})
+        route = f"/ether/v1/flow-actions/{urllib.parse.quote(key)}"
+        ether_block = self.instance.manifest.get("ether")
+        if isinstance(ether_block, dict):
+            contributes = ether_block.get("contributes")
+            if isinstance(contributes, dict):
+                for fa in contributes.get("flowActions") or []:
+                    if isinstance(fa, dict) and fa.get("key") == key and fa.get("route"):
+                        route = str(fa["route"])
+                        break
+        headers: Dict[str, str] = {}
+        if body.get("idempotencyKey"):
+            headers[HEADER_IDEMPOTENCY_KEY] = str(body["idempotencyKey"])
+        return self.instance.dispatch(
+            {
+                "method": "POST",
+                "path": route,
+                "headers": headers,
+                "body": json.dumps(body),
+            }
+        )
+
     def view(
         self,
         page: str = "home",
@@ -1920,6 +3289,327 @@ def create_test_harness(
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Content kinds: base classes, host services, kit helpers (Ether v0.3.8)
+# ---------------------------------------------------------------------------
+
+MAX_KIND_LIBRARY_SHELVES = 40
+
+
+class KindLibraryShelf(TypedDict, total=False):
+    """One default Recommended shelf declared under ``library.shelves`` (max 40).
+
+    Each shelf gets the stable row ID ``plugin:<viewID>:shelf:<key>``.
+    """
+
+    key: str
+    label: str
+    sort: Literal["title", "added", "released", "year", "rating", "index"]
+    direction: Literal["asc", "desc"]
+    facet: str
+    value: str
+    values: List[str]
+    filters: Dict[str, List[str]]
+
+
+class KindLibraryTab(TypedDict, total=False):
+    """One sub-tab declared on a kind library (up to 50)."""
+
+    key: str
+    label: str
+    kind: Literal["recommended", "library", "collections", "people", "view", "live"]
+    facet: str
+    order: Literal["count", "name"]
+    card: Literal["poster", "landscape", "square"]
+    layout: Literal["grid", "list", "timeline"]
+    search: bool
+    searchPlaceholder: str
+    sort: Literal["title", "added", "released", "year", "rating", "index", "lastViewed"]
+    direction: Literal["asc", "desc"]
+    filters: Dict[str, Any]
+
+
+class KindLibraryDecl(TypedDict, total=False):
+    """Library presentation declaration on a contributed content kind."""
+
+    name: str
+    icon: str
+    card: Literal["poster", "landscape", "square"]
+    dateDisplay: Literal["year", "date"]
+    tabs: List[KindLibraryTab]
+    shelves: List[KindLibraryShelf]
+
+
+class CatalogProvider:
+    """Serve browse/detail for one declared kind. Items are plain dicts in
+    the KindItem wire shape; requests are dicts with an extra ``kind`` key."""
+
+    def browse(self, ctx: PluginContext, req: Dict[str, Any]) -> Dict[str, Any]:
+        raise NotImplementedError
+
+    def detail(self, ctx: PluginContext, kind: str, item_id: str) -> Dict[str, Any]:
+        raise NotImplementedError
+
+    # Optional: define `changes(ctx, req)` for delta pull sync,
+    # `search(ctx, req)` when the kind declares browse.liveSearch, and
+    # `expand(ctx, req)` when the kind declares browse.expand.
+
+
+class KindResolver:
+    """Turn a playable item into ordered playable sources."""
+
+    def resolve(self, ctx: PluginContext, req: Dict[str, Any]) -> Dict[str, Any]:
+        raise NotImplementedError
+
+
+class KindMatcher:
+    """Score source candidates for one item (spec: matches, best first)."""
+
+    def match(self, ctx: PluginContext, req: Dict[str, Any]) -> Dict[str, Any]:
+        raise NotImplementedError
+
+
+class KindLiveProvider:
+    """Serve a kind's declared "live" tab: list currently live streams and
+    resolve a live item ID into a playable stream URL."""
+
+    def live(self, ctx: PluginContext, req: Dict[str, Any]) -> Dict[str, Any]:
+        raise NotImplementedError
+
+    def resolve_live(self, ctx: PluginContext, req: Dict[str, Any]) -> Dict[str, Any]:
+        raise NotImplementedError
+
+
+class FrontendAdapter:
+    """A plugin-provided protocol surface. Ether authenticates first;
+    `handle` receives X-Ether-Viewer headers and never a credential."""
+
+    def handle(
+        self, method: str, path: str, headers: Dict[str, str], body: bytes
+    ) -> Tuple[int, Dict[str, str], Union[bytes, str]]:
+        raise NotImplementedError
+
+
+class SetupTester:
+    """Answer /ether/v1/setup/{step}/test with {ok, detail, fields?}."""
+
+    def test_setup(self, ctx: PluginContext, req: Dict[str, Any]) -> Dict[str, Any]:
+        raise NotImplementedError
+
+
+# Spec-name aliases.
+Matcher = KindMatcher
+
+
+def candidate_ref(candidate: Dict[str, Any]) -> str:
+    """The stable ref matchers report for a source candidate."""
+    if candidate.get("infoHash"):
+        return "infohash:" + str(candidate["infoHash"]).lower()
+    if candidate.get("magnet"):
+        return "magnet:" + str(candidate["magnet"])
+    if candidate.get("nzbUrl"):
+        return "nzb:" + str(candidate["nzbUrl"])
+    return str(candidate.get("title") or "")
+
+
+def stream_url(
+    ctx: PluginContext,
+    item_ref: str,
+    part_index: Optional[int] = None,
+) -> str:
+    """Mint an Ether stream URL for one of this plugin's own kind items
+    (spec §6.5) or one zero-based part (#576). Kept as a thin wrapper over
+    PluginContext.stream_url."""
+    return ctx.stream_url(item_ref, part_index=part_index)
+
+
+def kinds_visible(
+    ctx: PluginContext,
+    kind: str,
+    ids: List[str],
+) -> List[str]:
+    """Evaluate the library's Rules and viewer access policy for a bounded
+    batch (at most 500) of external IDs in `kind` (#615)."""
+    return ctx.kinds_visible(kind, ids)
+
+
+def kinds_browse(
+    ctx: PluginContext,
+    kind: str,
+    query: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Browse or search `kind` with the library's Rules and viewer access
+    policy applied for the requesting frontend-adapter viewer (#615)."""
+    return ctx.kinds_browse(kind, query=query)
+
+
+class _KindsClient:
+    def __init__(
+        self,
+        call_json: Callable[..., Any],
+        default_viewer_token: Optional[Callable[[], str]] = None,
+    ) -> None:
+        self._call = call_json
+        self._default_viewer_token = default_viewer_token
+
+    def _resolve_viewer_token(self, viewer_token: Optional[str]) -> str:
+        tok = viewer_token if viewer_token is not None else (
+            self._default_viewer_token() if self._default_viewer_token else ""
+        )
+        return str(tok or "").strip()
+
+    def upsert(self, kind: str, items: List[Dict[str, Any]]) -> int:
+        result = self._call("POST", f"/ether/plugin-host/kinds/{urllib.parse.quote(kind)}/upsert", {"items": items})
+        return int((result or {}).get("accepted") or 0)
+
+    def delete(self, kind: str, external_ids: List[str]) -> None:
+        self._call("POST", f"/ether/plugin-host/kinds/{urllib.parse.quote(kind)}/delete", {"externalIds": external_ids})
+
+    def items(self, kind: str, cursor: str = "", limit: int = 200) -> Dict[str, Any]:
+        q = urllib.parse.urlencode({"cursor": cursor, "limit": limit})
+        return self._call("GET", f"/ether/plugin-host/kinds/{urllib.parse.quote(kind)}/items?{q}") or {"items": []}
+
+    def visible(
+        self,
+        kind: str,
+        ids: List[str],
+        viewer_token: Optional[str] = None,
+    ) -> List[str]:
+        tok = self._resolve_viewer_token(viewer_token)
+        if not tok:
+            raise RuntimeError("kinds.visible: no authenticated frontend adapter viewer token on this request")
+        if len(ids) > MAX_KIND_VISIBLE_IDS:
+            raise ValueError(f"kinds.visible: batch larger than {MAX_KIND_VISIBLE_IDS} ids")
+        result = self._call(
+            "POST",
+            f"/ether/plugin-host/kinds/{urllib.parse.quote(kind, safe='')}/visible",
+            {"ids": list(ids)},
+            extra_headers={HEADER_VIEWER_TOKEN: tok},
+        )
+        return list((result or {}).get("ids") or [])
+
+    def browse(
+        self,
+        kind: str,
+        query: Optional[Dict[str, Any]] = None,
+        viewer_token: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        tok = self._resolve_viewer_token(viewer_token)
+        if not tok:
+            raise RuntimeError("kinds.browse: no authenticated frontend adapter viewer token on this request")
+        result = self._call(
+            "POST",
+            f"/ether/plugin-host/kinds/{urllib.parse.quote(kind, safe='')}/browse",
+            dict(query or {}),
+            extra_headers={HEADER_VIEWER_TOKEN: tok},
+        )
+        return result or {"items": []}
+
+    def resolve_sources(self, query: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Find owner sources. indexer_search accepts category (comma-separated
+        Newznab IDs or family names, e.g. music/books/comics; with empty query,
+        fetches up to 100 recent releases) and profile (quality profile name for
+        video release scoring; default uses owner default). Video candidates
+        include score, resolution, source and codec alongside indexer/indexerId;
+        non-video candidates omit those video fields. A release source may set
+        release.fileIndex or candidate.fileIndex (zero-based provider torrent
+        list), or release.file (exact path/unique basename), to open any file
+        kind. Invalid selections fail; omitted selectors retain video selection.
+        Explicit file selection is supported for torrents, not NZB members.
+        """
+        result = self._call("POST", "/ether/plugin-host/sources/resolve", query)
+        return list((result or {}).get("candidates") or [])
+
+
+def archive_list(data: bytes) -> List[Dict[str, Any]]:
+    """List non-directory members of a zip/cbz/epub in archive order."""
+    import io
+    import zipfile
+
+    out: List[Dict[str, Any]] = []
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        for info in zf.infolist():
+            if not info.is_dir():
+                out.append({"index": len(out), "name": info.filename, "size": info.file_size})
+    return out
+
+
+def archive_read_member(data: bytes, name: str) -> bytes:
+    import io
+    import zipfile
+
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        return zf.read(name)
+
+
+def parse_feed(data: Union[bytes, str]) -> Dict[str, Any]:
+    """Parse RSS/Atom/JSON Feed into {title, summary, link, entries:[...]}."""
+    if isinstance(data, bytes):
+        data = data.decode("utf-8", errors="replace")
+    if data.lstrip().startswith("{"):
+        doc = json.loads(data)
+        return {
+            "title": doc.get("title", ""), "summary": doc.get("description", ""),
+            "link": doc.get("home_page_url", ""),
+            "entries": [
+                {
+                    "id": it.get("id") or it.get("url", ""), "title": it.get("title", ""),
+                    "summary": it.get("summary", ""), "link": it.get("url", ""),
+                    "audio": (it.get("attachments") or [{}])[0].get("url", ""),
+                    "date": it.get("date_published", ""),
+                }
+                for it in doc.get("items") or []
+            ],
+        }
+    import xml.etree.ElementTree as ET
+
+    root = ET.fromstring(data)
+
+    def local(tag: str) -> str:
+        return tag.rsplit("}", 1)[-1]
+
+    def child_text(el: Any, name: str) -> str:
+        for c in el:
+            if local(c.tag) == name:
+                return (c.text or "").strip()
+        return ""
+
+    if local(root.tag) == "feed":
+        entries = []
+        for e in root.iter():
+            if local(e.tag) != "entry":
+                continue
+            page = media = ""
+            for c in e:
+                if local(c.tag) == "link":
+                    if c.get("rel") == "enclosure":
+                        media = c.get("href", "")
+                    elif not page:
+                        page = c.get("href", "")
+            entries.append({"id": child_text(e, "id") or page, "title": child_text(e, "title"),
+                            "summary": child_text(e, "summary"), "link": page, "audio": media,
+                            "date": child_text(e, "updated")})
+        return {"title": child_text(root, "title"), "summary": child_text(root, "subtitle"), "link": "", "entries": entries}
+    channel = root
+    for e in root.iter():
+        if local(e.tag) == "channel":
+            channel = e
+            break
+    entries = []
+    for e in channel:
+        if local(e.tag) != "item":
+            continue
+        enc = ""
+        for c in e:
+            if local(c.tag) == "enclosure":
+                enc = c.get("url", "")
+        entries.append({"id": child_text(e, "guid") or child_text(e, "link"), "title": child_text(e, "title"),
+                        "summary": child_text(e, "description"), "link": child_text(e, "link"),
+                        "audio": enc, "date": child_text(e, "pubDate")})
+    return {"title": child_text(channel, "title"), "summary": child_text(channel, "description"),
+            "link": child_text(channel, "link"), "entries": entries}
+
+
 # Capability starter templates
 # ---------------------------------------------------------------------------
 

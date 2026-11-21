@@ -684,8 +684,11 @@ func TestJellyfinNamedPeopleProviderLinksAndRuntime(t *testing.T) {
 	if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &item) != nil {
 		t.Fatal(w.Code, w.Body.String())
 	}
+	// #614: a credit with no person id at all cannot be emitted on the
+	// Jellyfin surface (BaseItemPerson.Id is a required UUID in
+	// jellyfin-sdk-kotlin); it is dropped instead of failing the page.
 	people, _ := item["People"].([]any)
-	if len(people) != 1 || people[0].(map[string]any)["Name"] != "Actor" || people[0].(map[string]any)["Id"] != nil {
+	if len(people) != 0 {
 		t.Fatal(item["People"])
 	}
 	urls, _ := item["ExternalUrls"].([]any)
@@ -901,6 +904,13 @@ type staticEditions struct{ versions []frontend.Version }
 
 func (s staticEditions) Editions(context.Context, *frontend.Viewer, frontend.Device, frontend.RatingKey) ([]frontend.Version, error) {
 	return s.versions, nil
+}
+func (staticEditions) Variants(context.Context, frontend.ResolveRequest, int) ([]frontend.ReleaseVariant, error) {
+	return nil, nil
+}
+func (staticEditions) RefillSearchCache(*frontend.Title) <-chan struct{} { return nil }
+func (staticEditions) Available(context.Context, frontend.RatingKey) (bool, bool) {
+	return false, false
 }
 
 type issuedHandles struct{ n int }

@@ -49,7 +49,7 @@ func TestH264ProfileDecisionMatchesFirstSegmentSPS(t *testing.T) {
 	}
 	profiles := &core.ClientCapabilityProfiles{DirectPlay: []core.ClientDirectPlayProfile{{MediaType: "video", Containers: []string{"mp4"}, VideoCodecs: []string{"h264"}, AudioCodecs: []string{"ac3"}}}, Transcoding: []core.ClientTranscodeProfile{{MediaType: "video", Delivery: "hls", Containers: []string{"mpegts"}, VideoCodecs: []string{"h264"}, AudioCodecs: []string{"ac3"}, MaxAudioChannels: "6"}}}
 	caps := core.ClientCaps{Profiles: profiles, Containers: []string{"mp4"}, VideoCodecs: []string{"h264"}, AudioCodecs: []string{"ac3"}, HLSContainers: []string{"mpegts"}}
-	b := &Broker{deps: BrokerDeps{Transcoder: m}}
+	b := &Broker{deps: BrokerDeps{SurfacePolicy: testSessionPolicy, Transcoder: m}}
 	d, err := b.decideProfile(&core.PlaySession{Info: *info}, frontend.PlanRequest{Caps: caps, Intent: frontend.PlayIntent{Options: core.DecideOptions{DirectPlay: true, DirectStream: true, AudioStream: 1, SubtitleStream: -1}}})
 	if err != nil || d.VideoCopy || d.H264Level != 51 {
 		t.Fatalf("negotiated decision %+v: %v", d, err)
@@ -58,8 +58,20 @@ func TestH264ProfileDecisionMatchesFirstSegmentSPS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	playlist := httptest.NewRecorder()
+	hs.ServePlaylist(playlist, httptest.NewRequest(http.MethodGet, "/index.m3u8", nil))
+	name := ""
+	for _, line := range strings.Split(playlist.Body.String(), "\n") {
+		if n, ok := transcode.ParseSegmentName(line); ok && n == 0 {
+			name = line
+			break
+		}
+	}
+	if name == "" {
+		t.Fatal("playlist has no first segment")
+	}
 	w := httptest.NewRecorder()
-	hs.ServeSegment(w, httptest.NewRequest(http.MethodGet, "/00000.ts", nil), 0)
+	hs.ServeSegment(w, httptest.NewRequest(http.MethodGet, "/"+name, nil), 0)
 	if w.Code != http.StatusOK || w.Body.Len() == 0 {
 		t.Fatalf("segment %d: %s", w.Code, w.Body.String())
 	}

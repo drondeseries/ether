@@ -124,8 +124,8 @@ func (e *realEnv) videoSpanKey(t *testing.T, container string, init, seg []byte,
 	return first - shift, last - shift, key
 }
 
-// joinedMonotonic decodes a joined Matroska stream and requires its video
-// frames to never go backwards.
+// joinedMonotonic decodes a joined Matroska or fMP4 stream and requires its
+// video frames to never go backwards.
 func (e *realEnv) joinedMonotonic(t *testing.T, file string) {
 	t.Helper()
 	cmd := mediaproc.CommandContext(t.Context(), 2*time.Minute, e.ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries", "frame=best_effort_timestamp_time", "-of", "csv=p=0", file)
@@ -395,7 +395,7 @@ func TestIntegrationKeyframePlannedEncodedRuns(t *testing.T) {
 		id := s.rungs[len(s.rungs)-1].id
 		for n := 0; n < len(starts)-1; n++ {
 			rec := httptest.NewRecorder()
-			s.ServeRungSegment(rec, httptest.NewRequest(http.MethodGet, "/", nil), id, n)
+			s.ServeRungSegment(rec, mediaRequest(s, httptest.NewRequest(http.MethodGet, "/", nil), n), id, n)
 			if rec.Code != 200 {
 				t.Fatalf("rung segment %d: %d %s", n, rec.Code, rec.Body.String())
 			}
@@ -527,18 +527,22 @@ func TestIntegrationCopyWithoutKeyframeIndex(t *testing.T) {
 				init0 = fetch(t, hs, InitSegment)
 			}
 			// Each segment holds the GOPs starting in its range; one inside
-			// a GOP longer than a segment repeats that GOP (TS, fMP4) or is
-			// an empty Cluster (Matroska). Every segment with video starts on
-			// a keyframe and decodes alone, and together they cover the
-			// title from the first segment fetched without gaps.
+			// a GOP longer than a segment repeats that GOP (TS) or is an
+			// empty placeholder in order (HLS fMP4, Matroska). Every segment
+			// with video starts on a keyframe and decodes alone, and
+			// together they cover the title from the first segment fetched
+			// without gaps.
 			check := func(from, to int, label string) {
 				t.Helper()
 				covered := -1.0
 				for n := from; n < to; n++ {
 					seg := fetch(t, hs, n)
 					name := fmt.Sprintf("%s-%s-%d", label, container, n)
-					if container == ContainerMatroska && len(seg) < 64 {
-						continue // an empty Cluster inside a long GOP
+					if container == ContainerMatroska && len(seg) <= emptyClusterSize {
+						continue // an empty placeholder inside a long GOP
+					}
+					if container == ContainerFMP4 && isEmptyFMP4(seg) {
+						continue // an empty placeholder inside a long GOP
 					}
 					first, end := e.videoSpan(t, container, init0, seg, name)
 					// A restart that continues playback starts its first segment
@@ -557,14 +561,14 @@ func TestIntegrationCopyWithoutKeyframeIndex(t *testing.T) {
 				}
 			}
 			check(0, total, "first")
-			if container == ContainerMatroska {
-				// Plex joins the header and successive fragments into one
+			if container == ContainerMatroska || container == ContainerFMP4 {
+				// Players join the init and successive fragments into one
 				// stream: in order, it must decode and never run backwards.
 				joined := append([]byte(nil), init0...)
 				for n := 0; n < total; n++ {
 					joined = append(joined, fetch(t, hs, n)...)
 				}
-				e.joinedMonotonic(t, e.writeTemp(t, "noindex-joined.mkv", joined))
+				e.joinedMonotonic(t, e.writeTemp(t, "noindex-joined."+segmentExt(container), joined))
 			}
 			// Seeks with every segment cached: a fresh client asks for a
 			// segment inside a GOP (an alias) or starting one; what it gets
@@ -577,12 +581,12 @@ func TestIntegrationCopyWithoutKeyframeIndex(t *testing.T) {
 					t.Fatalf("%s retry changed bytes: %d -> %d", name, len(seg), len(retry))
 				}
 				// A connection interrupted halfway through the seek response
-				// resumes the same GOP, even for a cached Matroska alias.
+				// resumes the same GOP, even for a cached alias.
 				offset := len(seg) / 2
 				req := httptest.NewRequest(http.MethodGet, "/segment", nil)
 				req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
 				rec := httptest.NewRecorder()
-				hs.ServeSegment(rec, req, n)
+				hs.ServeSegment(rec, mediaRequest(hs, req, n), n)
 				if rec.Code != http.StatusPartialContent || !bytes.Equal(rec.Body.Bytes(), seg[offset:]) {
 					t.Fatalf("%s range retry: status=%d bytes=%d", name, rec.Code, rec.Body.Len())
 				}
@@ -590,10 +594,10 @@ func TestIntegrationCopyWithoutKeyframeIndex(t *testing.T) {
 					t.Errorf("%s holds video %.3f-%.3f, playlist says %.3f-%.3f", name, first, end, starts[n], starts[n+1])
 				}
 			}
-			if container == ContainerMatroska {
+			if container == ContainerMatroska || container == ContainerFMP4 {
 				_ = fetch(t, hs, 14)
 				head := httptest.NewRecorder()
-				hs.ServeSegment(head, httptest.NewRequest(http.MethodHead, "/0.mkv", nil), 0)
+				hs.ServeSegment(head, mediaRequest(hs, httptest.NewRequest(http.MethodHead, "/0."+segmentExt(container), nil), 0), 0)
 				if head.Code != http.StatusOK || head.Body.Len() != 0 {
 					t.Fatalf("HEAD segment: %d bytes=%d", head.Code, head.Body.Len())
 				}
@@ -621,19 +625,216 @@ func TestIntegrationCopyWithoutKeyframeIndex(t *testing.T) {
 			}
 			check(mid, total, "restart")
 			// A failover inside a GOP whose start is already published: the
-			// new run must not repeat that GOP (Plex's joined Matroska
-			// stream would run backwards).
+			// new run must not repeat that GOP (joined Matroska and HLS fMP4
+			// streams would run backwards).
 			if err := hs.SwapInput(context.Background(), e.url("noindex-10s.mkv"), *info, 25*time.Second); err != nil {
 				t.Fatal(err)
 			}
 			check(6, total, "swap")
-			if container == ContainerMatroska {
+			if container == ContainerMatroska || container == ContainerFMP4 {
 				joined := append([]byte(nil), init0...)
 				for n := 0; n < total; n++ {
 					joined = append(joined, fetch(t, hs, n)...)
 				}
-				e.joinedMonotonic(t, e.writeTemp(t, "noindex-swap-joined.mkv", joined))
+				e.joinedMonotonic(t, e.writeTemp(t, "noindex-swap-joined."+segmentExt(container), joined))
 			}
 		})
 	}
+}
+
+// An MPEG-TS source has no keyframe index and its timestamp seek lands
+// inside a GOP. A copy started there must still open on the keyframe before
+// the start point, mid-title (not a GOP late) and inside the title's last GOP
+// (where there is no next keyframe at all).
+func TestIntegrationUnindexedTSCopyStartsOnKeyframeBefore(t *testing.T) {
+	e := newRealEnv(t, WithoutHWDetection(), WithBuffering(4*time.Second, 0, 0))
+	e.gen(t, "noindex-4s.ts", 14, "-c:v", "libx264", "-preset", "ultrafast", "-g", "96", "-keyint_min", "96", "-sc_threshold", "0", "-c:a", "aac", "-f", "mpegts")
+	info, err := e.m.Probe(t.Context(), e.url("noindex-4s.ts"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(info.Keyframes) != 0 {
+		t.Fatal("probe produced a keyframe index; this test needs none")
+	}
+	for _, c := range []struct {
+		at, key time.Duration
+	}{{6 * time.Second, 4 * time.Second}, {13 * time.Second, 12 * time.Second}} {
+		t.Run(c.at.String(), func(t *testing.T) {
+			d := core.Decision{Kind: core.DecisionRemux, Container: ContainerMPEGTS, VideoCopy: true, AudioCopy: true, AudioStream: 1}
+			hs, err := e.m.StartHLS(context.Background(), core.HLSRequest{SessionID: "noindex-ts-" + c.at.String(), InputURL: e.url("noindex-4s.ts"), Info: *info, Decision: d, StartOffset: c.at})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer hs.Close()
+			name := "start-" + c.at.String()
+			seg := fetch(t, hs, 0)
+			first, _, key := e.videoSpanKey(t, ContainerMPEGTS, nil, seg, name)
+			if !key || math.Abs(first-c.key.Seconds()) > 0.1 {
+				t.Fatalf("%s opens on video at %.3f (keyframe %v), want the keyframe at %v", name, first, key, c.key)
+			}
+			e.decodesAlone(t, ContainerMPEGTS, nil, seg, name)
+		})
+	}
+}
+
+// A TS copy's fast-start ramp is encoded, and the copy can only take over
+// at a keyframe. Without a keyframe index that handover is unknown, so the
+// session keeps one copy plan: every listed segment is served, and the
+// video runs on without a hole, from a start between keyframes and through
+// a GOP that outlasts the title's remaining segments.
+func TestIntegrationUnindexedTSCopyWithFastStartIsContinuous(t *testing.T) {
+	e := newRealEnv(t, WithoutHWDetection(), WithBuffering(4*time.Second, 0, 0))
+	e.m.UpdateConfig(config.Transcode{FastStart: true, FastStartSegments: 2})
+	e.gen(t, "ramp-4s.mkv", 30, "-c:v", "libx264", "-preset", "ultrafast", "-g", "96", "-keyint_min", "96", "-sc_threshold", "0", "-c:a", "ac3")
+	e.gen(t, "ramp-onegop.mkv", 10, "-c:v", "libx264", "-preset", "ultrafast", "-g", "1000", "-keyint_min", "1000", "-sc_threshold", "0", "-c:a", "ac3")
+	for _, c := range []struct {
+		name string
+		at   time.Duration
+	}{{"ramp-4s.mkv", 10500 * time.Millisecond}, {"ramp-onegop.mkv", 0}} {
+		t.Run(c.name, func(t *testing.T) {
+			info, err := e.m.Probe(t.Context(), e.url(c.name))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(info.Keyframes) != 0 {
+				t.Fatal("probe produced a keyframe index; this test needs none")
+			}
+			// Video copied, audio transcoded (as for AC3 to a Plex Web client).
+			d := core.Decision{Kind: core.DecisionTranscode, Container: ContainerMPEGTS, VideoCopy: true, AudioCodec: "aac", AudioStream: 1}
+			hs, err := e.m.StartHLS(context.Background(), core.HLSRequest{SessionID: "ramp-" + c.name, InputURL: e.url(c.name), Info: *info, Decision: d, StartOffset: c.at})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer hs.Close()
+			starts := planStarts(t, hs, c.at)
+			covered := -1.0
+			for n := 0; n < len(starts)-1; n++ {
+				seg := fetch(t, hs, n) // fails the test on anything but 200
+				name := fmt.Sprintf("%s-%d", c.name, n)
+				first, end := e.videoSpan(t, ContainerMPEGTS, nil, seg, name)
+				if covered >= 0 && first > covered+0.1 {
+					t.Fatalf("%s starts at %.3f: video %.3f-%.3f skipped", name, first, covered, first)
+				}
+				covered = math.Max(covered, end)
+			}
+			if covered < starts[len(starts)-1]-0.2 {
+				t.Fatalf("segments cover video up to %.3f of %.3f", covered, starts[len(starts)-1])
+			}
+		})
+	}
+}
+
+func TestIntegrationFMP4CopyVideoEncodedEAC3MidTitleRestart(t *testing.T) {
+	e := newRealEnv(t, WithoutHWDetection(), WithBuffering(2*time.Second, 0, 0))
+	// 23.976 fps HEVC with 4 B-frames + 5.1 DTS: keyframes at 3.003s/4.004s
+	// have DTS < 4.000s, which previously cut chunk 0 before accurate_seek
+	// delivered any decoded audio to eac3 ("Cannot write moov atom before EAC3 packets parsed").
+	const fx = "hevc-dts-23976.mkv"
+	e.gen(t, fx, 12,
+		"-vf", "fps=24000/1001",
+		"-c:v", "libx265", "-preset", "ultrafast",
+		"-x265-params", "keyint=24:min-keyint=24:scenecut=0:open-gop=0:bframes=4:log-level=error",
+		"-c:a", "dca", "-strict", "-2", "-ac", "6", "-b:a", "768k",
+	)
+	info, err := e.m.Probe(t.Context(), e.url(fx))
+	if err != nil {
+		t.Fatal(err)
+	}
+	info.Keyframes = e.keyframeIndex(t, fx)
+	d := core.Decision{
+		Kind:            core.DecisionTranscode,
+		Container:       ContainerFMP4,
+		VideoCopy:       true,
+		AudioCodec:      "eac3",
+		AudioChannels:   6,
+		AudioSampleRate: 48000,
+		AudioStream:     1,
+		SubtitleStream:  -1,
+	}
+
+	assertCompleteEAC3Init := func(t *testing.T, initBytes []byte, label string) {
+		t.Helper()
+		top, err := readBoxes(initBytes, 0, len(initBytes))
+		if err != nil {
+			t.Fatalf("%s init boxes: %v", label, err)
+		}
+		hasMoov := false
+		for _, b := range top {
+			if b.typ == "moov" {
+				hasMoov = true
+				if !isCompleteFMP4Moov(initBytes[b.start:b.end]) {
+					t.Fatalf("%s init moov is incomplete (missing mvex or dec3)", label)
+				}
+			}
+		}
+		if !hasMoov {
+			t.Fatalf("%s init has no moov", label)
+		}
+	}
+
+	assertAudioDecodes := func(t *testing.T, initBytes, segBytes []byte, label string) {
+		t.Helper()
+		file := e.writeTemp(t, label+"-audio.m4s", append(append([]byte(nil), initBytes...), segBytes...))
+		var stderr bytes.Buffer
+		cmd := mediaproc.CommandContext(t.Context(), 2*time.Minute, e.ffprobe,
+			"-v", "error", "-select_streams", "a:0", "-show_entries", "frame=nb_samples", "-of", "csv=p=0", file)
+		cmd.Stderr = &stderr
+		out, err := cmd.Output()
+		if err != nil || stderr.Len() > 0 || len(strings.Fields(string(out))) == 0 {
+			t.Fatalf("%s audio decode failed: err=%v frames=%q stderr=%s", label, err, string(out), stderr.String())
+		}
+	}
+
+	// 1. Mid-session restart onto the retained initial clock.
+	hs, err := e.m.StartHLS(context.Background(), core.HLSRequest{
+		SessionID: "eac3-restart",
+		InputURL:  e.url(fx),
+		Info:      *info,
+		Decision:  d,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hs.Close()
+	sess := hs.(*Session)
+	starts := planStarts(t, hs, 0)
+	total := len(starts) - 1
+	init0 := fetch(t, hs, InitSegment)
+	assertCompleteEAC3Init(t, init0, "initial")
+	e.checkSegmentsWith(t, hs, ContainerFMP4, init0, starts, 0, 1, "eac3-first")
+
+	mid := 2 // ~4.0s
+	sess.mu.Lock()
+	for n := range sess.done[0] {
+		if n >= mid-1 {
+			delete(sess.done[0], n)
+		}
+	}
+	err = sess.startRunLocked(mid, false)
+	sess.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.checkSegmentsWith(t, hs, ContainerFMP4, init0, starts, mid, total, "eac3-restart")
+	assertAudioDecodes(t, init0, fetch(t, hs, mid), "eac3-restart-seg")
+
+	// 2. Fresh start mid-GOP (StartOffset > 0), where the restarted run's own
+	// init is published directly as EXT-X-MAP.
+	offset := 2950 * time.Millisecond
+	hsOff, err := e.m.StartHLS(context.Background(), core.HLSRequest{
+		SessionID:   "eac3-offset",
+		InputURL:    e.url(fx),
+		Info:        *info,
+		Decision:    d,
+		StartOffset: offset,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hsOff.Close()
+	startsOff := planStarts(t, hsOff, offset)
+	initOff := fetch(t, hsOff, InitSegment)
+	assertCompleteEAC3Init(t, initOff, "offset")
+	e.checkSegmentsWith(t, hsOff, ContainerFMP4, initOff, startsOff, 0, len(startsOff)-1, "eac3-offset")
+	assertAudioDecodes(t, initOff, fetch(t, hsOff, 0), "eac3-offset-seg0")
 }

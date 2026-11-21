@@ -73,7 +73,7 @@ func TestPremiereVisibilityBeforePaginationAndSearch(t *testing.T) {
 		t.Fatal(err)
 	}
 	a.RecordSearch(t.Context(), ep, []core.Release{{ID: "proof", Name: "D.Premiere.S01E01.1080p.WEB-DL", Indexer: "Fake"}})
-	wrapped := availabilityCatalog{c, a}
+	wrapped := availabilityCatalog{Catalog: c, availability: a}
 	for offset, want := range []core.RatingKey{core.ShowKey(4), core.ShowKey(5)} {
 		p, e := wrapped.Browse(t.Context(), core.BrowseQuery{Filter: core.Filter{Type: core.TypeShow}, Sort: core.SortTitle, Limit: 1, Offset: offset})
 		if e != nil || p.Total != 2 || len(p.Items) != 1 || p.Items[0].Key != want {
@@ -227,7 +227,7 @@ func TestAvailabilityCatalogFirstCharacterMatchesBrowse(t *testing.T) {
 			}},
 		}
 		labCfg.Usenet.Providers = []config.UsenetProvider{{Host: "fake", Enabled: true}}
-		labCat, err := catalog.New(roDB, nil, labCfg.Catalog, slog.New(slog.DiscardHandler))
+		labCat, err := catalog.New(roDB, nil, labCfg.Catalog, slog.New(slog.DiscardHandler), catalog.WithLibraryPolicies(catalog.LibraryPolicies{MovieRules: labCfg.Catalog.Exclusions}))
 		if err != nil {
 			t.Fatal(err)
 		}

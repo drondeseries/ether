@@ -60,23 +60,25 @@ func ArrangeLayout(candidates []LayoutCandidate, finalize func([]LayoutCandidate
 	return out, nil
 }
 
-// LayoutRows applies shared Home placement to neutral frontend rows.
-func LayoutRows(ctx context.Context, source core.NeutralHomeLayoutSource, libraries []Library, req frontend.RowRequest, sit core.HomeSituation, rows []frontend.Row) ([]frontend.Row, error) {
+// LayoutRows applies shared Home or per-library placement to neutral frontend rows.
+func LayoutRows(ctx context.Context, source core.NeutralHomeLayoutSource, _ []Library, req frontend.RowRequest, sit core.HomeSituation, rows []frontend.Row) ([]frontend.Row, error) {
 	section := "home"
 	if req.Placement == frontend.PlacementLibrary {
-		section = "movies"
-		for _, l := range libraries {
-			if strconv.Itoa(l.ID) == req.ViewID && l.Type == core.TypeShow {
-				section = "shows"
-			}
+		if id, err := strconv.Atoi(req.ViewID); err == nil && id > 0 {
+			sit.LibraryID = id
+			section = "library:" + strconv.Itoa(id)
+		} else if sit.LibraryID > 0 {
+			section = "library:" + strconv.Itoa(sit.LibraryID)
 		}
 	}
 	if req.Placement == frontend.PlacementDetail {
 		return rows, nil
 	}
 	candidates := make([]core.NeutralHomeRow, 0, len(rows))
-	for _, row := range rows {
-		n := core.NeutralHomeRow{ID: row.ID, Title: row.Title, Kind: row.Kind, Purpose: row.Purpose, ItemCount: len(row.Entries)}
+	indices := make(map[string]int, len(rows))
+	for i, row := range rows {
+		indices[row.ID] = i
+		n := core.NeutralHomeRow{ID: row.ID, Title: row.Title, Kind: row.Kind, Purpose: row.Purpose, ItemCount: len(row.Entries), Always: row.Layout.Always, PreviewOnFocus: row.PreviewOnFocus, RankedTop10: row.RankedTop10}
 		for _, entry := range row.Entries {
 			if entry.Title != nil {
 				n.Items = append(n.Items, *entry.Title)
@@ -87,16 +89,27 @@ func LayoutRows(ctx context.Context, source core.NeutralHomeLayoutSource, librar
 		}
 		candidates = append(candidates, n)
 	}
-	ordered, err := ArrangeNeutralHome(ctx, source, req.Viewer, sit, section, candidates)
+	ordered, err := source.FinalizeNeutralHome(ctx, req.Viewer, sit, section, candidates)
 	if err != nil {
 		return nil, err
 	}
 	out := make([]frontend.Row, 0, len(ordered))
-	for i, index := range ordered {
+	for _, arranged := range ordered {
+		index, ok := indices[arranged.ID]
+		if !ok {
+			continue
+		}
 		row := rows[index]
-		row.Rank = i
-		row.Layout.Order = i
+		rank := len(out)
+		row.Rank = rank
+		row.Layout.Order = rank
 		row.Layout.Style = row.Style
+		row.Layout.Always = arranged.Always
+		row.PreviewOnFocus = arranged.PreviewOnFocus
+		row.Layout.PreviewOnFocus = arranged.PreviewOnFocus
+		row.Layout.PreviewOnFocusPolicy = arranged.PreviewOnFocusPolicy
+		row.RankedTop10 = arranged.RankedTop10
+		row.Layout.RankedTop10 = arranged.RankedTop10
 		out = append(out, row)
 	}
 	return out, nil

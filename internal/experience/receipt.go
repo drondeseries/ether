@@ -51,9 +51,13 @@ type ReceiptSubject struct {
 }
 
 type ReceiptOptions struct {
-	DB            *sql.DB
-	Active        func(context.Context, int64) (*core.User, error)
-	Allowed       func(context.Context, *core.User, core.Device, core.Protocol, ReceiptSubject) bool
+	DB      *sql.DB
+	Active  func(context.Context, int64) (*core.User, error)
+	Allowed func(context.Context, *core.User, core.Device, core.Protocol, ReceiptSubject) bool
+	// Prefetch, when set, loads the titles a batch's subjects name in one
+	// read before Allowed checks them one by one, so a row of cards costs
+	// one catalogue read, not one per card.
+	Prefetch      func(context.Context, []core.RatingKey)
 	AllowedAction func(context.Context, *core.User, core.Device, core.Protocol, ReceiptSubject, frontend.RowInteractionKind) bool
 	Record        func(context.Context, *core.User, core.Device, core.Protocol, ReceiptSubject, frontend.RowInteractionKind) error
 	Now           func() time.Time
@@ -91,7 +95,7 @@ func NewReceipts(o ReceiptOptions) (*Receipts, error) {
 	return &Receipts{opts: o, codec: codec}, nil
 }
 
-var ErrReceipt = errors.New("experience: invalid interaction receipt")
+var ErrReceipt = frontend.ErrInteractionReceipt
 
 func snapshotMatches(subject ReceiptSubject, imp *core.NeutralImpression) bool {
 	if imp == nil || imp.RowID == "" || imp.Purpose != subject.Purpose || imp.Rank != subject.Rank {

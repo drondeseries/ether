@@ -41,6 +41,9 @@ func (t tileSessions) ServeMedia(w http.ResponseWriter, r *http.Request) { t.bas
 func (t tileSessions) Report(c context.Context, a frontend.SessionAccess, id string, line frontend.Timeline) error {
 	return t.base.Report(c, a, id, line)
 }
+func (t tileSessions) KeepAlive(c context.Context, a frontend.SessionAccess, id string) error {
+	return t.base.KeepAlive(c, a, id)
+}
 func (t tileSessions) Stop(c context.Context, a frontend.SessionAccess, id string) error {
 	return t.base.Stop(c, a, id)
 }
@@ -65,6 +68,12 @@ func (t tileSessions) TranscodeFor(c context.Context, id string) (core.HLSSessio
 func (t tileSessions) Events(c context.Context, s frontend.EventScope) (<-chan frontend.Event, error) {
 	return t.base.Events(c, s)
 }
+func (t tileSessions) TrickplayAvailable(id string) bool     { return t.base.TrickplayAvailable(id) }
+func (t tileSessions) TrickplayBIF(id string) ([]byte, bool) { return t.base.TrickplayBIF(id) }
+func (t tileSessions) TrickplayFrame(id string, at time.Duration) ([]byte, bool) {
+	return t.base.TrickplayFrame(id, at)
+}
+func (t tileSessions) CancelTrickplay(id string) { t.base.CancelTrickplay(id) }
 
 func (t tileSessions) TrickplayOffer(context.Context, frontend.SessionAccess, core.RatingKey) (frontend.TrickplayOffer, bool) {
 	if !t.offer {

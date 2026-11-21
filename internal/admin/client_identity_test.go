@@ -29,18 +29,18 @@ func TestClientIdentitySection(t *testing.T) {
 		return serve(h, r)
 	}
 
-	rec := put(`{"tvSearch":"sonarr","movieSearch":"radarr"}`)
+	rec := put(`{"userAgent":"CustomClient/2.0"}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("PUT clientIdentity: %d %s", rec.Code, rec.Body)
 	}
-	if got := store.Get().ClientIdentity; got.TVSearch != "sonarr" || got.MovieSearch != "radarr" {
+	if got := store.Get().ClientIdentity; got.UserAgent != "CustomClient/2.0" {
 		t.Fatalf("policy not saved: %+v", got)
 	}
 
-	// An unknown selector is rejected on the field that carries it.
-	rec = put(`{"tvGrab":"nope"}`)
+	// An invalid user agent is rejected on clientIdentity.userAgent.
+	rec = put(`{"userAgent":"bad\u0007ua"}`)
 	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("unknown selector: %d %s", rec.Code, rec.Body)
+		t.Fatalf("control char user agent: %d %s", rec.Code, rec.Body)
 	}
 	var e struct {
 		Error struct {
@@ -50,17 +50,17 @@ func TestClientIdentitySection(t *testing.T) {
 	decode(t, rec, &e)
 	found := false
 	for _, f := range e.Error.Fields {
-		found = found || f.Field == "clientIdentity.tvGrab"
+		found = found || f.Field == "clientIdentity.userAgent"
 	}
 	if !found {
-		t.Fatalf("no field error for tvGrab: %+v", e.Error.Fields)
+		t.Fatalf("no field error for userAgent: %+v", e.Error.Fields)
 	}
-	if got := store.Get().ClientIdentity.TVGrab; got != "" {
-		t.Fatalf("rejected value was saved: %q", got)
+	if got := store.Get().ClientIdentity.UserAgent; got != "CustomClient/2.0" {
+		t.Fatalf("rejected value overwrote stored value: %q", got)
 	}
 
 	// Custom header values are sealed at rest and redacted in responses.
-	rec = put(`{"tvSearch":"custom","userAgent":"MyClient/1.0","headers":{"X-Api-Client":"s3cret"}}`)
+	rec = put(`{"userAgent":"MyClient/1.0","headers":{"X-Api-Client":"s3cret"}}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("custom identity: %d %s", rec.Code, rec.Body)
 	}
@@ -85,21 +85,12 @@ func TestClientIdentitySection(t *testing.T) {
 		t.Fatalf("section GET leaks the header: %s", rec.Body)
 	}
 	var section struct {
-		Value   json.RawMessage         `json:"value"`
-		Presets []config.IdentityPreset `json:"presets"`
+		Value            json.RawMessage `json:"value"`
+		DefaultUserAgent string          `json:"defaultUserAgent"`
 	}
 	decode(t, rec, &section)
-	wantPresets := []string{"ether", "sonarr", "radarr", "prowlarr", "nzbhydra2", "sabnzbd", "nzbget"}
-	if len(section.Presets) != len(wantPresets) {
-		t.Fatalf("presets = %+v", section.Presets)
-	}
-	for i, key := range wantPresets {
-		if section.Presets[i].Key != key {
-			t.Fatalf("preset %d = %q, want %q", i, section.Presets[i].Key, key)
-		}
-		if section.Presets[i].UserAgent == "" {
-			t.Fatalf("%s has no user agent", key)
-		}
+	if section.DefaultUserAgent == "" || section.DefaultUserAgent != config.DefaultUserAgent() {
+		t.Fatalf("defaultUserAgent = %q, want %q", section.DefaultUserAgent, config.DefaultUserAgent())
 	}
 	// Sending the redacted form back keeps the stored value.
 	if rec = put(string(section.Value)); rec.Code != http.StatusOK {
@@ -110,15 +101,15 @@ func TestClientIdentitySection(t *testing.T) {
 	}
 }
 
-func TestIndexerClientIdentityOverrideValidation(t *testing.T) {
+func TestIndexerUserAgentOverrideValidation(t *testing.T) {
 	store := newStore(t, func(c *config.Config) { seededConfig(c); c.SetupComplete = true })
 	h := admin.NewHandler(admin.Deps{Config: store, IsOwnerToken: storedOwner(store)})
-	body := `[{"id":"i1","name":"Idx","url":"https://idx.example.com","apiKey":"ix-key","dailyLimit":0,"dailyGrabs":0,"priority":0,"enabled":true,"movieCategories":null,"tvCategories":null,"clientIdentity":"sabnzbd"}]`
+	body := `[{"id":"i1","name":"Idx","url":"https://idx.example.com","apiKey":"ix-key","dailyLimit":0,"dailyGrabs":0,"priority":0,"enabled":true,"movieCategories":null,"tvCategories":null,"userAgent":"bad\u0007ua"}]`
 	r := req(http.MethodPut, "/ether/api/config/indexers", body)
 	r.Header.Set("X-Plex-Token", ownerToken)
 	rec := serve(h, r)
 	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("downloader override: %d %s", rec.Code, rec.Body)
+		t.Fatalf("invalid userAgent override: %d %s", rec.Code, rec.Body)
 	}
 	var e struct {
 		Error struct {
@@ -128,7 +119,7 @@ func TestIndexerClientIdentityOverrideValidation(t *testing.T) {
 	decode(t, rec, &e)
 	found := false
 	for _, f := range e.Error.Fields {
-		found = found || f.Field == "indexers[0].clientIdentity"
+		found = found || f.Field == "indexers[0].userAgent"
 	}
 	if !found {
 		t.Fatalf("no field error for the override: %+v", e.Error.Fields)

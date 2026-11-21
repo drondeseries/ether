@@ -12,13 +12,6 @@ import (
 	"testing"
 )
 
-func boolInt(v bool) int {
-	if v {
-		return 1
-	}
-	return 0
-}
-
 func TestExactIdentityRequiredAndCached(t *testing.T) {
 	for _, tc := range []struct{ name, ids, want string }{{"exact", `[{"id":"tmdb://550"}]`, "plex://movie/5d7768265af944001f1f6976"}, {"mismatch", `[{"id":"tmdb://551"}]`, ""}, {"absent", `[]`, ""}} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -28,7 +21,11 @@ func TestExactIdentityRequiredAndCached(t *testing.T) {
 				t.Fatal(e)
 			}
 			defer db.Close()
+			seedCatalogTitle(t, db, core.MovieKey(550), "movie", "Fight Club", 1999)
+			seedCatalogTitle(t, db, core.ShowKey(1396), "show", "Breaking Bad", 2008)
+			seedCatalogTitle(t, db, core.ShowKey(456), "show", "The Simpsons", 1989)
 			calls := 0
+			const canonical = "plex://movie/5d7768265af944001f1f6976"
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				calls++
 				if (r.URL.Path == "/library/metadata/matches" && r.URL.Query().Get("guid") != "tmdb://550") || r.Header.Get("X-Plex-Token") != "fixture" {
@@ -37,7 +34,9 @@ func TestExactIdentityRequiredAndCached(t *testing.T) {
 				if r.Header.Get("X-Plex-Client-Identifier") != "install-id" {
 					t.Fatalf("client id %q", r.Header.Get("X-Plex-Client-Identifier"))
 				}
-				w.Write([]byte(`{"MediaContainer":{"Metadata":[{"guid":"plex://movie/5d7768265af944001f1f6976","type":"movie","Guid":` + tc.ids + `}]}}`))
+				// The canonical record carries the title and year; the
+				// search hit is verified against it, so identity needs both.
+				w.Write([]byte(`{"MediaContainer":{"Metadata":[{"guid":"` + canonical + `","type":"movie","title":"Fight Club","year":1999,"Guid":` + tc.ids + `}]}}`))
 			}))
 			defer srv.Close()
 			s := New(db, Options{BaseURL: srv.URL, Token: func() string { return "fixture" }, ClientIdentifier: func() string { return "install-id" }})
@@ -54,6 +53,13 @@ func TestExactIdentityRequiredAndCached(t *testing.T) {
 	}
 }
 
+func boolInt(v bool) int {
+	if v {
+		return 1
+	}
+	return 0
+}
+
 func TestPerInstallClientIdentifier(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.OpenMemory(ctx)
@@ -61,11 +67,14 @@ func TestPerInstallClientIdentifier(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	seedCatalogTitle(t, db, core.MovieKey(550), "movie", "Fight Club", 1999)
+	seedCatalogTitle(t, db, core.ShowKey(1396), "show", "Breaking Bad", 2008)
+	seedCatalogTitle(t, db, core.ShowKey(456), "show", "The Simpsons", 1989)
 
 	var gotHeader string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotHeader = r.Header.Get("X-Plex-Client-Identifier")
-		w.Write([]byte(`{"MediaContainer":{"Metadata":[{"guid":"plex://movie/5d7768265af944001f1f6976","type":"movie","Guid":[{"id":"tmdb://550"}]}]}}`))
+		w.Write([]byte(`{"MediaContainer":{"Metadata":[{"guid":"plex://movie/5d7768265af944001f1f6976","type":"movie","title":"Fight Club","year":1999,"Guid":[{"id":"tmdb://550"}]}]}}`))
 	}))
 	defer srv.Close()
 
@@ -97,6 +106,9 @@ func TestTokenNotForwardedOnRedirect(t *testing.T) {
 	ctx := context.Background()
 	db, _ := store.OpenMemory(ctx)
 	defer db.Close()
+	seedCatalogTitle(t, db, core.MovieKey(550), "movie", "Fight Club", 1999)
+	seedCatalogTitle(t, db, core.ShowKey(1396), "show", "Breaking Bad", 2008)
+	seedCatalogTitle(t, db, core.ShowKey(456), "show", "The Simpsons", 1989)
 	calls := 0
 	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls++ }))
 	defer other.Close()
@@ -115,6 +127,9 @@ func TestSeasonAndEpisodeResolutionAndCachedMany(t *testing.T) {
 		t.Fatal(e)
 	}
 	defer db.Close()
+	seedCatalogTitle(t, db, core.MovieKey(550), "movie", "Fight Club", 1999)
+	seedCatalogTitle(t, db, core.ShowKey(1396), "show", "Breaking Bad", 2008)
+	seedCatalogTitle(t, db, core.ShowKey(456), "show", "The Simpsons", 1989)
 
 	const (
 		showGUID   = "plex://show/5d9c086c46115600200aa2fe"
@@ -126,12 +141,12 @@ func TestSeasonAndEpisodeResolutionAndCachedMany(t *testing.T) {
 		switch r.URL.Path {
 		case "/library/metadata/matches":
 			if r.URL.Query().Get("type") == "2" && r.URL.Query().Get("guid") == "tmdb://1396" {
-				w.Write([]byte(`{"MediaContainer":{"Metadata":[{"guid":"` + showGUID + `","type":"show","Guid":[{"id":"tmdb://1396"}]}]}}`))
+				w.Write([]byte(`{"MediaContainer":{"Metadata":[{"guid":"` + showGUID + `","type":"show","title":"Breaking Bad","year":2008,"Guid":[{"id":"tmdb://1396"}]}]}}`))
 				return
 			}
 			w.Write([]byte(`{"MediaContainer":{"Metadata":[]}}`))
 		case "/library/metadata/5d9c086c46115600200aa2fe":
-			w.Write([]byte(`{"MediaContainer":{"Metadata":[{"guid":"` + showGUID + `","type":"show","Guid":[{"id":"tmdb://1396"}]}]}}`))
+			w.Write([]byte(`{"MediaContainer":{"Metadata":[{"guid":"` + showGUID + `","type":"show","title":"Breaking Bad","year":2008,"Guid":[{"id":"tmdb://1396"}]}]}}`))
 		case "/library/metadata/5d9c086c46115600200aa2fe/children":
 			w.Write([]byte(`{"MediaContainer":{"Metadata":[{"guid":"` + seasonGUID + `","type":"season","index":1}]}}`))
 		case "/library/metadata/602e5e2194f08e002d001122/children":
@@ -168,6 +183,9 @@ func TestChildrenPaging120Episodes(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	seedCatalogTitle(t, db, core.MovieKey(550), "movie", "Fight Club", 1999)
+	seedCatalogTitle(t, db, core.ShowKey(1396), "show", "Breaking Bad", 2008)
+	seedCatalogTitle(t, db, core.ShowKey(456), "show", "The Simpsons", 1989)
 
 	const (
 		showGUID   = "plex://show/5d9c086c46115600200aa2fe"
@@ -184,12 +202,12 @@ func TestChildrenPaging120Episodes(t *testing.T) {
 		switch r.URL.Path {
 		case "/library/metadata/matches":
 			if r.URL.Query().Get("type") == "2" && r.URL.Query().Get("guid") == "tmdb://456" {
-				w.Write([]byte(`{"MediaContainer":{"Metadata":[{"guid":"` + showGUID + `","type":"show","Guid":[{"id":"tmdb://456"}]}]}}`))
+				w.Write([]byte(`{"MediaContainer":{"Metadata":[{"guid":"` + showGUID + `","type":"show","title":"The Simpsons","year":1989,"Guid":[{"id":"tmdb://456"}]}]}}`))
 				return
 			}
 			w.Write([]byte(`{"MediaContainer":{"Metadata":[]}}`))
 		case "/library/metadata/5d9c086c46115600200aa2fe":
-			w.Write([]byte(`{"MediaContainer":{"Metadata":[{"guid":"` + showGUID + `","type":"show","Guid":[{"id":"tmdb://456"}]}]}}`))
+			w.Write([]byte(`{"MediaContainer":{"Metadata":[{"guid":"` + showGUID + `","type":"show","title":"The Simpsons","year":1989,"Guid":[{"id":"tmdb://456"}]}]}}`))
 		case "/library/metadata/5d9c086c46115600200aa2fe/children":
 			if r.URL.Query().Get("X-Plex-Container-Size") != "50" || r.URL.Query().Get("X-Plex-Container-Start") != "0" {
 				t.Fatalf("season children query = %v", r.URL.Query())
@@ -255,10 +273,13 @@ func TestBackgroundScheduleWarmsGUIDs(t *testing.T) {
 		t.Fatal(e)
 	}
 	defer db.Close()
+	seedCatalogTitle(t, db, core.MovieKey(550), "movie", "Fight Club", 1999)
+	seedCatalogTitle(t, db, core.ShowKey(1396), "show", "Breaking Bad", 2008)
+	seedCatalogTitle(t, db, core.ShowKey(456), "show", "The Simpsons", 1989)
 
 	const want = "plex://movie/5d7768265af944001f1f6976"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"MediaContainer":{"Metadata":[{"guid":"` + want + `","type":"movie","Guid":[{"id":"tmdb://550"}]}]}}`))
+		w.Write([]byte(`{"MediaContainer":{"Metadata":[{"guid":"` + want + `","type":"movie","title":"Fight Club","year":1999,"Guid":[{"id":"tmdb://550"}]}]}}`))
 	}))
 	defer srv.Close()
 
@@ -270,5 +291,45 @@ func TestBackgroundScheduleWarmsGUIDs(t *testing.T) {
 
 	if got := s.Cached(ctx, core.MovieKey(550)); got != want {
 		t.Fatalf("background cached=%q, want %q", got, want)
+	}
+}
+
+func TestIMDBFallbackWhenTMDBMissingFromPlex(t *testing.T) {
+	const canonical = "plex://movie/66112233445566778899aabb"
+	for _, tc := range []struct {
+		name string
+		ids  string
+		want string
+	}{
+		{"imdb_only", `[{"id":"imdb://tt32212403"}]`, canonical},
+		{"conflicting_tmdb", `[{"id":"imdb://tt32212403"},{"id":"tmdb://999999"}]`, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			db, err := store.OpenMemory(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			k := core.MovieKey(1280015)
+			seedCatalogTitle(t, db, k, "movie", "Sunny Dancer", 2026)
+			if _, err := db.Exec(`UPDATE catalog_titles SET imdb='tt32212403' WHERE key=?`, int64(k)); err != nil {
+				t.Fatal(err)
+			}
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/library/metadata/matches" && r.URL.Query().Get("guid") == "tmdb://1280015" {
+					w.Write([]byte(`{"MediaContainer":{"Metadata":[]}}`))
+					return
+				}
+				w.Write([]byte(`{"MediaContainer":{"Metadata":[{"guid":"` + canonical + `","type":"movie","title":"Sunny Dancer","year":2026,"Guid":` + tc.ids + `}]}}`))
+			}))
+			defer srv.Close()
+
+			s := New(db, Options{BaseURL: srv.URL, Token: func() string { return "fixture" }})
+			got, err := s.Resolve(ctx, k)
+			if err != nil || got != tc.want {
+				t.Fatalf("Resolve=%q err=%v, want %q", got, err, tc.want)
+			}
+		})
 	}
 }

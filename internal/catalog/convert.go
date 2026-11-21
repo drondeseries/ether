@@ -293,6 +293,9 @@ func (c *Catalog) movieToTitle(ctx context.Context, m tmdb.Movie) core.Title {
 		PosterPath: m.PosterPath, BackdropPath: m.BackdropPath,
 		Genres: c.genreNames(ctx, "movie", m.GenreIDs, m.Genres), Adult: m.Adult,
 	}
+	if m.Adult {
+		t.EnforcementRating = contentrating.UncertifiedAdult
+	}
 	if !rel.IsZero() {
 		t.Year = rel.Year()
 	}
@@ -361,6 +364,7 @@ func applyMovieYear(t *core.Title, primary time.Time, dates *tmdb.ReleaseDates) 
 
 func (c *Catalog) movieDetailsToTitle(ctx context.Context, d *tmdb.MovieDetails) core.Title {
 	t := c.movieToTitle(ctx, d.Movie)
+	c.applyTranslatedNames(&t, d.Translations, d.AlternativeTitles)
 	// Date added is the earliest theatrical date. The title year is the
 	// primary release_date, which is what TMDB, IMDb and Plex match on.
 	// A later regional theatrical date must not move that year. With no
@@ -370,7 +374,6 @@ func (c *Catalog) movieDetailsToTitle(ctx context.Context, d *tmdb.MovieDetails)
 	}
 	applyMovieYear(&t, tmdb.ParseDate(d.ReleaseDate), d.ReleaseDates)
 	t.Keywords = keywordNames(d.Keywords)
-	t.AlternativeTitles = altTitles(d.AlternativeTitles, t.Title, t.OriginalTitle)
 	t.Tagline = d.Tagline
 	t.Status = d.Status
 	if d.Runtime > 0 {
@@ -391,8 +394,11 @@ func (c *Catalog) movieDetailsToTitle(ctx context.Context, d *tmdb.MovieDetails)
 		t.CollectionID = d.BelongsTo.ID
 		t.CollectionName = d.BelongsTo.Name
 	}
-	sel := contentrating.Select(movieCertifications(d.ReleaseDates), c.config().Region)
+	certs := movieCertifications(d.ReleaseDates)
+	region := c.config().Region
+	sel := contentrating.Select(certs, region)
 	t.ContentRating, t.ContentRatingSource = sel.Value, sel.Source
+	t.EnforcementRating = contentrating.EffectiveEnforcement(contentrating.EnforceCertifications(certs, region), sel.Value, t.Adult, t.Keywords)
 	return t
 }
 
@@ -406,6 +412,9 @@ func (c *Catalog) tvToTitle(ctx context.Context, s tmdb.TVShow) core.Title {
 		PosterPath: s.PosterPath, BackdropPath: s.BackdropPath,
 		Genres: c.genreNames(ctx, "tv", s.GenreIDs, s.Genres), Countries: s.OriginCountry, Adult: s.Adult,
 	}
+	if s.Adult {
+		t.EnforcementRating = contentrating.UncertifiedAdult
+	}
 	if !rel.IsZero() {
 		t.Year = rel.Year()
 	}
@@ -414,8 +423,8 @@ func (c *Catalog) tvToTitle(ctx context.Context, s tmdb.TVShow) core.Title {
 
 func (c *Catalog) tvDetailsToTitle(ctx context.Context, d *tmdb.TVDetails) core.Title {
 	t := c.tvToTitle(ctx, d.TVShow)
+	c.applyTranslatedNames(&t, d.Translations, d.AlternativeTitles)
 	t.Keywords = keywordNames(d.Keywords)
-	t.AlternativeTitles = altTitles(d.AlternativeTitles, t.Title, t.OriginalTitle)
 	t.Tagline = d.Tagline
 	t.Status = d.Status
 	t.LastAirDate = tmdb.ParseDate(d.LastAirDate)
@@ -473,8 +482,11 @@ func (c *Catalog) tvDetailsToTitle(ctx context.Context, d *tmdb.TVDetails) core.
 	t.LogoPath = logoPath(d.Images)
 	t.ChildCount = d.NumberOfSeasons
 	t.LeafCount = d.NumberOfEpisodes
-	sel := contentrating.Select(tvCertifications(d.ContentRatings), c.config().Region)
+	certs := tvCertifications(d.ContentRatings)
+	region := c.config().Region
+	sel := contentrating.Select(certs, region)
 	t.ContentRating, t.ContentRatingSource = sel.Value, sel.Source
+	t.EnforcementRating = contentrating.EffectiveEnforcement(contentrating.EnforceCertifications(certs, region), sel.Value, t.Adult, t.Keywords)
 	return t
 }
 
@@ -490,11 +502,11 @@ func seasonToTitle(show core.Title, s tmdb.SeasonSummary) core.Title {
 	}
 	t := core.Title{
 		Key: core.SeasonKey(show.IDs.TMDB, s.SeasonNumber), Type: core.TypeSeason,
-		IDs: core.IDs{TMDB: s.ID}, ShowKey: show.Key, ShowIDs: show.IDs, ShowTitle: show.Title, ShowOriginalTitle: show.OriginalTitle, ShowYear: show.Year,
+		IDs: core.IDs{TMDB: s.ID}, ShowKey: show.Key, ShowIDs: show.IDs, ShowTitle: show.Title, ShowOriginalTitle: show.OriginalTitle, ShowEnglishTitle: show.EnglishTitle, ShowYear: show.Year,
 		SeasonTitle: name, Season: s.SeasonNumber, Title: name, SortTitle: sortTitle(name),
 		Summary: s.Overview, Released: rel, PosterPath: s.PosterPath, BackdropPath: show.BackdropPath,
 		ChildCount: s.EpisodeCount, Rating: s.VoteAverage,
-		Genres: show.Genres, ContentRating: show.ContentRating, ContentRatingSource: show.ContentRatingSource, Language: show.Language, Adult: show.Adult,
+		Genres: show.Genres, ContentRating: show.ContentRating, EnforcementRating: show.EnforcementRating, ContentRatingSource: show.ContentRatingSource, Language: show.Language, Adult: show.Adult,
 	}
 	if t.PosterPath == "" {
 		t.PosterPath = show.PosterPath
@@ -513,12 +525,12 @@ func episodeToTitle(show core.Title, seasonName string, e tmdb.Episode) core.Tit
 	}
 	t := core.Title{
 		Key: core.EpisodeKey(show.IDs.TMDB, e.SeasonNumber, e.EpisodeNumber), Type: core.TypeEpisode,
-		IDs: core.IDs{TMDB: e.ID}, ShowKey: show.Key, ShowIDs: show.IDs, ShowTitle: show.Title, ShowOriginalTitle: show.OriginalTitle, ShowYear: show.Year,
+		IDs: core.IDs{TMDB: e.ID}, ShowKey: show.Key, ShowIDs: show.IDs, ShowTitle: show.Title, ShowOriginalTitle: show.OriginalTitle, ShowEnglishTitle: show.EnglishTitle, ShowYear: show.Year,
 		SeasonTitle: seasonName, Season: e.SeasonNumber, Episode: e.EpisodeNumber,
 		Title: title, SortTitle: sortTitle(title), Summary: e.Overview, Released: rel,
 		StillPath: e.StillPath, PosterPath: e.StillPath, BackdropPath: show.BackdropPath,
 		Rating: e.VoteAverage, VoteCount: e.VoteCount,
-		Genres: show.Genres, ContentRating: show.ContentRating, ContentRatingSource: show.ContentRatingSource, Language: show.Language, Adult: show.Adult,
+		Genres: show.Genres, ContentRating: show.ContentRating, EnforcementRating: show.EnforcementRating, ContentRatingSource: show.ContentRatingSource, Language: show.Language, Adult: show.Adult,
 	}
 	if e.Runtime != nil && *e.Runtime > 0 {
 		t.Runtime = time.Duration(*e.Runtime) * time.Minute
@@ -574,21 +586,30 @@ const (
 )
 
 // altTitles keeps the alternative titles release names can use: written in
-// Latin script (a release name's script), not the title or original title
-// again, unique after normalization, in TMDB's order, at most maxAltTitles.
+// Latin script, plus preferred localized names in any script; not the title
+// or original title again, unique after normalization, at most maxAltTitles.
 // Romanized originals ("Sousou no Frieren") are what anime and foreign
 // releases are named by. Non-nil when TMDB sent the block, so an empty list
 // replaces stale rows.
-func altTitles(a *tmdb.AltTitles, title, original string) []string {
-	if a == nil {
+func altTitles(a *tmdb.AltTitles, title, original string, preferred ...string) []string {
+	if a == nil && preferred == nil {
 		return nil
 	}
 	out := []string{}
 	seen := map[string]bool{releaseparse.NormalizeTitle(title): true, releaseparse.NormalizeTitle(original): true}
-	for _, list := range [][]tmdb.AltTitle{a.Titles, a.Results} {
+	// Requested-language translations and regional names go first, including
+	// native scripts. Other aliases keep the existing Latin-script policy.
+	lists := [][]tmdb.AltTitle{{}}
+	for _, name := range preferred {
+		lists[0] = append(lists[0], tmdb.AltTitle{Title: name})
+	}
+	if a != nil {
+		lists = append(lists, a.Titles, a.Results)
+	}
+	for i, list := range lists {
 		for _, alt := range list {
 			name := strings.TrimSpace(alt.Title)
-			if name == "" || len(name) > maxAltTitleLen || !latinScript(name) {
+			if name == "" || len(name) > maxAltTitleLen || (i > 0 && !latinScript(name)) {
 				continue
 			}
 			norm := releaseparse.NormalizeTitle(name)

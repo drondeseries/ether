@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"time"
 
@@ -20,6 +21,7 @@ func init() {
 }
 
 type surfaceCapabilities struct {
+	policy  core.FrontendHostPolicy
 	app     *App
 	surface frontend.Protocol
 }
@@ -36,12 +38,12 @@ func (s surfaceCapabilities) Build(ctx context.Context, req frontend.CapabilityR
 	if err != nil {
 		return frontend.CapabilityResult{}, err
 	}
+	profileDeclared := declared
 	cfg := s.app.cfg.Read()
 	overrides := cfg.Clients.Overrides
-	// Plex applies this baseline in its own cap builder. A Jellyfin or Emby
-	// client that sent no codec lists gets the same floor. A sent DeviceProfile
-	// already filled those lists, and that declaration wins.
-	if s.surface != "plex" {
+	// Frontends with their own capability builder already apply this baseline.
+	// Otherwise fill only missing codec lists; an explicit declaration wins.
+	if !s.policy.NativePlaybackCapabilities {
 		declared = playbackFloor(declared, overrides)
 	}
 	policy := transcode.ResolvePolicy(declared, overrides)
@@ -51,13 +53,33 @@ func (s surfaceCapabilities) Build(ctx context.Context, req frontend.CapabilityR
 	if len(declared.DVProfiles) == 0 {
 		declared.DVProfiles = append([]int(nil), policy.DolbyVisionProfiles...)
 	}
+	declared = transcode.ApplyForcedOverrides(declared, "", overrides)
+	declared.PreserveEmptyVideoCodecs = s.policy.NativePlaybackCapabilities
+	qualityCaps := declared
 	declared = resolver.ApplyClientRules(cfg.Quality, declared, req.Viewer)
 	declared.ClientIP = ip.String()
+	declared.InferBuffering = s.policy.InferBuffering
+	declared.NoPlaybackTelemetry = !s.policy.PlaybackTelemetry
 	result := frontend.CapabilityResult{Client: declared, Quality: resolver.SelectProfile(cfg.Quality, declared, req.Viewer)}
-	if req.Viewer != nil && s.surface != "plex" {
+	if (s.surface == "jellyfin" || s.surface == "silo") && (req.Profile.MaxStreamingBitrate > 0 || len(req.Profile.DirectPlayProfiles) > 0 || len(req.Device.VideoCodecs) > 0) {
+		s.app.log.Info("playback capability selection", "product", declared.Product,
+			"maxHeight", declared.MaxHeight, "videoCodecs", declared.VideoCodecs,
+			"profileMaxHeight", profileDeclared.MaxHeight, "profileHeightDeclared", profileDeclared.ExplicitMaxHeight,
+			"profileHDR10", profileDeclared.HDR10, "profileDolbyVision", profileDeclared.DolbyVision,
+			"hdr10", declared.HDR10, "dolbyVision", declared.DolbyVision,
+			"maxBitrateKbps", declared.MaxBitrateKbps,
+			"qualityRule", result.Quality.Name, "qualityMaxHeight", result.Quality.MaxHeight,
+			"qualityHDR", result.Quality.AllowHDR,
+			"qualityLayers", resolver.ExplainQuality(resolver.QualityQuestion{Quality: cfg.Quality, Caps: qualityCaps, User: req.Viewer}).Layers)
+	}
+	if req.Viewer != nil && !s.policy.NativeClientFamilies {
 		s.app.recordFrontendFamily(ctx, s.surface, declared)
 	}
 	return result, nil
+}
+
+func (s surfaceCapabilities) ApplyClientRules(q frontend.HostQualityConfig, caps core.ClientCaps, viewer *core.Viewer, media string) core.ClientCaps {
+	return resolver.ApplyClientRulesForMedia(q, caps, viewer, media)
 }
 
 func (a *App) recordFrontendFamily(ctx context.Context, surface frontend.Protocol, caps core.ClientCaps) {
@@ -71,7 +93,7 @@ func (a *App) recordFrontendFamily(ctx context.Context, surface frontend.Protoco
 		return
 	}
 	policy := transcode.ClientPolicyFor(core.ClientCaps{Protocol: surface, Product: product, Platform: caps.Platform, Device: device})
-	if policy.Family == "generic" || (policy.Family == "Plex Web" && surface != "plex") {
+	if policy.Family == "generic" || policy.Family == "Plex Web" {
 		policy.Family = product
 	}
 	data, err := json.Marshal(policy)
@@ -101,7 +123,7 @@ func (a *App) recordFrontendFamily(ctx context.Context, surface frontend.Protoco
 // playbackFloor copies a recognized client's registry codecs onto empty
 // lists. The generic preset is not a declaration, so an unknown client stays
 // unrestricted. HDR flags stay with the profile: the preset does not certify
-// a display.
+// a display, except for native-player apps (see the quirk below).
 func playbackFloor(declared core.ClientCaps, overrides []core.ClientCapabilityOverride) core.ClientCaps {
 	device := declared.Device
 	if device == "" {
@@ -122,6 +144,19 @@ func playbackFloor(declared core.ClientCaps, overrides []core.ClientCapabilityOv
 	}
 	if declared.MaxHeight == 0 && !declared.ExplicitMaxHeight && defaults.MaxHeight > 0 {
 		declared.MaxHeight = defaults.MaxHeight
+		if defaults.HeightLocked {
+			declared.MaxHeightSource = "App compatibility override"
+		} else {
+			declared.MaxHeightSource = fmt.Sprintf("registry preset %q", defaults.ID)
+		}
+	}
+	// An app that plays through its own native player (registry quirk
+	// native-player-dynamic-range: Stremio desktop/Android, Nuvio) renders
+	// HDR itself and tone-maps for an SDR display, so the record's range
+	// flags are the player's, not a display claim. An explicit refusal wins.
+	if !declared.ExplicitNoHDR && transcode.HasQuirk(declared.Product, declared.Platform, device, "", declared.Version, "native-player-dynamic-range") {
+		declared.HDR10 = declared.HDR10 || defaults.HDR10
+		declared.DolbyVision = declared.DolbyVision || (defaults.DolbyVision && !defaults.DolbyVisionOff)
 	}
 	return declared
 }

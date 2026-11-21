@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/braedonsaunders/ether/internal/frontend/frontendtest"
+	"github.com/braedonsaunders/ether/internal/frontend/kit/authhdr"
 	"github.com/braedonsaunders/ether/internal/frontends/m3u"
 	"net/http/httptest"
 	"strings"
@@ -29,7 +30,7 @@ func (testRemoteLogo) GetUntrustedURL(context.Context, string) ([]byte, string, 
 
 func TestFrontendLiveTVUsesViewerPolicy(t *testing.T) {
 	ctx := context.Background()
-	a := setupTestApp(t, true)
+	a := setupTestAppConfigured(t, true, Options{}, nil)
 	if err := a.users.SetOwner(ctx, plextv.Account{ID: 42, Username: "owner"}, "owner-token"); err != nil {
 		t.Fatal(err)
 	}
@@ -87,6 +88,25 @@ func TestFrontendLiveTVUsesViewerPolicy(t *testing.T) {
 	if rows, err := facade.Guide(ctx, viewer, q); err != nil || len(rows) != 0 {
 		t.Fatal(rows, err)
 	}
+	paged := frontend.LiveGuidePageQuery{LiveGuideQuery: q}
+	paged.Limit = 1
+	first, err := facade.GuidePage(ctx, owner, paged)
+	if err != nil || len(first.Items) != 1 || !first.More || first.Snapshot == "" {
+		t.Fatal("missing guide continuation", first, err)
+	}
+	paged.Offset, paged.Snapshot = 1, first.Snapshot
+	second, err := facade.GuidePage(ctx, owner, paged)
+	if err != nil || len(second.Items) != 1 || second.Items[0].ID == first.Items[0].ID {
+		t.Fatal("guide page repeated", second, err)
+	}
+	paged.Snapshot = "changed"
+	if _, err := facade.GuidePage(ctx, owner, paged); !errors.Is(err, frontend.ErrLiveGuideStale) {
+		t.Fatal("changed guide snapshot accepted", err)
+	}
+	paged.Snapshot, paged.Offset = "", 0
+	if page, err := facade.GuidePage(ctx, viewer, paged); err != nil || len(page.Items) != 0 || page.More {
+		t.Fatal("restricted guide page leaked", page, err)
+	}
 	q.Until = q.From.Add(8 * 24 * time.Hour)
 	if _, err := facade.Guide(ctx, owner, q); err == nil {
 		t.Fatal("unbounded window")
@@ -98,7 +118,7 @@ func TestFrontendLiveTVUsesViewerPolicy(t *testing.T) {
 
 func TestChannelArtworkGrantFollowsLiveTVPolicy(t *testing.T) {
 	ctx := context.Background()
-	a := setupTestApp(t, true)
+	a := setupTestAppConfigured(t, true, Options{}, nil)
 	local, err := identity.NewLocal(a.db)
 	if err != nil {
 		t.Fatal(err)
@@ -141,7 +161,7 @@ func TestChannelArtworkGrantFollowsLiveTVPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	service, err := identity.NewArtworkImageGrantService(a.db, "jellyfin", grants, func() frontend.Experience { return nil }, source, time.Minute, nil)
+	service, err := identity.NewArtworkImageGrantService(a.db, "jellyfin", grants, func() frontend.Experience { return nil }, source, time.Minute, nil, identity.ImageGrantOptions{Token: authhdr.MediaBrowserToken, PublicContentTags: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,7 +222,7 @@ func TestChannelArtworkGrantFollowsLiveTVPolicy(t *testing.T) {
 // Exercise the real M3U handler through the shared adapter, not a mock guide.
 func TestM3UGuideOver4096Channels(t *testing.T) {
 	ctx := context.Background()
-	a := setupTestApp(t, true)
+	a := setupTestAppConfigured(t, true, Options{}, nil)
 	if err := a.users.SetOwner(ctx, plextv.Account{ID: 42, Username: "owner"}, "owner-token"); err != nil {
 		t.Fatal(err)
 	}
@@ -246,5 +266,132 @@ func TestM3UGuideOver4096Channels(t *testing.T) {
 	}
 	if got := strings.Count(rec.Body.String(), "<channel "); got != 4100 {
 		t.Fatalf("channels=%d", got)
+	}
+}
+
+// Each app's lineup, guide, tune check and Home rows honour the owner's
+// per-app visibility; the console (no app) and other apps keep the channel.
+func TestFrontendLiveTVHonoursPerAppVisibility(t *testing.T) {
+	ctx := context.Background()
+	a := setupTestAppConfigured(t, true, Options{}, nil)
+	if err := a.users.SetOwner(ctx, plextv.Account{ID: 42, Username: "owner"}, "owner-token"); err != nil {
+		t.Fatal(err)
+	}
+	owner, err := a.users.Owner(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.catalog.UpsertTitle(ctx, core.Title{Key: core.MovieKey(1), Type: core.TypeMovie, IDs: core.IDs{TMDB: 1}, Title: "Programme", Released: time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)}, true); err != nil {
+		t.Fatal(err)
+	}
+	c, err := a.livetv.SaveChannel(ctx, livetv.Channel{ID: "app-channel", Number: "1", Name: "Channel", Kind: "virtual", Enabled: true, HiddenApps: []string{"xtream", "jellyfin", "jellyfin"}, Items: []livetv.Item{{Key: core.MovieKey(1), Title: "Programme", DurationMS: 3600000}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(c.HiddenApps, ",") != "jellyfin,xtream" {
+		t.Fatalf("apps not normalized: %v", c.HiddenApps)
+	}
+	if _, err := a.livetv.SaveChannel(ctx, livetv.Channel{ID: "bad", Name: "Bad", Kind: "virtual", HiddenApps: []string{"stremio"}}); err == nil {
+		t.Fatal("accepted an app without Live TV")
+	}
+	channelGUID, _ := ids.StringGUID(ids.Channel, c.ID)
+	now := time.Now().UTC()
+	q := frontend.LiveGuideQuery{From: now, Until: now.Add(2 * time.Hour)}
+	for _, app := range []string{"", "jellyfin", "emby", "silo", "xtream", "m3u"} {
+		want := 1
+		if app == "jellyfin" || app == "xtream" {
+			want = 0
+		}
+		facade := surfaceLiveTV{app: a, surface: app}
+		if rows, err := facade.Channels(ctx, owner); err != nil || len(rows) != want {
+			t.Fatalf("%q lineup: %v %v", app, rows, err)
+		}
+		if _, err := facade.ResolveChannelGUID(ctx, owner, channelGUID); (err == nil) != (want == 1) {
+			t.Fatalf("%q resolve: %v", app, err)
+		}
+		if guide, err := facade.Guide(ctx, owner, q); err != nil || (len(guide) > 0) != (want == 1) {
+			t.Fatalf("%q guide: %v %v", app, guide, err)
+		}
+		if err := (sessionLive{service: a.livetv, cached: a.catalog.CachedGet}).Allowed(core.WithLiveApp(ctx, app), owner, c.ID); (err == nil) != (want == 1) {
+			t.Fatalf("%q tune: %v", app, err)
+		}
+		if rows, err := (liveForApp{svc: a.livetv, app: app}).AllowedChannels(ctx, owner); err != nil || len(rows) != want {
+			t.Fatalf("%q Home rows: %v %v", app, rows, err)
+		}
+	}
+}
+
+// Exercise the keyless XMLTV path through the neutral guide and real opaque
+// image grants, including reauthorization when channel visibility changes.
+func TestLiveGuideProgrammeArtworkPolicy(t *testing.T) {
+	ctx := context.Background()
+	a := setupTestAppConfigured(t, true, Options{}, nil)
+	local, _ := identity.NewLocal(a.db)
+	viewerID, err := local.CreateViewer(ctx, "guide-viewer", "password-1234")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = a.users.RefreshViewers(ctx); err != nil {
+		t.Fatal(err)
+	}
+	viewer, err := a.users.ActiveUser(ctx, viewerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Hour)
+	xml := `<tv><channel id="news"><display-name>News</display-name></channel><programme channel="news" start="` + now.Format("20060102150405 -0700") + `" stop="` + now.Add(time.Hour).Format("20060102150405 -0700") + `"><title>Bulletin</title><category>News</category><icon src="https://example.invalid/programme.svg?secret=upstream"/></programme></tv>`
+	_, err = a.livetv.ImportSource(ctx, livetv.Source{ID: "epg-art", Name: "Guide", Playlist: "#EXTM3U\n#EXTINF:-1 tvg-id=\"news\" tvg-logo=\"https://example.invalid/logo.svg\",News\nhttps://example.invalid/stream\n", Guide: xml})
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := *a.artwork
+	source.URLImages = testRemoteLogo{}
+	facade := surfaceLiveTV{app: a, surface: "vela", channelArtwork: source.ChannelImage, programmeArtwork: source.ProgrammeImages, artwork: source}
+	q := frontend.LiveGuidePageQuery{LiveGuideQuery: frontend.LiveGuideQuery{From: now, Until: now.Add(time.Hour), Limit: 1}}
+	page, err := facade.GuidePage(ctx, viewer, q)
+	if err != nil || len(page.Items) != 1 {
+		t.Fatalf("guide %+v %v", page, err)
+	}
+	p := page.Items[0]
+	if p.Item != 0 || len(p.Images) != 1 || len(p.Genres) != 1 || p.Genres[0] != "News" || strings.Contains(p.Images[0].Path, "secret") {
+		t.Fatalf("keyless EPG dropped or leaked: %+v", p)
+	}
+	grants, err := identity.NewGrants(a.db, a.users, time.Hour, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential, err := grants.Issue(ctx, viewerID, nil, "vela", core.Device{ID: "tv"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	images, err := identity.NewArtworkImageGrantService(a.db, "vela", grants, func() frontend.Experience { return nil }, source, time.Minute, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := frontend.ImageGrantRequest{Credential: credential, Device: core.Device{ID: "tv"}, Channel: p.ChannelID, Image: p.Images[0]}
+	secret, err := images.Issue(ctx, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := httptest.NewRecorder()
+	images.Serve(w, httptest.NewRequest("GET", "/?w=0", nil), secret)
+	if w.Code != 200 || w.Header().Get("Content-Type") != "image/svg+xml" {
+		t.Fatalf("programme image %d %s", w.Code, w.Body.String())
+	}
+	tampered := req
+	tampered.Image.Subject = "other-1"
+	if _, err = images.Issue(ctx, tampered); err == nil {
+		t.Fatal("accepted different airing")
+	}
+	if err = a.livetv.SetChannelViewers(ctx, p.ChannelID, livetv.ChannelViewers{Deny: []int64{viewerID}}); err != nil {
+		t.Fatal(err)
+	}
+	w = httptest.NewRecorder()
+	images.Serve(w, httptest.NewRequest("GET", "/?w=0", nil), secret)
+	if w.Code != 404 {
+		t.Fatal("image survived channel policy change", w.Code)
+	}
+	if _, err = images.Issue(ctx, req); err == nil {
+		t.Fatal("issued hidden programme image")
 	}
 }

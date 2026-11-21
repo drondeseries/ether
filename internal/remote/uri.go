@@ -6,6 +6,8 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+
+	"github.com/braedonsaunders/ether/internal/frontend/kit/clientnet"
 )
 
 // Secure-connection modes, matching config.Plex.SecureConnections and PMS's
@@ -55,24 +57,7 @@ func PlexDirectLabel(ip net.IP) string {
 // ParsePlexDirectHost reverses PlexDirectHost. ok is false for hosts that
 // are not "<ip-label>.<hash>.plex.direct".
 func ParsePlexDirectHost(host string) (ip net.IP, hash string, ok bool) {
-	host = strings.TrimSuffix(strings.ToLower(host), ".")
-	if !strings.HasSuffix(host, ".plex.direct") {
-		return nil, "", false
-	}
-	labels := strings.Split(strings.TrimSuffix(host, ".plex.direct"), ".")
-	if len(labels) != 2 || labels[0] == "" || labels[1] == "" {
-		return nil, "", false
-	}
-	l := labels[0]
-	if strings.Count(l, "-") == 3 {
-		ip = net.ParseIP(strings.ReplaceAll(l, "-", ".")).To4()
-	} else {
-		ip = net.ParseIP(strings.ReplaceAll(l, "-", ":"))
-	}
-	if ip == nil {
-		return nil, "", false
-	}
-	return ip, labels[1], true
+	return clientnet.ParsePlexDirectHost(host)
 }
 
 // BuildOptions describes the server's addresses for BuildConnections.
@@ -162,6 +147,16 @@ func BuildConnections(o BuildOptions) []Connection {
 		addIP(o.WAN, o.PublicPort, false)
 	}
 	for _, c := range parsedCustom {
+		// A container on a bridge network only sees its own address, so the
+		// owner names the host's LAN IP here. Publish its plex.direct form too:
+		// a browser client cannot use the plain-IP URL securely.
+		if ip := net.ParseIP(c.Address); ip != nil && c.Local && wantHTTPS {
+			if v4 := ip.To4(); v4 != nil {
+				ip = v4
+			}
+			add(Connection{Protocol: "https", Address: ip.String(), Port: c.Port, Local: true, IPv6: c.IPv6, Custom: true,
+				URI: "https://" + net.JoinHostPort(PlexDirectHost(ip, o.CertHash), strconv.Itoa(c.Port))})
+		}
 		if secure == SecureRequired && c.Protocol == "http" && (wantHTTPS || o.HTTPSOnPlainIP || hasCustomHTTPS) {
 			continue
 		}

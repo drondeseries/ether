@@ -40,18 +40,22 @@ import {
 import { RecordDrawer } from "../sources/form";
 import { pagedTableLabels } from "../../i18n/appkit-labels";
 import { PinStatusBadge } from "./Pinned";
+import { SeasonPinDrawer } from "./SeasonPinDrawer";
 
 const pad = (n: number | undefined) => String(n ?? 0).padStart(2, "0");
 
 /** Pick a movie, or a show then a season then an episode. */
 export function TitlePicker({
   onPick,
+  onPinsChanged,
 }: {
   onPick: (key: string, name: string, media?: "movie" | "tv") => void;
+  onPinsChanged?: () => void;
 }) {
   const id = useId();
   const [show, setShow] = useState<TitleCard | null>(null);
   const [season, setSeason] = useState("");
+  const [pinningSeason, setPinningSeason] = useState(false);
   const seasons = useAsync(
     (signal) => (show ? releaseConsole.children(show.key, signal) : Promise.resolve([])),
     [show?.key],
@@ -122,8 +126,31 @@ export function TitlePicker({
               ))}
             </Select>
           </Field>
+          {season ? (
+            <Button
+              variant="outline"
+              onClick={() => setPinningSeason(true)}
+              disabled={!episodes.data || episodeList.length === 0}
+            >
+              <PinIcon size={14} /> {t("Pin a release for every episode")}
+            </Button>
+          ) : null}
           {seasons.error ? <ErrorPanel error={seasons.error} className="w-full" /> : null}
           {episodes.error ? <ErrorPanel error={episodes.error} className="w-full" /> : null}
+          <SeasonPinDrawer
+            open={pinningSeason && Boolean(season)}
+            target={season ? { key: season } : null}
+            label={(() => {
+              const s = seasonList.find((item) => item.key === season);
+              const sTitle = s ? s.title || t("Season {n}", { n: s.season ?? 0 }) : "";
+              return sTitle ? `${show.title} · ${sTitle}` : show.title;
+            })()}
+            onClose={() => setPinningSeason(false)}
+            onPinned={() => {
+              void episodes.reload();
+              onPinsChanged?.();
+            }}
+          />
         </div>
       ) : null}
     </div>
@@ -164,7 +191,16 @@ function verdict(r: ConsoleRelease) {
     return (
       <span>
         <Badge variant="destructive">{t("Rejected")}</Badge>
-        {r.reason ? <span className="mt-1 block text-xs text-fg-muted">{r.reason}</span> : null}
+        {r.reason ? (
+          <span className="mt-1 block text-xs text-fg-muted">
+            {r.minimumFormatScore != null
+              ? t("Score {score} is below this profile's minimum of {minimum}", {
+                  score: r.formatScore,
+                  minimum: r.minimumFormatScore,
+                })
+              : r.reason}
+          </span>
+        ) : null}
       </span>
     );
   return (
@@ -172,6 +208,16 @@ function verdict(r: ConsoleRelease) {
       <Badge variant={r.winner ? "success" : "secondary"}>
         {r.winner ? t("Plays first") : t("Fallback #{rank}", { rank: r.rank ?? "?" })}
       </Badge>
+      {r.minimumFormatScore != null ? (
+        <span className="mt-1 block text-xs text-warning">
+          {t("Best available — below this profile's minimum (score {score} of {minimum})", {
+            score: r.formatScore,
+            minimum: r.minimumFormatScore,
+          })}
+        </span>
+      ) : r.reason ? (
+        <span className="mt-1 block text-xs text-fg-muted">{r.reason}</span>
+      ) : null}
       {r.route ? <span className="mt-1 block text-[11px] text-fg-subtle">{r.route}</span> : null}
       {r.compatibility ? (
         <span className="mt-1 block text-[11px] text-fg-subtle">{r.compatibility}</span>
@@ -327,6 +373,10 @@ export function ReleaseSearch({ onPinsChanged }: { onPinsChanged?: () => void })
           onPick={(k, n, picked) => {
             setProfile("");
             setParams({ key: k, title: n, ...(picked ? { media: picked } : {}) });
+          }}
+          onPinsChanged={() => {
+            void result.reload();
+            onPinsChanged?.();
           }}
         />
         <div className="flex flex-wrap items-end gap-3">
@@ -522,12 +572,15 @@ export function ReleaseSearch({ onPinsChanged }: { onPinsChanged?: () => void })
                       <span className="block">
                         <span className="tabular-nums">{r.score.toFixed(0)}</span>
                         {(r.customFormats ?? []).length ? (
-                          <span className="mt-1 flex flex-wrap justify-end gap-1">
-                            {(r.customFormats ?? []).map((f) => (
-                              <Badge key={f.id} variant="outline">
-                                {f.name} {f.score > 0 ? `+${f.score}` : f.score}
-                              </Badge>
-                            ))}
+                          <span className="mt-1 block text-xs text-fg-muted">
+                            {(r.customFormats ?? [])
+                              .map((f) =>
+                                t("{score} {format}", {
+                                  score: f.score > 0 ? `+${f.score}` : String(f.score),
+                                  format: f.name,
+                                }),
+                              )
+                              .join(" · ")}
                           </span>
                         ) : null}
                       </span>

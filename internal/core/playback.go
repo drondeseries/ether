@@ -25,8 +25,28 @@ type HLSRamp struct {
 }
 
 type HLSRequest struct {
-	Ramp   HLSRamp    `json:",omitzero"`
-	Resume *HLSResume `json:",omitempty"`
+	// PMSDASH selects the single-video PMS manifest and five-second grid for Plex TV apps.
+	PMSDASH bool
+
+	// MediaGeneration is a trusted presentation namespace retained across encoder
+	// recovery. A new playback start must use a fresh value; empty mints one.
+	MediaGeneration string `json:",omitempty"`
+
+	// QualityRungs explicitly requests the lazy, policy-filtered file-session ladder.
+	QualityRungs    bool
+	QualityRungIDs  []string
+	QualityVariants []QualityVariant `json:"-"`
+
+	// LazyStart defers the first encoder until the client selects a rendition.
+	LazyStart bool
+	// LadderVideoCodecs restricts optional encoded rungs when non-nil.
+	// An empty list permits only the primary decision.
+	LadderVideoCodecs []string
+	Diagnostics       bool
+	// Continuous disables ramps and governor changes that introduce discontinuities.
+	Continuous bool
+	Ramp       HLSRamp    `json:",omitzero"`
+	Resume     *HLSResume `json:",omitempty"`
 	// RecoveryStart is trusted composition only; nil preserves legacy behavior.
 	RecoveryStart *RecoveryStart `json:",omitempty"`
 
@@ -41,6 +61,10 @@ type HLSRequest struct {
 	// SoftSubtitleStream, when set, asks the encoder to expose this embedded
 	// text stream as ASS alongside its ordinary media output.
 	SoftSubtitleStream *int
+	// TextSubtitleStreams tees embedded text tracks from the HLS video input.
+	TextSubtitleStreams []int `json:",omitempty"`
+	// TextSubtitleSource is the host-verified file revision for durable cue windows.
+	TextSubtitleSource string `json:",omitempty"`
 	// RequireIndependentProof emits HLS independence tags only when the
 	// session can guarantee every advertised segment is independently decodable.
 	// Zero preserves the legacy playlist contract for existing callers.
@@ -52,6 +76,11 @@ type HLSRequest struct {
 	// LiveInput permits playlist demuxers for owner-configured live sources.
 	// Ordinary resolved media must leave this false, even if duration is unknown.
 	LiveInput bool
+	// LiveFromBacklog starts a live HLS input at the first segment its
+	// playlist lists (Live TV's relay trims that playlist to the channel's
+	// stability reserve), so the backlog primes the reserve instead of the
+	// demuxer's default three segments from the live edge.
+	LiveFromBacklog bool
 	// CopyTimestamps preserves source timestamps for HTTP Matroska output.
 	CopyTimestamps bool
 	// InputHeaders are optional HTTP headers ffmpeg must send when reading
@@ -64,6 +93,11 @@ type HLSRequest struct {
 	Info        MediaInfo
 	Decision    Decision
 	StartOffset time.Duration
+	// ResumeHint advises the transcoder of the expected resume position when
+	// StartOffset is 0: Matroska HLS warms a speculative copy seek without
+	// moving the playlist origin, and DASH places its initial run at the
+	// resume segment rather than segment 0.
+	ResumeHint time.Duration `json:",omitempty"`
 	// SegmentDuration defaults to 4s when zero (5s for DASH).
 	SegmentDuration time.Duration
 	// Protocol is ProtocolHLS (default when empty), ProtocolDASH, or
@@ -143,6 +177,9 @@ type SubtitleExtractor interface {
 
 // DecideOptions are per-request choices from the Plex decision request.
 type DecideOptions struct {
+	// ToneMap limits apply only to HDR-to-SDR video conversion, never direct
+	// playback or copy-only remux. Zero preserves the existing output budget.
+	ToneMapMaxHeight, ToneMapMaxBitrateKbps int
 	// DisableVideoTranscode prevents optional enhancement from promoting direct playback.
 	DisableVideoTranscode bool
 
@@ -150,6 +187,7 @@ type DecideOptions struct {
 	DirectStream   bool     // client allows remux
 	MaxBitrateKbps int      // client-requested cap (maxVideoBitrate)
 	MaxHeight      int      // from videoResolution
+	MaxWidth       int      // explicit output width ceiling
 	AudioStream    int      // selected stream index, -1 default
 	SubtitleStream int      // -1 none
 	AudioFilters   []string // trusted owner/viewer audio processing; forces audio encoding
@@ -228,6 +266,13 @@ type PlaySession struct {
 	// and mid-play buffering (additive). Nil for a source no play request
 	// or client timeline has reached.
 	Experience *PlayExperience `json:"experience,omitempty"`
+	// SegmentStart is where the requested episode begins inside a combined
+	// multi-episode file ("S01E01-E02" played for its second episode):
+	// server-started streams add it to the client's episode-relative
+	// position. Zero for a file holding only the requested episode, and
+	// recomputed on every snapshot so a failover to another release
+	// re-derives it (additive).
+	SegmentStart time.Duration `json:"segmentStart,omitempty"`
 }
 
 // LiveChannel identifies a live session's selected channel independently of its programme.
@@ -243,6 +288,17 @@ func (s *PlaySession) SourceReleaseID() string {
 		return ""
 	}
 	return s.Resolution.Release.ID
+}
+
+// SourcePosition translates a client's episode-relative position into the
+// source file's timeline, past any earlier episodes a combined file holds
+// before the requested one (SegmentStart). Server-started streams start at
+// the translated position; client-reported positions stay episode-relative.
+func (s *PlaySession) SourcePosition(client time.Duration) time.Duration {
+	if s == nil {
+		return client
+	}
+	return client + s.SegmentStart
 }
 
 // PlayExperience measures what the viewer saw (additive).
@@ -276,15 +332,21 @@ type EncoderStatus struct {
 	PlayerPosition *time.Duration `json:"playerPosition,omitempty"`
 	Runway         *time.Duration `json:"runway,omitempty"`
 	Decision       Decision       `json:"decision"`
-	Processor      string         `json:"processor"`
-	Filters        string         `json:"filters"`
-	Phase          string         `json:"phase"`
-	Reason         string         `json:"reason,omitempty"`
-	StartedAt      time.Time      `json:"startedAt"`
-	UpdatedAt      time.Time      `json:"updatedAt"`
-	Speed          float64        `json:"speed"`
-	OutputTime     time.Duration  `json:"outputTime"`
-	ReadyUntil     time.Duration  `json:"readyUntil"`
+	// Rung is the ABR rung the active run encodes ("" or "base" for the
+	// session's primary decision).
+	Rung               string        `json:"rung,omitempty"`
+	Processor          string        `json:"processor"`
+	Filters            string        `json:"filters"`
+	Phase              string        `json:"phase"`
+	Reason             string        `json:"reason,omitempty"`
+	StartedAt          time.Time     `json:"startedAt"`
+	UpdatedAt          time.Time     `json:"updatedAt"`
+	Speed              float64       `json:"speed"`
+	OutputTime         time.Duration `json:"outputTime"`
+	ReadyUntil         time.Duration `json:"readyUntil"`
+	MinOffsetAvailable time.Duration `json:"minOffsetAvailable,omitempty"`
+	HWDecoder          string        `json:"hwDecoder,omitempty"`
+	HWEncoder          string        `json:"hwEncoder,omitempty"`
 }
 
 type Playback interface {
@@ -306,6 +368,16 @@ type Playback interface {
 	Failover(ctx context.Context, sessionID string, at time.Duration) (*PlaySession, error)
 	Stop(sessionID string)
 	Sessions() []*PlaySession
+}
+
+// DirectDeliverer is implemented by a Playback that can name the provider URL
+// a direct play of one of its sessions may be redirected to (additive). A
+// runtime without it — a remote cluster playback, a fixture — always relays.
+type DirectDeliverer interface {
+	// DirectDelivery reports the provider URL this session's file can be
+	// fetched from directly, and records the read as a direct play of a live
+	// session, the way a relayed range read would.
+	DirectDelivery(sessionID string) (link DirectSourceLink, ok bool)
 }
 
 // SurfaceScopedPlayback separates client identifiers by their authenticated
@@ -347,4 +419,11 @@ type PlaybackSourceHistory struct {
 // authorization or a claim that a local path has remained unchanged.
 type PlaybackSourceSnapshot interface {
 	CurrentSource(context.Context, string) (PlaybackSourceObservation, error)
+}
+
+// PlaybackSelectionFence validates an observed selection against the exact
+// current source. fn must be short and must not read media or call a provider.
+// The source fence is acquired before any manual-intent database writer in fn.
+type PlaybackSelectionFence interface {
+	WithSourceSelection(context.Context, string, string, func(MediaInfo) error) error
 }

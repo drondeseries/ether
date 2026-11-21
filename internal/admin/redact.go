@@ -82,6 +82,7 @@ func RedactConfig(cfg config.Config) config.Config {
 	out.Trakt.ClientSecret = redact(out.Trakt.ClientSecret)
 	out.Simkl.ClientSecret = redact(out.Simkl.ClientSecret)
 	out.OpenSubtitles = redactOpenSubtitles(out.OpenSubtitles)
+	out.SubDL.APIKey = redact(out.SubDL.APIKey)
 	if cfg.Subtitles.Providers != nil {
 		out.Subtitles.Providers = make([]config.SubtitleProvider, len(cfg.Subtitles.Providers))
 		for i, p := range cfg.Subtitles.Providers {
@@ -108,6 +109,7 @@ func RedactConfig(cfg config.Config) config.Config {
 		for i, ix := range cfg.Indexers {
 			ix.APIKey = redact(ix.APIKey)
 			ix.SecretSettings = redactMap(ix.SecretSettings)
+			ix.RequestIdentity = redactRequestIdentity(ix.RequestIdentity)
 			if ix.IsStremio() {
 				ix.URL = redactStremioURL(ix.URL)
 			}
@@ -282,6 +284,7 @@ func UnredactConfig(next, prev config.Config) (config.Config, []FieldError) {
 	out.Trakt = errs.unredactTrakt(next.Trakt, prev.Trakt)
 	out.Simkl.ClientSecret = errs.restore("simkl.clientSecret", next.Simkl.ClientSecret, prev.Simkl.ClientSecret, strings.TrimSpace(next.Simkl.ClientID) == strings.TrimSpace(prev.Simkl.ClientID))
 	out.OpenSubtitles = errs.unredactOpenSubtitles(next.OpenSubtitles, prev.OpenSubtitles)
+	out.SubDL.APIKey = errs.restore("subdl.apiKey", next.SubDL.APIKey, prev.SubDL.APIKey, true)
 	if next.Subtitles.Providers != nil {
 		out.Subtitles.Providers = make([]config.SubtitleProvider, len(next.Subtitles.Providers))
 		for i, p := range next.Subtitles.Providers {
@@ -390,7 +393,53 @@ func (e *placeholderErrors) unredactIndexer(field string, ix config.Indexer, fla
 	bound := found && indexerIdentity(old, prev.IndexerSites.FlareSolverrURL) == indexerIdentity(ix, flareSolverr)
 	ix.APIKey = e.restore(field+".apiKey", ix.APIKey, old.APIKey, bound)
 	ix.SecretSettings = e.restoreMap(field+".secretSettings", ix.SecretSettings, old.SecretSettings, bound)
+	ix.RequestIdentity = restoreRequestIdentity(ix.RequestIdentity, old.RequestIdentity, bound)
 	return ix
+}
+
+// redactRequestIdentity hides credential header values (Authorization,
+// Cookie, …); other override values stay visible so the owner can edit them.
+func redactRequestIdentity(ri *config.IndexerRequestIdentity) *config.IndexerRequestIdentity {
+	if ri == nil {
+		return nil
+	}
+	out := *ri
+	hide := func(ovs []config.KVOverride) []config.KVOverride {
+		cp := append([]config.KVOverride(nil), ovs...)
+		for i := range cp {
+			if config.SensitiveHeader(cp[i].Name) {
+				cp[i].Value = redact(cp[i].Value)
+			}
+		}
+		return cp
+	}
+	out.Headers = hide(ri.Headers)
+	out.GrabHeaders = hide(ri.GrabHeaders)
+	return &out
+}
+
+func restoreRequestIdentity(next, prev *config.IndexerRequestIdentity, bound bool) *config.IndexerRequestIdentity {
+	if next == nil || prev == nil || !bound {
+		return next
+	}
+	out := *next
+	restore := func(ovs, olds []config.KVOverride) []config.KVOverride {
+		cp := append([]config.KVOverride(nil), ovs...)
+		for i := range cp {
+			if !config.SensitiveHeader(cp[i].Name) || !isRedacted(cp[i].Value) {
+				continue
+			}
+			for _, o := range olds {
+				if strings.EqualFold(o.Name, cp[i].Name) {
+					cp[i].Value = o.Value
+				}
+			}
+		}
+		return cp
+	}
+	out.Headers = restore(next.Headers, prev.Headers)
+	out.GrabHeaders = restore(next.GrabHeaders, prev.GrabHeaders)
+	return &out
 }
 
 func (e *placeholderErrors) unredactDebrid(field string, p config.DebridProvider, prev []config.DebridProvider) config.DebridProvider {

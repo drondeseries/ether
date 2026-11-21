@@ -48,7 +48,7 @@ func TestPlexStreamBindingAndSidecar(t *testing.T) {
 	}
 	events := NewEventBus(nil, active)
 	defer events.Close()
-	b, err := NewBroker(BrokerDeps{
+	b, err := NewBroker(BrokerDeps{SurfacePolicy: testSessionPolicy,
 		Events: events, Playback: &fakePlayback{sessions: map[string]*core.PlaySession{}, limit: 2},
 		Progress: &fakeProgress{}, ActiveViewer: active,
 		CanPlay: func(*core.Viewer, bool, time.Time) bool { return true },
@@ -71,31 +71,31 @@ func TestPlexStreamBindingAndSidecar(t *testing.T) {
 	defer b.Close(ctx)
 	surface := BindSurface(b, "plex")
 	api := surface.(interface {
-		BindPlexStream(context.Context, frontend.SessionAccess, PlexStreamBinding) (int64, error)
-		ResolvePlexStream(context.Context, frontend.SessionAccess, int64) (PlexStreamBinding, error)
-		OpenPlexSidecar(context.Context, frontend.SessionAccess, auth.Acceptance, int64) (io.ReadCloser, core.StreamInfo, error)
+		BindStream(context.Context, frontend.SessionAccess, StreamBinding) (int64, error)
+		ResolveStream(context.Context, frontend.SessionAccess, int64) (StreamBinding, error)
+		OpenSidecar(context.Context, frontend.SessionAccess, auth.Acceptance, int64) (io.ReadCloser, core.StreamInfo, error)
 	})
 	access := frontend.SessionAccess{Viewer: friend, Protocol: "plex"}
 	info := core.StreamInfo{Type: "subtitle", Codec: "srt", Language: "en", External: true, ExternalURL: "ether-subtitle:one"}
-	id, err := api.BindPlexStream(ctx, access, PlexStreamBinding{Key: core.MovieKey(4), Index: 3, Info: info})
-	if err != nil || id == 0 || id != PlexWireID(core.MovieKey(4), PlexStreamSlot(3, info)) {
+	id, err := api.BindStream(ctx, access, StreamBinding{Key: core.MovieKey(4), Index: 3, Info: info})
+	if err != nil || id == 0 || id != WireID(core.MovieKey(4), PlexStreamSlot(3, info)) {
 		t.Fatalf("bind %d %v", id, err)
 	}
-	again, err := api.BindPlexStream(ctx, access, PlexStreamBinding{Key: core.MovieKey(4), Index: 3, Info: info})
+	again, err := api.BindStream(ctx, access, StreamBinding{Key: core.MovieKey(4), Index: 3, Info: info})
 	if err != nil || again != id {
 		t.Fatalf("rebind %d %v", again, err)
 	}
-	if _, err := api.BindPlexStream(ctx, frontend.SessionAccess{Viewer: friend, Protocol: "jellyfin"}, PlexStreamBinding{Key: core.MovieKey(4), Info: info}); !errors.Is(err, core.ErrUnauthorized) {
+	if _, err := api.BindStream(ctx, frontend.SessionAccess{Viewer: friend, Protocol: "jellyfin"}, StreamBinding{Key: core.MovieKey(4), Info: info}); !errors.Is(err, core.ErrUnauthorized) {
 		t.Fatalf("other surface: %v", err)
 	}
-	got, err := api.ResolvePlexStream(ctx, access, id)
+	got, err := api.ResolveStream(ctx, access, id)
 	if err != nil || got.WireID != id || got.Info.ExternalURL != info.ExternalURL {
 		t.Fatalf("resolve %+v %v", got, err)
 	}
-	if _, err := api.ResolvePlexStream(ctx, access, id+9_000_000); !errors.Is(err, core.ErrNotFound) {
+	if _, err := api.ResolveStream(ctx, access, id+9_000_000); !errors.Is(err, core.ErrNotFound) {
 		t.Fatalf("missing id: %v", err)
 	}
-	reader, opened, err := api.OpenPlexSidecar(ctx, access, receipt, id)
+	reader, opened, err := api.OpenSidecar(ctx, access, receipt, id)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,10 +107,10 @@ func TestPlexStreamBindingAndSidecar(t *testing.T) {
 	if _, err := db.ExecContext(ctx, `UPDATE auth_users SET active=0 WHERE id=?`, friend.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := api.ResolvePlexStream(ctx, access, id); !errors.Is(err, core.ErrUnauthorized) {
+	if _, err := api.ResolveStream(ctx, access, id); !errors.Is(err, core.ErrUnauthorized) {
 		t.Fatalf("revoked viewer: %v", err)
 	}
-	revoked, info, err := api.OpenPlexSidecar(ctx, access, receipt, id)
+	revoked, info, err := api.OpenSidecar(ctx, access, receipt, id)
 	if revoked != nil || info.ExternalURL != "" || !errors.Is(err, core.ErrUnauthorized) {
 		if revoked != nil {
 			_ = revoked.Close()
@@ -124,7 +124,7 @@ func TestPlexSidecarFileHasNoReaderOnMiss(t *testing.T) {
 	active := func(_ context.Context, id int64) (*core.Viewer, error) { return &core.Viewer{ID: id}, nil }
 	events := NewEventBus(nil, active)
 	defer events.Close()
-	b, err := NewBroker(BrokerDeps{
+	b, err := NewBroker(BrokerDeps{SurfacePolicy: testSessionPolicy,
 		Events: events, Playback: &fakePlayback{sessions: map[string]*core.PlaySession{}, limit: 1},
 		Progress: &fakeProgress{}, ActiveViewer: active,
 		CanPlay:      func(*core.Viewer, bool, time.Time) bool { return true },
@@ -148,11 +148,11 @@ func TestPlexSidecarFileHasNoReaderOnMiss(t *testing.T) {
 	_ = f.Close()
 	access := frontend.SessionAccess{Viewer: &core.Viewer{ID: 3}, Protocol: "plex"}
 	info := core.StreamInfo{Type: "subtitle", Codec: "srt", External: true, ExternalURL: f.Name()}
-	id, err := b.BindPlexStream(ctx, access, PlexStreamBinding{Key: core.MovieKey(8), Index: 1, Info: info})
+	id, err := b.BindStream(ctx, access, StreamBinding{Key: core.MovieKey(8), Index: 1, Info: info})
 	if err != nil {
 		t.Fatal(err)
 	}
-	reader, opened, err := b.OpenPlexSidecar(ctx, access, auth.Acceptance{}, id)
+	reader, opened, err := b.OpenSidecar(ctx, access, auth.Acceptance{}, id)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,15 +162,49 @@ func TestPlexSidecarFileHasNoReaderOnMiss(t *testing.T) {
 	}
 	missing := info
 	missing.ExternalURL = f.Name() + "-absent"
-	miss, err := b.BindPlexStream(ctx, access, PlexStreamBinding{Key: core.MovieKey(8), Index: 2, Info: missing})
+	miss, err := b.BindStream(ctx, access, StreamBinding{Key: core.MovieKey(8), Index: 2, Info: missing})
 	if err != nil {
 		t.Fatal(err)
 	}
-	reader, _, err = b.OpenPlexSidecar(ctx, access, auth.Acceptance{}, miss)
+	reader, _, err = b.OpenSidecar(ctx, access, auth.Acceptance{}, miss)
 	if reader != nil || !errors.Is(err, core.ErrNotFound) {
 		if reader != nil {
 			_ = reader.Close()
 		}
 		t.Fatalf("missing file reader=%v err=%v", reader != nil, err)
+	}
+}
+
+func TestStreamTableEstimatedTransition(t *testing.T) {
+	table := NewStreamTable()
+	key := core.MovieKey(42)
+	audio := core.StreamInfo{Index: 1, Type: "audio", Codec: "aac", Channels: 2}
+
+	id, err := table.Bind(StreamBinding{Key: key, Index: 1, Info: audio, Estimated: true})
+	if err != nil || id == 0 {
+		t.Fatalf("bind estimated: id=%d err=%v", id, err)
+	}
+	got, ok := table.Lookup(id)
+	if !ok || !got.Estimated {
+		t.Fatalf("lookup estimated: got=%+v ok=%v", got, ok)
+	}
+
+	// Re-binding the same slot with a real probed stream clears Estimated.
+	id2, err := table.Bind(StreamBinding{Key: key, Index: 1, Info: audio, Estimated: false})
+	if err != nil || id2 != id {
+		t.Fatalf("bind real: id=%d want %d err=%v", id2, id, err)
+	}
+	got, ok = table.Lookup(id)
+	if !ok || got.Estimated {
+		t.Fatalf("lookup after real bind: got=%+v ok=%v", got, ok)
+	}
+
+	// A later estimated render never downgrades a real stream binding.
+	if _, err := table.Bind(StreamBinding{Key: key, Index: 1, Info: audio, Estimated: true}); err != nil {
+		t.Fatalf("rebind estimated: %v", err)
+	}
+	got, ok = table.Lookup(id)
+	if !ok || got.Estimated {
+		t.Fatalf("estimated render downgraded real binding: got=%+v ok=%v", got, ok)
 	}
 }

@@ -25,6 +25,7 @@ const (
 // sectionScopes classifies every top-level key of Config whose whole value
 // shares one scope.
 var sectionScopes = map[string]Scope{
+	"vela":           Local, // installs and optional file:// release channels belong to this node
 	"frontends":      Shared,
 	"frontendPorts":  Local,
 	"posters":        Shared,
@@ -39,8 +40,10 @@ var sectionScopes = map[string]Scope{
 	"quality":        Shared,
 	"trakt":          Shared,
 	"simkl":          Shared,
+	"mdblist":        Shared,
 	"plexServers":    Shared,
 	"openSubtitles":  Shared,
+	"subdl":          Shared,
 	"llm":            Shared,
 	"updates":        Shared, // incl. maxDrain: every node drains the same way
 	"markers":        Shared,
@@ -64,11 +67,10 @@ var mixedSections = map[string]map[string]Scope{
 	"server": {
 		"trustedProxyCIDRs":  Local,
 		"port":               Local,
+		"portExplicit":       Local,
 		"bindAddress":        Local,
 		"logLevel":           Local,
 		"friendlyName":       Shared,
-		"moviesLibraryName":  Shared,
-		"tvShowsLibraryName": Shared,
 		"webFrameOrigins":    Shared,
 		"allowRemoteConsole": Shared,
 		"startupAnimation":   Shared, // console preference, the same on every node
@@ -81,6 +83,7 @@ var mixedSections = map[string]map[string]Scope{
 		"internalAddress": Local,
 	},
 	"plex": {
+		"fileCheckTimeout":           Shared,
 		"compatibilityVersion":       Shared,
 		"latestCompatibilityVersion": Shared,
 		"trackLatestVersion":         Shared,
@@ -94,6 +97,7 @@ var mixedSections = map[string]map[string]Scope{
 		"certHash":                   Shared,
 		"secureConnections":          Shared,
 		"usePlexMetadata":            Shared,
+		"delivery":                   Shared,
 		// Each node is reached through its own port forward.
 		"useUpnp":    Local,
 		"publicPort": Local,
@@ -107,6 +111,7 @@ var mixedSections = map[string]map[string]Scope{
 		"storage":                  Local,
 		"dir":                      Local,
 		"budgetBytes":              Local,
+		"libraryBudgetBytes":       Local, // release library (NZB vault) cap, sized to this node's disk
 		"mode":                     Local,
 		"preloadEnabled":           Local,
 		"preloadBudgetBytes":       Local,
@@ -123,6 +128,8 @@ var mixedSections = map[string]map[string]Scope{
 		"retentionDays":            Local,
 		"replayBoostHours":         Local,
 		"disableSpeculation":       Local,
+		"speculativeWarming":       Local,
+		"keepWarmTitles":           Local,
 		"detailWarmup":             Local,
 		"detailBytes":              Local,
 		"playbackReadAheadMinutes": Local,
@@ -135,6 +142,7 @@ var mixedSections = map[string]map[string]Scope{
 	},
 	"transcode": {
 		"rtxVideo":             Local, // executable, GPU and enhancement resource limits are node-specific
+		"videoTranscoding":     Local, // node-local transcode policy like maxTranscodes
 		"ffmpegPath":           Local,
 		"ffprobePath":          Local,
 		"hwAccel":              Local,
@@ -170,8 +178,11 @@ var mixedSections = map[string]map[string]Scope{
 		"flareSolverrUrl": Local,
 	},
 	"extras": {
+		"themeMusic":   Shared,
 		"enabled":      Shared,
 		"prewarmBytes": Shared,
+		// Trailer bytes live under this node's cache directory.
+		"trailerCacheMaxBytes": Local,
 		// The resolver tool is a binary on this node's disk.
 		"resolverCommand": Local,
 		"resolverArgs":    Local,
@@ -286,6 +297,11 @@ func toDoc(c Config) map[string]any {
 	return doc
 }
 
+func syncDerived(c *Config) {
+	c.Catalog.ReleaseMode = c.Availability.ModeFor("movie")
+	c.Catalog.HomeReleaseOffsetDays = c.Availability.HomeReleaseOffsetDays
+}
+
 func fromDoc(doc map[string]any) (Config, error) {
 	b, err := json.Marshal(doc)
 	if err != nil {
@@ -293,7 +309,7 @@ func fromDoc(doc map[string]any) (Config, error) {
 	}
 	var c Config
 	err = json.Unmarshal(b, &c)
-	c.Catalog.ReleaseMode = c.Availability.EffectiveMode()
+	syncDerived(&c)
 	return c, err
 }
 
@@ -309,14 +325,28 @@ func SharedJSON(c Config) []byte {
 // document lacks (written by an older version) take their defaults;
 // node-local keys in the document are ignored.
 func MergeShared(local Config, sharedJSON []byte) (Config, error) {
+	c, _, err := mergeShared(local, sharedJSON)
+	return c, err
+}
+
+// mergeShared is MergeShared reporting what settling the document's quality
+// profiles changed: a document written by a release that predates
+// per-media profiles or the Radarr/Sonarr-standard ranking is never run as
+// is (see normalizeQualityDocument and resetPreStandardQuality).
+func mergeShared(local Config, sharedJSON []byte) (Config, []string, error) {
 	var shared map[string]any
 	if err := json.Unmarshal(sharedJSON, &shared); err != nil {
-		return Config{}, err
+		return Config{}, nil, err
 	}
 	stripRetiredLiveTV(shared)
+	upgradeClientIdentity(shared)
+	keepStoredAutoUpdate(shared)
+	resetPreStandardQuality(shared)
+	settled := normalizeSharedDocument(shared)
 	base, _ := splitDoc(toDoc(Defaults("")))
 	overlayDeep(base, shared)
 	doc := toDoc(local)
 	overlayShared(doc, base)
-	return fromDoc(doc)
+	c, err := fromDoc(doc)
+	return c, settled, err
 }

@@ -3,14 +3,16 @@ package app
 import (
 	"context"
 	"fmt"
-	"github.com/braedonsaunders/ether/internal/spike"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/braedonsaunders/ether/internal/admin"
 	"github.com/braedonsaunders/ether/internal/cachefill"
 	"github.com/braedonsaunders/ether/internal/config"
 	"github.com/braedonsaunders/ether/internal/episodeorder"
+	"github.com/braedonsaunders/ether/internal/playback"
+	"github.com/braedonsaunders/ether/internal/spike"
 	"github.com/braedonsaunders/ether/internal/transcode"
 	"github.com/braedonsaunders/ether/internal/trickplay"
 )
@@ -22,7 +24,10 @@ func (a *App) buildIntegrations(ctx context.Context, cfg config.Config) error {
 		sharedShelf = cachefill.NewSharedStore(a.db, a.cacheNodeID())
 	}
 	a.cachefill, err = cachefill.New(a.cache.Directory(), cachefill.Deps{
-		Shared:  sharedShelf,
+		Shared:            sharedShelf,
+		Allowed:           a.safety.Allowed,
+		WatchlistPosition: a.cacheWatchlistPosition,
+		WatchlistIntents:  a.cacheWatchlistIntents, WatchlistDone: a.cacheWatchlistDone,
 		Catalog: a.catalog, Resolver: a.resolver, Engine: a.media, Cache: a.cache,
 		State: a.state, Household: a.cacheHousehold,
 		Config: a.runningCacheConfig, Owner: a.users.Owner,
@@ -76,6 +81,11 @@ func (a *App) buildIntegrations(ctx context.Context, cfg config.Config) error {
 		if err != nil {
 			return fmt.Errorf("local library: %w", err)
 		}
+		if mgr, ok := a.spikeLibrary.Playback().(*playback.Manager); ok && mgr != nil {
+			mgr.Subscribe(func(playback.Event) {
+				a.notifySessionsChanged()
+			})
+		}
 		a.closers = append(a.closers, func() { _ = a.spikeLibrary.Close() })
 	}
 	if a.transcoder != nil && !cfg.Spike.Enabled {
@@ -92,12 +102,45 @@ func (a *App) buildIntegrations(ctx context.Context, cfg config.Config) error {
 	a.closers = append(a.closers, a.frontends.close)
 	a.cfg.Subscribe(a.frontends.reconcile)
 	mux := http.NewServeMux()
+	a.mountAdapterMedia(mux)
 	mux.Handle("/ether/", a.perf.wrap("console", lanOnly(a.buildAdmin(), a.cfg.TrustedProxyCIDRs, a.cfg.AllowRemoteConsole)))
 	a.mountExtensibility(mux)
 	mux.HandleFunc("/ether", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/ether/", http.StatusFound)
 	})
-	mux.Handle("/", a.frontends.plexHandler())
+	mux.Handle("/", browserRootRedirect(a.frontends.plexHandler()))
 	a.handler = mux
 	return nil
+}
+
+// browserRootRedirect sends a person who types the server's address into a
+// browser to the console instead of Plex's 401. Only a bare GET or HEAD of
+// "/" that asks for HTML and carries nothing of Plex's (no X-Plex-* header,
+// no query) is redirected; every client request reaches Plex unchanged.
+func browserRootRedirect(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isBrowserRootRequest(r) {
+			http.Redirect(w, r, "/ether/", http.StatusFound)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func isBrowserRootRequest(r *http.Request) bool {
+	if r.URL.Path != "/" || r.URL.RawQuery != "" || (r.Method != http.MethodGet && r.Method != http.MethodHead) {
+		return false
+	}
+	for k := range r.Header {
+		if len(k) >= len("X-Plex-") && strings.EqualFold(k[:len("X-Plex-")], "X-Plex-") {
+			return false
+		}
+	}
+	for _, part := range strings.Split(strings.Join(r.Header.Values("Accept"), ","), ",") {
+		mt, _, _ := strings.Cut(part, ";")
+		if strings.EqualFold(strings.TrimSpace(mt), "text/html") {
+			return true
+		}
+	}
+	return false
 }

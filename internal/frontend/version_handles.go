@@ -2,6 +2,7 @@ package frontend
 
 import (
 	"context"
+	"time"
 
 	"github.com/braedonsaunders/ether/internal/core"
 )
@@ -32,10 +33,12 @@ type VersionHandles interface {
 	MatchSession(context.Context, VersionScope, string, string) error
 }
 
-// Editions is an optional local-media catalogue. Implementations return
-// probed copies already on disk and do not search indexers.
+// Editions is an optional local-media catalogue and release variant resolver.
 type Editions interface {
 	Editions(context.Context, *core.Viewer, core.Device, core.RatingKey) ([]Version, error)
+	Variants(ctx context.Context, req core.ResolveRequest, max int) ([]core.ReleaseVariant, error)
+	RefillSearchCache(t *core.Title) <-chan struct{}
+	Available(ctx context.Context, key core.RatingKey) (bool, bool)
 }
 
 // EditionBatch resolves local copies for a page in one lookup.
@@ -47,4 +50,25 @@ type EditionBatch interface {
 // whole requested offer set once and issues all handles atomically.
 type VersionHandleBatch interface {
 	IssueBatch(context.Context, VersionScope, core.RatingKey, []string) (map[string]string, error)
+}
+
+// VersionSlots is the cache-independent, configured version menu capability.
+// labels permits cached release facts on detail responses; false is the cheap
+// browse projection and must never search or resolve a title.
+type VersionSlots interface {
+	VersionSlots(context.Context, core.ResolveRequest, int, bool) ([]core.ReleaseVariant, error)
+}
+
+// VersionChoices inspects and clears a viewer's remembered version choice
+// (stored beside owner pins in the resolver).
+type VersionChoices interface {
+	ViewerChoiceFor(context.Context, *core.Viewer, *core.Title) (*core.ViewerChoiceSummary, error)
+	ClearViewerChoice(context.Context, *core.Viewer, *core.Title, string) (bool, error)
+}
+
+// VersionSwitcher swaps the underlying source of an active playback session to
+// another offered version at the given position. When the target version needs
+// a long fetch it leaves the active session undisturbed and returns ErrPreparing.
+type VersionSwitcher interface {
+	SwitchVersion(ctx context.Context, a SessionAccess, sessionID, versionHandle string, position time.Duration) (PlayPlan, error)
 }

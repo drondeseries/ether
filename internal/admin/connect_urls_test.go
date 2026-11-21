@@ -19,14 +19,41 @@ func TestConsoleConnectURLsReplaceContainerAddress(t *testing.T) {
 	}
 }
 
-func TestConsoleConnectURLsKeepHostNetworkListener(t *testing.T) {
-	r := httptestRequest("192.168.1.5:32400")
-	got := consoleConnectURLs(r, "jellyfin", []string{
-		"http://192.168.1.5:8096",
-		"http://192.168.1.5:32400/jellyfin",
-	}, config.Config{}, nil)
-	if len(got) != 2 || got[0] != "http://192.168.1.5:32400/jellyfin" || got[1] != "http://192.168.1.5:8096" {
-		t.Fatalf("connect URLs = %#v", got)
+func TestConsoleConnectURLsPreferDedicatedListenerOverSharedPort(t *testing.T) {
+	for _, tc := range []struct {
+		id         string
+		console    string
+		urls       []string
+		wantFirst  string
+		wantSecond string
+	}{
+		{
+			id:         "jellyfin",
+			console:    "192.168.68.65:32550",
+			urls:       []string{"http://192.168.68.65:32550/jellyfin", "http://192.168.68.65:8096"},
+			wantFirst:  "http://192.168.68.65:8096",
+			wantSecond: "http://192.168.68.65:32550/jellyfin",
+		},
+		{
+			id:         "emby",
+			console:    "192.168.68.65:32550",
+			urls:       []string{"http://192.168.68.65:32550/emby", "http://192.168.68.65:8097"},
+			wantFirst:  "http://192.168.68.65:8097",
+			wantSecond: "http://192.168.68.65:32550/emby",
+		},
+		{
+			id:         "silo",
+			console:    "10.0.0.43:32450",
+			urls:       []string{"http://10.0.0.43:8090", "http://10.0.0.43:32450/silo"},
+			wantFirst:  "http://10.0.0.43:8090",
+			wantSecond: "http://10.0.0.43:32450/silo",
+		},
+	} {
+		r := httptestRequest(tc.console)
+		got := consoleConnectURLs(r, tc.id, tc.urls, config.Config{}, nil)
+		if len(got) != 2 || got[0] != tc.wantFirst || got[1] != tc.wantSecond {
+			t.Fatalf("%s connect URLs = %#v, want [%q, %q]", tc.id, got, tc.wantFirst, tc.wantSecond)
+		}
 	}
 }
 
@@ -57,6 +84,22 @@ func TestConsoleConnectURLsPlexUsesTheBrowserHost(t *testing.T) {
 	}
 }
 
+// A console opened through a reverse proxy or the public host name must not
+// make that route (or an http:// guess for it) the Plex at-home address.
+func TestConsoleConnectURLsPlexNeverUsesThePublicRouteAtHome(t *testing.T) {
+	lan := []string{"http://192.168.1.5:32400"}
+	proxied := httptestRequest("ether.example.com")
+	proxied.Header.Set("X-Forwarded-For", "203.0.113.9")
+	if got := consoleConnectURLs(proxied, "plex", lan, config.Config{}, nil); len(got) != 1 || got[0] != lan[0] {
+		t.Fatalf("proxied connect URLs = %#v", got)
+	}
+	cfg := config.Config{Plex: config.Plex{PublicHost: "https://ether.example.com"}}
+	direct := httptestRequest("ether.example.com:32400")
+	if got := consoleConnectURLs(direct, "plex", lan, cfg, nil); len(got) != 1 || got[0] != lan[0] {
+		t.Fatalf("public host connect URLs = %#v", got)
+	}
+}
+
 func TestConsoleConnectURLsTrustForwardedHostFromLoopback(t *testing.T) {
 	r := httptestRequest("127.0.0.1:32400")
 	r.RemoteAddr = "127.0.0.1:9"
@@ -78,7 +121,7 @@ func TestConsoleConnectURLsPreferLANOverLoopback(t *testing.T) {
 		"http://192.168.68.66:8096",
 		"http://192.168.68.66:32400/jellyfin",
 	}, config.Config{}, nil)
-	if len(got) < 2 || got[0] != "http://192.168.68.66:32400/jellyfin" || got[1] != "http://192.168.68.66:8096" {
+	if len(got) < 2 || got[0] != "http://192.168.68.66:8096" || got[1] != "http://192.168.68.66:32400/jellyfin" {
 		t.Fatalf("connect URLs = %#v", got)
 	}
 	if got[len(got)-1] == "http://192.168.68.66:8096" {
@@ -113,6 +156,61 @@ func TestValidateCustomURLsRejectsJunkAndKeepsCGNAT(t *testing.T) {
 		}
 		if found == nil || found.Message != "Enter full http:// or https:// server URLs, separated by commas." {
 			t.Fatalf("ValidateConfig(%q) = %+v, want plex.customUrls field error", junk, errs)
+		}
+	}
+}
+
+// An app with its own public address shows that address first, never the
+// Plex custom URL; Plex itself keeps using its custom URLs, and a junk
+// per-app address is rejected like a junk custom URL.
+func TestConsoleConnectURLsPerAppPublicAddress(t *testing.T) {
+	r := httptestRequest("192.168.1.5:32400")
+	cfg := config.Config{
+		Plex:      config.Plex{CustomURLs: []string{"https://plex.example.com"}},
+		Frontends: map[string]config.Frontend{"jellyfin": {Enabled: true, PublicURL: "https://jelly.example.com/"}},
+	}
+	got := consoleConnectURLs(r, "jellyfin", []string{"http://192.168.1.5:8096"}, cfg, nil)
+	if len(got) == 0 || got[0] != "https://jelly.example.com" {
+		t.Fatalf("connect URLs = %#v, want the Jellyfin public address first", got)
+	}
+	for _, candidate := range got {
+		if candidate == "https://plex.example.com/jellyfin" {
+			t.Fatalf("connect URLs = %#v, must not show the Plex host for Jellyfin", got)
+		}
+	}
+	// Emby has no address of its own, so it keeps today's behaviour.
+	got = consoleConnectURLs(r, "emby", nil, cfg, nil)
+	found := false
+	for _, candidate := range got {
+		if candidate == "https://plex.example.com/emby" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("emby connect URLs = %#v, want the shared advertised address", got)
+	}
+	// A publicUrl on Plex itself is ignored.
+	cfg.Frontends["plex"] = config.Frontend{Enabled: true, PublicURL: "https://wrong.example.com"}
+	if _, ok := frontendPublicURL(cfg, "plex"); ok {
+		t.Fatal("Plex must not use a per-frontend public address")
+	}
+
+	base := config.Defaults(os.TempDir())
+	base.Frontends = map[string]config.Frontend{"jellyfin": {Enabled: true, PublicURL: "jelly.example.com"}}
+	errs := ValidateConfig(base)
+	found = false
+	for _, e := range errs {
+		if e.Field == "frontends.jellyfin.publicUrl" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("ValidateConfig = %+v, want frontends.jellyfin.publicUrl error", errs)
+	}
+	base.Frontends["jellyfin"] = config.Frontend{Enabled: true, PublicURL: "https://jelly.example.com"}
+	for _, e := range ValidateConfig(base) {
+		if e.Field == "frontends.jellyfin.publicUrl" {
+			t.Fatalf("ValidateConfig rejected a valid public address: %+v", e)
 		}
 	}
 }

@@ -9,9 +9,19 @@ import (
 
 	"github.com/braedonsaunders/ether/internal/core"
 	"github.com/braedonsaunders/ether/internal/handles/capability"
+	"github.com/braedonsaunders/ether/internal/store"
 )
 
-const deliveryNamespace = "sessions.delivery"
+func init() {
+	store.RegisterAfter("sessions_retention", "sessions")
+	store.Register("sessions_retention", 1, `CREATE INDEX sessions_devices_updated ON sessions_devices(updated_at);`)
+}
+
+const (
+	deliveryNamespace     = "sessions.delivery"
+	deviceRetention       = 90 * 24 * time.Hour
+	sourceOfferPruneLimit = 2000
+)
 
 type deliveryAuthority struct {
 	ViewerID   int64
@@ -39,6 +49,101 @@ func reserveDeliveryToken(ctx context.Context, db *sql.DB) (int64, error) {
 		return 0, err
 	}
 	return token, nil
+}
+
+// deliveryTokenKeep is how many of the newest delivery tokens Prune keeps.
+// A token is checked only when its own session publishes, and sessions have
+// no fixed lifetime, so retention counts later plays instead of time: a
+// session would have to outlive 100,000 newer plays to lose its token. A
+// token row is one integer, so the kept window costs about a megabyte.
+const deliveryTokenKeep = 100_000
+
+// Prune deletes delivery tokens older than the newest deliveryTokenKeep,
+// expired transient session handles/connections/flows, and stale device
+// capability rows, reporting the rows removed.
+func (b *Broker) Prune(ctx context.Context) (int64, error) {
+	if b == nil || b.deps.DB == nil {
+		return 0, nil
+	}
+	db := b.deps.DB
+	now := time.Now()
+	if b.deps.Now != nil {
+		now = b.deps.Now()
+	}
+	nowMS := now.UnixMilli()
+	deviceCutoff := now.Add(-deviceRetention).UnixMilli()
+
+	total, err := pruneDeliveryTokens(ctx, db, deliveryTokenKeep)
+	if err != nil {
+		return total, err
+	}
+	steps := []struct {
+		del  string
+		args []any
+	}{
+		{`DELETE FROM sessions_xtream_connections WHERE (grant_reference,target) IN (SELECT grant_reference,target FROM sessions_xtream_connections WHERE expires<=? ORDER BY expires LIMIT ?)`, []any{nowMS}},
+		{`DELETE FROM sessions_lazy_streams WHERE hash IN (SELECT s.hash FROM sessions_lazy_streams s WHERE s.expires<=? AND NOT EXISTS (SELECT 1 FROM capability_headers h WHERE h.namespace='lazy-stream' AND h.digest=s.hash) ORDER BY s.expires LIMIT ?)`, []any{nowMS}},
+		{`DELETE FROM sessions_detail_sources WHERE handle IN (SELECT handle FROM sessions_detail_sources WHERE expires<=? ORDER BY expires LIMIT ?)`, []any{nowMS}},
+		{`DELETE FROM plex_decision_arms WHERE (user_id,client_id,session_id,title_key) IN (SELECT user_id,client_id,session_id,title_key FROM plex_decision_arms WHERE expires<=? ORDER BY expires LIMIT ?)`, []any{nowMS}},
+		{`DELETE FROM plex_version_flows WHERE (user_id,client_id,title_key) IN (SELECT user_id,client_id,title_key FROM plex_version_flows WHERE expires<=? ORDER BY expires LIMIT ?)`, []any{nowMS}},
+		{`DELETE FROM sessions_devices WHERE (viewer_id,protocol,device_id) IN (SELECT viewer_id,protocol,device_id FROM sessions_devices WHERE updated_at<? ORDER BY updated_at LIMIT ?)`, []any{deviceCutoff}},
+	}
+	for _, st := range steps {
+		n, err := store.PruneBatched(ctx, db, st.del, st.args...)
+		total += n
+		if err != nil {
+			return total, err
+		}
+	}
+	n, err := pruneExpiredSourceOffers(ctx, db, nowMS)
+	total += n
+	if err != nil {
+		return total, err
+	}
+	return total, nil
+}
+
+func pruneExpiredSourceOffers(ctx context.Context, db *sql.DB, nowMS int64) (int64, error) {
+	var total int64
+	for total < sourceOfferPruneLimit && ctx.Err() == nil {
+		var hasExpired bool
+		if err := db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM capability_headers WHERE namespace='sessions.source-offer' AND expires<=?)`, nowMS).Scan(&hasExpired); err != nil {
+			return total, err
+		}
+		if !hasExpired {
+			break
+		}
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return total, err
+		}
+		if err = store.LockKey(ctx, store.DialectOf(db), tx, "sessions:source-offer-admission"); err != nil {
+			tx.Rollback()
+			return total, err
+		}
+		n, err := capability.PruneHeadersInTx(ctx, tx, "sessions.source-offer", nowMS, capability.HeaderBatchMax)
+		if err != nil {
+			tx.Rollback()
+			return total, err
+		}
+		if err = tx.Commit(); err != nil {
+			return total, err
+		}
+		total += n
+		if n < int64(capability.HeaderBatchMax) {
+			break
+		}
+	}
+	n, err := store.PruneBatched(ctx, db, `DELETE FROM sessions_source_offers WHERE id IN (SELECT o.id FROM sessions_source_offers o WHERE NOT EXISTS (SELECT 1 FROM capability_headers h WHERE h.namespace=o.namespace AND h.digest=o.digest) ORDER BY o.id LIMIT ?)`)
+	return total + n, err
+}
+
+func pruneDeliveryTokens(ctx context.Context, db *sql.DB, keep int64) (int64, error) {
+	var newest int64
+	if err := db.QueryRowContext(ctx, `SELECT COALESCE(MAX(id),0) FROM sessions_delivery_tokens`).Scan(&newest); err != nil || newest <= keep {
+		return 0, err
+	}
+	return store.PruneBatched(ctx, db, `DELETE FROM sessions_delivery_tokens WHERE id IN (SELECT id FROM sessions_delivery_tokens WHERE id<=? AND id NOT IN (SELECT token FROM sessions_delivery_authority) ORDER BY id LIMIT ?)`, newest-keep)
 }
 
 func (b *Broker) bindDeliveryAuthority(ctx context.Context, s *brokerSession, ps *core.PlaySession) error {
@@ -134,6 +239,9 @@ func publishDeliveryAuthority(ctx context.Context, db *sql.DB, next deliveryAuth
 	if err = capability.LockHeaderScopeInTx(ctx, db, tx, scope); err != nil {
 		return false, err
 	}
+	if err = retireExpiredDeliveryInTx(ctx, tx, next.ViewerID, now); err != nil {
+		return false, err
+	}
 	var issued int
 	if err = tx.QueryRowContext(ctx, `SELECT 1 FROM sessions_delivery_tokens WHERE id=?`, next.Token).Scan(&issued); err != nil {
 		return false, err
@@ -187,6 +295,47 @@ func publishDeliveryAuthority(ctx context.Context, db *sql.DB, next deliveryAuth
 		return false, err
 	}
 	return true, nil
+}
+
+// deliveryRetireBatch bounds the expired grants one publish retires. A
+// publish admits one header, so retiring several keeps every shard
+// draining even while most of its viewers are idle.
+const deliveryRetireBatch = 32
+
+func retireExpiredDeliveryInTx(ctx context.Context, tx *sql.Tx, viewer int64, now time.Time) error {
+	rows, err := tx.QueryContext(ctx, `SELECT digest,viewer_id,surface,device_id FROM capability_headers WHERE namespace=? AND shard=? AND expires<=? ORDER BY expires LIMIT ?`,
+		deliveryNamespace, viewer%capability.HeaderShardCount, now.UnixMilli(), deliveryRetireBatch)
+	if err != nil {
+		return err
+	}
+	type expired struct {
+		digest string
+		scope  capability.HeaderScope
+	}
+	var stale []expired
+	for rows.Next() {
+		e := expired{scope: capability.HeaderScope{Namespace: deliveryNamespace}}
+		if err = rows.Scan(&e.digest, &e.scope.ViewerID, &e.scope.Surface, &e.scope.DeviceID); err != nil {
+			rows.Close()
+			return err
+		}
+		stale = append(stale, e)
+	}
+	if err = rows.Close(); err != nil {
+		return err
+	}
+	for _, e := range stale {
+		if _, err = tx.ExecContext(ctx, `DELETE FROM sessions_delivery_authority WHERE viewer_id=? AND surface=? AND device_id=? AND header_digest=?`, e.scope.ViewerID, e.scope.Surface, e.scope.DeviceID, e.digest); err != nil {
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, `DELETE FROM capability_claims WHERE namespace=? AND digest=?`, deliveryNamespace, e.digest); err != nil {
+			return err
+		}
+		if err = capability.DropHeadersInTx(ctx, tx, e.scope, []string{e.digest}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func lookupDeliveryAuthority(ctx context.Context, db *sql.DB, viewer, item int64, surface, device string) (deliveryAuthority, bool, error) {

@@ -103,6 +103,9 @@ type Options struct {
 	// NodeID names this node on import-queue rows it claims; a random id is
 	// used when empty.
 	NodeID string
+	// OnTokenExpired is an optional non-blocking callback invoked when Trakt
+	// rejects a user's refresh token and disconnects the account.
+	OnTokenExpired func(userID int64, username, reason string)
 	// Sealer protects the stored tokens (secrets.go); nil stores them as
 	// given.
 	Sealer config.FieldSealer
@@ -149,8 +152,12 @@ type Client struct {
 	scMu     sync.Mutex
 	lastScro map[scrobbleKey]scrobbleState
 
-	pollUnit time.Duration // device poll interval unit (tests shrink it)
-	claimID  string        // this node's name on claimed import-queue rows
+	devMu   sync.Mutex
+	devices map[int64]*deviceFlow
+
+	pollUnit       time.Duration // device poll interval unit (tests shrink it)
+	claimID        string        // this node's name on claimed import-queue rows
+	onTokenExpired func(userID int64, username, reason string)
 }
 
 type cacheEntry struct {
@@ -199,7 +206,8 @@ func New(opts Options) *Client {
 		http: opts.HTTPClient, log: opts.Logger, now: opts.Now, maxWait: opts.MaxRetryAfter,
 		notify: make(chan struct{}, 1), done: make(chan struct{}), qsize: opts.QueueSize,
 		minPost: opts.MinPostInterval, cache: map[string]*cacheEntry{}, ttl: opts.CacheTTL,
-		lastScro: map[scrobbleKey]scrobbleState{}, pollUnit: time.Second, claimID: opts.NodeID,
+		lastScro: map[scrobbleKey]scrobbleState{}, devices: map[int64]*deviceFlow{},
+		pollUnit: time.Second, claimID: opts.NodeID, onTokenExpired: opts.OnTokenExpired,
 	}
 }
 
@@ -284,7 +292,7 @@ func (c *Client) do(ctx context.Context, method, path string, payload any, token
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("trakt-api-version", "2")
 		req.Header.Set("trakt-api-key", id)
-		req.Header.Set("User-Agent", httpclient.UserAgent)
+		req.Header.Set("User-Agent", httpclient.UserAgent())
 		if token != "" {
 			req.Header.Set("Authorization", "Bearer "+token)
 		}
@@ -298,7 +306,7 @@ func (c *Client) do(ctx context.Context, method, path string, payload any, token
 		if err != nil {
 			return resp.StatusCode, nil, err
 		}
-		if resp.StatusCode == http.StatusTooManyRequests && attempt == 0 && ctx.Err() == nil {
+		if resp.StatusCode == http.StatusTooManyRequests && path != "/oauth/device/token" && attempt == 0 && ctx.Err() == nil {
 			wait, ok := retryafter.Parse(retryAfter, c.now(), c.maxWait)
 			if !ok {
 				wait = c.maxWait
@@ -369,11 +377,14 @@ func (c *Client) Connected(ctx context.Context, userID int64) bool {
 	return err == nil && ok
 }
 
-// Disconnect removes a user's stored tokens.
+// Disconnect removes a user's stored tokens and clears any pending device code.
 func (c *Client) Disconnect(ctx context.Context, userID int64) error {
 	if c.db == nil {
 		return fmt.Errorf("trakt: no database configured")
 	}
+	c.devMu.Lock()
+	delete(c.devices, userID)
+	c.devMu.Unlock()
 	_, err := c.db.ExecContext(ctx, `DELETE FROM trakt_tokens WHERE user_id=?`, userID)
 	c.invalidateUser(userID)
 	return err
@@ -536,6 +547,9 @@ func (c *Client) Refresh(ctx context.Context, userID int64) error {
 		c.log.Warn("trakt refresh token rejected; disconnecting user", "user", userID, "status", status)
 		if derr := c.Disconnect(ctx, userID); derr != nil {
 			c.log.Warn("trakt disconnect failed", "user", userID, "err", derr)
+		}
+		if c.onTokenExpired != nil {
+			c.onTokenExpired(userID, t.Username, fmt.Sprintf("HTTP %d: %s", status, truncate(string(b), 160)))
 		}
 		return ErrRevoked
 	}

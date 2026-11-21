@@ -2,7 +2,9 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"time"
@@ -33,19 +35,21 @@ func (a *App) buildPlayback(ctx context.Context, cfg config.Config) error {
 	a.buildPlaybackPresentation()
 	// Playback and prefetch.
 	a.playback, err = playback.New(playback.Deps{
-		AugmentMedia: a.enrichSubtitles,
+		OpenResolution: a.openVaultResolution,
+		AugmentMedia:   a.enrichSubtitles,
 		NativeProbe: func(ctx context.Context, src core.MediaSource) (*core.MediaInfo, error) {
 			return transcode.ProbeSource(ctx, src, src.Size())
 		},
 		NativeTrailer: func(ctx context.Context, src core.MediaSource, info *core.MediaInfo) bool {
 			return transcode.ProbeTrailer(ctx, src, src.Size(), info)
 		},
-		Resolver:   a.resolver,
-		Engine:     playbackEngine(a),
-		Transcoder: tc,
-		Catalog:    a.catalog,
-		Cache:      a.cache,
-		State:      a.state,
+		Resolver:           a.resolver,
+		Engine:             playbackEngine(a),
+		Transcoder:         tc,
+		Catalog:            a.catalog,
+		Cache:              a.cache,
+		State:              a.state,
+		SelectTitleProfile: a.playbackProfile,
 		SelectProfile: func(caps core.ClientCaps, u *core.User, media string) core.QualityProfile {
 			return resolver.SelectProfileForMedia(a.cfg.Read().Quality, caps, u, media)
 		},
@@ -75,15 +79,57 @@ func (a *App) buildPlayback(ctx context.Context, cfg config.Config) error {
 			}
 			return nil, false
 		},
-		DB:            a.db,
-		Logger:        log,
-		Cluster:       a.clusterNode(),
-		DescribeGroup: a.describeLiveGroup,
-		Availability:  a.dbAvail,
-	}, cfg, playback.Options{Now: parityClock(), DataDir: dataDir, PayloadReplayGrace: 5 * time.Second, VerifyNativeProbe: os.Getenv("ETHER_VERIFY_NATIVE_PROBE") == "1", TracePlayback: tracePlayback})
+		DB:               a.db,
+		Logger:           log,
+		Timeline:         a.observePlayTimeline,
+		Cluster:          a.clusterNode(),
+		DescribeGroup:    a.describeLiveGroup,
+		Availability:     a.dbAvail,
+		SeasonRevealer:   a.revealTitleSeason,
+		Vault:            a.vault,
+		OpenVaulted:      a.openVaultedForProbe,
+		OpenCachedDebrid: a.openCachedDebridForProbe,
+		DebridFileMeta: func(rel core.Release) (string, int64, bool) {
+			if a.debrid == nil {
+				return "", 0, false
+			}
+			meta, ok := a.debrid.CachedFileMetadata(rel)
+			if !ok {
+				return "", 0, false
+			}
+			return meta.Path, meta.Size, true
+		},
+		ContentIDOf: func(releaseID string) string {
+			if a.resolver == nil {
+				return ""
+			}
+			return a.resolver.ContentIDForRelease(releaseID)
+		},
+		OnVersionProbed: func(_ core.RatingKey, _ core.Release) {
+			if a.resolver != nil {
+				a.resolver.InvalidateDetailVariants()
+			}
+		},
+		Events:             a.eventBus,
+		EnrichEventContext: a.enrichPlaybackEventContext,
+		CachedMarkers:      a.cachedPlaybackMarkers,
+	}, cfg, playback.Options{SessionSurface: sessionSurface, Now: parityClock(), DataDir: dataDir, PayloadReplayGrace: 5 * time.Second, VerifyNativeProbe: os.Getenv("ETHER_VERIFY_NATIVE_PROBE") == "1", TracePlayback: tracePlayback})
 	if err != nil {
 		return fmt.Errorf("playback: %w", err)
 	}
+	a.initMediaEventBridges()
+	if a.resolver != nil {
+		a.resolver.SetProbedMedia(a.playback.CachedReleaseProbe)
+		if a.cache != nil {
+			a.resolver.SetLocalCacheLookup(func(releaseID string) bool {
+				return releaseID != "" && a.cache.ReleaseBytes(releaseID) > 0
+			})
+		}
+	}
+	a.playback.Subscribe(func(ev playback.Event) {
+		a.onPlaybackSubtitleEvent(ev)
+		a.notifySessionsChanged()
+	})
 	a.closers = append(a.closers, func() { a.playback.Close() })
 	a.cache.Protect(a.protectedReleases)
 
@@ -106,15 +152,26 @@ func (a *App) buildPlaybackPresentation() {
 			}
 			return a.cfg.Get().Catalog.Language
 		},
-		PlexLayer: func(_ context.Context, user int64) (trackprefs.PlexLayer, bool) {
+		ProfileLanguages: func(ctx context.Context, user int64, _ core.RatingKey) []string {
+			if a.resolver == nil || a.users == nil {
+				return nil
+			}
+			u, err := a.users.ActiveUser(ctx, user)
+			if err != nil || u == nil {
+				return nil
+			}
+			return a.resolver.ProfileFor(core.ClientCaps{}, u).PreferredLanguages
+		},
+		AccountLayer: func(_ context.Context, user int64) (trackprefs.AccountLayer, bool) {
 			if a.users == nil {
-				return trackprefs.PlexLayer{}, false
+				return trackprefs.AccountLayer{}, false
 			}
 			d, ok := a.users.PlexDefaults(user)
 			if !ok || !d.HasProfile {
-				return trackprefs.PlexLayer{}, false
+				return trackprefs.AccountLayer{}, false
 			}
-			return trackprefs.PlexLayer{
+			return trackprefs.AccountLayer{
+				Source:           "plex", // Account provenance identity, not a behavior switch.
 				AudioLanguage:    d.AudioLanguage,
 				AutoSelectAudio:  d.AutoSelectAudio,
 				SubtitleLanguage: d.SubtitleLanguage,
@@ -124,9 +181,16 @@ func (a *App) buildPlaybackPresentation() {
 	})
 	a.markers = markers.New(markers.Options{DB: a.db, Logger: log.With("component", "markers"), Config: func() markers.Lookup {
 		c := a.cfg.Get().Markers
-		return markers.Lookup{Enabled: c.TheIntroDB, APIKey: c.APIKey, IntroOff: !c.OfferIntro(), CreditsOff: !c.OfferCredits(), SourceOrder: c.SourceOrder}
+		return markers.Lookup{Enabled: c.TheIntroDB, APIKey: c.APIKey, IntroOff: !c.OfferIntro(), CreditsOff: !c.OfferCredits(), SourceOrder: c.SourceOrder, SkipDB: c.SkipDB}
 	}, Aligner: a.subtitles.TimelineAligner(), Dialogue: a.markerDialogue})
 	a.buildAdoption()
+}
+
+func (a *App) openTranscodeSubtitle(id, format, source string) (io.ReadCloser, string, error) {
+	if a == nil || a.subtitles == nil {
+		return nil, "", core.ErrNotAvailable
+	}
+	return a.subtitles.OpenFormatFrom(id, format, source)
 }
 
 // buildEncoder constructs only local encoding, without catalogue, providers or playback.
@@ -140,7 +204,17 @@ func (a *App) buildEncoder(ctx context.Context, cfg config.Config) error {
 	tracePlayback := os.Getenv("ETHER_TRACE_PLAYBACK") == "1"
 	a.tracePlayback = tracePlayback
 	if a.opts.FixtureTranscoder == nil {
-		a.transcoder, err = transcode.New(cfg.Transcode, log, transcode.WithRuntimeDir(filepath.Join(dataDir, "tools")), transcode.WithTracePlayback(tracePlayback), transcode.WithEncoderObserver(func(sessionID string, started bool, excerpt string) {
+		a.transcoder, err = transcode.New(cfg.Transcode, log, transcode.WithEvents(a.eventBus), transcode.WithDecodeStore(a.db), transcode.WithRuntimeDir(filepath.Join(dataDir, "tools")), transcode.WithTracePlayback(tracePlayback), transcode.WithOnChange(a.publishDashboard), transcode.WithSubtitleOpener(a.openTranscodeSubtitle), transcode.WithEncoderObserver(func(sessionID string, started bool, excerpt string) {
+			if !started && excerpt != "" {
+				a.observePlayTimeline(playback.TimelineEvent{
+					SessionID: a.resolvePlayLogSession(sessionID),
+					Kind:      "error",
+					Level:     "error",
+					Failing:   true,
+					Message:   "Encoder failed",
+					Detail:    playback.OwnerError(errors.New(excerpt)),
+				})
+			}
 			if a.support == nil {
 				return
 			}

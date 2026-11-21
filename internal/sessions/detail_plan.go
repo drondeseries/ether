@@ -31,7 +31,7 @@ type detailFlight struct {
 func (b *Broker) DetailPlan(ctx context.Context, req frontend.PlanRequest) (frontend.PlayPlan, error) {
 	ctx, cancel := context.WithTimeout(ctx, detailPlanBudget)
 	defer cancel()
-	if req.Viewer == nil || req.Device.ID == "" || req.Protocol == "" || req.Item == 0 || req.Channel != "" || req.Intent.Plex != nil {
+	if req.Viewer == nil || req.Device.ID == "" || req.Protocol == "" || req.Item == 0 || req.Channel != "" || req.Intent.Hints != nil {
 		return frontend.PlayPlan{}, core.ErrUnauthorized
 	}
 	// Explicit source tracks require a generation pin through Open. Detail
@@ -54,7 +54,7 @@ func (b *Broker) DetailPlan(ctx context.Context, req frontend.PlanRequest) (fron
 	if lookup == nil {
 		lookup = b.deps.Lookup
 	}
-	title, err := lookup(ctx, viewer, req.Device, req.Item)
+	title, err := lookup(core.WithLiveApp(ctx, string(req.Protocol)), viewer, req.Device, req.Item)
 	if ctx.Err() != nil {
 		return frontend.PlayPlan{}, ctx.Err()
 	}
@@ -235,6 +235,7 @@ func (b *Broker) detailDecision(ctx context.Context, req frontend.PlanRequest, v
 		return frontend.PlayPlan{}, core.ErrNotAvailable
 	}
 	p.DirectPlay, p.DirectStream, p.Transcoding = b.planAlternatives(source, req)
+	p.VideoTranscodingOff = req.Channel == "" && b.videoTranscodingOff()
 	p.HLS, p.HLSContainer = b.hlsPlanOutput(source, req, p.Decision)
 	p.Media = publicMedia(source.Info)
 	p.Decision.AudioFilters = slices.Clone(p.Decision.AudioFilters)

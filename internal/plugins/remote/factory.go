@@ -2,6 +2,7 @@ package remote
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/braedonsaunders/ether/internal/core"
+	"github.com/braedonsaunders/ether/internal/events"
 	"github.com/braedonsaunders/ether/internal/plugins"
 	"github.com/braedonsaunders/ether/internal/safefetch"
 )
@@ -29,6 +32,8 @@ type Factory struct {
 	// TrustedLAN reports whether the owner confirmed the plugin's
 	// URL as a LAN origin at install (Manager grants carry it).
 	TrustedLAN func(pluginID string) bool
+	// LocalHosts returns the owner-granted local network hosts for one plugin.
+	LocalHosts func(pluginID string) []string
 	// Credential returns the credential Ether presents to the plugin
 	// on URL calls, or "" for none (plain Stremio add-ons).
 	Credential func(pluginID string) string
@@ -46,15 +51,19 @@ type Factory struct {
 //     sidecar connects out; calls go over Factory.Tunnel.
 //   - an http(s) manifest URL, or any other http(s) URL that is not
 //     a github.com repo page: URL mode against that base.
-//   - a github.com repo URL: a repo is not an endpoint, so the
-//     plugin is served by a sidecar over the tunnel.
+//   - a github.com repo URL: a repo is not an endpoint, so an Ether
+//     plugin is served by a sidecar over the tunnel. A plain Stremio
+//     add-on published as static files in the repo (manifest.json at
+//     its root, e.g. "USA TV Next") needs no sidecar: its routes are
+//     read from raw.githubusercontent.com, where the installer found
+//     its manifest.
 func (f *Factory) RuntimeFactory() plugins.RuntimeFactory {
 	return func(inst plugins.Installed) (plugins.Runtime, error) {
 		if inst.Manifest.Ether != nil && inst.Manifest.Ether.Runtime.Kind != "" &&
 			inst.Manifest.Ether.Runtime.Kind != "remote" {
 			return nil, fmt.Errorf("plugin %s: remote factory cannot open runtime kind %q", inst.ID, inst.Manifest.Ether.Runtime.Kind)
 		}
-		mode, base := endpointFor(inst.SourceURL)
+		mode, base := endpointOf(inst.SourceURL, inst.Manifest)
 		switch mode {
 		case endpointTunnel:
 			if f.Tunnel == nil {
@@ -76,6 +85,10 @@ func (f *Factory) RuntimeFactory() plugins.RuntimeFactory {
 			if f.TrustedLAN != nil && f.TrustedLAN(inst.ID) {
 				opts.TrustedOrigin = base
 			}
+			if f.LocalHosts != nil {
+				pluginID := inst.ID
+				opts.TrustedHosts = func() []string { return f.LocalHosts(pluginID) }
+			}
 			client, err := NewURLClient(opts)
 			if err != nil {
 				return nil, fmt.Errorf("plugin %s: %w", inst.ID, err)
@@ -85,6 +98,31 @@ func (f *Factory) RuntimeFactory() plugins.RuntimeFactory {
 			return nil, fmt.Errorf("plugin %s: no remote endpoint in source URL", inst.ID)
 		}
 	}
+}
+
+// endpointOf picks a plugin's endpoint: endpointFor, except that a plain
+// Stremio add-on from a GitHub repo reads its static routes from
+// raw.githubusercontent.com instead of waiting for a sidecar.
+func endpointOf(source string, man plugins.Manifest) (endpointMode, string) {
+	mode, base := endpointFor(source)
+	if mode == endpointTunnel && man.IsStremioOnly() {
+		if raw, ok := githubRawBase(source); ok {
+			return endpointURL, raw
+		}
+	}
+	return mode, base
+}
+
+// SidecarState reports whether a remote plugin is served by a sidecar over
+// the tunnel and whether that sidecar is connected now (plugins.SidecarState).
+func (f *Factory) SidecarState(r plugins.Record) (needsSidecar, connected bool) {
+	if r.Manifest.RuntimeKind() != "remote" {
+		return false, false
+	}
+	if mode, _ := endpointOf(r.SourceURL, r.Manifest); mode != endpointTunnel {
+		return false, false
+	}
+	return true, f.Tunnel != nil && f.Tunnel.IsConnected(r.ID)
 }
 
 type endpointMode int
@@ -115,6 +153,32 @@ func endpointFor(source string) (endpointMode, string) {
 	default:
 		return endpointNone, ""
 	}
+}
+
+// githubRawBase maps a github.com repo link to the raw-file base its
+// static Stremio routes are served from: the branch the link names
+// (/tree/<branch> or /blob/<branch>/...), else HEAD, which GitHub
+// resolves to the default branch.
+func githubRawBase(source string) (string, bool) {
+	u, err := url.Parse(strings.TrimSpace(source))
+	if err != nil || !strings.EqualFold(u.Hostname(), "github.com") {
+		return "", false
+	}
+	parts := strings.FieldsFunc(u.Path, func(r rune) bool { return r == '/' })
+	if len(parts) < 2 {
+		return "", false
+	}
+	owner, repo := parts[0], strings.TrimSuffix(parts[1], ".git")
+	ref := "HEAD"
+	if len(parts) >= 4 && (parts[2] == "tree" || parts[2] == "blob") {
+		ref = parts[3]
+	}
+	for _, seg := range []string{owner, repo, ref} {
+		if seg == "" || seg == "." || seg == ".." {
+			return "", false
+		}
+	}
+	return "https://raw.githubusercontent.com/" + url.PathEscape(owner) + "/" + url.PathEscape(repo) + "/" + url.PathEscape(ref), true
 }
 
 // contractRuntime adapts a transport Runtime to plugins.Runtime.
@@ -170,12 +234,20 @@ func toRequest(req plugins.Request) Request {
 	for k, v := range req.Headers {
 		headers[k] = []string{v}
 	}
+	body := []byte(req.Body)
+	if len(body) == 0 && req.BodyBase64 != "" {
+		// A non-JSON body travels only base64-encoded; remote transports
+		// carry raw bytes, so restore them here.
+		if raw, err := base64.StdEncoding.DecodeString(req.BodyBase64); err == nil {
+			body = raw
+		}
+	}
 	return Request{
 		Method:  req.Method,
 		Path:    req.Path,
 		Query:   query,
 		Headers: headers,
-		Body:    []byte(req.Body),
+		Body:    body,
 		Locale:  req.Locale,
 	}
 }
@@ -200,6 +272,10 @@ type HostAdapter struct {
 	// secret.get, so this is how it recovers configuration after a
 	// restart or reconnect. Without it only non-secret settings are served.
 	SettingsWithSecrets func(ctx context.Context, pluginID string) (map[string]any, error)
+	// ResolveAdapterViewerToken verifies an X-Ether-Viewer-Token minted for an
+	// active frontend adapter call for pluginID and returns its authenticated
+	// viewer ID (Manager.ResolveAdapterViewerToken).
+	ResolveAdapterViewerToken func(pluginID, token string) (int64, bool)
 }
 
 func (a HostAdapter) host(pluginID string) (plugins.Host, error) {
@@ -224,11 +300,14 @@ func mapHostErr(err error) error {
 	case errors.Is(err, plugins.ErrUnavailable):
 		return fmt.Errorf("%w: %v", ErrUnavailable, err)
 	case errors.Is(err, plugins.ErrQuotaExceeded):
-		return fmt.Errorf("%w: %v", ErrTooLarge, err)
+		return fmt.Errorf("%w: %w", ErrTooLarge, err)
+	case errors.Is(err, plugins.ErrRateLimited):
+		return fmt.Errorf("%w: %v", ErrRateLimited, err)
 	default:
 		var ve *plugins.ValidationError
 		var collectionInput *plugins.CollectionInputError
-		if errors.As(err, &ve) || errors.As(err, &collectionInput) {
+		var unsafeMember *plugins.UnsafeArchiveMemberError
+		if errors.As(err, &ve) || errors.As(err, &collectionInput) || errors.As(err, &unsafeMember) {
 			return fmt.Errorf("%w: %v", ErrInvalid, err)
 		}
 		return err
@@ -267,6 +346,40 @@ func (a HostAdapter) KVList(ctx context.Context, pluginID, prefix string) ([]str
 	}
 	keys, err := h.KVList(ctx, prefix)
 	return keys, mapHostErr(err)
+}
+
+func (a HostAdapter) KVUsage(ctx context.Context, pluginID string) (plugins.KVUsage, error) {
+	h, err := a.host(pluginID)
+	if err != nil {
+		return plugins.KVUsage{}, err
+	}
+	usage, err := h.KVUsage(ctx)
+	return usage, mapHostErr(err)
+}
+
+func (a HostAdapter) BadgesSet(ctx context.Context, pluginID, setKey string, entries []plugins.BadgeEntry) error {
+	h, err := a.host(pluginID)
+	if err != nil {
+		return err
+	}
+	return mapHostErr(h.BadgesSet(ctx, setKey, entries))
+}
+
+func (a HostAdapter) BadgesClear(ctx context.Context, pluginID, setKey string) error {
+	h, err := a.host(pluginID)
+	if err != nil {
+		return err
+	}
+	return mapHostErr(h.BadgesClear(ctx, setKey))
+}
+
+func (a HostAdapter) BadgesUsage(ctx context.Context, pluginID string) (plugins.BadgeUsage, error) {
+	h, err := a.host(pluginID)
+	if err != nil {
+		return plugins.BadgeUsage{}, err
+	}
+	usage, err := h.BadgesUsage(ctx)
+	return usage, mapHostErr(err)
 }
 
 func (a HostAdapter) CatalogSearch(ctx context.Context, pluginID, query string, limit, offset int) (json.RawMessage, error) {
@@ -321,6 +434,134 @@ func (a HostAdapter) CollectionsUpsert(ctx context.Context, pluginID string, col
 	return mapHostErr(h.CollectionsUpsert(ctx, collection))
 }
 
+func (a HostAdapter) KindUpsert(ctx context.Context, pluginID, kindKey string, items []core.KindItem) (int, error) {
+	h, err := a.host(pluginID)
+	if err != nil {
+		return 0, err
+	}
+	n, err := h.KindUpsert(ctx, kindKey, items)
+	return n, mapHostErr(err)
+}
+
+// KindUpsertWithResult additionally reports the added/updated/unchanged
+// split when the plugin host provides it (#646).
+func (a HostAdapter) KindUpsertWithResult(ctx context.Context, pluginID, kindKey string, items []core.KindItem) (plugins.KindUpsertResult, error) {
+	h, err := a.host(pluginID)
+	if err != nil {
+		return plugins.KindUpsertResult{}, err
+	}
+	if wh, ok := h.(interface {
+		KindUpsertWithResult(context.Context, string, []core.KindItem) (plugins.KindUpsertResult, error)
+	}); ok {
+		result, err := wh.KindUpsertWithResult(ctx, kindKey, items)
+		return result, mapHostErr(err)
+	}
+	n, err := h.KindUpsert(ctx, kindKey, items)
+	return plugins.KindUpsertResult{Accepted: n}, mapHostErr(err)
+}
+
+func (a HostAdapter) KindDelete(ctx context.Context, pluginID, kindKey string, externalIDs []string) error {
+	h, err := a.host(pluginID)
+	if err != nil {
+		return err
+	}
+	return mapHostErr(h.KindDelete(ctx, kindKey, externalIDs))
+}
+
+func (a HostAdapter) KindItems(ctx context.Context, pluginID, kindKey, cursor string, limit int) (core.KindPage, error) {
+	h, err := a.host(pluginID)
+	if err != nil {
+		return core.KindPage{}, err
+	}
+	page, err := h.KindItems(ctx, kindKey, cursor, limit)
+	return page, mapHostErr(err)
+}
+
+func (a HostAdapter) resolveAdapterViewer(pluginID, viewerToken string) (int64, error) {
+	if a.ResolveAdapterViewerToken == nil {
+		return 0, ErrPermissionDenied
+	}
+	viewerID, ok := a.ResolveAdapterViewerToken(pluginID, viewerToken)
+	if !ok || viewerID <= 0 {
+		return 0, ErrPermissionDenied
+	}
+	return viewerID, nil
+}
+
+func (a HostAdapter) KindVisible(ctx context.Context, pluginID, viewerToken, kindKey string, ids []string) ([]string, error) {
+	viewerID, err := a.resolveAdapterViewer(pluginID, viewerToken)
+	if err != nil {
+		return nil, err
+	}
+	h, err := a.host(pluginID)
+	if err != nil {
+		return nil, err
+	}
+	visible, err := h.KindVisible(plugins.WithViewer(ctx, viewerID), kindKey, ids)
+	return visible, mapHostErr(err)
+}
+
+func (a HostAdapter) KindBrowse(ctx context.Context, pluginID, viewerToken, kindKey string, q core.KindBrowseRequest) (core.KindPage, error) {
+	viewerID, err := a.resolveAdapterViewer(pluginID, viewerToken)
+	if err != nil {
+		return core.KindPage{}, err
+	}
+	h, err := a.host(pluginID)
+	if err != nil {
+		return core.KindPage{}, err
+	}
+	page, err := h.KindBrowse(plugins.WithViewer(ctx, viewerID), kindKey, q)
+	return page, mapHostErr(err)
+}
+
+func (a HostAdapter) ResolveSources(ctx context.Context, pluginID string, q core.SourceQuery) ([]core.SourceCandidate, error) {
+	h, err := a.host(pluginID)
+	if err != nil {
+		return nil, err
+	}
+	cands, err := h.ResolveSources(ctx, q)
+	return cands, mapHostErr(err)
+}
+
+func (a HostAdapter) CachePut(ctx context.Context, pluginID, libraryKey, name string, r io.Reader) (string, error) {
+	h, err := a.host(pluginID)
+	if err != nil {
+		return "", err
+	}
+	ref, err := h.CachePut(ctx, libraryKey, name, r)
+	return ref, mapHostErr(err)
+}
+
+func (a HostAdapter) CacheOpen(ctx context.Context, pluginID, blobRef string) (io.ReadSeekCloser, error) {
+	h, err := a.host(pluginID)
+	if err != nil {
+		return nil, err
+	}
+	rc, err := h.CacheOpen(ctx, blobRef)
+	return rc, mapHostErr(err)
+}
+
+func (a HostAdapter) CacheDelete(ctx context.Context, pluginID, blobRef string) error {
+	h, err := a.host(pluginID)
+	if err != nil {
+		return err
+	}
+	return mapHostErr(h.CacheDelete(ctx, blobRef))
+}
+
+func (a HostAdapter) StreamURL(ctx context.Context, pluginID string, viewerID int64, itemRef string) (string, error) {
+	return a.StreamPartURL(ctx, pluginID, viewerID, itemRef, nil)
+}
+
+func (a HostAdapter) StreamPartURL(ctx context.Context, pluginID string, viewerID int64, itemRef string, partIndex *int) (string, error) {
+	h, err := a.host(pluginID)
+	if err != nil {
+		return "", err
+	}
+	u, err := h.StreamPartURL(plugins.WithViewer(ctx, viewerID), itemRef, partIndex)
+	return u, mapHostErr(err)
+}
+
 func (a HostAdapter) Settings(ctx context.Context, pluginID string) (map[string]any, error) {
 	if a.SettingsWithSecrets != nil {
 		if _, err := a.host(pluginID); err != nil {
@@ -335,6 +576,14 @@ func (a HostAdapter) Settings(ctx context.Context, pluginID string) (map[string]
 	}
 	v, err := h.Settings(ctx)
 	return v, mapHostErr(err)
+}
+
+func (a HostAdapter) PublishEvent(ctx context.Context, pluginID, key string, payload json.RawMessage, corr events.Correlation) error {
+	h, err := a.host(pluginID)
+	if err != nil {
+		return err
+	}
+	return mapHostErr(h.PublishEvent(ctx, key, payload, corr))
 }
 
 func (a HostAdapter) NotifyOwner(ctx context.Context, pluginID, text string) error {
@@ -367,4 +616,29 @@ func GrantsLAN(grantsOf func(ctx context.Context, pluginID string) (plugins.Gran
 		g, err := grantsOf(ctx, pluginID)
 		return err == nil && g.LAN
 	}
+}
+
+// GrantsLocalHosts adapts a Manager-like grants lookup to Factory.LocalHosts.
+func GrantsLocalHosts(grantsOf func(ctx context.Context, pluginID string) (plugins.Grants, error)) func(string) []string {
+	if grantsOf == nil {
+		return nil
+	}
+	return func(pluginID string) []string {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		g, err := grantsOf(ctx, pluginID)
+		if err != nil {
+			return nil
+		}
+		return g.LocalHosts
+	}
+}
+
+func (a HostAdapter) CallDataHost(ctx context.Context, pluginID, name string, args json.RawMessage) (json.RawMessage, error) {
+	h, err := a.host(pluginID)
+	if err != nil {
+		return nil, err
+	}
+	out, err := plugins.CallDataHost(ctx, h, name, args)
+	return out, mapHostErr(err)
 }

@@ -1,0 +1,300 @@
+package debrid
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"testing"
+
+	"github.com/braedonsaunders/ether/internal/core"
+	"github.com/braedonsaunders/ether/internal/nzb"
+)
+
+func packNZB(subjects ...string) []byte {
+	var b strings.Builder
+	b.WriteString(`<nzb><head><meta type="password">pw</meta></head>`)
+	for i, s := range subjects {
+		fmt.Fprintf(&b, `<file poster="p" date="1" subject="%s"><groups><group>a.b</group></groups><segments><segment bytes="100" number="1">id%d@x</segment></segments></file>`, s, i)
+	}
+	b.WriteString(`</nzb>`)
+	return []byte(b.String())
+}
+
+func TestEpisodeNZBKeepsOnlyWantedEpisode(t *testing.T) {
+	data := packNZB(
+		`&quot;Ted.Lasso.S03E01.1080p.WEB-DL.x264.mkv&quot; yEnc (1/1)`,
+		`&quot;Ted.Lasso.S03E02.1080p.WEB-DL.x264.mkv&quot; yEnc (1/1)`,
+		`&quot;Ted.Lasso.S03E02.1080p.WEB-DL.x264.par2&quot; yEnc (1/1)`,
+		`&quot;Ted.Lasso.S03E01.1080p.WEB-DL.x264.par2&quot; yEnc (1/1)`,
+	)
+	out, err := EpisodeNZB(data, &core.ReleaseTarget{Season: 3, Episode: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, err := nzb.Parse(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(doc.Files) != 2 || !strings.Contains(doc.Files[0].Name, "S03E02") || !strings.Contains(doc.Files[1].Name, "S03E02") {
+		t.Fatalf("files = %v", doc.Files)
+	}
+	if doc.Password() != "pw" {
+		t.Fatalf("password lost: %q", doc.Password())
+	}
+}
+
+func TestEpisodeNZBKeepsArchiveSet(t *testing.T) {
+	data := packNZB(
+		`&quot;ted.lasso.s03e01.part1.rar&quot; yEnc (1/1)`,
+		`&quot;ted.lasso.s03e01.part2.rar&quot; yEnc (1/1)`,
+		`&quot;ted.lasso.s03e02.part1.rar&quot; yEnc (1/1)`,
+	)
+	out, err := EpisodeNZB(data, &core.ReleaseTarget{Season: 3, Episode: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, _ := nzb.Parse(out)
+	if len(doc.Files) != 2 {
+		t.Fatalf("want 2 volumes, got %d", len(doc.Files))
+	}
+}
+
+func TestEpisodeNZBMissingEpisode(t *testing.T) {
+	data := packNZB(`&quot;Ted.Lasso.S03E01.1080p.mkv&quot; yEnc (1/1)`)
+	if _, err := EpisodeNZB(data, &core.ReleaseTarget{Season: 3, Episode: 5}); err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+type fakeNamer struct{ out []byte }
+
+func (n fakeNamer) NameFiles(context.Context, string, []byte) ([]byte, error) { return n.out, nil }
+
+func TestEpisodeNZBNamesObfuscatedPackFirst(t *testing.T) {
+	big := func(subject string, id int) string {
+		return fmt.Sprintf(`<file poster="p" date="1" subject="%s"><groups><group>a.b</group></groups><segments><segment bytes="2000000" number="1">id%d@x</segment></segments></file>`, subject, id)
+	}
+	obf := []byte("<nzb>" + big("&quot;q01X9k3Pq9LmZr7Tb2Wc8Hn4Jd&quot; yEnc (1/1)", 1) + big("&quot;q02X9k3Pq9LmZr7Tb2Wc8Hn4Jd&quot; yEnc (1/1)", 2) + "</nzb>")
+	named := []byte("<nzb>" + big("&quot;Show.S01E01.mkv&quot; yEnc (1/1)", 1) + big("&quot;Show.S01E02.mkv&quot; yEnc (1/1)", 2) + "</nzb>")
+	x := &Indexer{packNamer: fakeNamer{named}}
+	out, err := x.episodeNZB(context.Background(), core.Release{ID: "r", Target: &core.ReleaseTarget{Season: 1, Episode: 2}}, obf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, _ := nzb.Parse(out)
+	if len(doc.Files) != 1 || doc.Files[0].Name != "Show.S01E02.mkv" {
+		t.Fatalf("files = %+v", doc.Files)
+	}
+	// Without a namer the obfuscated pack cannot be narrowed.
+	if _, err := (&Indexer{}).episodeNZB(context.Background(), core.Release{Target: &core.ReleaseTarget{Season: 1, Episode: 2}}, obf); err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestEpisodeNZBKeepsPackPar2IndexButNoRecoveryVolumes(t *testing.T) {
+	data := packNZB(
+		`&quot;Show.S01E01.mkv&quot; yEnc (1/1)`,
+		`&quot;Show.S01E02.mkv&quot; yEnc (1/1)`,
+		`&quot;Show.S01.par2&quot; yEnc (1/1)`,
+		`&quot;Show.S01.vol000+01.par2&quot; yEnc (1/1)`,
+	)
+	out, err := EpisodeNZB(data, &core.ReleaseTarget{Season: 1, Episode: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, _ := nzb.Parse(out)
+	var names []string
+	for _, f := range doc.Files {
+		names = append(names, f.Name)
+	}
+	if len(names) != 2 || names[0] != "Show.S01E02.mkv" || names[1] != "Show.S01.par2" {
+		t.Fatalf("files = %v", names)
+	}
+}
+
+func TestEpisodeNZBPrefersTheEpisodesOwnPar2Index(t *testing.T) {
+	data := packNZB(
+		`&quot;Show.S01E01.mkv&quot; yEnc (1/1)`,
+		`&quot;Show.S01E01.par2&quot; yEnc (1/1)`,
+		`&quot;Show.S01E01.vol000+01.par2&quot; yEnc (1/1)`,
+		`&quot;Show.S01E02.par2&quot; yEnc (1/1)`,
+		`&quot;Show.S01.par2&quot; yEnc (1/1)`,
+	)
+	out, err := EpisodeNZB(data, &core.ReleaseTarget{Season: 1, Episode: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, _ := nzb.Parse(out)
+	if len(doc.Files) != 2 || doc.Files[1].Name != "Show.S01E01.par2" {
+		t.Fatalf("files = %+v", doc.Files)
+	}
+}
+
+func TestEpisodeNZBKeepsOpaqueArchiveSetWithEpisodeHint(t *testing.T) {
+	data := packNZB(
+		`&quot;q9Zr7Tb2Wc8Hn4Jd.part001.rar&quot; yEnc (1/1)`,
+		`&quot;q9Zr7Tb2Wc8Hn4Jd.part002.rar&quot; yEnc (1/1)`,
+		`&quot;q9Zr7Tb2Wc8Hn4Jd.par2&quot; yEnc (1/1)`,
+		`&quot;q9Zr7Tb2Wc8Hn4Jd.vol000+01.par2&quot; yEnc (1/1)`,
+	)
+	out, err := EpisodeNZB(data, &core.ReleaseTarget{Season: 3, Episode: 4, AbsoluteEpisode: 24})
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, _ := nzb.Parse(out)
+	if len(doc.Files) != 3 {
+		t.Fatalf("want both volumes and the index, got %d files", len(doc.Files))
+	}
+	h, ok := doc.EpisodeHint()
+	if !ok || h.Season != 3 || h.Episode != 4 || h.Absolute != 24 {
+		t.Fatalf("hint = %+v %v", h, ok)
+	}
+	if doc.Password() != "pw" {
+		t.Fatalf("password lost: %q", doc.Password())
+	}
+	// A different episode is a different document, so a separate release.
+	other, _ := EpisodeNZB(data, &core.ReleaseTarget{Season: 3, Episode: 5})
+	if string(other) == string(out) {
+		t.Fatal("episode hints did not change the document")
+	}
+}
+
+func TestEpisodeNZBNamedSetsNeverFallBackToOpaqueArchive(t *testing.T) {
+	// Every set names its episode, so a missing episode stays missing.
+	data := packNZB(
+		`&quot;Show.S01E01.part1.rar&quot; yEnc (1/1)`,
+		`&quot;Show.S01E02.part1.rar&quot; yEnc (1/1)`,
+	)
+	if _, err := EpisodeNZB(data, &core.ReleaseTarget{Season: 1, Episode: 7}); err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestEpisodeNZBOpaqueArchiveOfAnotherSeasonIsNotKept(t *testing.T) {
+	data := packNZB(
+		`&quot;Show.S01.part001.rar&quot; yEnc (1/1)`,
+		`&quot;Show.S02.part001.rar&quot; yEnc (1/1)`,
+	)
+	out, err := EpisodeNZB(data, &core.ReleaseTarget{Season: 1, Episode: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, _ := nzb.Parse(out)
+	if len(doc.Files) != 1 || !strings.Contains(doc.Files[0].Name, "S01") {
+		t.Fatalf("want only the S01 set, got %d files", len(doc.Files))
+	}
+	if _, err := EpisodeNZB(data, &core.ReleaseTarget{Season: 3, Episode: 1}); err == nil {
+		t.Fatal("season 3 must not fall back to a named season's set")
+	}
+}
+
+func TestEpisodeNZBOutputIsDeterministic(t *testing.T) {
+	data := []byte(strings.Replace(string(packNZB(`&quot;q9Zr7Tb2Wc8Hn4Jd.part001.rar&quot; yEnc (1/1)`)),
+		`<meta type="password">pw</meta>`, `<meta type="password">pw</meta><meta type="a">1</meta><meta type="b">2</meta><meta type="c">3</meta>`, 1))
+	tgt := &core.ReleaseTarget{Season: 1, Episode: 2}
+	first, err := EpisodeNZB(data, tgt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 50; i++ {
+		again, _ := EpisodeNZB(data, tgt)
+		if string(again) != string(first) {
+			t.Fatal("subset bytes differ between calls")
+		}
+	}
+}
+
+func TestChooseFileAndEpisodeNZBAcceptAliasNumberedFiles(t *testing.T) {
+	tgt := &core.ReleaseTarget{
+		Season:           1,
+		Episode:          750,
+		CanonicalSeason:  1,
+		CanonicalEpisode: 750,
+		AbsoluteEpisode:  750,
+		Aliases:          []core.EpisodeNumber{{Season: 18, Episode: 4}},
+		ShowYear:         1999,
+	}
+	got, err := ChooseFile([]File{
+		{Path: "One Piece Season 18/One.Piece.S18E03.1080p.WEB-DL.mkv", Size: 900 << 20},
+		{Path: "One Piece Season 18/One.Piece.S18E04.1080p.WEB-DL.mkv", Size: 920 << 20},
+	}, tgt)
+	if err != nil || !strings.Contains(got.Path, "S18E04") {
+		t.Fatalf("ChooseFile alias = %+v, err=%v", got, err)
+	}
+	if !chosenFileMatchesTarget("One.Piece.S18E04.1080p.WEB-DL.mkv", tgt) {
+		t.Fatal("chosenFileMatchesTarget rejected valid alias S18E04")
+	}
+	if chosenFileMatchesTarget("One.Piece.S18E05.1080p.WEB-DL.mkv", tgt) {
+		t.Fatal("chosenFileMatchesTarget accepted wrong alias S18E05")
+	}
+
+	data := packNZB(
+		`&quot;One.Piece.S18E03.1080p.WEB-DL.mkv&quot; yEnc (1/1)`,
+		`&quot;One.Piece.S18E04.1080p.WEB-DL.mkv&quot; yEnc (1/1)`,
+	)
+	out, err := EpisodeNZB(data, tgt)
+	if err != nil {
+		t.Fatalf("EpisodeNZB alias failed: %v", err)
+	}
+	doc, err := nzb.Parse(out)
+	if err != nil || len(doc.Files) != 1 || !strings.Contains(doc.Files[0].Name, "S18E04") {
+		t.Fatalf("EpisodeNZB alias doc = %+v, err=%v", doc, err)
+	}
+}
+
+// A plugin's explicit file choice narrows an NZB to that file (and its
+// archive set), by document index or by name (#644).
+func TestEpisodeNZBExactFileSelection(t *testing.T) {
+	data := packNZB(
+		`&quot;Collection/First.2020.mp4&quot; yEnc (1/1)`,
+		`&quot;Second.2021.mp4&quot; yEnc (1/1)`,
+		`&quot;Second.2021.par2&quot; yEnc (1/1)`,
+		`&quot;Third.2022.part1.rar&quot; yEnc (1/1)`,
+		`&quot;Third.2022.part2.rar&quot; yEnc (1/1)`,
+	)
+	names := func(out []byte) []string {
+		doc, err := nzb.Parse(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got []string
+		for _, f := range doc.Files {
+			got = append(got, f.Name)
+		}
+		return got
+	}
+
+	out, err := EpisodeNZB(data, &core.ReleaseTarget{AllowNonVideo: true, ExactFile: "Second.2021.mp4"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := names(out); len(got) != 2 || got[0] != "Second.2021.mp4" || got[1] != "Second.2021.par2" {
+		t.Fatalf("exact name kept %v", got)
+	}
+
+	idx := 3 // first RAR volume: the whole set is kept, plus the pack PAR2 index
+	out, err = EpisodeNZB(data, &core.ReleaseTarget{AllowNonVideo: true, FileIndex: &idx})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := names(out); len(got) != 3 || got[0] != "Second.2021.par2" || got[1] != "Third.2022.part1.rar" || got[2] != "Third.2022.part2.rar" {
+		t.Fatalf("fileIndex kept %v", got)
+	}
+
+	if _, err := EpisodeNZB(data, &core.ReleaseTarget{AllowNonVideo: true, ExactFile: "Missing.mp4"}); err == nil {
+		t.Fatal("expected error for missing exact file")
+	}
+	bad := 9
+	if _, err := EpisodeNZB(data, &core.ReleaseTarget{AllowNonVideo: true, FileIndex: &bad}); err == nil {
+		t.Fatal("expected error for out-of-range fileIndex")
+	}
+	// Without AllowNonVideo the selectors stay video-target machinery and
+	// do not narrow on their own.
+	out, err = EpisodeNZB(data, &core.ReleaseTarget{ExactFile: "Second.2021.mp4"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(out) != string(data) {
+		t.Fatal("non-plugin target unexpectedly narrowed the NZB")
+	}
+}

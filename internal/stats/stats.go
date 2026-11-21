@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -59,12 +60,17 @@ ALTER TABLE stats_plays ADD COLUMN reason_detail TEXT NOT NULL DEFAULT '';`)
 	store.Register("stats", 9, `ALTER TABLE stats_plays ADD COLUMN quality_fallback TEXT NOT NULL DEFAULT '';`)
 	store.Register("stats", 10, `ALTER TABLE stats_plays ADD COLUMN client_ip TEXT;
 ALTER TABLE stats_plays ADD COLUMN audio_copy INTEGER;`)
+	store.RegisterAfter("stats_seen_devices", "stats")
+	store.Register("stats_seen_devices", 1, `ALTER TABLE stats_plays ADD COLUMN product TEXT NOT NULL DEFAULT '';
+ALTER TABLE stats_plays ADD COLUMN device_match TEXT NOT NULL DEFAULT '';
+CREATE INDEX stats_plays_device_latest ON stats_plays(platform,device,updated DESC,id DESC);`)
 }
 
 type Options struct {
 	Newsletter    func(context.Context, string) error
 	StopSession   func(string) error
 	SessionExists func(string) bool
+	Session       func(string) (*core.PlaySession, bool)
 	Playback      core.Playback
 	Providers     func() []usenet.ProviderStats
 	Indexers      func(context.Context) ([]newznab.Remaining, error)
@@ -84,12 +90,19 @@ type Options struct {
 	MetadataType func(core.RatingKey) int
 	// AccountName labels a user on Dashboard media rows.
 	AccountName func(int64) string
+	// Debrid and Stream report this node's cumulative debrid account and
+	// streaming-engine counters; the sampler keeps their daily growth.
+	Debrid func() []DebridSample
+	Stream func() (StreamSample, bool)
 }
 type Service struct {
 	db       *sql.DB
 	opts     Options
 	mu       sync.Mutex
 	previous map[string]usenet.ProviderStats
+	// prevDebrid and prevStream are the last debrid samples (under mu).
+	prevDebrid map[string]DebridSample
+	prevStream StreamSample
 	// vmu serializes play records: viewings maps playback sessions onto
 	// history rows, and a row's writes must land in observation order.
 	vmu      sync.Mutex
@@ -97,6 +110,24 @@ type Service struct {
 	// plays holds play records through a database outage (clustered).
 	plays *store.Outbox[string, playRecord]
 	dash  *Dashboard
+
+	timelineMu       sync.Mutex
+	timelineOnce     sync.Once
+	timelineStopOnce sync.Once
+	timelineCh       chan timelineCmd
+	timelineStop     chan struct{}
+	timelineDone     chan struct{}
+	logSink          *SessionLogSink
+}
+
+func (s *Service) liveSession(id string) (*core.PlaySession, bool) {
+	if s.opts.Session != nil {
+		return s.opts.Session(id)
+	}
+	if s.opts.Playback != nil {
+		return s.opts.Playback.Session(id)
+	}
+	return nil, false
 }
 
 // playRecord is one observation of a play, captured when it was made.
@@ -166,7 +197,13 @@ func (s *Service) ObservePlayback(ev playback.Event) {
 	if ev.Session == nil {
 		return
 	}
-	if err := s.Record(ctx, ev.Session, ev.Kind == "stop", ev.Error); err != nil {
+	ended := ev.Kind == "stop"
+	if !ended && ev.Kind == "error" && (s.opts.Session != nil || s.opts.Playback != nil) {
+		if _, live := s.liveSession(ev.Session.ID); !live {
+			ended = true
+		}
+	}
+	if err := s.Record(ctx, ev.Session, ended, ev.Error); err != nil {
 		s.opts.Logger.Warn("record playback stats", "err", err)
 	}
 }
@@ -180,13 +217,17 @@ func (s *Service) Record(ctx context.Context, p *core.PlaySession, ended bool, p
 	if p == nil || p.ID == "" {
 		return nil
 	}
+	problem = clampTimelineText(problem)
 	release := ""
 	if p.Resolution != nil {
 		release = p.Resolution.Release.Name
 	}
 	s.vmu.Lock()
 	defer s.vmu.Unlock()
-	r, ok := s.viewings.observe(*p, s.opts.Now().UTC(), ended, problem)
+	r, rowID, ok := s.viewings.observe(*p, s.opts.Now().UTC(), ended, problem)
+	if rowID != "" && rowID != p.ID {
+		s.aliasTimelineSession(p.ID, rowID)
+	}
 	if !ok {
 		return nil
 	}
@@ -198,7 +239,7 @@ func (s *Service) Record(ctx context.Context, p *core.PlaySession, ended bool, p
 	return s.record(ctx, r)
 }
 
-// Close flushes device metadata and play records held through a database outage.
+// Close flushes device metadata, timeline writes, and play records held through a database outage.
 // The caller controls the shutdown budget with ctx.
 func (s *Service) Close(ctx context.Context) error {
 	var err error
@@ -208,6 +249,7 @@ func (s *Service) Close(ctx context.Context) error {
 	if s.plays != nil {
 		err = errors.Join(err, s.plays.Close(ctx))
 	}
+	err = errors.Join(err, s.closeTimeline(ctx))
 	return err
 }
 
@@ -221,7 +263,7 @@ func (s *Service) OutboxStatus() (st store.OutboxStatus, ok bool) {
 }
 
 func (s *Service) record(ctx context.Context, r playRecord) error {
-	p, now, ended, problem := &r.p, r.at, r.ended, r.problem
+	p, now, ended, problem := &r.p, r.at, r.ended, clampTimelineText(r.problem)
 	start := p.StartedAt
 	if start.IsZero() {
 		start = now
@@ -234,14 +276,21 @@ func (s *Service) record(ctx context.Context, r playRecord) error {
 	if device == "" {
 		device = p.Client.Device
 	}
+	clientID := p.Client.ClientID
+	if clientID == "" {
+		clientID = p.ClientID
+	}
+	if clientID != "" {
+		s.dash.SeeDevice(clientID, device, p.Client.Platform)
+	}
 	q := measure(p, r.release)
 	if problem == "" {
-		problem = q.startFailure
+		problem = clampTimelineText(q.startFailure)
 	}
 	_, err := s.db.ExecContext(ctx, `INSERT INTO stats_plays(id,user_id,rating_key,username,title,platform,device,decision,started,updated,ended,bytes,duration_ms,failovers,error,node_id,`+
-		`measured,played,pictured,ttff_ms,start_failed,buffer_events,buffer_ms,down_failovers,source_kbps,uhd,hdr,remote,origin,release_name,reason_kind,reason_detail,quality_fallback,client_ip,audio_copy) `+
-		`VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET username=excluded.username,title=excluded.title,platform=excluded.platform,device=excluded.device,decision=excluded.decision,updated=excluded.updated,`+
-		`ended=excluded.ended,`+
+		`measured,played,pictured,ttff_ms,start_failed,buffer_events,buffer_ms,down_failovers,source_kbps,uhd,hdr,remote,origin,release_name,reason_kind,reason_detail,quality_fallback,client_ip,audio_copy,product,device_match) `+
+		`VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET username=excluded.username,title=excluded.title,platform=excluded.platform,device=excluded.device,decision=excluded.decision,updated=excluded.updated,`+
+		`ended=excluded.ended,product=excluded.product,device_match=excluded.device_match,`+
 		`bytes=CASE WHEN excluded.bytes>stats_plays.bytes THEN excluded.bytes ELSE stats_plays.bytes END,`+
 		`duration_ms=CASE WHEN excluded.duration_ms>stats_plays.duration_ms THEN excluded.duration_ms ELSE stats_plays.duration_ms END,`+
 		`failovers=excluded.failovers,error=CASE WHEN excluded.error='' THEN stats_plays.error ELSE excluded.error END,node_id=excluded.node_id,`+
@@ -259,7 +308,10 @@ func (s *Service) record(ctx context.Context, r playRecord) error {
 		`reason_detail=CASE WHEN excluded.decision='' THEN stats_plays.reason_detail ELSE excluded.reason_detail END,`+
 		`quality_fallback=CASE WHEN excluded.quality_fallback='' THEN stats_plays.quality_fallback ELSE excluded.quality_fallback END`,
 		p.ID, p.UserID, int64(p.Key), p.Username, p.TitleName, p.Client.Platform, device, string(p.Decision), start.Unix(), now.Unix(), end, p.BytesServed, p.Info.Duration.Milliseconds(), p.Failovers, problem, s.opts.NodeID,
-		q.played, q.pictured, q.ttffMS, q.startFailed, q.bufferEvents, q.bufferMS, p.DownFailovers, q.sourceKbps, q.uhd, q.hdr, q.remote, p.Origin, q.release, q.reasonKind, q.reasonDetail, p.QualityFallback, nullIP(p.Client.ClientIP), audioCopy(p))
+		q.played, q.pictured, q.ttffMS, q.startFailed, q.bufferEvents, q.bufferMS, p.DownFailovers, q.sourceKbps, q.uhd, q.hdr, q.remote, p.Origin, q.release, q.reasonKind, q.reasonDetail, p.QualityFallback, nullIP(p.Client.ClientIP), audioCopy(p), p.Client.Product, p.Client.Device)
+	if err == nil && clientID != "" {
+		_, err = s.db.ExecContext(ctx, `UPDATE stats_device_registry SET last_seen=?,latest_play_id=? WHERE client_identifier=? AND last_seen<=?`, now.Unix(), p.ID, clientID, now.Unix())
+	}
 	return err
 }
 
@@ -281,13 +333,30 @@ func (s *Service) ObserveState(ev state.Event) {
 	}
 	t := now.UnixMilli()
 	completed := 0
+	var newlyCompletedID string
 	if ev.Completed {
 		completed = 1
+		var id string
+		var prevCompleted, count int
+		if err := s.db.QueryRowContext(ctx,
+			`SELECT id,completed,(SELECT COUNT(*) FROM stats_plays WHERE user_id=? AND rating_key=? AND ended=0) FROM stats_plays WHERE user_id=? AND rating_key=? AND ended=0 LIMIT 1`,
+			ev.UserID, int64(ev.Key), ev.UserID, int64(ev.Key),
+		).Scan(&id, &prevCompleted, &count); err == nil && count == 1 && prevCompleted == 0 {
+			newlyCompletedID = id
+		}
 	}
 	_, err := s.db.ExecContext(ctx, `UPDATE stats_plays SET watched_ms=watched_ms+CASE WHEN CAST(? AS TEXT)='progress' AND timeline_state='playing' AND timeline>0 AND CAST(? AS BIGINT)>timeline AND CAST(? AS BIGINT)-timeline<=60000 THEN CAST(? AS BIGINT)-timeline ELSE 0 END,`+
 		`timeline=?,timeline_state=?,duration_ms=CASE WHEN CAST(? AS BIGINT)>duration_ms THEN CAST(? AS BIGINT) ELSE duration_ms END,completed=CASE WHEN CAST(? AS BIGINT)>completed THEN CAST(? AS BIGINT) ELSE completed END WHERE id=(SELECT id FROM stats_plays WHERE user_id=? AND rating_key=? AND ended=0) AND (SELECT COUNT(*) FROM stats_plays WHERE user_id=? AND rating_key=? AND ended=0)=1`, string(ev.Kind), t, t, t, t, ev.State, ev.Duration.Milliseconds(), ev.Duration.Milliseconds(), completed, completed, ev.UserID, int64(ev.Key), ev.UserID, int64(ev.Key))
 	if err != nil {
 		s.opts.Logger.Warn("record timeline stats", "err", err)
+	} else if newlyCompletedID != "" {
+		s.ObserveTimeline(playback.TimelineEvent{
+			SessionID: newlyCompletedID,
+			At:        now,
+			Kind:      "completed",
+			Level:     "info",
+			Message:   "Playback completed",
+		})
 	}
 	if ev.Kind == state.EventCompleted && s.dash != nil && s.opts.MetadataType != nil {
 		if typ := s.opts.MetadataType(ev.Key); typ > 0 {
@@ -349,6 +418,18 @@ func (s *Service) Sample(ctx context.Context) {
 	if s.opts.Indexers != nil {
 		if v, err := s.opts.Indexers(ctx); err == nil {
 			s.snapshot(ctx, "indexers", v)
+		}
+	}
+	if s.opts.Debrid != nil {
+		if err := s.SnapshotDebrid(ctx, s.opts.Debrid()); err != nil {
+			s.opts.Logger.Warn("sample debrid stats", "err", err)
+		}
+	}
+	if s.opts.Stream != nil {
+		if v, ok := s.opts.Stream(); ok {
+			if err := s.SnapshotStream(ctx, v); err != nil {
+				s.opts.Logger.Warn("sample stream stats", "err", err)
+			}
 		}
 	}
 }
@@ -438,6 +519,7 @@ func (s *Service) History(ctx context.Context, since, until time.Time, user int6
 		if err := rows.Scan(&p.ID, &p.UserID, &p.Key, &p.Username, &p.Title, &p.Platform, &p.Device, &p.Decision, &p.Started, &p.Updated, &p.Ended, &p.Bytes, &p.WatchedMS, &p.DurationMS, &p.Completed, &p.Failovers, &p.Error, &p.IP); err != nil {
 			return nil, err
 		}
+		p.Error = clampTimelineText(p.Error)
 		out = append(out, p)
 	}
 	return out, rows.Err()
@@ -476,6 +558,119 @@ type Summary struct {
 	Users          []Bucket        `json:"users"`
 	Since          time.Time       `json:"since"`
 	Until          time.Time       `json:"until"`
+}
+
+// friendlyPlatform normalises raw client platform slugs case-insensitively to
+// owner-facing names before Delivery aggregates play counts and transfer bytes.
+// mapped reports whether raw matched a known canonical platform table entry.
+func friendlyPlatform(raw string) (label string, mapped bool) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return "", true
+	}
+	var b strings.Builder
+	for _, r := range strings.ToLower(s) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		}
+	}
+	switch b.String() {
+	case "", "unknown", "generic":
+		return "", true
+	case "web", "plexweb", "browser", "html5":
+		return "Web", true
+	case "tvos", "appletv", "appletvos":
+		return "Apple TV", true
+	case "ios", "iphone", "ipod":
+		return "iOS", true
+	case "ipados", "ipad":
+		return "iPadOS", true
+	case "visionos", "applevision":
+		return "visionOS", true
+	case "macos", "macosx", "osx", "darwin", "mac":
+		return "macOS", true
+	case "androidtv":
+		return "Android TV", true
+	case "googletv":
+		return "Google TV", true
+	case "firetv", "fireos", "amazonfiretv":
+		return "Fire TV", true
+	case "android":
+		return "Android", true
+	case "linux":
+		return "Linux", true
+	case "windows", "win32", "win64", "uwp":
+		return "Windows", true
+	case "tizen", "samsung", "samsungtizen":
+		return "Tizen", true
+	case "webos", "lgwebos", "netcast":
+		return "webOS", true
+	case "roku":
+		return "Roku", true
+	case "chromecast":
+		return "Chromecast", true
+	case "xbox":
+		return "Xbox", true
+	case "playstation", "ps4", "ps5":
+		return "PlayStation", true
+	case "vidaa", "hisense":
+		return "VIDAA", true
+	case "vizio", "smartcast":
+		return "Vizio", true
+	case "kodi":
+		return "Kodi", true
+	case "chrome":
+		return "Chrome", true
+	case "safari":
+		return "Safari", true
+	case "firefox":
+		return "Firefox", true
+	case "edge":
+		return "Edge", true
+	}
+	if s == strings.ToLower(s) && s[0] >= 'a' && s[0] <= 'z' {
+		return strings.ToUpper(s[:1]) + s[1:], false
+	}
+	return s, false
+}
+
+func mergePlatformBuckets(raw []Bucket) []Bucket {
+	if len(raw) == 0 {
+		return []Bucket{}
+	}
+	byKey := make(map[string]int, len(raw))
+	out := make([]Bucket, 0, len(raw))
+	for _, b := range raw {
+		trimmed := strings.TrimSpace(b.Label)
+		label, mapped := friendlyPlatform(trimmed)
+		key := strings.ToLower(label)
+		if idx, ok := byKey[key]; ok {
+			out[idx].Plays += b.Plays
+			out[idx].WatchedMS += b.WatchedMS
+			out[idx].Bytes += b.Bytes
+			if !mapped && trimmed != strings.ToLower(trimmed) {
+				out[idx].Label = trimmed
+			}
+			continue
+		}
+		byKey[key] = len(out)
+		out = append(out, Bucket{
+			Label:     label,
+			Plays:     b.Plays,
+			WatchedMS: b.WatchedMS,
+			Bytes:     b.Bytes,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Plays != out[j].Plays {
+			return out[i].Plays > out[j].Plays
+		}
+		if out[i].Bytes != out[j].Bytes {
+			return out[i].Bytes > out[j].Bytes
+		}
+		return out[i].Label < out[j].Label
+	})
+	return out
 }
 
 func (s *Service) Summary(ctx context.Context, since, until time.Time, user int64, tzMinutes ...int) (Summary, error) {
@@ -542,6 +737,7 @@ func (s *Service) Summary(ctx context.Context, since, until time.Time, user int6
 			return out, err
 		}
 	}
+	out.Platforms = mergePlatformBuckets(out.Platforms)
 	if err := s.keyBuckets(ctx, &out, where, args); err != nil {
 		return out, err
 	}
@@ -564,6 +760,10 @@ type Cost struct {
 	Currency string  `json:"currency"`
 }
 
+// costKinds are the sources a plan price can belong to: Usenet providers,
+// indexers, debrid accounts and IPTV sources.
+var costKinds = map[string]bool{"provider": true, "indexer": true, "debrid": true, "iptv": true}
+
 func (s *Service) SetCost(ctx context.Context, c Cost) error {
 	c.Currency = strings.ToUpper(c.Currency)
 	validCurrency := len(c.Currency) == 3
@@ -572,7 +772,7 @@ func (s *Service) SetCost(ctx context.Context, c Cost) error {
 			validCurrency = false
 		}
 	}
-	if (c.Kind != "provider" && c.Kind != "indexer") || c.ID == "" || c.Monthly < 0 || c.Monthly > 1000000 || math.IsNaN(c.Monthly) || math.IsInf(c.Monthly, 0) || !validCurrency {
+	if !costKinds[c.Kind] || c.ID == "" || c.Monthly < 0 || c.Monthly > 1000000 || math.IsNaN(c.Monthly) || math.IsInf(c.Monthly, 0) || !validCurrency {
 		return fmt.Errorf("kind, ID, nonnegative price and three-letter currency required")
 	}
 	_, err := s.db.ExecContext(ctx, `INSERT INTO stats_costs(kind,id,monthly,currency) VALUES(?,?,?,?) ON CONFLICT(kind,id) DO UPDATE SET monthly=excluded.monthly,currency=excluded.currency`, c.Kind, c.ID, c.Monthly, c.Currency)

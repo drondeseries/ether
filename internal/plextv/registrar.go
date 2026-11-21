@@ -16,6 +16,7 @@ import (
 	"github.com/braedonsaunders/ether/internal/config"
 	"github.com/braedonsaunders/ether/internal/core"
 	"github.com/braedonsaunders/ether/internal/remote"
+	"github.com/braedonsaunders/ether/internal/store"
 )
 
 // ConfigStore is the part of *config.Store the registrar uses.
@@ -82,11 +83,13 @@ type Status struct {
 	PlexReachableCheckedAt time.Time `json:"plexReachableCheckedAt,omitzero"`
 	// Recent authenticated inbound traffic is external evidence even when
 	// plex.tv's independent connectivity check fails. Never persist client IPs.
-	RemoteClientLastSeen  time.Time `json:"remoteClientLastSeen,omitzero"`
-	RemoteClientReachable bool      `json:"remoteClientReachable"`
-	Friends               int       `json:"friends"`
-	LastFriendSync        time.Time `json:"lastFriendSync,omitempty"`
-	FriendSyncError       string    `json:"friendSyncError,omitempty"`
+	RemoteClientLastSeen  time.Time         `json:"remoteClientLastSeen,omitzero"`
+	RemoteClientReachable bool              `json:"remoteClientReachable"`
+	Friends               int               `json:"friends"`
+	LastFriendSync        time.Time         `json:"lastFriendSync,omitempty"`
+	FriendSyncError       string            `json:"friendSyncError,omitempty"`
+	TokenDiagnostics      *TokenDiagnostics `json:"tokenDiagnostics,omitempty"`
+	ServerTokenRequired   bool              `json:"serverTokenRequired,omitempty"`
 	// TokenRejected reports that plex.tv answered the server token with
 	// 401/403 (publishing or friend sync): typically the device record
 	// still belongs to an account the server was claimed by before.
@@ -137,8 +140,9 @@ type RegistrarOptions struct {
 	// plex.direct https variants for clients asking with includeHttps=1.
 	PublishPlexDirect bool
 
-	Logger *slog.Logger
-	Now    func() time.Time
+	Logger   *slog.Logger
+	Now      func() time.Time
+	OnChange func()
 }
 
 // Registrar runs Ether's plex.tv presence: claim, connection publishing,
@@ -171,6 +175,8 @@ type Registrar struct {
 	next                 map[string]time.Time
 	lastUnknownTokenSync time.Time
 	pubFail              int
+	friendFail           int    // consecutive non-unauthorized friend sync failures
+	friendContention     int    // consecutive SQLite write-contention failures in SyncFriendsNow
 	pubGeneration        uint64 // advances whenever fresh connections must be published
 	forcePub             bool
 	mappingOn            bool
@@ -184,10 +190,26 @@ type Registrar struct {
 	// claimedToken is the server token while claimed; a switch to
 	// unclaimed releases it (releaseClaim).
 	claimedToken string
+	// Account credential retained only until the first post-claim sync (at most
+	// one minute of eligibility), so a 1080 can compare both resource views.
+	diagnosticOwnerToken string
+	diagnosticOwnerUntil time.Time
+
+	// reachTargets is the URI set the last self-check probed.
+	reachTargets []string
 }
 
 // rejectedRetry spaces out friend syncs while plex.tv rejects the token.
 const rejectedRetry = 15 * time.Minute
+
+// friendContentionRetry retries a friend sync promptly when another writer
+// held SQLite across the write gate (e.g. post-upgrade index builds or WAL
+// maintenance) instead of waiting the full 30-minute sync interval.
+const friendContentionRetry = 15 * time.Second
+
+// friendContentionWarnThreshold is how many consecutive write-contention
+// attempts must fail before FriendSyncError surfaces a dashboard warning.
+const friendContentionWarnThreshold = 3
 
 const (
 	taskAddress = "address"
@@ -271,6 +293,7 @@ func NewRegistrar(o RegistrarOptions) (*Registrar, error) {
 				c.Plex.Token != "" && c.Plex.OwnerPlexID != 0 && c.Server.MachineIdentifier != ""
 		},
 		OnMessage: r.onPubsub,
+		OnChange:  r.notifyChange,
 	})
 	r.refreshConfigStatus(o.Config.Get())
 	return r, nil
@@ -398,6 +421,9 @@ func (r *Registrar) Trigger() {
 	r.requestPublishLocked()
 	r.next[taskAddress] = time.Time{}
 	r.next[taskMapping] = time.Time{}
+	if r.st.FriendSyncError != "" && !r.st.TokenRejected {
+		r.next[taskFriends] = time.Time{}
+	}
 	r.mu.Unlock()
 	select {
 	case r.wake <- struct{}{}:
@@ -405,6 +431,30 @@ func (r *Registrar) Trigger() {
 	}
 	select {
 	case r.mapWake <- struct{}{}:
+	default:
+	}
+}
+
+// ListenerReady wakes the loop once this server serves TLS. A trust check
+// that ran before the listener existed (every restart) is then confirmed or
+// cleared at once instead of at the next tick.
+func (r *Registrar) ListenerReady() {
+	// Any certificate handshake checked before the listener served was
+	// bound to fail: forget its misses and freshness so the trust check
+	// runs again on the next tick against the live listener, instead of
+	// keeping a pre-listen verdict until the next scheduled check (#407).
+	if r.o.Certs != nil {
+		r.o.Certs.forgetHandshakeMisses()
+	}
+	r.mu.Lock()
+	r.trustAt, r.trustFP = time.Time{}, ""
+	if r.next == nil {
+		r.next = map[string]time.Time{}
+	}
+	r.next[taskCert] = time.Time{}
+	r.mu.Unlock()
+	select {
+	case r.wake <- struct{}{}:
 	default:
 	}
 }
@@ -441,11 +491,31 @@ func (r *Registrar) requestPublishLocked() {
 	r.forcePub = true
 }
 
+func (r *Registrar) notifyChange() {
+	if r != nil && r.o.OnChange != nil {
+		r.o.OnChange()
+	}
+}
+
 // Status returns a snapshot for the admin dashboard.
 func (r *Registrar) Status() Status {
 	r.mu.Lock()
 	st := r.st
 	r.mu.Unlock()
+	if r.o.Config != nil {
+		// Status runs on hot request paths (per-title section lookups), so
+		// read the four fields it needs without cloning the whole config.
+		var cfg config.Config
+		if live, ok := r.o.Config.(interface{ Read() config.Config }); ok {
+			cfg = live.Read()
+		} else {
+			cfg = r.o.Config.Get()
+		}
+		st.Claimed = cfg.Plex.Claimed && cfg.Plex.Token != ""
+		st.OwnerUsername = cfg.Plex.OwnerUsername
+		st.MachineIdentifier = cfg.Server.MachineIdentifier
+		st.RemoteAccess = cfg.Plex.RemoteAccess
+	}
 	age := r.o.Now().Sub(st.RemoteClientLastSeen)
 	st.RemoteClientReachable = !st.RemoteClientLastSeen.IsZero() && age >= 0 && age < 5*time.Minute
 	st.LANAddresses = slices.Clone(st.LANAddresses)
@@ -461,23 +531,95 @@ func (r *Registrar) Status() Status {
 	return st
 }
 
-// WANState never resurrects an older failed check after newer client evidence
-// expires. Without a fresh positive observation that state is unknown.
-func (st Status) WANState() string {
-	if st.RemoteClientReachable || (st.PlexReachable != nil && *st.PlexReachable) {
-		return "reachable"
+// WANCheck is the away-from-home verdict the console shows. Reason names
+// the evidence: "outside_client" (an authenticated client connected from
+// outside within five minutes), "plex_tv" (plex.tv's connectivity check),
+// "self_check" (this server fetched its own /identity through the published
+// address), "self_check_failed", "wrong_identity" (the address answers as
+// another server) or "not_checked". Address is the published route the
+// verdict is about, when it is a specific one.
+type WANCheck struct {
+	State     string    `json:"state"`
+	Reason    string    `json:"reason,omitempty"`
+	Address   string    `json:"address,omitempty"`
+	CheckedAt time.Time `json:"checkedAt,omitzero"`
+}
+
+// WANState is WANCheck().State.
+func (st Status) WANState() string { return st.WANCheck().State }
+
+// WANCheck never resurrects an older failed check after newer client
+// evidence expires, and never calls a route reachable without a positive
+// observation. The self-check is a real request through the published
+// address, but it starts inside the network (NAT loopback, split DNS): its
+// failure is "unknown", not "unreachable", unless another server answered.
+func (st Status) WANCheck() WANCheck {
+	if st.RemoteClientReachable {
+		return WANCheck{State: "reachable", Reason: "outside_client", CheckedAt: st.RemoteClientLastSeen}
+	}
+	if st.PlexReachable != nil && *st.PlexReachable {
+		return WANCheck{State: "reachable", Reason: "plex_tv", CheckedAt: st.PlexReachableCheckedAt}
 	}
 	// A plex.tv verdict does not identify which published route it tested.
-	// A reverse proxy can work while the direct public port is closed.
+	// A reverse proxy can work while the direct public port is closed, so a
+	// published outside custom route is judged by its own self-check.
+	var custom []string
 	for _, c := range st.Connections {
-		if c.Custom && c.URI != "" && slices.Contains(st.PublishedURIs, c.URI) {
-			return "unknown"
+		if c.Custom && !c.Local && c.URI != "" && slices.Contains(st.PublishedURIs, c.URI) && !slices.Contains(custom, c.URI) {
+			custom = append(custom, c.URI)
 		}
 	}
-	if st.PlexReachable != nil && (st.RemoteClientLastSeen.IsZero() || !st.PlexReachableCheckedAt.Before(st.RemoteClientLastSeen)) {
-		return "unreachable"
+	if len(custom) > 0 {
+		if check, ok := st.selfCheck(custom); ok {
+			return check
+		}
+		return WANCheck{State: "unknown", Reason: "not_checked", Address: custom[0]}
 	}
-	return "unknown"
+	if st.PlexReachable != nil && (st.RemoteClientLastSeen.IsZero() || !st.PlexReachableCheckedAt.Before(st.RemoteClientLastSeen)) {
+		return WANCheck{State: "unreachable", Reason: "plex_tv", CheckedAt: st.PlexReachableCheckedAt}
+	}
+	// No custom route: every self-probe target is the direct public route.
+	if st.Reachability != nil {
+		var uris []string
+		for _, pr := range st.Reachability.Results {
+			uris = append(uris, pr.URI)
+		}
+		if check, ok := st.selfCheck(uris); ok && check.State == "reachable" {
+			return check
+		}
+	}
+	return WANCheck{State: "unknown"}
+}
+
+// selfCheck is the latest self-probe verdict among uris: a success first,
+// then another server answering, then a plain failure.
+func (st Status) selfCheck(uris []string) (WANCheck, bool) {
+	if st.Reachability == nil {
+		return WANCheck{}, false
+	}
+	var wrong, failed string
+	for _, pr := range st.Reachability.Results {
+		if pr.URI == "" || !slices.Contains(uris, pr.URI) {
+			continue
+		}
+		switch {
+		case pr.OK:
+			return WANCheck{State: "reachable", Reason: "self_check", Address: pr.URI, CheckedAt: st.Reachability.Checked}, true
+		case strings.Contains(pr.Error, "different server"):
+			if wrong == "" {
+				wrong = pr.URI
+			}
+		case failed == "":
+			failed = pr.URI
+		}
+	}
+	if wrong != "" {
+		return WANCheck{State: "unreachable", Reason: "wrong_identity", Address: wrong, CheckedAt: st.Reachability.Checked}, true
+	}
+	if failed != "" {
+		return WANCheck{State: "unknown", Reason: "self_check_failed", Address: failed, CheckedAt: st.Reachability.Checked}, true
+	}
+	return WANCheck{}, false
 }
 
 // ObserveRemoteClient is called only after Plex authentication. It performs
@@ -488,12 +630,19 @@ func (r *Registrar) ObserveRemoteClient(address string) {
 	if ip == nil || !ip.IsGlobalUnicast() || ip.IsPrivate() || ip.IsLoopback() || remote.IsCGNAT(ip) {
 		return
 	}
+	now := r.o.Now()
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if own := net.ParseIP(r.st.PublicIP); own != nil && own.Equal(ip) {
+		r.mu.Unlock()
 		return
 	}
-	r.st.RemoteClientLastSeen = r.o.Now()
+	age := now.Sub(r.st.RemoteClientLastSeen)
+	wasReachable := !r.st.RemoteClientLastSeen.IsZero() && age >= 0 && age < 5*time.Minute
+	r.st.RemoteClientLastSeen = now
+	r.mu.Unlock()
+	if !wasReachable {
+		r.notifyChange()
+	}
 }
 
 func (r *Registrar) refreshConfigStatus(cfg config.Config) {
@@ -587,11 +736,25 @@ func (r *Registrar) runDue(ctx context.Context) {
 	if r.due(taskOwner, r.o.OwnerInterval) {
 		if err := r.RefreshOwner(ctx); err != nil && ctx.Err() == nil {
 			r.log.Debug("plex.tv owner refresh failed", "err", err)
-			r.schedule(taskOwner, r.o.Now().Add(10*time.Minute))
+			retry := 10 * time.Minute
+			if store.IsWriteContention(err) {
+				retry = min(friendContentionRetry, r.o.OwnerInterval)
+			}
+			r.schedule(taskOwner, r.o.Now().Add(retry))
 		}
 	}
-	if cfg.Plex.RemoteAccess && r.due(taskReach, r.o.ReachabilityInterval) {
-		r.CheckReachability(ctx)
+	// Custom URLs are published with remote access off too; check them, and
+	// re-check at once when the public routes change (a new public host).
+	if cfg.Plex.RemoteAccess || len(cfg.Plex.CustomURLs) > 0 {
+		uris := r.reachURIs(cfg)
+		r.mu.Lock()
+		if !slices.Equal(uris, r.reachTargets) {
+			r.next[taskReach] = time.Time{}
+		}
+		r.mu.Unlock()
+		if r.due(taskReach, r.o.ReachabilityInterval) {
+			r.CheckReachability(ctx)
+		}
 	}
 }
 
@@ -607,11 +770,13 @@ func (r *Registrar) ensureMapping(ctx context.Context, cfg config.Config) {
 			r.mappingOn = false
 			r.requestPublishLocked()
 			r.mu.Unlock()
+			r.notifyChange()
 		}
 		return
 	}
 	prev := r.o.Mapper.Status()
 	st, err := r.o.Mapper.Ensure(ctx, serverPort(cfg), publicPort(cfg))
+	mapChanged := st.Active != prev.Active || st.ExternalPort != prev.ExternalPort || st.ExternalIP != prev.ExternalIP || st.LastError != prev.LastError
 	r.mu.Lock()
 	r.mappingOn = true
 	if st.Active && (st.ExternalPort != prev.ExternalPort || !prev.Active) {
@@ -626,6 +791,9 @@ func (r *Registrar) ensureMapping(ctx context.Context, cfg config.Config) {
 	r.mu.Unlock()
 	if err != nil && ctx.Err() == nil {
 		r.log.Debug("port mapping failed", "err", err)
+	}
+	if mapChanged {
+		r.notifyChange()
 	}
 }
 
@@ -674,8 +842,8 @@ func (r *Registrar) refreshAddresses(ctx context.Context, cfg config.Config) {
 	wan, wanErr := "", ""
 	if plexAppsEnabled(cfg) && cfg.Plex.RemoteAccess {
 		switch {
-		case cfg.Plex.PublicHost != "":
-			wan = cfg.Plex.PublicHost
+		case strings.TrimSpace(cfg.Plex.PublicHost) != "":
+			wan = strings.TrimSpace(cfg.Plex.PublicHost)
 		default:
 			if m := r.o.Mapper.Status(); m.Active && m.ExternalIP != "" && remote.IsPublicIP(net.ParseIP(m.ExternalIP)) {
 				wan = m.ExternalIP
@@ -687,7 +855,7 @@ func (r *Registrar) refreshAddresses(ctx context.Context, cfg config.Config) {
 		}
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	addrChanged := !slices.Equal(lan, r.lastLAN) || wan != r.lastWAN || wanErr != r.st.PublicIPErr
 	if !slices.Equal(lan, r.lastLAN) || wan != r.lastWAN {
 		r.st.RemoteClientLastSeen = time.Time{}
 		if r.lastLAN != nil || r.lastWAN != "" {
@@ -699,6 +867,10 @@ func (r *Registrar) refreshAddresses(ctx context.Context, cfg config.Config) {
 	r.st.LANAddresses = lan
 	r.st.PublicIP = wan
 	r.st.PublicIPErr = wanErr
+	r.mu.Unlock()
+	if addrChanged {
+		r.notifyChange()
+	}
 }
 
 // connections builds the connection list from the latest addresses.
@@ -717,26 +889,13 @@ func (r *Registrar) connections(cfg config.Config) []remote.Connection {
 	if wanS != "" {
 		if ip := net.ParseIP(wanS); ip != nil {
 			wan = ip
-		} else if strings.HasPrefix(wanS, "https://") || strings.HasPrefix(wanS, "http://") {
-			// PublicHost supplied as a full URL (e.g. https://plex.example.com).
-			extraURLs = append(extraURLs, wanS)
 		} else {
-			// PublicHost is a DNS name: publish it as a custom URL, using https
-			// when a custom TLS certificate is installed, port 443 is used, or
-			// secure connections are required.
-			port := r.wanPort(cfg)
-			hostPort := net.JoinHostPort(wanS, fmt.Sprint(port))
-			customCert := r.o.Certs != nil && r.o.Certs.Info().Present && r.o.Certs.Info().Custom && !r.o.Certs.Info().SelfSigned
-			if cfg.Plex.SecureConnections != remote.SecureDisabled && (customCert || port == 443 || cfg.Plex.SecureConnections == remote.SecureRequired) {
-				if port == 443 {
-					extraURLs = append(extraURLs, "https://"+wanS)
-				} else {
-					extraURLs = append(extraURLs, "https://"+hostPort)
-				}
+			customCert := false
+			if r.o.Certs != nil {
+				info := r.o.Certs.Info()
+				customCert = info.Present && info.Custom && !info.SelfSigned
 			}
-			if cfg.Plex.SecureConnections != remote.SecureRequired && port != 443 {
-				extraURLs = append(extraURLs, "http://"+hostPort)
-			}
+			extraURLs = append(extraURLs, publicHostURLs(wanS, r.wanPort(cfg), cfg.Plex.SecureConnections, customCert)...)
 		}
 	}
 	hash := cfg.Plex.CertHash
@@ -751,6 +910,43 @@ func (r *Registrar) connections(cfg config.Config) []remote.Connection {
 		LAN: lan, WAN: wan, LocalPort: serverPort(cfg), PublicPort: r.wanPort(cfg),
 		CertHash: hash, Secure: cfg.Plex.SecureConnections, CustomURLs: extraURLs,
 	})
+}
+
+// publicHostURLs turns the owner's public host name into connection URLs.
+// A typed scheme is honoured exactly (case-insensitively, surrounding space
+// ignored), so https://plex.example.com is never downgraded. A bare DNS name
+// (optionally host:port) reaches Ether's own listener, whose certificate
+// only names plex.direct hosts: https is used when a custom certificate is
+// installed, the port is 443, or secure connections are required; plain
+// http is added unless secure connections are required or the port is 443.
+func publicHostURLs(host string, port int, secure string, customCert bool) []string {
+	host = strings.TrimSpace(host)
+	if scheme, rest, ok := strings.Cut(host, "://"); ok {
+		scheme = strings.ToLower(scheme)
+		if scheme != "http" && scheme != "https" {
+			return nil
+		}
+		return []string{scheme + "://" + strings.TrimSuffix(rest, "/")}
+	}
+	if h, p, err := net.SplitHostPort(host); err == nil {
+		if n, err := strconv.Atoi(p); err == nil && n > 0 && n <= 65535 {
+			host, port = h, n
+		}
+	}
+	host = strings.TrimSuffix(host, "/")
+	var out []string
+	hostPort := net.JoinHostPort(host, strconv.Itoa(port))
+	if secure != remote.SecureDisabled && (customCert || port == 443 || secure == remote.SecureRequired) {
+		if port == 443 {
+			out = append(out, "https://"+host)
+		} else {
+			out = append(out, "https://"+hostPort)
+		}
+	}
+	if secure != remote.SecureRequired && port != 443 {
+		out = append(out, "http://"+hostPort)
+	}
+	return out
 }
 
 // publishable is the URI list sent to plex.tv. Like PMS, every address goes
@@ -907,6 +1103,7 @@ func (r *Registrar) PublishNow(ctx context.Context) error {
 		r.st.LastPublish = r.o.Now()
 		r.st.LastPublishError = err.Error()
 		r.mu.Unlock()
+		r.notifyChange()
 		return err
 	}
 	now := r.o.Now()
@@ -935,6 +1132,7 @@ func (r *Registrar) PublishNow(ctx context.Context) error {
 		r.st.TokenRejected = errors.Is(err, core.ErrUnauthorized)
 		r.mu.Unlock()
 		r.log.Warn("publish connections failed", "err", err)
+		r.notifyChange()
 		return err
 	}
 	r.st.PublishedURIs = uris
@@ -990,6 +1188,7 @@ func (r *Registrar) PublishNow(ctx context.Context) error {
 	if regErr != nil && ctx.Err() == nil {
 		r.log.Debug("servers.xml registration failed (non-fatal)", "err", regErr)
 	}
+	defer r.notifyChange()
 	res, ferr := r.client.FindServer(ctx, cfg.Plex.Token, cfg.Server.MachineIdentifier)
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -1014,20 +1213,79 @@ func (r *Registrar) SyncFriendsNow(ctx context.Context) error {
 	if cfg.Plex.Token == "" {
 		return errors.New("plextv: not claimed")
 	}
+	r.mu.Lock()
+	diagnosticOwner := r.diagnosticOwnerToken
+	if r.o.Now().After(r.diagnosticOwnerUntil) {
+		diagnosticOwner = ""
+	}
+	r.diagnosticOwnerToken = ""
+	r.mu.Unlock()
 	friends, err := r.client.Friends(ctx, cfg.Plex.Token)
+	if serverTokenRequired(err) {
+		r.diagnoseServerToken(ctx, cfg, diagnosticOwner)
+		// Old installs could persist the PIN account token. Repair once per
+		// scheduled sync, never in a loop, and serialize with claim/unclaim.
+		r.claimMu.Lock()
+		current := r.o.Config.Get()
+		if current.Plex.Token == cfg.Plex.Token && current.Plex.Claimed {
+			acct, repairErr := r.client.User(ctx, cfg.Plex.Token)
+			if repairErr == nil && acct.ID != cfg.Plex.OwnerPlexID {
+				repairErr = errors.New("plex.tv token does not belong to the saved server owner")
+			}
+			if repairErr == nil {
+				_, repairErr = r.claim(ctx, cfg.Plex.Token)
+			}
+			if repairErr != nil {
+				r.log.Warn("server token repair failed", "err", repairErr)
+			} else {
+				cfg = r.o.Config.Get()
+				friends, err = r.client.Friends(ctx, cfg.Plex.Token)
+			}
+		}
+		r.claimMu.Unlock()
+	}
+	fromUsers := false
 	if err == nil && r.o.Users != nil {
+		fromUsers = true
 		err = r.o.Users.SyncFriends(ctx, friends)
 	}
+	defer r.notifyChange()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.st.LastFriendSync = r.o.Now()
+	r.st.ServerTokenRequired = serverTokenRequired(err)
 	if err != nil {
-		r.st.FriendSyncError = err.Error()
-		if errors.Is(err, core.ErrUnauthorized) {
+		switch {
+		case serverTokenRequired(err):
+			r.st.ServerTokenRequired = true
+			r.st.FriendSyncError = err.Error()
+			r.friendFail = 0
+			r.friendContention = 0
+			r.next[taskFriends] = r.o.Now().Add(rejectedRetry)
+		case errors.Is(err, core.ErrUnauthorized):
 			// A rejected token stays rejected until the owner re-claims:
 			// retry rarely instead of every minute.
+			r.friendFail = 0
+			r.friendContention = 0
+			r.st.FriendSyncError = err.Error()
 			r.st.TokenRejected = true
 			r.next[taskFriends] = r.o.Now().Add(rejectedRetry)
+		case fromUsers && store.IsWriteContention(err):
+			r.friendContention++
+			if r.friendContention >= friendContentionWarnThreshold {
+				r.st.FriendSyncError = err.Error()
+			}
+			if ctx.Err() == nil {
+				r.next[taskFriends] = r.o.Now().Add(min(friendContentionRetry, r.o.FriendSyncInterval))
+			}
+		default:
+			r.friendContention = 0
+			r.friendFail++
+			r.st.FriendSyncError = err.Error()
+			if ctx.Err() == nil {
+				backoff := min(time.Minute<<min(r.friendFail-1, 4), r.o.FriendSyncInterval) // 1m .. 16m
+				r.next[taskFriends] = r.o.Now().Add(backoff)
+			}
 		}
 		r.log.Warn("friend sync failed", "err", err)
 		return err
@@ -1038,8 +1296,14 @@ func (r *Registrar) SyncFriendsNow(ctx context.Context) error {
 			n++
 		}
 	}
+	r.friendFail = 0
+	r.friendContention = 0
 	r.st.Friends = n
 	r.st.FriendSyncError = ""
+	r.st.ServerTokenRequired = false
+	if ctx.Err() == nil {
+		r.next[taskFriends] = r.o.Now().Add(r.o.FriendSyncInterval)
+	}
 	return nil
 }
 
@@ -1063,6 +1327,34 @@ func (r *Registrar) SyncFriendsOnUnknownToken(ctx context.Context) error {
 // CheckReachability probes the WAN connections and records the result.
 func (r *Registrar) CheckReachability(ctx context.Context) remote.Reachability {
 	cfg := r.o.Config.Get()
+	uris := r.reachURIs(cfg)
+	res := r.o.Reach.Check(ctx, uris, cfg.Server.MachineIdentifier)
+	r.mu.Lock()
+	r.st.Reachability = &res
+	r.reachTargets = uris
+	r.mu.Unlock()
+	r.notifyChange()
+	return res
+}
+
+// RequestReachabilityCheck asks the loop to run the self-check now (the
+// owner's "run checks again").
+func (r *Registrar) RequestReachabilityCheck() {
+	r.mu.Lock()
+	r.next[taskReach] = time.Time{}
+	if !r.st.TokenRejected {
+		r.next[taskFriends] = time.Time{}
+	}
+	r.mu.Unlock()
+	select {
+	case r.wake <- struct{}{}:
+	default:
+	}
+}
+
+// reachURIs is what the self-check probes: the public plex.direct name and
+// every outside custom route (the first direct WAN URI when neither exists).
+func (r *Registrar) reachURIs(cfg config.Config) []string {
 	var uris []string
 	// PMS checks its own public plex.direct name on the mapped public port,
 	// even when the local listener uses a different port.
@@ -1085,11 +1377,7 @@ func (r *Registrar) CheckReachability(ctx context.Context) remote.Reachability {
 			uris = append(uris, c.URI)
 		}
 	}
-	res := r.o.Reach.Check(ctx, uris, cfg.Server.MachineIdentifier)
-	r.mu.Lock()
-	r.st.Reachability = &res
-	r.mu.Unlock()
-	return res
+	return uris
 }
 
 // RenewCertificate runs the certificate manager; force bypasses the
@@ -1132,12 +1420,14 @@ func (r *Registrar) RenewCertificate(ctx context.Context, force bool) error {
 		r.mu.Unlock()
 	}
 	r.refreshCertTrust(ctx)
+	r.notifyChange()
 	return err
 }
 
 // refreshCertTrust re-checks the installed plex.direct certificate on the
-// certificate schedule, sooner after a failed handshake, and again after a
-// reissue. Status polls only read the stored result.
+// certificate schedule, at the next tick after a first failed handshake (the
+// startup check runs before the listener serves), a minute after a confirmed
+// one, and again after a reissue. Status polls only read the stored result.
 func (r *Registrar) refreshCertTrust(ctx context.Context) {
 	if r.o.Certs == nil || ctx.Err() != nil {
 		return
@@ -1186,6 +1476,11 @@ func (r *Registrar) refreshCertTrust(ctx context.Context) {
 }
 
 func (r *Registrar) certTrustFresh(info CertInfo) bool {
+	if r.o.Certs.trustPending(info.Fingerprint) {
+		// One failed handshake is confirmed or cleared at the next tick
+		// (Tick), so a restart never leaves a false warning behind.
+		return false
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if info.Fingerprint == "" || info.Fingerprint != r.trustFP || r.trustAt.IsZero() {
@@ -1248,6 +1543,11 @@ func (r *Registrar) scheduleCertCheck() {
 func (r *Registrar) Claim(ctx context.Context, userToken string) (*ClaimResult, error) {
 	r.claimMu.Lock()
 	defer r.claimMu.Unlock()
+	return r.claim(ctx, userToken)
+}
+
+// claim requires claimMu.
+func (r *Registrar) claim(ctx context.Context, userToken string) (*ClaimResult, error) {
 	// Persist before the remote operation so a crash after claim cannot lose
 	// the need to bind a managed certificate to the new device record.
 	if r.o.Certs != nil {
@@ -1275,6 +1575,9 @@ func (r *Registrar) Claim(ctx context.Context, userToken string) (*ClaimResult, 
 	}
 	r.mu.Lock()
 	r.claimedToken = res.ServerToken
+	r.diagnosticOwnerToken = userToken
+	r.diagnosticOwnerUntil = r.o.Now().Add(time.Minute)
+	r.st.ServerTokenRequired = false
 	r.st.TokenRejected = false
 	r.st.PlexPass = res.Owner.Subscription.Active
 	r.st.OwnerFeatures = ownerFeatures(nil, res.Owner.Subscription.Features)
@@ -1303,6 +1606,7 @@ func (r *Registrar) Claim(ctx context.Context, userToken string) (*ClaimResult, 
 	r.refreshConfigStatus(r.o.Config.Get())
 	r.log.Info("server claimed", "owner", res.Owner.Username)
 	r.Trigger()
+	r.notifyChange()
 	return res, nil
 }
 
@@ -1416,11 +1720,16 @@ func (r *Registrar) releaseClaim(ctx context.Context, token string) {
 	r.st.OwnerFeatures = nil
 	r.st.PublishedURIs = nil
 	r.st.ResourceConnections = nil
+	r.friendFail = 0
+	r.friendContention = 0
 	r.st.LastPublishError = ""
 	r.st.FriendSyncError = ""
+	r.st.ServerTokenRequired = false
+	r.diagnosticOwnerToken = ""
 	r.st.TokenRejected = false
 	r.mu.Unlock()
 	r.refreshConfigStatus(r.o.Config.Get())
+	r.notifyChange()
 }
 
 // RefreshOwner re-reads the owner's account (Plex Pass state) and passes it
@@ -1460,6 +1769,7 @@ func (r *Registrar) RefreshOwner(ctx context.Context) error {
 	r.st.OwnerFeatures = ownerFeatures(features, acct.Subscription.Features)
 	r.next[taskOwner] = r.o.Now().Add(r.o.OwnerInterval)
 	r.mu.Unlock()
+	r.notifyChange()
 	if r.o.Users != nil {
 		return r.o.Users.SetOwner(ctx, *acct, cfg.Plex.Token)
 	}
@@ -1481,7 +1791,15 @@ func (r *Registrar) onPubsub(m PubsubMessage) {
 		r.st.PlexReachableCheckedAt = r.o.Now()
 		r.asyncID = ""
 		r.mu.Unlock()
-		r.log.Info("plex.tv connectivity check", "reachable", ok)
+		r.notifyChange()
+		attrs := []any{"reachable", ok, "direction", "inbound"}
+		if m.Address != "" {
+			attrs = append(attrs, "address", m.Address)
+		}
+		if m.Port != "" {
+			attrs = append(attrs, "port", m.Port)
+		}
+		r.log.Info("plex.tv connectivity check", attrs...)
 	case "refreshCertificate":
 		r.schedule(taskCert, time.Time{})
 		r.Trigger()

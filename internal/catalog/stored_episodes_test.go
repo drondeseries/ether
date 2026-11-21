@@ -163,3 +163,37 @@ func TestRecentAirSkipsExcludedTitles(t *testing.T) {
 		t.Fatalf("window %v %v", got, err)
 	}
 }
+
+// A large section total is served stale while it recounts: background
+// catalogue writes bump the write generation constantly, and a page's
+// total must not recount the whole section on every page (#639). The
+// stale value is the previous total, before the write that bumped the
+// generation.
+func TestCountStoredEpisodesServesStaleLargeTotal(t *testing.T) {
+	ctx := context.Background()
+	c := newChunkTestCatalog(t)
+	now := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	c.SetNow(func() time.Time { return now })
+	past := now.Add(-time.Hour).Unix()
+	const total = staleCountMin + 5
+	if _, err := c.db.ExecContext(ctx, `INSERT INTO catalog_titles(key,type,title,sort_title,released_ts,browsable,adult) VALUES(?,'show','s','s',?,1,0)`, int64(core.ShowKey(1)), past); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.db.ExecContext(ctx, `WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n< ?) INSERT INTO catalog_titles(key,type,show_key,season,episode,title,sort_title,released_ts,adult) SELECT ?+n,'episode',?,1,n,'e','e',?,0 FROM seq`, total, int64(core.EpisodeKey(1, 1, 0)), int64(core.ShowKey(1)), past); err != nil {
+		t.Fatal(err)
+	}
+	n, err := c.CountStoredEpisodes(ctx, core.Filter{})
+	if err != nil || n != total {
+		t.Fatalf("first count %d %v, want %d", n, err, total)
+	}
+	// A catalogue write bumps the generation; the next total is the stale
+	// one (without the new episode), served without a recount.
+	extra := core.Title{Key: core.EpisodeKey(1, 2, 1), Type: core.TypeEpisode, ShowKey: core.ShowKey(1), Season: 2, Episode: 1, Title: "new", Released: now.Add(-time.Hour)}
+	if err := c.UpsertTitle(ctx, extra, false); err != nil {
+		t.Fatal(err)
+	}
+	n, err = c.CountStoredEpisodes(ctx, core.Filter{})
+	if err != nil || n != total {
+		t.Fatalf("stale count %d %v, want previous total %d", n, err, total)
+	}
+}

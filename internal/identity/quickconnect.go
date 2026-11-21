@@ -9,9 +9,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/braedonsaunders/ether/internal/core"
+	"github.com/braedonsaunders/ether/internal/frontend"
 	"github.com/braedonsaunders/ether/internal/store"
 )
 
@@ -40,6 +42,20 @@ type QuickConnect struct {
 	ttl, grantTTL  time.Duration
 	now            func() time.Time
 	expire, insert *sql.Stmt
+	onApproved     atomic.Pointer[func(viewerID int64, target ApprovedTarget)]
+}
+
+// SetOnApproved installs an optional non-blocking observer notified when a
+// Quick Connect code is approved by a viewer.
+func (q *QuickConnect) SetOnApproved(fn func(viewerID int64, target ApprovedTarget)) {
+	if q == nil {
+		return
+	}
+	if fn == nil {
+		q.onApproved.Store(nil)
+		return
+	}
+	q.onApproved.Store(&fn)
 }
 
 const (
@@ -175,6 +191,10 @@ func (q *QuickConnect) approve(ctx context.Context, surface, code string, viewer
 	}
 	if n != 1 {
 		return q.rejectCode(ctx, code)
+	}
+	if fn := q.onApproved.Load(); fn != nil && *fn != nil {
+		target, _ := q.ApprovedTarget(ctx, code, viewerID)
+		(*fn)(viewerID, target)
 	}
 	return nil
 }
@@ -351,7 +371,11 @@ func (q *QuickConnect) replay(ctx context.Context, tx *sql.Tx, requestedSurface,
 	if err != nil {
 		return "", err
 	}
-	if device.ID != storedDevice || device.Client != storedClient {
+	// Android TV initiates with a random user-scoped device hash, but
+	// redeems with its installation ID. The approved secret authorizes
+	// redemption; keep the original grant binding on retries as well.
+	rotatingAndroidTV := surface == "jellyfin" && frontend.JellyfinAndroidTVClient(storedClient) && frontend.JellyfinAndroidTVClient(device.Client)
+	if !rotatingAndroidTV && (device.ID != storedDevice || device.Client != storedClient) {
 		return "", core.ErrUnauthorized
 	}
 	grantHashValue, ok := grantHash(token)

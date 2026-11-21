@@ -1,6 +1,6 @@
 import { ViewerCatalogRules } from "./ViewerCatalogRules";
 import { Button, SearchSelect, SettingsSection, Switch, toast } from "@braedonsaunders/appkit-ui";
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import { Link } from "react-router-dom";
 import { ChipGroup, NumberInput } from "../../components/fields";
 import { ErrorPanel, LoadingRows } from "../../components/feedback";
@@ -23,20 +23,29 @@ import { PlexWatchSync } from "./sections/PlexWatchSync";
 import { FromPlexDefaults } from "./FromPlexDefaults";
 import { ViewerLiveTVAccess } from "./sections/ViewerLiveTV";
 import { ViewerSimkl } from "./sections/ViewerSimkl";
+import { ViewerMDBList } from "./sections/ViewerMDBList";
+import { ViewerTrakt } from "./sections/ViewerTrakt";
 import { KID_PRESETS, ListText, normalizePolicy, type SafetyPolicy } from "./shared";
-
-const HOURS = Array.from({ length: 24 }, (_, h) => ({
-  value: h,
-  label: `${String(h).padStart(2, "0")}:00`,
-}));
+import { librariesApi } from "../libraries/api";
 
 /** A searchable IANA timezone picker; a stored zone the browser lacks stays listed. */
-function TimeZoneSelect({ value, onChange }: { value: string; onChange: (zone: string) => void }) {
-  const options = useMemo(() => {
+function TimeZoneSelect({
+  value,
+  onChange,
+  serverDefault = false,
+}: {
+  value: string;
+  onChange: (zone: string) => void;
+  serverDefault?: boolean;
+}) {
+  const options = (() => {
     const zones = timeZones();
     const list = value && !zones.includes(value) ? [value, ...zones] : zones;
-    return list.map((zone) => ({ value: zone, label: zone.replace(/_/g, " ") }));
-  }, [value]);
+    return [
+      ...(serverDefault ? [{ value: "", label: t("Server time zone") }] : []),
+      ...list.map((zone) => ({ value: zone, label: zone.replace(/_/g, " ") })),
+    ];
+  })();
   return (
     <SearchSelect
       value={value}
@@ -49,11 +58,127 @@ function TimeZoneSelect({ value, onChange }: { value: string; onChange: (zone: s
   );
 }
 
+/** Libraries this viewer can open (empty restriction = every library, §1.4). */
+function ViewerLibraries({
+  userId,
+  allowed,
+  isOwner,
+  onSaved,
+}: {
+  userId: number;
+  allowed?: number[] | null;
+  isOwner?: boolean;
+  onSaved: () => void;
+}) {
+  const libs = useAsync((signal) => librariesApi.list(signal), []);
+  const [draft, setDraft] = useState<number[] | null>(null);
+  const [saving, setSaving] = useState(false);
+  const all = libs.data ?? [];
+  const current = draft ?? allowed ?? [];
+  const unrestricted = current.length === 0;
+  const dirty = draft !== null && JSON.stringify(draft) !== JSON.stringify(allowed ?? []);
+  const toggleLibrary = (id: number, on: boolean) =>
+    setDraft((prev) => {
+      const base = prev ?? allowed ?? [];
+      return on ? [...base, id].sort((a, b) => a - b) : base.filter((x) => x !== id);
+    });
+  return (
+    <SettingsSection
+      title={t("Libraries this viewer can open")}
+      description={t(
+        "With every library allowed, new libraries open for this viewer too. Pick libraries to limit them to just those.",
+      )}
+    >
+      {libs.loading ? (
+        <LoadingRows rows={2} />
+      ) : (
+        <>
+          <SettingsRow
+            title={t("All libraries")}
+            control={
+              <Switch
+                aria-label={t("All libraries")}
+                checked={unrestricted || Boolean(isOwner)}
+                disabled={Boolean(isOwner)}
+                onChange={(e) => setDraft(e.target.checked ? [] : all.map((l) => l.id))}
+              />
+            }
+          />
+          {!unrestricted && !isOwner
+            ? all.map((l) => (
+                <SettingsRow
+                  key={l.id}
+                  title={l.name}
+                  control={
+                    <Switch
+                      aria-label={l.name}
+                      checked={current.includes(l.id)}
+                      onChange={(e) => toggleLibrary(l.id, e.target.checked)}
+                    />
+                  }
+                />
+              ))
+            : null}
+          {isOwner ? (
+            <p className="px-5 py-4 text-sm text-fg-muted">
+              {t("The owner can always open every library.")}
+            </p>
+          ) : (
+            <div className="pt-2">
+              <Button
+                size="sm"
+                disabled={!dirty || saving}
+                onClick={() => {
+                  setSaving(true);
+                  api
+                    .updateUser(userId, { allowedLibraries: current })
+                    .then(() => {
+                      toast.success(t("Saved"));
+                      setDraft(null);
+                      onSaved();
+                    })
+                    .catch((e: unknown) => toast.error(errorMessage(e)))
+                    .finally(() => setSaving(false));
+                }}
+              >
+                {t("Save")}
+              </Button>
+            </div>
+          )}
+        </>
+      )}
+    </SettingsSection>
+  );
+}
+
+/**
+ * Connected watch-history accounts for one viewer (Sign-in & devices › Connected accounts):
+ * Plex account sync, Plex Media Server mappings, Trakt, Simkl and MDBList.
+ */
+export function ViewerAccountSync({ viewer }: { viewer: Viewer }) {
+  const id = viewer.id;
+  const config = useAsync(() => api.getConfig(), []);
+  const trakt = config.data?.trakt;
+  const simkl = config.data?.simkl;
+  const mdblist = config.data?.mdblist;
+  return (
+    <div className="space-y-6">
+      <PlexWatchSync viewerId={id} plexId={viewer.plexId} />
+      {config.data ? (
+        <>
+          <ViewerTrakt viewerId={id} ready={Boolean(trakt?.enabled && trakt.clientId.trim())} />
+          <ViewerSimkl viewerId={id} ready={Boolean(simkl?.enabled && simkl.clientId.trim())} />
+          <ViewerMDBList viewerId={id} ready={Boolean(mdblist?.enabled)} />
+        </>
+      ) : null}
+    </div>
+  );
+}
+
 /**
  * Everything that decides what one viewer may watch and when: streams at
- * once, the content rating limit, parental controls, allowed times, Live TV
- * and their connected accounts. One in-place form; the save bar writes
- * whichever parts changed. Account actions run immediately.
+ * once, the content rating limit, parental controls, allowed times and Live TV.
+ * One in-place form; the save bar writes whichever parts changed.
  */
 export function ViewerAccess({ viewer }: { viewer: Viewer }) {
   const id = viewer.id;
@@ -119,7 +244,7 @@ export function ViewerAccess({ viewer }: { viewer: Viewer }) {
   const l = limits.draft;
   const p = rules.draft;
   const noUser = users.data && (!user || !l);
-  const simkl = config.data?.simkl;
+  const isOwner = Boolean(user?.isOwner || viewer.isOwner);
   return (
     <div className="space-y-6">
       <ViewerCatalogRules key={id} id={id} region={String(config.data?.catalog?.region || "US")} />
@@ -139,67 +264,76 @@ export function ViewerAccess({ viewer }: { viewer: Viewer }) {
               )}
             </p>
           ) : null}
-          <SettingsSection
-            title={t("Parental controls")}
-            description={t(
-              "Adult titles are always excluded. Unrated titles are blocked when a rating limit applies.",
-            )}
-          >
-            <SettingsRow
-              title={t("Start from a preset")}
+          {!isOwner ? (
+            <SettingsSection
+              title={t("Parental controls")}
               description={t(
-                "Replaces the parental controls, playback restrictions and allowed times below.",
+                "Adult titles are always excluded. Unrated titles are blocked when a rating limit applies.",
               )}
-              control={
-                <div className="flex flex-wrap gap-2">
-                  {KID_PRESETS.map((preset) => (
-                    <Button
-                      key={preset.value}
-                      variant="outline"
-                      size="sm"
-                      disabled={presetBusy}
-                      onClick={() => void applyPreset(preset.value)}
-                    >
-                      {preset.label}
-                    </Button>
-                  ))}
-                </div>
-              }
-            />
-            {user && l ? (
-              <RatingLimitRow
-                value={l.maxContentRating}
-                onChange={(maxContentRating) => patchLimits({ maxContentRating })}
-                isOwner={user.isOwner}
+            >
+              <SettingsRow
+                title={t("Start from a preset")}
+                description={t(
+                  "Replaces the parental controls, playback restrictions and allowed times below.",
+                )}
+                control={
+                  <div className="flex flex-wrap gap-2">
+                    {KID_PRESETS.map((preset) => (
+                      <Button
+                        key={preset.value}
+                        variant="outline"
+                        size="sm"
+                        disabled={presetBusy}
+                        onClick={() => void applyPreset(preset.value)}
+                      >
+                        {preset.label}
+                      </Button>
+                    ))}
+                  </div>
+                }
               />
-            ) : null}
-            <SettingsRow
-              title={t("Blocked genres")}
-              description={t("Comma-separated, e.g. Horror, Thriller.")}
-              control={
-                <div className="w-64">
-                  <ListText
-                    ariaLabel={t("Blocked genres")}
-                    value={p.blockedGenres}
-                    onChange={(v) => patchPolicy({ blockedGenres: v })}
-                  />
-                </div>
-              }
-            />
-            <SettingsRow
-              title={t("Blocked keywords")}
-              description={t("Comma-separated TMDB keywords.")}
-              control={
-                <div className="w-64">
-                  <ListText
-                    ariaLabel={t("Blocked keywords")}
-                    value={p.blockedKeywords}
-                    onChange={(v) => patchPolicy({ blockedKeywords: v })}
-                  />
-                </div>
-              }
-            />
-          </SettingsSection>
+              {user && l ? (
+                <RatingLimitRow
+                  value={l.maxContentRating}
+                  onChange={(maxContentRating) => patchLimits({ maxContentRating })}
+                  isOwner={user.isOwner}
+                />
+              ) : null}
+              <SettingsRow
+                title={t("Blocked genres")}
+                description={t("Comma-separated, e.g. Horror, Thriller.")}
+                control={
+                  <div className="w-64">
+                    <ListText
+                      ariaLabel={t("Blocked genres")}
+                      value={p.blockedGenres}
+                      onChange={(v) => patchPolicy({ blockedGenres: v })}
+                    />
+                  </div>
+                }
+              />
+              <SettingsRow
+                title={t("Blocked keywords")}
+                description={t("Comma-separated TMDB keywords.")}
+                control={
+                  <div className="w-64">
+                    <ListText
+                      ariaLabel={t("Blocked keywords")}
+                      value={p.blockedKeywords}
+                      onChange={(v) => patchPolicy({ blockedKeywords: v })}
+                    />
+                  </div>
+                }
+              />
+            </SettingsSection>
+          ) : null}
+
+          <ViewerLibraries
+            userId={id}
+            allowed={user?.allowedLibraries}
+            isOwner={isOwner}
+            onSaved={() => void users.reload()}
+          />
 
           <SettingsSection title={t("Playback restrictions")}>
             {user && l ? (
@@ -243,45 +377,122 @@ export function ViewerAccess({ viewer }: { viewer: Viewer }) {
             />
           </SettingsSection>
 
-          <SettingsSection
-            title={t("Allowed times")}
-            description={t(
-              "Hours when this viewer can start playback. Leave every hour clear to allow any time.",
-            )}
-          >
-            <SettingsRow
-              title={t("Timezone")}
-              control={
-                <div className="w-64">
-                  <TimeZoneSelect
-                    value={p.timezone}
-                    onChange={(timezone) => patchPolicy({ timezone })}
+          {user && !isOwner ? (
+            <SettingsSection
+              title={t("Allowed times")}
+              description={t("Let the current item finish, then pause playback until wake time.")}
+            >
+              <SettingsRow
+                title={t("Bedtime")}
+                control={
+                  <Switch
+                    checked={!!p.bedtime}
+                    onChange={(e) =>
+                      patchPolicy({
+                        allowedHours: [],
+                        bedtime: e.target.checked
+                          ? { time: "20:00", wakeTime: "06:00", timezone: p.timezone }
+                          : null,
+                      })
+                    }
+                    aria-label={t("Bedtime")}
                   />
-                </div>
-              }
-            />
-            <SettingsRow stacked title={t("Allowed hours")}>
-              <ChipGroup
-                ariaLabel={t("Allowed hours")}
-                size="sm"
-                options={HOURS}
-                value={p.allowedHours}
-                onChange={(v) => patchPolicy({ allowedHours: [...v].sort((a, b) => a - b) })}
+                }
               />
-            </SettingsRow>
-          </SettingsSection>
+              {!p.bedtime && p.allowedHours.length > 0 ? (
+                <SettingsRow
+                  title={t("Allowed times")}
+                  control={
+                    <span>
+                      {p.allowedHours
+                        .map((hour) => `${String(hour).padStart(2, "0")}:00`)
+                        .join(", ")}
+                    </span>
+                  }
+                />
+              ) : null}
+              {p.bedtime ? (
+                <>
+                  <SettingsRow
+                    title={t("Bedtime starts")}
+                    control={
+                      <input
+                        type="time"
+                        className="rounded border border-border bg-background px-3 py-2"
+                        aria-label={t("Bedtime starts")}
+                        required
+                        value={p.bedtime.time}
+                        onChange={(e) =>
+                          patchPolicy({ bedtime: { ...p.bedtime!, time: e.target.value } })
+                        }
+                      />
+                    }
+                  />
+                  <SettingsRow
+                    title={t("Wake time")}
+                    control={
+                      <input
+                        type="time"
+                        className="rounded border border-border bg-background px-3 py-2"
+                        aria-label={t("Wake time")}
+                        required
+                        value={p.bedtime.wakeTime || "06:00"}
+                        onChange={(e) =>
+                          patchPolicy({ bedtime: { ...p.bedtime!, wakeTime: e.target.value } })
+                        }
+                      />
+                    }
+                  />
+                  <SettingsRow
+                    title={t("Days")}
+                    description={t(
+                      "Choose the days bedtime starts. With no days selected, it applies every day.",
+                    )}
+                    control={
+                      <ChipGroup
+                        ariaLabel={t("Days")}
+                        options={[
+                          { value: 0, label: t("Sunday") },
+                          { value: 1, label: t("Monday") },
+                          { value: 2, label: t("Tuesday") },
+                          { value: 3, label: t("Wednesday") },
+                          { value: 4, label: t("Thursday") },
+                          { value: 5, label: t("Friday") },
+                          { value: 6, label: t("Saturday") },
+                        ]}
+                        value={p.bedtime.days ?? []}
+                        onChange={(days) => patchPolicy({ bedtime: { ...p.bedtime!, days } })}
+                      />
+                    }
+                  />
+                </>
+              ) : null}
+              <SettingsRow
+                title={t("Time zone")}
+                description={t("Leave empty to use the server’s time zone.")}
+                control={
+                  <div className="w-64">
+                    <TimeZoneSelect
+                      serverDefault={!!p.bedtime || p.allowedHours.length === 0}
+                      value={p.timezone}
+                      onChange={(timezone) =>
+                        patchPolicy({
+                          timezone,
+                          ...(p.bedtime ? { bedtime: { ...p.bedtime, timezone } } : {}),
+                        })
+                      }
+                    />
+                  </div>
+                }
+              />
+            </SettingsSection>
+          ) : null}
         </>
       )}
 
       <FromPlexDefaults viewerId={id} show="share" />
 
       <ViewerLiveTVAccess viewerId={id} />
-
-      <PlexWatchSync viewerId={id} plexId={viewer.plexId} />
-
-      {config.data ? (
-        <ViewerSimkl viewerId={id} ready={Boolean(simkl?.enabled && simkl.clientId.trim())} />
-      ) : null}
 
       <SaveBar
         dirty={limits.dirty || rules.dirty}

@@ -181,6 +181,10 @@ func compileCondition(c core.ReleaseCondition, lookup FieldLookup) (condition, e
 	}
 	switch c.Operator {
 	case "equals", "contains":
+	case "in":
+		if !spec.External {
+			return out, fmt.Errorf("unsupported comparison %q", c.Operator)
+		}
 	case "regex":
 		re, err := regexp.Compile("(?i)" + c.Value)
 		if err != nil {
@@ -190,7 +194,7 @@ func compileCondition(c core.ReleaseCondition, lookup FieldLookup) (condition, e
 	default:
 		return out, fmt.Errorf("unsupported comparison %q", c.Operator)
 	}
-	if spec.ValueClass == "language" && c.Operator != "equals" {
+	if spec.ValueClass == "language" && !spec.External && c.Operator != "equals" {
 		return out, fmt.Errorf("languages use exact matching; use filename for expressions")
 	}
 	if len(spec.Operators) > 0 && !slices.Contains(spec.Operators, c.Operator) {
@@ -210,7 +214,7 @@ func compileExternalShape(out condition) (condition, error) {
 			return out, fmt.Errorf("invalid numeric range")
 		}
 		return out, nil
-	case "equals", "contains", "regex":
+	case "equals", "contains", "in", "regex":
 		if strings.TrimSpace(c.Value) == "" || len(c.Value) > 512 {
 			return out, fmt.Errorf("condition needs a value of at most 512 characters")
 		}
@@ -293,27 +297,6 @@ func Better(a, b Result) bool {
 		if a.Preferences[i] != b.Preferences[i] {
 			return a.Preferences[i] > b.Preferences[i]
 		}
-	}
-	return false
-}
-
-// BetterByRanking compares policy results using the rule:<id> order in ranking,
-// falling back to Better when ranking carries no rule entries.
-func BetterByRanking(a, b Result, ranking []string) bool {
-	if a.Fallback != b.Fallback {
-		return a.Fallback < b.Fallback
-	}
-	hasRules := false
-	for _, step := range ranking {
-		if id, ok := strings.CutPrefix(step, core.RankRulePrefix); ok && id != "" {
-			hasRules = true
-			if pa, pb := a.PreferRule(id), b.PreferRule(id); pa != pb {
-				return pa > pb
-			}
-		}
-	}
-	if !hasRules {
-		return Better(a, b)
 	}
 	return false
 }

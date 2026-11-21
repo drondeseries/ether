@@ -78,7 +78,7 @@ const PAGES = localized<PageDef[]>(() => [
     sections: [],
     keywords: searchTerms(
       msg(
-        "users friends accounts people overview home taste recent activity audio subtitles limits sign-in devices lists alerts",
+        "users friends accounts people overview home taste recent activity audio subtitles limits sign-in devices lists alerts watchlist monitoring",
       ),
     ),
   },
@@ -99,11 +99,6 @@ const PAGES = localized<PageDef[]>(() => [
     title: t("Live TV"),
     sections: [
       { key: "channels", title: t("Channels"), keywords: searchTerms(msg("virtual channel")) },
-      {
-        key: "sources",
-        title: t("IPTV sources"),
-        keywords: searchTerms(msg("m3u xmltv playlist")),
-      },
       { key: "guide", title: t("Guide"), keywords: searchTerms(msg("epg schedule")) },
       {
         key: "looks",
@@ -125,20 +120,28 @@ const PAGES = localized<PageDef[]>(() => [
     ),
   },
   {
-    href: "/catalog",
-    title: t("Catalog"),
+    href: "/libraries",
+    title: t("Libraries"),
     sections: [
       {
-        key: "rules",
-        title: t("Rules"),
-        keywords: searchTerms(msg("hide show rules library exclusions")),
+        key: "1/rules",
+        title: t("Movies · Rules"),
+        keywords: searchTerms(msg("hide show rules movie exclusions visibility")),
       },
       {
-        key: "settings",
-        title: t("Catalog settings"),
-        keywords: searchTerms(
-          msg("tmdb language region obscure new releases playable digital watchlist monitoring"),
-        ),
+        key: "1/settings",
+        title: t("Movies · Settings"),
+        keywords: searchTerms(msg("tmdb language region obscure new releases playable digital")),
+      },
+      {
+        key: "2/rules",
+        title: t("TV Shows · Rules"),
+        keywords: searchTerms(msg("hide show rules tv exclusions visibility")),
+      },
+      {
+        key: "2/settings",
+        title: t("TV Shows · Settings"),
+        keywords: searchTerms(msg("tmdb language region obscure new releases episodes")),
       },
     ],
     keywords: searchTerms(msg("catalogue movies shows browse search library")),
@@ -183,6 +186,11 @@ const PAGES = localized<PageDef[]>(() => [
         keywords: searchTerms(msg("nntp backfill connections")),
       },
       {
+        key: "iptv",
+        title: t("IPTV"),
+        keywords: searchTerms(msg("m3u xmltv playlist")),
+      },
+      {
         key: "indexers",
         title: t("Indexers"),
         keywords: searchTerms(
@@ -192,9 +200,16 @@ const PAGES = localized<PageDef[]>(() => [
         ),
       },
       {
-        key: "stats",
-        title: t("Stats"),
-        keywords: searchTerms(msg("quota price plan cost success speed plays failover")),
+        key: "statistics",
+        title: t("Statistics"),
+        keywords: searchTerms(
+          msg("stats dashboard success speed plays failover cache data downloaded debrid"),
+        ),
+      },
+      {
+        key: "usage",
+        title: t("Usage"),
+        keywords: searchTerms(msg("usage quota price plan cost per play iptv")),
       },
     ],
   },
@@ -343,6 +358,7 @@ const PAGES = localized<PageDef[]>(() => [
       { key: "betterposters", href: "/services/overview#betterposters", title: "BetterPosters" },
       { key: "rpdb", href: "/services/overview#rpdb", title: "RPDB" },
       { key: "custom", href: "/services/overview#custom", title: t("Custom posters") },
+      { key: "posterflow", href: "/services/overview#posterflow", title: "PosterFlow" },
       { key: "tmdb", title: "TMDB", keywords: searchTerms(msg("tmdb api key catalogue")) },
       // Tabs for these only exist once the service is on, so ⌘K lands on the
       // overview card where it can be enabled or configured.
@@ -359,6 +375,12 @@ const PAGES = localized<PageDef[]>(() => [
         keywords: searchTerms(msg("simkl sync history")),
       },
       {
+        key: "mdblist",
+        href: "/services/overview#mdblist",
+        title: "MDBList",
+        keywords: searchTerms(msg("mdblist sync history")),
+      },
+      {
         key: "llm",
         href: "/services/overview#llm",
         title: t("Language model"),
@@ -369,6 +391,12 @@ const PAGES = localized<PageDef[]>(() => [
         href: "/services/overview#opensubtitles",
         title: "OpenSubtitles",
         keywords: searchTerms(msg("subtitles")),
+      },
+      {
+        key: "subdl",
+        href: "/services/overview#subdl",
+        title: "SubDL",
+        keywords: searchTerms(msg("subtitles subdl")),
       },
       {
         key: "ratings",

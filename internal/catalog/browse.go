@@ -5,7 +5,9 @@ import (
 	"context"
 	"fmt"
 	"github.com/braedonsaunders/ether/internal/config"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,6 +21,10 @@ import (
 // in-memory count and page caching so repeated library/recommendation reads
 // return without hitting disk.
 func (c *Catalog) Browse(ctx context.Context, q core.BrowseQuery) (core.Page, error) {
+	q.Filter.MovieFilter, q.Filter.EpisodeFilter = nil, nil
+	if err := c.ensureCatalogueSources(ctx, q.Filter); err != nil {
+		return core.Page{}, err
+	}
 	if q.PlaylistSource != nil {
 		return c.browsePlaylist(ctx, q)
 	}
@@ -58,16 +64,42 @@ func (c *Catalog) Browse(ctx context.Context, q core.BrowseQuery) (core.Page, er
 	}
 	gen := c.writeGen.Load()
 	minBucket := c.minuteBucket()
-	ckey := c.consoleAvailabilityCacheKey(q.Filter) + "|" + browseFilterKey(q.Filter) + fmt.Sprintf("|rules:%s:%#v:%s", q.Filter.RuleVisibility, q.Filter.PreviewRules, q.Filter.PreviewFallback)
+	ckey := c.consoleAvailabilityCacheKey(q.Filter) + "|" + browseFilterKey(c.policyKeyFilter(q.Filter)) + fmt.Sprintf("|rules:%s:%v:%#v:%s|extra:%#v:%s|tab:%#v:%s", q.Filter.RuleVisibility, q.Filter.ApplyCanonicalInPreview, q.Filter.PreviewRules, q.Filter.PreviewFallback, q.Filter.ExtraRules, q.Filter.ExtraFallback, q.Filter.TabRules, q.Filter.TabFallback)
 	bkey := fmt.Sprintf("after:%d|", q.AfterKey) + fmt.Sprintf("%s|%s|%v|%v|%d|%d|%v", ckey, q.Sort, q.Desc, q.SecondarySorts, offset, limit, q.NoTotal)
-	cacheable := !groupHasState(q.Filter.Group)
+	cacheable := !filterHasViewerState(q.Filter)
+	// An export page holds partial titles (ListRows) and is read once per
+	// export: it neither serves from nor fills the page cache.
+	listRows := q.ListRows != nil && q.Sort == core.SortKey
+	pageCacheable := cacheable && !listRows
+	// A ranking window (core.WithRankingCandidates) reads its titles
+	// partial and caches that page apart, under rkey; a full page serves it.
+	var rank *rankProjection
+	rkey := ""
+	cand := core.RankingCandidatesFrom(ctx)
+	if cand != nil && !listRows {
+		rank = &rankProjection{facts: cand.Facts | c.policyFacts(c.visibilityFor(ctx)) | c.viewerPolicyFacts(ctx), detail: cand.Detail}
+		rkey = bkey + fmt.Sprintf("|rank:%d", rank.facts)
+	}
 	c.cacheMu.RLock()
-	if ent, ok := c.browseCache[bkey]; cacheable && !q.SortLastViewed && ok && ent.gen == gen && ent.minute == minBucket {
+	if ent, ok := c.browseCache[bkey]; pageCacheable && !q.SortLastViewed && ok && ent.gen == gen && ent.minute == minBucket {
 		items := make([]core.Title, len(ent.page.Items))
 		for i := range ent.page.Items {
 			items[i] = cloneTitle(ent.page.Items[i])
 		}
 		c.cacheMu.RUnlock()
+		c.kickMovieYears(items)
+		return core.Page{Items: items, Total: ent.page.Total}, nil
+	}
+	if ent, ok := c.browseCache[rkey]; rank != nil && pageCacheable && !q.SortLastViewed && ok && ent.gen == gen && ent.minute == minBucket {
+		items := make([]core.Title, len(ent.page.Items))
+		for i := range ent.page.Items {
+			items[i] = cloneTitle(ent.page.Items[i])
+		}
+		partial := slices.Clone(ent.partial)
+		c.cacheMu.RUnlock()
+		if err := c.finishRankPage(ctx, cand, items, partial); err != nil {
+			return core.Page{}, err
+		}
 		c.kickMovieYears(items)
 		return core.Page{Items: items, Total: ent.page.Total}, nil
 	}
@@ -99,9 +131,14 @@ func (c *Catalog) Browse(ctx context.Context, q core.BrowseQuery) (core.Page, er
 		total = cntEnt.total
 	default:
 		if !cacheable {
-			err = c.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM catalog_titles t WHERE `+where, args...).Scan(&total)
+			// A viewer's state filter is never cached, but an unwatched
+			// listing's total still comes from the tally (tallyTotal).
+			var ok bool
+			if total, ok, err = c.tallyTotal(ctx, q.Filter, where, args); err == nil && !ok {
+				err = c.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM catalog_titles t`+c.topicIndexHint(q.Filter)+` WHERE `+where, args...).Scan(&total)
+			}
 		} else {
-			total, err = c.countBrowse(ctx, ckey, where, args)
+			total, err = c.countBrowse(ctx, q.Filter, ckey, where, args)
 		}
 		if err != nil {
 			return core.Page{}, err
@@ -109,7 +146,7 @@ func (c *Catalog) Browse(ctx context.Context, q core.BrowseQuery) (core.Page, er
 	}
 	if total == 0 || offset >= total {
 		page := core.Page{Items: []core.Title{}, Total: total}
-		if cacheable && !q.SortLastViewed && c.writeGen.Load() == gen {
+		if pageCacheable && !q.SortLastViewed && c.writeGen.Load() == gen {
 			c.cacheMu.Lock()
 			if len(c.browseCache) >= 512 {
 				c.browseCache = map[string]cachedBrowse{}
@@ -129,15 +166,49 @@ func (c *Catalog) Browse(ctx context.Context, q core.BrowseQuery) (core.Page, er
 		}
 		return core.Page{Items: items, Total: total}, nil
 	}
+	if q.AfterKey > 0 && seekableBrowse(q) {
+		items, err := c.seekPage(ctx, q, where, args, offset, limit)
+		if err != nil {
+			return core.Page{}, err
+		}
+		if q.NoTotal {
+			total = offset + len(items)
+		}
+		c.kickMovieYears(items)
+		return core.Page{Items: items, Total: total}, nil
+	}
+	if q.Filter.CollectionMembers != 0 {
+		// A collection library reads its page straight from the semi-join:
+		// the cached page keys cannot promise to follow a rebuild, and the
+		// count always comes from the predicates above.
+		items, err := c.queryPagedTitles(ctx, `SELECT `+prefixedCols("t")+` FROM catalog_titles t WHERE `+where+` ORDER BY `+browseOrder(q)+`, t.key ASC LIMIT ? OFFSET ?`, append(append([]any{}, args...), limit, offset)...)
+		if err != nil {
+			return core.Page{}, err
+		}
+		if q.Sort == core.SortAdded {
+			if err := applyAirAddedTimes(ctx, c.db, items, c.now()); err != nil {
+				return core.Page{}, err
+			}
+		}
+		if items == nil {
+			items = []core.Title{}
+		}
+		c.kickMovieYears(items)
+		return core.Page{Items: items, Total: total}, nil
+	}
 	pageWhere, pageArgs := where, args
-	keysetHint := ""
+	// A title-sorted page probes a positive studio filter per row instead of
+	// enumerating every matching title; the total (above) keeps the
+	// studio-index-driven IN-list form.
+	pageWhere = c.studioProbe(ctx, pageWhere, q.Filter)
+	keysetHint := c.topicIndexHint(q.Filter)
 	if q.Sort == core.SortKey && q.AfterKey > 0 {
 		pageWhere += " AND t.key>?"
 		pageArgs = append(append([]any{}, args...), q.AfterKey)
 		// Pin the seek: planner statistics must never turn a keyset page back
 		// into a sort of the type's whole browse set.
-		if q.Filter.Type != "" && store.DialectOf(c.db) != store.Postgres {
-			keysetHint = " INDEXED BY " + keysetIndex
+		if q.Filter.Topic == "" && q.Filter.Type != "" && store.DialectOf(c.db) != store.Postgres {
+			keysetHint = c.indexedBy(keysetIndex)
 		}
 	}
 	if q.Sort == core.SortUpdated && q.Filter.UpdatedAfter == 0 {
@@ -172,17 +243,20 @@ func (c *Catalog) Browse(ctx context.Context, q core.BrowseQuery) (core.Page, er
 		hint := keysetHint
 		if store.DialectOf(c.db) != store.Postgres && !consolePositiveEvidence(q.Filter) && !consoleHasSparseCandidates(q.Filter) {
 			if len(q.Filter.Languages) == 1 && q.Filter.MinVotes > 0 {
-				hint = " INDEXED BY catalog_titles_console_language_votes_page"
+				hint = c.indexedBy("catalog_titles_console_language_votes_page")
 			} else if q.Sort == core.SortPopularity && len(q.SecondarySorts) == 0 {
-				hint = " INDEXED BY catalog_titles_console_pop_page"
+				hint = c.indexHint("catalog_titles_console_pop_page")
 			}
 			if q.Sort == core.SortYear && q.Desc && len(q.SecondarySorts) == 1 && q.SecondarySorts[0].Sort == core.SortTitle && !q.SecondarySorts[0].Desc {
-				hint = " INDEXED BY catalog_titles_console_year_title_page"
+				hint = c.indexHint("catalog_titles_console_year_title_page")
 			}
 		}
 		// Sort/filter only narrow covering-index keys, then hydrate the page.
 		// This avoids reading large title payloads while rejecting candidates.
 		query = `SELECT ` + prefixedCols("t") + ` FROM catalog_titles t JOIN (SELECT t.key AS page_key FROM catalog_titles t` + hint + ` WHERE ` + pageWhere + ` ORDER BY ` + order + `, t.key ASC LIMIT ? OFFSET ?) p ON t.key=p.page_key ORDER BY ` + order + `,t.key ASC`
+	}
+	if rq, ok := c.rankPageQuery(ctx, q, pageWhere); ok && !computedAdded {
+		query = rq
 	}
 	if computedAdded {
 		// The computed date added has no index, so the whole filtered set is
@@ -202,8 +276,28 @@ func (c *Catalog) Browse(ctx context.Context, q core.BrowseQuery) (core.Page, er
 		// The date expression comes before the filter in the narrow subquery.
 		queryArgs = append(append([]any{}, orderArgs...), pageArgs...)
 	}
+	if rank != nil {
+		ctx = withRankProjection(ctx, rank)
+	}
 	var items []core.Title
+	years, byYear := yearMergeable(q, offset, limit)
 	switch {
+	case byYear:
+		keys, err := c.yearMergedKeys(ctx, pageWhere, pageArgs, q, years, offset, limit)
+		if err != nil {
+			return core.Page{}, err
+		}
+		if items, err = c.titlesInKeyOrder(ctx, keys); err != nil {
+			return core.Page{}, err
+		}
+	case titleWalkPage(q):
+		keys, err := c.titlePageKeys(ctx, pageWhere, pageArgs, q, offset, limit)
+		if err != nil {
+			return core.Page{}, err
+		}
+		if items, err = c.titlesInKeyOrder(ctx, keys); err != nil {
+			return core.Page{}, err
+		}
 	case q.Filter.LocalOnly && q.NoTotal && q.Filter.Type == "" && !q.SortLastViewed && !computedAdded && offset+limit <= mergedPageMax:
 		keys, err := c.consoleMergedKeys(ctx, pageWhere, pageArgs, q, offset, limit)
 		if err != nil {
@@ -224,6 +318,10 @@ func (c *Catalog) Browse(ctx context.Context, q core.BrowseQuery) (core.Page, er
 		if items, err = c.titlesInKeyOrder(ctx, keys); err != nil {
 			return core.Page{}, err
 		}
+	case listRows:
+		if items, err = c.queryListRows(ctx, q.ListRows, query, append(queryArgs, limit, offset)...); err != nil {
+			return core.Page{}, err
+		}
 	default:
 		if items, err = c.queryPagedTitles(ctx, query, append(queryArgs, limit, offset)...); err != nil {
 			return core.Page{}, err
@@ -240,7 +338,13 @@ func (c *Catalog) Browse(ctx context.Context, q core.BrowseQuery) (core.Page, er
 	if q.NoTotal {
 		total = offset + len(items)
 	}
-	if cacheable && !q.SortLastViewed && c.writeGen.Load() == gen {
+	key := bkey
+	var partial []core.RatingKey
+	if rank != nil && len(rank.partial) > 0 {
+		key, partial = rkey, slices.Clone(rank.partial)
+		cand.MarkPartial(partial)
+	}
+	if pageCacheable && !q.SortLastViewed && c.writeGen.Load() == gen {
 		cachedItems := make([]core.Title, len(items))
 		for i := range items {
 			cachedItems[i] = cloneTitle(items[i])
@@ -249,7 +353,7 @@ func (c *Catalog) Browse(ctx context.Context, q core.BrowseQuery) (core.Page, er
 		if len(c.browseCache) >= 512 {
 			c.browseCache = map[string]cachedBrowse{}
 		}
-		c.browseCache[bkey] = cachedBrowse{page: core.Page{Items: cachedItems, Total: total}, gen: gen, minute: minBucket}
+		c.browseCache[key] = cachedBrowse{page: core.Page{Items: cachedItems, Total: total}, gen: gen, minute: minBucket, partial: partial}
 		c.cacheMu.Unlock()
 	}
 	c.kickMovieYears(items)
@@ -380,14 +484,42 @@ func (c *Catalog) LibraryPosters(ctx context.Context, typ core.MediaType, limit 
 	return out, rows.Err()
 }
 
+// policyKeyFilter drops the viewer from a cache key when the viewer browses
+// under the owner's rules: browseWhere reads the viewer only to pick those
+// rules, so every such viewer's identical filter shares one cached page and
+// total. A viewer with rules of their own keeps their id and revision.
+func (c *Catalog) policyKeyFilter(f core.Filter) core.Filter {
+	if f.CatalogViewerID == 0 || filterHasViewerState(f) {
+		return f
+	}
+	c.viewerRules.RLock()
+	v, ok := c.viewerRules.entries[f.CatalogViewerID]
+	c.viewerRules.RUnlock()
+	if ok && v.document.Mode != "inherit" && v.document.Mode != "" {
+		return f
+	}
+	f.CatalogViewerID, f.CatalogRuleRevision = 0, 0
+	return f
+}
+
 // browseFilterKey distinguishes a nil IncludeKeys (no restriction) from an
 // empty list (match nothing). fmt %+v prints both as [].
 func browseFilterKey(f core.Filter) string {
+	f.MovieFilter, f.EpisodeFilter = nil, nil
+	f = normalizeGateCacheFilter(f)
 	group := f.Group
 	f.Group = nil
 	childVisibility := f.ChildVisibility
 	f.ChildVisibility = nil
-	key := fmt.Sprintf("%+v", f)
+	// A large exclusion set (step aside holds tens of thousands of titles)
+	// keys by digest: formatting every key on each request would cost more
+	// than the page it caches.
+	excluded := ""
+	if len(f.ExcludeKeys) > inlineKeyLimit {
+		excluded = "|excluded:" + keySetDigest(f.ExcludeKeys)
+		f.ExcludeKeys = nil
+	}
+	key := fmt.Sprintf("%+v", f) + excluded
 	if childVisibility != nil {
 		key += "|child:" + browseFilterKey(*childVisibility)
 	}
@@ -397,7 +529,7 @@ func browseFilterKey(f core.Filter) string {
 			return ""
 		}
 		if groupHasOwnState(g) {
-			return fmt.Sprintf("state:%d:%v:%v:%d:%d:%v:%s:%s:%d", g.UserID, boolValue(g.Unwatched), boolValue(g.InProgress), g.LastViewedAfter, g.LastViewedBefore, g.ParentOnly, g.StateField, g.StateOperator, g.StateValue) + fmt.Sprintf("|watchlist:%s", boolValue(g.OnWatchlist))
+			return fmt.Sprintf("state:%d:%v:%v:%v:%v:%v:%v:%d:%d:%v:%s:%s:%d", g.UserID, boolValue(g.Watched), boolValue(g.Unwatched), boolValue(g.InProgress), boolValue(g.History), boolValue(g.Favorite), boolValue(g.Watchlist), g.LastViewedAfter, g.LastViewedBefore, g.ParentOnly, g.StateField, g.StateOperator, g.StateValue) + fmt.Sprintf("|watchlist:%s", boolValue(g.OnWatchlist))
 		}
 		if g.Filter != nil {
 			return fmt.Sprintf("leaf:%v(", g.ParentOnly) + browseFilterKey(*g.Filter) + ")"
@@ -426,7 +558,16 @@ func boolValue(v *bool) string {
 }
 
 func groupHasOwnState(g *core.FilterGroup) bool {
-	return g.OnWatchlist != nil || g.StateField != "" || g.Unwatched != nil || g.InProgress != nil || g.LastViewedAfter != 0 || g.LastViewedBefore != 0
+	return g.OnWatchlist != nil || g.Watchlist != nil || g.Favorite != nil || g.StateField != "" ||
+		g.Watched != nil || g.Unwatched != nil || g.InProgress != nil || g.History != nil ||
+		g.LastViewedAfter != 0 || g.LastViewedBefore != 0
+}
+
+func filterHasViewerState(f core.Filter) bool {
+	return groupHasState(f.Group) ||
+		libraryfilter.RulesHaveViewerState(f.TabRules) ||
+		libraryfilter.RulesHaveViewerState(f.ExtraRules) ||
+		libraryfilter.RulesHaveViewerState(f.PreviewRules)
 }
 
 func groupHasState(g *core.FilterGroup) bool {
@@ -459,13 +600,105 @@ func flagInt(b bool) int {
 	return 0
 }
 
+// TitleInFilter reports whether the title key is a member of the saved
+// filter f (a filter library's predicate), using the same indexed SQL the
+// library browse runs: one indexed read of catalog_titles by key, never a
+// walk. The saved filter is used verbatim (type, genres, keywords, year,
+// tags and any advanced group), with the runtime fields browse injects
+// (viewer, date windows, rule preview, availability keys) left zero so
+// membership is a property of the saved filter alone, not of who is asking.
+func (c *Catalog) TitleInFilter(ctx context.Context, f core.Filter, key core.RatingKey) (bool, error) {
+	members, err := c.TitlesInFilter(ctx, f, []core.RatingKey{key})
+	return members[key], err
+}
+
+// TitlesInFilter is TitleInFilter for a batch of keys: one indexed query per
+// chunk over the same membership SQL, never a per-title round trip or a walk
+// of the library. The result holds exactly the keys that are members.
+func (c *Catalog) TitlesInFilter(ctx context.Context, f core.Filter, keys []core.RatingKey) (map[core.RatingKey]bool, error) {
+	out := make(map[core.RatingKey]bool, len(keys))
+	for start := 0; start < len(keys); start += 400 {
+		if err := c.titlesInFilterChunk(ctx, f, keys[start:min(start+400, len(keys))], out); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+func (c *Catalog) titlesInFilterChunk(ctx context.Context, f core.Filter, keys []core.RatingKey, out map[core.RatingKey]bool) error {
+	f.LocalOnly = true
+	// Membership protects direct lookup and playback. Discovery-only hides
+	// affect browse pages, never whether a title belongs to an allowed source.
+	if len(f.ExtraRules) > 0 {
+		rules := make([]core.LibraryExclusion, 0, len(f.ExtraRules))
+		for _, rule := range f.ExtraRules {
+			if rule.Scope != core.VisibilityDiscovery {
+				rules = append(rules, rule)
+			}
+		}
+		f.ExtraRules = rules
+	}
+	if len(f.TabRules) > 0 {
+		rules := make([]core.LibraryExclusion, 0, len(f.TabRules))
+		for _, rule := range f.TabRules {
+			if rule.Scope != core.VisibilityDiscovery {
+				rules = append(rules, rule)
+			}
+		}
+		f.TabRules = rules
+	}
+	f.IncludeKeys = keys
+	f.ExcludeKeys = nil
+	if !libraryfilter.RulesHaveViewerState(f.TabRules) && !libraryfilter.RulesHaveViewerState(f.ExtraRules) {
+		f.CatalogViewerID = 0
+	}
+	f.RuleVisibility = ""
+	f.PreviewRules = nil
+	f.PreviewFallback = ""
+	f.ApplyCanonicalInPreview = false
+	f.CatalogCandidates = false
+	f.HiddenMovieSeq, f.HiddenShowSeq, f.HiddenEpisodeSeq = 0, 0, 0
+	f.AvailabilityKeepKeys = nil
+	f.UpdatedAfter, f.UpdatedBefore, f.AddedAfter, f.AddedBefore = 0, 0, 0, 0
+	f.DigitalDiscovery = false
+	f.DigitalDateEvidence = false
+	where, args, err := c.browseWhereMode(f, true)
+	if err != nil {
+		return err
+	}
+	rows, err := c.db.QueryContext(ctx, `SELECT t.key FROM catalog_titles AS t WHERE `+where, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var k core.RatingKey
+		if err := rows.Scan(&k); err != nil {
+			return err
+		}
+		out[k] = true
+	}
+	return rows.Err()
+}
+
 func (c *Catalog) browseWhere(f core.Filter) (string, []any, error) {
+	return c.browseWhereMode(f, false)
+}
+
+// Membership evaluates saved predicates independently of presentation/release gates.
+func (c *Catalog) browseWhereMode(f core.Filter, membershipOnly bool) (string, []any, error) {
+	f.MovieFilter, f.EpisodeFilter = nil, nil
 	// Positive metadata flags retain their source meaning; absence is unknown.
 	if f.Anime {
 		f.Keywords = append(append([]string{}, f.Keywords...), "anime")
 	}
 	var conds []string
 	var args []any
+	if f.Topic != "" {
+		match, topicArgs := c.topicMatch(f.Topic)
+		conds = append(conds, match)
+		args = append(args, topicArgs...)
+	}
 	for _, tag := range f.Tags {
 		conds = append(conds, "t.key IN (SELECT key FROM catalog_owner_tags WHERE tag=?)")
 		args = append(args, strings.ToLower(strings.TrimSpace(tag)))
@@ -483,36 +716,45 @@ func (c *Catalog) browseWhere(f core.Filter) (string, []any, error) {
 		conds = append(conds, "EXISTS (SELECT 1 FROM catalog_genres kg WHERE kg.key=t.key AND kg.genre='Kids')")
 	}
 	nowTS := c.now().Unix()
-	if cfg := c.config(); cfg.ShowUpcomingMovies && f.RuleVisibility == "" {
-		conds = append(conds, "(t.browsable=1 OR (t.type='movie' AND t.release_known=1 AND t.released_ts>? AND ((?<=0 AND ?<=0) OR (?>0 AND t.popularity>=?) OR (?>0 AND t.vote_count>=?))))", "t.adult=0")
-		args = append(args, nowTS, cfg.MinPopularity, cfg.MinVotes, cfg.MinPopularity, cfg.MinPopularity, cfg.MinVotes, cfg.MinVotes)
-	} else {
-		conds = append(conds, "t.browsable=1", "t.adult=0")
+	if !membershipOnly {
+		if cfg := c.config(); cfg.ShowUpcomingMovies && f.RuleVisibility == "" {
+			conds = append(conds, "(t.browsable=1 OR (t.type='movie' AND t.release_known=1 AND t.released_ts>? AND ((?<=0 AND ?<=0) OR (?>0 AND t.popularity>=?) OR (?>0 AND t.vote_count>=?))))", "t.adult=0")
+			args = append(args, nowTS, cfg.MinPopularity, cfg.MinVotes, cfg.MinPopularity, cfg.MinPopularity, cfg.MinVotes, cfg.MinVotes)
+		} else {
+			conds = append(conds, "t.browsable=1", "t.adult=0")
+		}
+		// queryTitles keeps released titles, plus explicitly enabled upcoming
+		// movies. Apply that same guard before counting and paging.
+		// The Postgres driver binds Go bools as 0/1 for the BIGINT flag
+		// columns; a bare `AND ?` would make Postgres infer boolean and reject
+		// the int. Compare the flag numerically with an int argument instead.
+		conds = append(conds, "t.release_known=1 AND (t.released_ts<=? OR (t.type='movie' AND ?<>0))")
+		args = append(args, nowTS, flagInt(c.config().ShowUpcomingMovies))
+		if gc, ga := browseGateConds(f, nowTS); len(gc) > 0 {
+			conds = append(conds, gc...)
+			args = append(args, ga...)
+		}
 	}
-	// queryTitles keeps released titles, plus explicitly enabled upcoming
-	// movies. Apply that same guard before counting and paging.
-	// The Postgres driver binds Go bools as 0/1 for the BIGINT flag
-	// columns; a bare `AND ?` would make Postgres infer boolean and reject
-	// the int. Compare the flag numerically with an int argument instead.
-	conds = append(conds, "t.release_known=1 AND (t.released_ts<=? OR (t.type='movie' AND ?<>0))")
-	args = append(args, nowTS, flagInt(c.config().ShowUpcomingMovies))
-	for _, hidden := range []struct{ kind, generation string }{
-		{"movie", f.HiddenMovieGeneration}, {"show", f.HiddenShowGeneration},
+	for _, hidden := range []struct {
+		kind string
+		seq  int64
+	}{
+		{"movie", f.HiddenMovieSeq}, {"show", f.HiddenShowSeq},
 	} {
-		if hidden.generation != "" {
-			conds = append(conds, "NOT EXISTS (SELECT 1 FROM availability_hidden ah WHERE ah.kind=? AND ah.generation=? AND ah.rating_key=t.key)")
-			args = append(args, hidden.kind, hidden.generation)
+		if hidden.seq != 0 {
+			conds = append(conds, "NOT EXISTS (SELECT 1 FROM availability_hidden ah WHERE ah.kind=? AND ah.from_seq<=? AND ah.to_seq>? AND ah.rating_key=t.key)")
+			args = append(args, hidden.kind, hidden.seq, hidden.seq)
 		}
 	}
 	// Facets query children directly rather than through storedEpisodesWhere.
 	// They inherit their show's decision and episodes apply their own too.
-	if (f.Type == core.TypeEpisode || f.Type == core.TypeSeason) && f.HiddenShowGeneration != "" {
-		conds = append(conds, "NOT EXISTS (SELECT 1 FROM availability_hidden ah WHERE ah.kind='show' AND ah.generation=? AND ah.rating_key=t.show_key)")
-		args = append(args, f.HiddenShowGeneration)
+	if (f.Type == core.TypeEpisode || f.Type == core.TypeSeason) && f.HiddenShowSeq != 0 {
+		conds = append(conds, "NOT EXISTS (SELECT 1 FROM availability_hidden ah WHERE ah.kind='show' AND ah.from_seq<=? AND ah.to_seq>? AND ah.rating_key=t.show_key)")
+		args = append(args, f.HiddenShowSeq, f.HiddenShowSeq)
 	}
-	if f.Type == core.TypeEpisode && f.HiddenEpisodeGeneration != "" {
-		clause := "NOT EXISTS (SELECT 1 FROM availability_hidden ah WHERE ah.kind='episode' AND ah.generation=? AND ah.rating_key=t.key)"
-		args = append(args, f.HiddenEpisodeGeneration)
+	if f.Type == core.TypeEpisode && f.HiddenEpisodeSeq != 0 {
+		clause := "NOT EXISTS (SELECT 1 FROM availability_hidden ah WHERE ah.kind='episode' AND ah.from_seq<=? AND ah.to_seq>? AND ah.rating_key=t.key)"
+		args = append(args, f.HiddenEpisodeSeq, f.HiddenEpisodeSeq)
 		if len(f.AvailabilityKeepKeys) > 0 {
 			clause = "(" + clause + " OR t.key IN (" + placeholders(len(f.AvailabilityKeepKeys)) + "))"
 			for _, key := range f.AvailabilityKeepKeys {
@@ -531,39 +773,79 @@ func (c *Catalog) browseWhere(f core.Filter) (string, []any, error) {
 		args = append(args, nowTS)
 	}
 	if f.RuleVisibility != "" {
-		policy, err := libraryfilter.CompilePolicy(f.PreviewRules, f.PreviewFallback)
+		if f.ApplyCanonicalInPreview {
+			if policy := c.viewerFilter(f.CatalogViewerID, false); policy != nil {
+				clause, a := c.policySQLHidden(f.CatalogViewerID, policy)
+				conds = append(conds, clause)
+				args = append(args, a...)
+			}
+		}
+		if f.RuleVisibility != "all" {
+			policy, err := c.compileLibraryRulesModeForViewer(f.PreviewRules, f.PreviewFallback, false, f.CatalogViewerID)
+			if err != nil {
+				return "", nil, err
+			}
+			clause, values := policy.SQLHidden()
+			if f.RuleVisibility == "shown" {
+				clause = "NOT (" + clause + ")"
+			}
+			conds = append(conds, "("+clause+")")
+			args = append(args, values...)
+		}
+	} else if !membershipOnly && !f.CatalogCandidates {
+		if policy := c.viewerFilter(f.CatalogViewerID, false); policy != nil {
+			clause, a := c.policySQLHidden(f.CatalogViewerID, policy)
+			conds = append(conds, clause)
+			args = append(args, a...)
+			// A strict viewer's rules fail closed on rows without details whose
+			// fields they cannot judge, as FilterVisibility and safety do.
+			if !policy.Passive() && c.strictViewer(f.CatalogViewerID, f.MaxContentRating != "") {
+				if u := policy.SQLUndecidable(); u != "0=1" {
+					conds = append(conds, "NOT (t.detail=0 AND "+u+")")
+				}
+			}
+		}
+	}
+	if len(f.ExtraRules) > 0 || f.ExtraFallback != "" {
+		extra, err := c.compileLibraryRulesModeForViewer(f.ExtraRules, f.ExtraFallback, membershipOnly, f.CatalogViewerID)
 		if err != nil {
 			return "", nil, err
 		}
-		clause, values := policy.SQLHidden()
-		if f.RuleVisibility == "shown" {
-			clause = "NOT (" + clause + ")"
+		if !extra.Passive() {
+			clause, values := extra.SQLShown()
+			conds = append(conds, "("+clause+")")
+			args = append(args, values...)
 		}
-		conds = append(conds, "("+clause+")")
-		args = append(args, values...)
-	} else if policy := c.viewerFilter(f.CatalogViewerID, false); !f.CatalogCandidates && policy != nil {
-		q, a := policy.SQLHidden()
-		conds = append(conds, "NOT ("+q+")")
-		args = append(args, a...)
+	}
+	if len(f.TabRules) > 0 || f.TabFallback != "" {
+		tabPolicy, err := c.compileLibraryRulesModeForViewer(f.TabRules, f.TabFallback, membershipOnly, f.CatalogViewerID)
+		if err != nil {
+			return "", nil, err
+		}
+		if !tabPolicy.Passive() {
+			clause, values := tabPolicy.SQLShown()
+			conds = append(conds, "("+clause+")")
+			args = append(args, values...)
+		}
 	}
 	// Rule browsing gates like everything else: its totals must match the
 	// titles queryTitles hands back, which never include ungated movies.
-	if c.config().ReleaseMode == config.ModeDigital && !(f.DigitalDiscovery && f.HiddenMovieGeneration != "") {
+	if cfg := c.config(); !membershipOnly && cfg.ReleaseMode == config.ModeDigital && !(f.DigitalDiscovery && f.HiddenMovieSeq != 0) {
 		gateSQL := homeReleaseSQL("t")
-		if c.config().ShowUpcomingMovies {
+		if cfg.ShowUpcomingMovies {
 			gateSQL = "(t.type='movie' AND t.release_known=1 AND t.released_ts>? OR (" + gateSQL + "))"
 			args = append(args, nowTS)
 		}
 		conds = append(conds, gateSQL)
-		args = append(args, homeReleaseCutoff(c.now()), nowTS)
+		args = append(args, homeReleaseCutoff(c.now()), homeReleaseDeadline(c.now(), cfg.HomeReleaseOffsetDays))
 	}
-	if f.DigitalDiscovery && f.HiddenMovieGeneration == "" {
+	if f.DigitalDiscovery && f.HiddenMovieSeq == 0 {
 		// FilterDiscovery admits digital-mode movies only when a passed
 		// home date is known. Local and explicitly upcoming movies bypass
 		// that evidence window, as they do in the availability service.
 		digital := "1=0"
 		if f.DigitalDateEvidence {
-			digital = "EXISTS (SELECT 1 FROM catalog_home_release dh WHERE dh.key=t.key AND dh.checked=1 AND dh.earliest_ts>0 AND dh.earliest_ts<=?)"
+			digital = "EXISTS (SELECT 1 FROM catalog_home_release dh WHERE dh.key=t.key AND dh.checked=1 AND dh.earliest_ts<>0 AND dh.earliest_ts<=?)"
 		}
 		if len(f.AvailabilityKeepKeys) > 0 {
 			digital += " OR t.key IN (" + placeholders(len(f.AvailabilityKeepKeys)) + ")"
@@ -571,11 +853,35 @@ func (c *Catalog) browseWhere(f core.Filter) (string, []any, error) {
 		conds = append(conds, "(t.type<>'movie' OR (t.key>=? AND t.key<?) OR (t.release_known=1 AND t.released_ts>? AND ?<>0) OR ("+digital+"))")
 		args = append(args, int64(core.LocalKey(0)), int64(core.LocalKey(0))+1000000000000000, nowTS, flagInt(c.config().ShowUpcomingMovies))
 		if f.DigitalDateEvidence {
-			args = append(args, nowTS)
+			args = append(args, homeReleaseDeadline(c.now(), f.HomeReleaseOffsetDays))
 		}
 		for _, key := range f.AvailabilityKeepKeys {
 			args = append(args, key)
 		}
+	}
+	if len(f.CatalogueSources) > 0 {
+		all := false
+		for _, id := range f.CatalogueSources {
+			if id == "tmdb-movies" || id == "tmdb-tv" {
+				all = true
+			}
+		}
+		if !all {
+			marks := make([]string, len(f.CatalogueSources))
+			for i, id := range f.CatalogueSources {
+				marks[i] = "?"
+				args = append(args, id)
+			}
+			conds = append(conds, "t.key IN (SELECT lcm.key FROM libraries_catalogue_members lcm WHERE lcm.source_id IN ("+strings.Join(marks, ",")+"))")
+		}
+	}
+	if f.CollectionMembers != 0 {
+		// A collection library is a semi-join on the collection's
+		// materialised members, never a list of keys in memory. Only a
+		// shared member is shown to everyone; per-viewer rules are the
+		// collection engine's business, not this page's.
+		conds = append(conds, "EXISTS (SELECT 1 FROM collections_members cm WHERE cm.spec_id=? AND cm.key=t.key AND cm.shared=1)")
+		args = append(args, f.CollectionMembers)
 	}
 	if f.IncludeKeys != nil {
 		if len(f.IncludeKeys) == 0 {
@@ -588,10 +894,9 @@ func (c *Catalog) browseWhere(f core.Filter) (string, []any, error) {
 		}
 	}
 	if len(f.ExcludeKeys) > 0 {
-		conds = append(conds, "t.key NOT IN ("+placeholders(len(f.ExcludeKeys))+")")
-		for _, k := range f.ExcludeKeys {
-			args = append(args, k)
-		}
+		cond, a := c.keyMembership("t.key", true, f.ExcludeKeys)
+		conds = append(conds, cond)
+		args = append(args, a...)
 	}
 	switch f.Type {
 	case core.TypeMovie, core.TypeShow:
@@ -610,12 +915,16 @@ func (c *Catalog) browseWhere(f core.Filter) (string, []any, error) {
 		conds = append(conds, "t.fetched_at<=? AND t.fetched_at>0")
 		args = append(args, f.UpdatedBefore)
 	}
+	// The series date predicates below sit inside an OR. LIMIT 1 OFFSET 0
+	// keeps each EXISTS a per-row probe on PostgreSQL, which otherwise
+	// hashes it: reads every aired episode of the catalogue per request.
+	// SQLite probes by key either way and needs the LIMIT for the OFFSET.
 	if f.AddedAfter != 0 {
 		if f.Type == core.TypeMovie {
 			conds = append(conds, "t.released_ts>=?")
 			args = append(args, f.AddedAfter)
 		} else {
-			conds = append(conds, `(t.released_ts>=? OR (t.type='show' AND EXISTS (SELECT 1 FROM catalog_titles ae WHERE ae.show_key=t.key AND ae.type='episode' AND ae.release_known=1 AND ae.adult=0 AND ae.released_ts>=? AND ae.released_ts<=?)))`)
+			conds = append(conds, `(t.released_ts>=? OR (t.type='show' AND EXISTS (SELECT 1 FROM catalog_titles ae WHERE ae.show_key=t.key AND ae.type='episode' AND ae.release_known=1 AND ae.adult=0 AND ae.released_ts>=? AND ae.released_ts<=? LIMIT 1 OFFSET 0)))`)
 			args = append(args, f.AddedAfter, f.AddedAfter, nowTS)
 		}
 	}
@@ -624,12 +933,12 @@ func (c *Catalog) browseWhere(f core.Filter) (string, []any, error) {
 			conds = append(conds, "t.released_ts<=?")
 			args = append(args, f.AddedBefore)
 		} else {
-			conds = append(conds, `(t.released_ts<=? AND (t.type<>'show' OR NOT EXISTS (SELECT 1 FROM catalog_titles ae WHERE ae.show_key=t.key AND ae.type='episode' AND ae.release_known=1 AND ae.adult=0 AND ae.released_ts>? AND ae.released_ts<=?)))`)
+			conds = append(conds, `(t.released_ts<=? AND (t.type<>'show' OR NOT EXISTS (SELECT 1 FROM catalog_titles ae WHERE ae.show_key=t.key AND ae.type='episode' AND ae.release_known=1 AND ae.adult=0 AND ae.released_ts>? AND ae.released_ts<=? LIMIT 1 OFFSET 0)))`)
 			args = append(args, f.AddedBefore, f.AddedBefore, nowTS)
 		}
 	}
 	if len(f.Genres) > 0 {
-		conds = append(conds, `EXISTS (SELECT 1 FROM catalog_genres g WHERE g.key=t.key AND g.genre IN (`+placeholders(len(f.Genres))+`))`)
+		conds = append(conds, genreExistsSQL(len(f.Genres)))
 		for _, g := range f.Genres {
 			args = append(args, g)
 		}
@@ -658,11 +967,17 @@ func (c *Catalog) browseWhere(f core.Filter) (string, []any, error) {
 			args = append(args, strings.ToLower(strings.TrimSpace(k)))
 		}
 	}
-	if f.YearFrom > 0 {
+	if f.YearFrom > 0 && f.YearFrom == f.YearTo {
+		// One year is an equality, so a title-sorted page walks the
+		// (year, sort_title) index in order: as a range, the planner reads
+		// every title of the year and sorts them.
+		conds = append(conds, "t.year=?")
+		args = append(args, f.YearFrom)
+	} else if f.YearFrom > 0 {
 		conds = append(conds, "t.year>=?")
 		args = append(args, f.YearFrom)
 	}
-	if f.YearTo > 0 {
+	if f.YearTo > 0 && f.YearTo != f.YearFrom {
 		conds = append(conds, "t.year<=? AND t.year>0")
 		args = append(args, f.YearTo)
 	}
@@ -712,7 +1027,11 @@ func (c *Catalog) browseWhere(f core.Filter) (string, []any, error) {
 		args = append(args, f.MinRating)
 	}
 	if f.MaxRating > 0 {
-		conds = append(conds, "t.rating>0 AND t.rating<=?")
+		if f.MaxRatingExclusive {
+			conds = append(conds, "t.rating>0 AND t.rating<?")
+		} else {
+			conds = append(conds, "t.rating>0 AND t.rating<=?")
+		}
 		args = append(args, f.MaxRating)
 	}
 	if len(f.ExcludeRatings) > 0 {
@@ -753,20 +1072,25 @@ func (c *Catalog) browseWhere(f core.Filter) (string, []any, error) {
 			args = append(args, v)
 		}
 	}
+	if len(f.ContentRatings) > 0 || len(f.ExcludeContentRatings) > 0 {
+		conds = append(conds, sqlBlockUncertifiedAdult("t"))
+	}
 	if len(f.ContentRatings) > 0 {
-		conds = append(conds, "t.content_rating IN ("+placeholders(len(f.ContentRatings))+")")
-		for _, v := range f.ContentRatings {
-			args = append(args, v)
-		}
+		sql, vals := sqlMatchRatings("LOWER(TRIM(t.content_rating))", "t.content_rating_rank", f.ContentRatings)
+		conds = append(conds, sql)
+		args = append(args, vals...)
 	}
 	if len(f.ExcludeContentRatings) > 0 {
 		conds = append(conds, "t.content_rating NOT IN ("+placeholders(len(f.ExcludeContentRatings))+")")
 		for _, v := range f.ExcludeContentRatings {
 			args = append(args, v)
 		}
+		sql, vals := sqlMatchRatings("LOWER(TRIM(t.content_rating))", "t.content_rating_rank", f.ExcludeContentRatings)
+		conds = append(conds, "NOT "+sql)
+		args = append(args, vals...)
 	}
 	if f.MaxContentRating != "" {
-		if level := contentrating.LevelOf(f.MaxContentRating); level != contentrating.Unrated {
+		if level := contentrating.EnforceLevelOf(f.MaxContentRating); level != contentrating.Unrated {
 			conds = append(conds, "t.content_rating_rank>0 AND t.content_rating_rank<=?")
 			args = append(args, int(level))
 			if f.SaferPlexRating && c.saferRating != nil {
@@ -778,7 +1102,7 @@ func (c *Catalog) browseWhere(f core.Filter) (string, []any, error) {
 		}
 	}
 	if f.MinContentRating != "" {
-		if level := contentrating.LevelOf(f.MinContentRating); level != contentrating.Unrated {
+		if level := contentrating.EnforceLevelOf(f.MinContentRating); level != contentrating.Unrated {
 			conds = append(conds, "t.content_rating_rank>0 AND t.content_rating_rank>=?")
 			args = append(args, int(level))
 		} else {
@@ -855,16 +1179,24 @@ func (c *Catalog) browseWhere(f core.Filter) (string, []any, error) {
 		conds = append(conds, "t.key"+op+"(SELECT key FROM catalog_credits WHERE "+predicate+")")
 		args = append(args, creditArgs...)
 	}
+	// Positive studio filters name their studios from the vocabulary
+	// (studio_names.go) and find the titles from catalog_studios' (studio,
+	// key) index, never asking every title for its studios. The count and
+	// the seek drive from the studio index; a title-sorted page probes each
+	// title it walks instead (studioProbe), so a dense studio does not
+	// enumerate its whole matching set per request.
+	byStudio := func(names string, nameArgs []any) {
+		conds = append(conds, studioINListSQL(names))
+		args = append(args, nameArgs...)
+	}
 	if f.Studio != "" && len(f.StudioFilters) == 0 {
-		conds = append(conds, `EXISTS (SELECT 1 FROM catalog_studios bs WHERE bs.key=t.key AND bs.studio=?)`)
-		args = append(args, f.Studio)
+		byStudio(`SELECT ?`, []any{f.Studio})
 	}
 	for _, sf := range f.StudioFilters {
 		val := strings.ToLower(sf.Value)
 		switch sf.Op {
 		case "==":
-			conds = append(conds, `EXISTS (SELECT 1 FROM catalog_studios s WHERE s.key=t.key AND LOWER(s.studio)=?)`)
-			args = append(args, val)
+			byStudio(`SELECT n.studio FROM catalog_studio_names n WHERE n.titles>0 AND LOWER(n.studio)=?`, []any{val})
 		case "!==":
 			conds = append(conds, `NOT EXISTS (SELECT 1 FROM catalog_studios s WHERE s.key=t.key AND LOWER(s.studio)=?)`)
 			args = append(args, val)
@@ -872,28 +1204,16 @@ func (c *Catalog) browseWhere(f core.Filter) (string, []any, error) {
 			conds = append(conds, `NOT EXISTS (SELECT 1 FROM catalog_studios s WHERE s.key=t.key AND LOWER(s.studio) LIKE ? ESCAPE '\')`)
 			args = append(args, "%"+escapeLike(val)+"%")
 		case "<=":
-			conds = append(conds, `EXISTS (SELECT 1 FROM catalog_studios s WHERE s.key=t.key AND LOWER(s.studio) LIKE ? ESCAPE '\')`)
-			args = append(args, escapeLike(val)+"%")
+			byStudio(c.studioNamesLike(escapeLike(val)+"%", val))
 		case ">=":
-			conds = append(conds, `EXISTS (SELECT 1 FROM catalog_studios s WHERE s.key=t.key AND LOWER(s.studio) LIKE ? ESCAPE '\')`)
-			args = append(args, "%"+escapeLike(val))
+			byStudio(c.studioNamesLike("%"+escapeLike(val), val))
 		default: // "="
-			conds = append(conds, `EXISTS (SELECT 1 FROM catalog_studios s WHERE s.key=t.key AND LOWER(s.studio) LIKE ? ESCAPE '\')`)
-			args = append(args, "%"+escapeLike(val)+"%")
+			byStudio(c.studioNamesLike("%"+escapeLike(val)+"%", val))
 		}
 	}
-	if fc := strings.TrimSpace(f.FirstCharacter); fc != "" {
-		switch {
-		case fc == "#" || fc == "0":
-			conds = append(conds, "t.sort_title < 'a'")
-		case fc == "~" || fc == "…":
-			conds = append(conds, "t.sort_title >= '{'")
-		case len(fc) == 1 && ((fc[0] >= 'a' && fc[0] <= 'z') || (fc[0] >= 'A' && fc[0] <= 'Z')):
-			lo := strings.ToLower(fc)
-			hi := string(lo[0] + 1)
-			conds = append(conds, "t.sort_title >= ? AND t.sort_title < ?")
-			args = append(args, lo, hi)
-		}
+	if cond, condArgs := sortNameRangeOf(f).sql("t.sort_title"); cond != "" {
+		conds = append(conds, cond)
+		args = append(args, condArgs...)
 	}
 	if f.Query != "" {
 		match, matchArgs := c.titleMatch("t.", f.Query)
@@ -961,11 +1281,15 @@ func (c *Catalog) browseWhere(f core.Filter) (string, []any, error) {
 			}
 		}
 	}
-	if f.RuleVisibility == "" {
+	if !membershipOnly && f.RuleVisibility == "" {
+		// The unary plus keeps "released by now" (nearly every title) from
+		// steering the plan: without planner statistics SQLite took it as a
+		// selective range on catalog_titles_type_browse_count and sorted the
+		// whole type for every sorted page instead of walking its sort index.
 		if c.config().ShowUpcomingMovies {
-			conds = append(conds, "t.release_known=1 AND (t.type='movie' OR t.released_ts<=?)")
+			conds = append(conds, "t.release_known=1 AND (t.type='movie' OR +t.released_ts<=?)")
 		} else {
-			conds = append(conds, "t.release_known=1 AND t.released_ts<=?")
+			conds = append(conds, "t.release_known=1 AND +t.released_ts<=?")
 		}
 		args = append(args, nowTS)
 	}
@@ -992,13 +1316,20 @@ const staleCountMin = 10000
 // recountEvery spaces the background recounts of one stale total or facet.
 var recountEvery = 30 * time.Second
 
-// countBrowse counts a browse filter's matches and caches the total.
-func (c *Catalog) countBrowse(ctx context.Context, ckey, where string, args []any) (int, error) {
+// countBrowse counts a browse filter's matches and caches the total. Library
+// listings are answered from the maintained tally (browse_tally.go); other
+// filters count their matches.
+func (c *Catalog) countBrowse(ctx context.Context, f core.Filter, ckey, where string, args []any) (int, error) {
 	gen := c.writeGen.Load()
 	minBucket := c.minuteBucket()
-	var total int
-	if err := c.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM catalog_titles t WHERE `+where, args...).Scan(&total); err != nil {
+	total, ok, err := c.tallyTotal(ctx, f, where, args)
+	if err != nil {
 		return 0, err
+	}
+	if !ok {
+		if err := c.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM catalog_titles t`+c.topicIndexHint(f)+` WHERE `+where, args...).Scan(&total); err != nil {
+			return 0, err
+		}
 	}
 	// Stamped with the generation it started at, so a write during the
 	// count makes the next read recount; storing it even then keeps a busy
@@ -1025,7 +1356,7 @@ func (c *Catalog) FacetFilter(ctx context.Context, f core.Filter, facet string) 
 	}
 	gen := c.writeGen.Load()
 	minBucket := c.minuteBucket()
-	fkey := fmt.Sprintf("%+v|%s", f, facet) + c.consoleGateKey(f)
+	fkey := fmt.Sprintf("%+v|%s", digestExcluded(normalizeGateCacheFilter(f)), facet) + excludedKey(f) + c.consoleGateKey(f)
 	c.cacheMu.RLock()
 	ent, cached := c.facetCache[fkey]
 	c.cacheMu.RUnlock()
@@ -1037,6 +1368,22 @@ func (c *Catalog) FacetFilter(ctx context.Context, f core.Filter, facet string) 
 		// served stale while a recount runs; but a catalogue writing
 		// continuously would recount them on every read.
 		return append([]core.FacetValue(nil), ent.vals...), nil
+	}
+	if !cached && facet != "firstCharacter" {
+		// Availability generations and session keep-keys move with the
+		// catalogue's evidence, and each new value was a new key that
+		// counted the whole browse set on the request. The same filter's
+		// counts under the previous generation stand in while it recounts.
+		c.cacheMu.RLock()
+		ent, cached = c.facetCache[facetFamilyKey(f, facet)+c.consoleGateKey(f)]
+		c.cacheMu.RUnlock()
+		if cached {
+			_ = c.hydrate(ctx, "facet:"+fkey, 0, func(ctx context.Context) error {
+				_, err := c.countFacet(ctx, f, facet)
+				return err
+			})
+			return append([]core.FacetValue(nil), ent.vals...), nil
+		}
 	}
 	if cached && facet != "firstCharacter" {
 		// Library-wide counts walk every title. Serve the last counts and
@@ -1052,22 +1399,22 @@ func (c *Catalog) FacetFilter(ctx context.Context, f core.Filter, facet string) 
 	return c.countFacet(ctx, f, facet)
 }
 
+// facetFamilyKey is a facet's cache key without the fields that move with
+// availability evidence rather than with the filter: hidden-set
+// generations and the viewer's playing titles.
+func facetFamilyKey(f core.Filter, facet string) string {
+	clearGateFields(&f)
+	f.HiddenMovieSeq, f.HiddenShowSeq, f.HiddenEpisodeSeq = 0, 0, 0
+	f.AvailabilityKeepKeys = nil
+	return "family|" + fmt.Sprintf("%+v|%s", digestExcluded(f), facet) + excludedKey(f)
+}
+
 // jumpBarRecountEvery is the most a jump bar's counts lag the catalogue.
 const jumpBarRecountEvery = 2 * time.Second
 
-// countFacet computes a facet's value counts over the browsable set and
-// caches them.
-func (c *Catalog) countFacet(ctx context.Context, f core.Filter, facet string) ([]core.FacetValue, error) {
-	if facet == "firstCharacter" {
-		f.FirstCharacter = ""
-	}
-	gen := c.writeGen.Load()
-	minBucket := c.minuteBucket()
-	fkey := fmt.Sprintf("%+v|%s", f, facet)
-	base, args, err := c.browseWhere(f)
-	if err != nil {
-		return nil, err
-	}
+// facetCountSQL counts a facet's values directly over the titles base
+// admits.
+func (c *Catalog) facetCountSQL(facet, base string) (string, error) {
 	var q string
 	switch facet {
 	case "tag":
@@ -1075,11 +1422,16 @@ func (c *Catalog) countFacet(ctx context.Context, f core.Filter, facet string) (
 	case "language":
 		q = `SELECT t.language,COUNT(*) FROM catalog_titles t WHERE ` + base + ` AND t.language<>'' GROUP BY t.language ORDER BY COUNT(*) DESC,t.language ASC LIMIT 200`
 	case "genre":
-		q = `SELECT g.genre, COUNT(*) FROM catalog_genres g JOIN catalog_titles t ON t.key=g.key WHERE ` + base + ` GROUP BY g.genre ORDER BY COUNT(*) DESC, g.genre ASC`
+		q = `SELECT g.genre, COUNT(*) FROM catalog_genres g JOIN catalog_titles t ON t.key=g.key WHERE ` + base + ` AND g.genre<>'' GROUP BY g.genre ORDER BY COUNT(*) DESC, g.genre ASC`
 	case "studio":
-		q = `SELECT s.studio, COUNT(*) FROM catalog_studios s JOIN catalog_titles t ON t.key=s.key WHERE ` + base + ` GROUP BY s.studio ORDER BY COUNT(*) DESC, s.studio ASC LIMIT 200`
+		q = `SELECT s.studio, COUNT(*) FROM catalog_studios s JOIN catalog_titles t ON t.key=s.key WHERE ` + base + ` AND s.studio<>'' GROUP BY s.studio ORDER BY COUNT(*) DESC, s.studio ASC LIMIT 200`
 	case "country":
-		q = `SELECT co.country, COUNT(*) FROM catalog_countries co JOIN catalog_titles t ON t.key=co.key WHERE ` + base + ` GROUP BY co.country ORDER BY COUNT(*) DESC, co.country ASC LIMIT 200`
+		q = `SELECT co.country, COUNT(*) FROM catalog_countries co JOIN catalog_titles t ON t.key=co.key WHERE ` + base + ` AND co.country<>'' GROUP BY co.country ORDER BY COUNT(*) DESC, co.country ASC LIMIT 200`
+	case "studioAll":
+		// Every studio, for clients that list and resolve them all.
+		q = `SELECT s.studio, COUNT(*) FROM catalog_studios s JOIN catalog_titles t ON t.key=s.key WHERE ` + base + ` AND s.studio<>'' GROUP BY s.studio ORDER BY s.studio ASC`
+	case "countryAll":
+		q = `SELECT co.country, COUNT(*) FROM catalog_countries co JOIN catalog_titles t ON t.key=co.key WHERE ` + base + ` AND co.country<>'' GROUP BY co.country ORDER BY co.country ASC`
 	case "year":
 		q = `SELECT CAST(t.year AS TEXT), COUNT(*) FROM catalog_titles t WHERE ` + base + ` AND t.year>0 GROUP BY t.year ORDER BY t.year DESC`
 	case "decade":
@@ -1098,18 +1450,68 @@ func (c *Catalog) countFacet(ctx context.Context, f core.Filter, facet string) (
 		}
 		q = `SELECT ` + bucket + `, COUNT(*) FROM catalog_titles t WHERE ` + base + ` GROUP BY 1 ORDER BY 1 ASC`
 	default:
-		return nil, fmt.Errorf("catalog: unknown facet %q", facet)
+		return "", fmt.Errorf("catalog: unknown facet %q", facet)
 	}
-	rows, err := c.db.QueryContext(ctx, q, args...)
+	return q, nil
+}
+
+// countFacet computes a facet's value counts over the browsable set and
+// caches them.
+func (c *Catalog) countFacet(ctx context.Context, f core.Filter, facet string) ([]core.FacetValue, error) {
+	if facet == "firstCharacter" {
+		f.FirstCharacter = ""
+	}
+	gen := c.writeGen.Load()
+	minBucket := c.minuteBucket()
+	fkey := fmt.Sprintf("%+v|%s", digestExcluded(normalizeGateCacheFilter(f)), facet) + excludedKey(f) + c.consoleGateKey(f)
+	base, args, err := c.browseWhere(f)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	// The jump bar and the filter lists from their tallies: a few rows per
+	// value, not every title.
+	tallied, ok, err := c.facetFromTally(ctx, f, facet, base, args)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		tallied = nil
+	}
+	q, err := c.facetCountSQL(facet, base)
+	if err != nil {
+		return nil, err
+	}
 	var out []core.FacetValue
-	for rows.Next() {
-		var v core.FacetValue
-		if err := rows.Scan(&v.Key, &v.Count); err != nil {
+	next := func() (core.FacetValue, bool, error) {
+		if len(tallied) == 0 {
+			return core.FacetValue{}, false, nil
+		}
+		v := tallied[0]
+		tallied = tallied[1:]
+		return v, true, nil
+	}
+	if tallied == nil {
+		rows, err := c.db.QueryContext(ctx, q, args...)
+		if err != nil {
 			return nil, err
+		}
+		defer rows.Close()
+		next = func() (core.FacetValue, bool, error) {
+			var v core.FacetValue
+			if !rows.Next() {
+				return v, false, rows.Err()
+			}
+			err := rows.Scan(&v.Key, &v.Count)
+			return v, err == nil, err
+		}
+	}
+	for {
+		v, ok, err := next()
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			break
 		}
 		v.Title = v.Key
 		switch {
@@ -1123,9 +1525,6 @@ func (c *Catalog) countFacet(ctx context.Context, f core.Filter, facet string) (
 	if out == nil {
 		out = []core.FacetValue{}
 	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
 	// Stamped with the generation it started at, as countBrowse does: a
 	// write during the count makes the next read recount, and storing it
 	// even then keeps a busy catalogue from counting on every read.
@@ -1133,7 +1532,11 @@ func (c *Catalog) countFacet(ctx context.Context, f core.Filter, facet string) (
 	if len(c.facetCache) >= 512 {
 		c.facetCache = map[string]cachedFacet{}
 	}
-	c.facetCache[fkey] = cachedFacet{vals: append([]core.FacetValue(nil), out...), gen: gen, minute: minBucket, counted: time.Now()}
+	entry := cachedFacet{vals: append([]core.FacetValue(nil), out...), gen: gen, minute: minBucket, counted: time.Now()}
+	c.facetCache[fkey] = entry
+	if family := facetFamilyKey(f, facet) + c.consoleGateKey(f); family != fkey {
+		c.facetCache[family] = entry
+	}
 	c.cacheMu.Unlock()
 	return out, nil
 }
@@ -1151,14 +1554,17 @@ type sortedKey struct {
 // query's order (browseOrder, then key), from one indexed page per type.
 // The sort column is numeric: text would merge by the database's collation.
 func (c *Catalog) mergedTypeKeys(ctx context.Context, where string, args []any, q core.BrowseQuery, offset, limit int) ([]core.RatingKey, error) {
+	if keys, ok, err := c.rankMergedKeys(ctx, where, args, q, offset, limit); ok || err != nil {
+		return keys, err
+	}
 	order := browseOrder(q)
 	col, dir, _ := strings.Cut(order, " ")
 	desc := dir == "DESC"
 	var all []sortedKey
 	for _, typ := range []core.MediaType{core.TypeMovie, core.TypeShow} {
-		hint := ""
+		hint := c.topicIndexHint(q.Filter)
 		if q.Filter.LocalOnly && q.Sort == core.SortPopularity && len(q.SecondarySorts) == 0 && store.DialectOf(c.db) != store.Postgres && !consoleHasSparseCandidates(q.Filter) {
-			hint = " INDEXED BY catalog_titles_console_pop_page"
+			hint = c.indexHint("catalog_titles_console_pop_page")
 		}
 		rows, err := c.db.QueryContext(ctx, `SELECT t.key, `+col+` FROM catalog_titles t`+hint+` WHERE `+where+` AND t.type=? ORDER BY `+order+`, t.key ASC LIMIT ?`, append(append([]any{}, args...), string(typ), offset+limit)...)
 		if err != nil {
@@ -1252,4 +1658,148 @@ func (c *Catalog) titlesInKeyOrder(ctx context.Context, keys []core.RatingKey) (
 	}
 	slices.SortFunc(titles, func(a, b core.Title) int { return at[a.Key] - at[b.Key] })
 	return titles, nil
+}
+
+// rankPageQuery is a popularity-ordered page of one type read off the rank
+// (rank.go): a walk of a catalog_rank index, the title rows joined by key,
+// then only the page's rows read in full. The order is rk then key, most
+// popular first, deterministic for paging. Filters that make a rank walk
+// long (people, keywords, collections and the other sparse console
+// candidates) keep the filter-driven plan.
+func (c *Catalog) rankPageQuery(ctx context.Context, q core.BrowseQuery, pageWhere string) (string, bool) {
+	if q.Filter.Type != core.TypeMovie && q.Filter.Type != core.TypeShow {
+		return "", false
+	}
+	keys, dir, ok := c.rankKeysQuery(ctx, q, pageWhere, q.Filter.Type)
+	if !ok {
+		return "", false
+	}
+	return `SELECT ` + prefixedCols("t") + ` FROM catalog_titles t JOIN (` + keys + `) p ON t.key=p.page_key ORDER BY p.page_rk ` + dir + `, p.page_key ASC`, true
+}
+
+// rankKeysQuery selects (page_key, page_rk) of typ's titles matching where,
+// in popularity order, with LIMIT ? OFFSET ? placeholders after where's
+// arguments. dir is the rk direction.
+func (c *Catalog) rankKeysQuery(ctx context.Context, q core.BrowseQuery, where string, typ core.MediaType) (string, string, bool) {
+	if !c.rankReady.Load() || q.SortLastViewed || len(q.SecondarySorts) > 0 {
+		return "", "", false
+	}
+	if q.Sort != core.SortPopularity && q.Sort != "" {
+		return "", "", false
+	}
+	if typ != core.TypeMovie && typ != core.TypeShow {
+		return "", "", false
+	}
+	if consoleHasSparseCandidates(q.Filter) {
+		return "", "", false
+	}
+	// Upcoming movies are listed without being browsable: walk every movie
+	// of the type in rank order (the non-browsable ones of a library are
+	// the few titles viewers touched below the bar).
+	upcoming := c.config().ShowUpcomingMovies && q.Filter.RuleVisibility == ""
+	// The walk is in rank order: a genre is a probe of each title passed.
+	where = c.genreProbe(where, q.Filter)
+	dir := "ASC" // rk is the negated popularity: ascending is most popular first
+	if q.Sort == core.SortPopularity && !q.Desc {
+		dir = "DESC"
+	}
+	// A page after a known title seeks on (rk, key) instead of skipping:
+	// deep pages cost what the first one does.
+	if q.AfterKey > 0 {
+		var rk float64
+		if err := c.db.QueryRowContext(ctx, `SELECT rk FROM catalog_rank WHERE key=?`, int64(q.AfterKey)).Scan(&rk); err != nil {
+			return "", "", false
+		}
+		op := ">"
+		if dir == "DESC" {
+			op = "<"
+		}
+		v := strconv.FormatFloat(rk, 'g', -1, 64)
+		where = "(t.rk" + op + v + " OR (t.rk=" + v + " AND t.key>" + strconv.FormatInt(int64(q.AfterKey), 10) + ")) AND " + where
+		if !rankOnly(where) {
+			return "", "", false
+		}
+	}
+	// Ties keep the catalogue's key order either way, as browseOrder's.
+	// When every column the filter reads is a rank column, the filter runs
+	// on the rank alone (no title row is read until the page's own).
+	if rankOnly(where) && !upcoming {
+		return `SELECT t.key AS page_key, t.rk AS page_rk FROM catalog_rank t WHERE t.type='` + string(typ) + `' AND ` + where +
+			` ORDER BY t.rk ` + dir + `, t.key ASC LIMIT ? OFFSET ?`, dir, true
+	}
+	// CROSS JOIN keeps the rank as SQLite's outer loop; PostgreSQL's
+	// planner chooses from statistics.
+	join := "CROSS JOIN"
+	if store.DialectOf(c.db) == store.Postgres {
+		join = "JOIN"
+	}
+	driver := " AND r.browsable=1"
+	if upcoming {
+		driver = ""
+	}
+	return `SELECT r.key AS page_key, r.rk AS page_rk FROM catalog_rank r ` + join + ` catalog_titles t ON t.key=r.key WHERE r.type='` + string(typ) + `'` + driver + ` AND r.adult=0 AND ` + where +
+		` ORDER BY r.rk ` + dir + `, r.key ASC LIMIT ? OFFSET ?`, dir, true
+}
+
+// rankMergedKeys is a movies-and-series popularity page from each type's
+// rank walk, merged on rk then key.
+func (c *Catalog) rankMergedKeys(ctx context.Context, where string, args []any, q core.BrowseQuery, offset, limit int) ([]core.RatingKey, bool, error) {
+	var all []sortedKey
+	desc := false
+	for _, typ := range []core.MediaType{core.TypeMovie, core.TypeShow} {
+		sqlQ, dir, ok := c.rankKeysQuery(ctx, q, where, typ)
+		if !ok {
+			return nil, false, nil
+		}
+		desc = dir == "DESC"
+		rows, err := c.db.QueryContext(ctx, sqlQ, append(append([]any{}, args...), offset+limit, 0)...)
+		if err != nil {
+			return nil, true, err
+		}
+		for rows.Next() {
+			var key int64
+			var rk float64
+			if err := rows.Scan(&key, &rk); err != nil {
+				rows.Close()
+				return nil, true, err
+			}
+			all = append(all, sortedKey{key: core.RatingKey(key), val: rk})
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return nil, true, err
+		}
+	}
+	slices.SortStableFunc(all, func(a, b sortedKey) int {
+		if c := compareSQL(a.val, b.val); c != 0 {
+			if desc {
+				return -c
+			}
+			return c
+		}
+		return cmp.Compare(a.key, b.key)
+	})
+	if offset >= len(all) {
+		return nil, true, nil
+	}
+	out := make([]core.RatingKey, 0, limit)
+	for _, a := range all[offset:min(offset+limit, len(all))] {
+		out = append(out, a.key)
+	}
+	return out, true, nil
+}
+
+var rankRefs = regexp.MustCompile(`\bt\.([a-z_]+)`)
+
+// rankOnly reports whether where reads only columns the rank carries.
+func rankOnly(where string) bool {
+	for _, m := range rankRefs.FindAllStringSubmatch(where, -1) {
+		switch m[1] {
+		case "key", "type", "browsable", "adult", "release_known", "released_ts", "year", "language", "runtime_sec", "status", "rk":
+		default:
+			return false
+		}
+	}
+	return true
 }

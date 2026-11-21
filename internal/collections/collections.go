@@ -20,6 +20,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"github.com/braedonsaunders/ether/internal/contentrating"
 	"log/slog"
 	"net/http"
 	"slices"
@@ -36,6 +37,7 @@ import (
 	"github.com/braedonsaunders/ether/internal/config"
 	"github.com/braedonsaunders/ether/internal/core"
 	"github.com/braedonsaunders/ether/internal/flight"
+	"github.com/braedonsaunders/ether/internal/httpclient"
 )
 
 var (
@@ -69,17 +71,23 @@ type Service struct {
 	auth     core.Auth
 	chat     Chatter
 	// Ephemeral vibe-search collections (vibe_ephemeral.go).
-	vibeRefiner core.VibeRefiner
-	vibe        *vibeRegistry
-	vibeTTL     time.Duration
-	vibeMax     int
-	scorer      atomic.Pointer[scorerBox]
-	art         *artwork.Renderer
-	images      *artwork.Images
-	catCfg      func() config.Catalog
-	kinds       *KindRegistry
-	traktCfg    func() config.Trakt
-	sealer      config.FieldSealer
+	describeMu     sync.Mutex
+	describeJobs   map[string]*describeJob
+	describeDrafts map[string]*describeDraft
+	describeActive int
+	describeAgent  CollectionDraftAgent
+	vibe           *vibeRegistry
+	vibeTTL        time.Duration
+	vibeMax        int
+	scorer         atomic.Pointer[scorerBox]
+	onBuilt        atomic.Pointer[func()]
+	onRebuilt      atomic.Pointer[func(RebuildEvent)]
+	art            *artwork.Renderer
+	images         *artwork.Images
+	catCfg         func() config.Catalog
+	kinds          *KindRegistry
+	traktCfg       func() config.Trakt
+	sealer         config.FieldSealer
 
 	liveTTL     time.Duration
 	tick        time.Duration
@@ -92,8 +100,9 @@ type Service struct {
 	flights  flight.Group[buildKey, *memberSet]
 	personal map[string]personalEntry
 
-	invalMu sync.Mutex
-	inval   *clusterbus.Invalidator // nil on a standalone server
+	invalMu       sync.Mutex
+	inval         *clusterbus.Invalidator // nil on a standalone server
+	repairedTiers atomic.Bool
 
 	// settings captured from options before New finishes.
 	opts options
@@ -107,7 +116,6 @@ type options struct {
 	userAgent  string
 	indexTTL   time.Duration
 	bases      *ExternalBases
-	noSeed     bool
 }
 
 // Option customises a Service.
@@ -148,8 +156,8 @@ func WithTraktConfig(fn func() config.Trakt) Option { return func(s *Service) { 
 // WithUserAgent identifies Ether to list sites.
 func WithUserAgent(ua string) Option { return func(s *Service) { s.opts.userAgent = ua } }
 
-// New creates the collection engine, migrating v1 smart collections and
-// seeding built-ins and starter collections.
+// New creates the collection engine and seeds the built-in discovery feeds.
+// It creates no owner collections; owners add them from templates.
 func New(db *sql.DB, cat core.Catalog, log *slog.Logger, opts ...Option) (*Service, error) {
 	if db == nil {
 		return nil, fmt.Errorf("collections: nil *sql.DB")
@@ -179,7 +187,7 @@ func New(db *sql.DB, cat core.Catalog, log *slog.Logger, opts ...Option) (*Servi
 	}
 	ua := s.opts.userAgent
 	if ua == "" {
-		ua = "Ether (+https://github.com/braedonsaunders/ether)"
+		ua = httpclient.UserAgent()
 	}
 	s.web = newWebClient(s.opts.httpClient, ua, s.now)
 	s.bases = defaultBases()
@@ -193,8 +201,8 @@ func New(db *sql.DB, cat core.Catalog, log *slog.Logger, opts ...Option) (*Servi
 	if err := s.separateDiscoveryCollections(ctx); err != nil {
 		return nil, err
 	}
-	if err := s.seedLibraryDefaults(ctx); err != nil {
-		return nil, fmt.Errorf("collections: defaults: %w", err)
+	if err := s.adoptLibraryDefaultTemplates(ctx); err != nil {
+		return nil, err
 	}
 	return s, nil
 }
@@ -202,6 +210,52 @@ func New(db *sql.DB, cat core.Catalog, log *slog.Logger, opts ...Option) (*Servi
 // SetScorer installs (or replaces) the personal scorer after construction,
 // for when the personalization engine is built after the collections.
 func (s *Service) SetScorer(sc core.PersonalScorer) { s.scorer.Store(&scorerBox{sc}) }
+
+// RebuildEvent describes a completed collection rebuild.
+type RebuildEvent struct {
+	CollectionID   string
+	CollectionName string
+	SourceKind     string
+	ItemCount      int
+	Added          int
+	Removed        int
+	DurationMS     int64
+}
+
+// WithOnRebuilt registers a non-blocking observer notified when any collection finishes rebuilding.
+func WithOnRebuilt(fn func(RebuildEvent)) Option {
+	return func(s *Service) { s.SetOnRebuilt(fn) }
+}
+
+// SetOnRebuilt installs or clears the rebuild observer after construction.
+func (s *Service) SetOnRebuilt(fn func(RebuildEvent)) {
+	if fn == nil {
+		s.onRebuilt.Store(nil)
+		return
+	}
+	s.onRebuilt.Store(&fn)
+}
+
+// SetOnBuilt registers a callback invoked whenever a collection build changes
+// stored membership, so downstream Home/section row caches invalidate as soon
+// as asynchronous remote-source builds complete.
+func (s *Service) SetOnBuilt(fn func()) {
+	if fn == nil {
+		s.onBuilt.Store(nil)
+		return
+	}
+	s.onBuilt.Store(&fn)
+}
+
+func (s *Service) notifyBuilt() {
+	if fn := s.onBuilt.Load(); fn != nil && *fn != nil {
+		(*fn)()
+		return
+	}
+	if inv, ok := s.personalScorer().(interface{ InvalidateOwnerRows() }); ok {
+		inv.InvalidateOwnerRows()
+	}
+}
 
 // SetState installs watch state for per-user rules (watched, in progress).
 func (s *Service) SetState(st core.State) {
@@ -531,19 +585,76 @@ func (s *Service) buildNow(ctx context.Context, row *specRow) (*memberSet, error
 			resolved = js
 		}
 	}
+	s.mu.Lock()
+	var prevKeys []core.RatingKey
+	if existing := s.members[row.id]; existing != nil {
+		prevKeys = existing.keys
+	}
+	s.mu.Unlock()
+	if prevKeys == nil && !row.lastBuilt.IsZero() {
+		if loaded, _, err := s.loadMembers(ctx, row.id); err == nil {
+			prevKeys = loaded
+		}
+	}
+	addedCount, removedCount := diffCollectionKeys(prevKeys, res.keys)
+	sourceKind := ""
+	if len(row.spec.Sources) > 0 {
+		sourceKind = row.spec.Sources[0].Kind
+	}
+
 	at := s.now().UTC().Truncate(time.Second)
 	if err := s.saveBuild(ctx, row.id, row.rawSpec, resolved, res.keys, res.unshared, res.itemCount(), res.warnings, res.hash, at); err != nil {
 		return nil, err
 	}
+	s.promoteMembers(ctx, res.keys)
+	took := time.Since(started)
 	s.log.Debug("collections: built", "id", row.publicID(), "name", row.spec.Name, "items", res.itemCount(),
-		"warnings", len(res.warnings), "took", time.Since(started).Round(time.Millisecond))
+		"warnings", len(res.warnings), "took", took.Round(time.Millisecond))
 	ms := &memberSet{keys: res.keys, personal: res.personal, personalX: res.personalX, unshared: res.unshared, spec: row.spec,
 		builtAt: at, hash: res.hash, loadedAt: s.now()}
-	if row.buildHash != res.hash {
+	changed := row.buildHash != res.hash
+	if changed {
 		row.changedAt = at
 	}
 	row.lastBuilt, row.buildHash, row.itemCount, row.warnings = at, res.hash, res.itemCount(), res.warnings
+	if changed {
+		s.notifyBuilt()
+	}
+	if fn := s.onRebuilt.Load(); fn != nil && *fn != nil {
+		(*fn)(RebuildEvent{
+			CollectionID:   row.publicID(),
+			CollectionName: row.spec.Name,
+			SourceKind:     sourceKind,
+			ItemCount:      res.itemCount(),
+			Added:          addedCount,
+			Removed:        removedCount,
+			DurationMS:     took.Milliseconds(),
+		})
+	}
 	return ms, nil
+}
+
+func diffCollectionKeys(prev, next []core.RatingKey) (added, removed int) {
+	if len(prev) == 0 {
+		return len(next), 0
+	}
+	prevSet := make(map[core.RatingKey]struct{}, len(prev))
+	for _, k := range prev {
+		prevSet[k] = struct{}{}
+	}
+	nextSet := make(map[core.RatingKey]struct{}, len(next))
+	for _, k := range next {
+		nextSet[k] = struct{}{}
+		if _, ok := prevSet[k]; !ok {
+			added++
+		}
+	}
+	for k := range prevSet {
+		if _, ok := nextSet[k]; !ok {
+			removed++
+		}
+	}
+	return added, removed
 }
 
 func resolvedChanged(a, b core.CollectionSpec) bool {
@@ -574,28 +685,18 @@ func (s *Service) serve(ctx context.Context, row *specRow, user *core.User, wait
 	if err != nil {
 		return nil, err
 	}
-	snap := s.idx.ready()
-	if snap == nil {
-		if !wait {
-			return nil, errNotBuilt
-		}
-		if snap, err = s.idx.get(ctx); err != nil {
-			return nil, err
+	upcoming := row.spec.ReleaseMode == "upcoming" || row.spec.ReleaseMode == "mixed"
+	snap, err := s.snapshotForServe(ctx, ms.keys, upcoming)
+	if err != nil {
+		return nil, err
+	}
+	present := make([]core.RatingKey, 0, len(ms.keys))
+	for _, k := range ms.keys {
+		if snap.entries[k] != nil {
+			present = append(present, k)
 		}
 	}
-	if row.spec.ReleaseMode == "upcoming" || row.spec.ReleaseMode == "mixed" {
-		titles, err := loadCollectionTitles(ctx, s.db, ms.keys)
-		if err != nil {
-			return nil, err
-		}
-		in := newInterner()
-		entries := make([]*entry, 0, len(titles))
-		for _, t := range titles {
-			entries = append(entries, entryFromTitle(t, in))
-		}
-		snap = mergeEntries(snap, entries)
-	}
-	keys := s.filterForUser(ctx, ms.keys, ms.personalRules(), user, snap)
+	keys := s.filterForUser(ctx, present, ms.personalRules(), user, snap)
 	if row.spec.ReleaseMode == "upcoming" || row.spec.ReleaseMode == "mixed" {
 		now := s.now()
 		filtered := make([]core.RatingKey, 0, len(keys))
@@ -721,8 +822,11 @@ func (s *Service) collectionFor(ctx context.Context, row *specRow, user *core.Us
 	if row.spec.MediaType == MediaMixed && t != "" {
 		keys = sectionKeys(keys, t)
 	}
-	c := core.Collection{Key: row.key(), Title: row.spec.Name, Summary: row.spec.Description, Kind: "smart",
+	c := core.Collection{PreviewOnFocus: row.spec.PreviewOnFocus, RankedTop10: row.spec.RankedTop10, Key: row.key(), Title: row.spec.Name, Summary: row.spec.Description, Kind: "smart",
 		OwnerUserID: row.owner, ChildCount: len(keys), Upcoming: row.spec.ReleaseMode == "upcoming" || row.spec.ReleaseMode == "mixed"}
+	if c.RankedTop10 {
+		c.ChildCount = min(c.ChildCount, 10)
+	}
 	if row.spec.MediaType == MediaMixed && t != "" {
 		c.Key = core.SectionCollectionKey(c.Key, t)
 	}
@@ -762,10 +866,29 @@ func (s *Service) collectionFor(ctx context.Context, row *specRow, user *core.Us
 			}
 		}
 	}
+	if (c.PosterPath == "" || c.BackdropPath == "" || c.Type == "") && len(keys) > 0 {
+		if ts, err := s.mirror.TitlesIncludingFuture(ctx, keys[:min(len(keys), 4)]); err == nil {
+			for _, mt := range ts {
+				if c.Type == "" {
+					c.Type = mt.Type
+				}
+				if c.PosterPath == "" && mt.PosterPath != "" {
+					c.PosterPath = mt.PosterPath
+				}
+				if c.BackdropPath == "" && mt.BackdropPath != "" {
+					c.BackdropPath = mt.BackdropPath
+				}
+				if c.PosterPath != "" && c.BackdropPath != "" {
+					break
+				}
+			}
+		}
+	}
 	if c.Type == "" {
 		c.Type = core.TypeMovie
 	}
 	c.UpdatedAt = row.stamp()
+	c.MembershipRevision = row.buildHash
 	return c
 }
 
@@ -870,15 +993,21 @@ func (s *Service) Items(ctx context.Context, user *core.User, key core.RatingKey
 			return core.Page{}, err
 		}
 		keys = sectionKeys(keys, section)
+		upcoming := row.spec.ReleaseMode == "upcoming" || row.spec.ReleaseMode == "mixed"
+		keys, err = s.mirror.ValidKeys(ctx, keys, upcoming)
+		if err != nil {
+			return core.Page{}, err
+		}
 		total := len(keys)
 		if offset >= total {
 			return core.Page{Items: []core.Title{}, Total: total}, nil
 		}
 		var items []core.Title
-		if row.spec.ReleaseMode == "upcoming" || row.spec.ReleaseMode == "mixed" {
-			items, err = loadCollectionTitles(ctx, s.db, keys[offset:pageEnd(offset, limit, total)])
+		pageKeys := keys[offset:pageEnd(offset, limit, total)]
+		if upcoming {
+			items, err = s.mirror.TitlesIncludingFuture(ctx, pageKeys)
 		} else {
-			items, err = loadTitles(ctx, s.db, keys[offset:pageEnd(offset, limit, total)])
+			items, err = s.mirror.Titles(ctx, pageKeys)
 		}
 		if err != nil {
 			return core.Page{}, err
@@ -1023,11 +1152,20 @@ func (s *Service) listFranchises(ctx context.Context, user *core.User) ([]core.C
 		return nil, err
 	}
 	if user != nil && user.MaxContentRating != "" {
-		// Child counts must reflect what this user may watch.
-		for i := range out {
-			if p, err := s.franchiseItems(ctx, user, out[i].Key, 0, 1); err == nil {
-				out[i].ChildCount = p.Total
+		// Child counts must reflect what this user may watch: the
+		// franchises' members in the mirror at or below the cap, counted in
+		// one grouped read (each franchise's titles were read one franchise
+		// at a time, thousands on a full mirror, and from TMDB when it is
+		// configured).
+		level := contentrating.EnforceLevelOf(user.MaxContentRating)
+		counts := map[int64]int{}
+		if level != contentrating.Unrated {
+			if counts, err = s.mirror.FranchiseRatedCounts(ctx, int(level)); err != nil {
+				return nil, err
 			}
+		}
+		for i := range out {
+			out[i].ChildCount = counts[out[i].Key.TMDB()]
 		}
 		kept := out[:0]
 		for _, c := range out {
@@ -1097,7 +1235,8 @@ func filterTitlesByRating(items []core.Title, user *core.User) []core.Title {
 	}
 	out := make([]core.Title, 0, len(items))
 	for _, t := range items {
-		if !ratingExceeds(t.ContentRating, user.MaxContentRating) {
+		enf := contentrating.EffectiveEnforcement(t.EnforcementRating, t.ContentRating, t.Adult, t.Keywords)
+		if !t.Adult && !ratingExceeds(enf, user.MaxContentRating) {
 			out = append(out, t)
 		}
 	}

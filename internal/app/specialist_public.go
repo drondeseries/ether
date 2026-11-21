@@ -33,9 +33,6 @@ func (a *App) runPublicRole(ctx context.Context) error {
 	if a.certs != nil {
 		background.start(func() { a.certs.RunSharedSync(ctx, plextv.DefaultCertSyncInterval) })
 	}
-	if a.cfg.Get().Server.NodeRoles.Has(config.RoleServer) {
-		a.startServerWorkers(ctx, &background)
-	}
 	cfg := a.cfg.Get()
 	if cfg.Plex.SecureConnections == "required" && a.certs != nil {
 		info := a.certs.Info()
@@ -67,6 +64,17 @@ func (a *App) runPublicRole(ctx context.Context) error {
 	}
 	front.gate.Open(a.publicRoleHandler())
 	a.markPublicReady()
+	if a.cfg.Get().Server.NodeRoles.Has(config.RoleServer) {
+		a.startServerWorkers(ctx, &background)
+	}
+
+	if a.cfg.Get().Server.NodeRoles.Has(config.RoleServer) {
+		background.start(func() { a.runRegistrarAsLeader(ctx) })
+		background.start(func() { a.registrar.RunPortMapping(ctx) })
+		if a.registrar != nil {
+			a.registrar.ListenerReady()
+		}
+	}
 	var result error
 	select {
 	case <-ctx.Done():
@@ -100,7 +108,7 @@ func (a *App) publicRoleHandler() http.Handler {
 		return a.handler
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if clusterplayback.IsPublicRepresentation(r) {
+		if clusterplayback.IsPublicRepresentation(r, deliveryPolicy()) {
 			http.NotFound(w, r)
 			return
 		}
@@ -108,14 +116,16 @@ func (a *App) publicRoleHandler() http.Handler {
 	})
 }
 func (a *App) startServerWorkers(ctx context.Context, g *backgroundGroup) {
+	g.start(func() { a.catalog.FinishStartup(ctx) })
 	a.catalog.WarmSearch(ctx)
+	// Every node that serves search keeps its own long-tail index.
+	g.start(func() { a.catalog.RunTail(ctx) })
 	g.start(func() { a.cluster.RunAsLeader(ctx, "catalogue sync", a.catalog.Run) })
 	g.start(func() { a.cluster.RunAsLeader(ctx, "trending charts", a.catalog.RunTrends) })
 	g.start(func() { a.cluster.RunAsLeader(ctx, "collection refresh", a.collections.Run) })
 	g.start(func() { a.trakt.Start(ctx) })
-	g.start(func() { a.runRegistrarAsLeader(ctx) })
-	g.start(func() { a.registrar.RunPortMapping(ctx) })
 	g.start(func() { a.cluster.RunAsLeader(ctx, "database maintenance", a.maintainDB) })
+	g.start(func() { a.runFlows(ctx) })
 	if a.plexWatch != nil {
 		g.start(func() { a.plexWatch.Run(ctx) })
 		g.start(func() { a.cluster.RunAsLeader(ctx, "plex watch imports", a.plexWatch.RunImports) })
@@ -148,6 +158,7 @@ func (a *App) applyServerConfig(c config.Config) {
 	a.llm.UpdateConfig(c.LLM)
 	a.trakt.UpdateConfig(c.Trakt)
 	a.subtitles.UpdateConfig(c.OpenSubtitles)
+	a.subtitles.UpdateSubDL(c.SubDL)
 	a.subtitles.UpdateProviders(c.Subtitles.Providers)
 	a.publishLibrarySections()
 	a.registrar.Trigger()

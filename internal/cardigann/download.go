@@ -230,15 +230,21 @@ func (r *Runner) getPayload(ctx context.Context, u *url.URL, method string, hdr 
 // ResolveTorrent fills a torrent release's info hash and magnet,
 // downloading its .torrent (one grab) when the result had only a link.
 func (r *Runner) ResolveTorrent(ctx context.Context, rel core.Release, reserve Reserver) (core.Release, error) {
+	rel.Private = rel.Private || r.def.IsPrivate()
 	if h := newznab.NormalizeInfoHash(rel.InfoHash); h != "" {
 		rel.InfoHash = h
-		if rel.MagnetURL == "" {
+		if rel.Private {
+			rel.MagnetURL = newznab.BareMagnet(h)
+		} else if rel.MagnetURL == "" {
 			rel.MagnetURL = newznab.MagnetFor(h, rel.Name, nil)
 		}
 		return rel, nil
 	}
 	if h := newznab.InfoHashFromMagnet(rel.MagnetURL); h != "" {
 		rel.InfoHash = h
+		if rel.Private {
+			rel.MagnetURL = newznab.BareMagnet(h)
+		}
 		return rel, nil
 	}
 	if rel.NZBURL == "" {
@@ -253,18 +259,28 @@ func (r *Runner) ResolveTorrent(ctx context.Context, rel core.Release, reserve R
 		if h == "" {
 			return rel, fmt.Errorf("%s: magnet for %q has no info hash: %w", r.def.Name, rel.Name, core.ErrReleaseRejected)
 		}
-		rel.InfoHash, rel.MagnetURL = h, p.magnet
+		rel.InfoHash = h
+		if rel.Private {
+			rel.MagnetURL = newznab.BareMagnet(h)
+		} else {
+			rel.MagnetURL = p.magnet
+		}
 		return rel, nil
 	}
 	meta, err := newznab.ParseTorrent(p.body)
 	if err != nil {
 		return rel, fmt.Errorf("%s: %q: %w", r.def.Name, rel.Name, err)
 	}
+	rel.InfoHash = meta.InfoHash
+	rel.Private = rel.Private || meta.Private
+	if rel.Private {
+		rel.MagnetURL = newznab.BareMagnet(meta.InfoHash)
+		return rel, nil
+	}
 	name := meta.Name
 	if name == "" {
 		name = rel.Name
 	}
-	rel.InfoHash = meta.InfoHash
 	rel.MagnetURL = newznab.MagnetFor(meta.InfoHash, name, meta.Trackers)
 	return rel, nil
 }

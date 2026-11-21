@@ -18,8 +18,9 @@ import { api, ApiError, apiStream, errorMessage } from "../../lib/api";
 import type { CollectionSpec } from "../../lib/contract";
 import { normalizeSpec } from "../../lib/rules";
 import { readAgentStream } from "../plugins/LiveStage";
-import { CatalogBrowser } from "../catalog/Catalog";
-import { TitleInspector } from "../catalog/TitleInspector";
+import { CatalogBrowser } from "../libraries/browser/Catalog";
+import { TitleInspector } from "../libraries/browser/TitleInspector";
+import { DescribeSurface, fillComposer } from "./DescribeSurface";
 import { DescribeWall } from "./DescribeWall";
 
 /** The agent route whose turns build one collection and outlive a reload. */
@@ -298,16 +299,12 @@ export function DescribeDialog({
   );
 
   return (
-    <Drawer
+    <DescribeSurface
       open={open}
       onClose={() => {
         closing.current = true;
         onClose();
       }}
-      size="xl"
-      // One fixed layout: posters on the top half, the conversation on the
-      // bottom half. Neither grows into the other or the footer.
-      bodyClassName="flex min-h-0 flex-col overflow-hidden p-0"
       title={
         <span className="flex items-center gap-2">
           <Sparkles size={18} className="text-primary" /> {t("Describe a collection")}
@@ -357,47 +354,42 @@ export function DescribeDialog({
           ) : null}
         </div>
       }
+      preview={
+        <>
+          {enabled === false ? (
+            <Alert variant="info" className="m-4">
+              <AlertTitle>{t("Describe it needs a language model")}</AlertTitle>
+              <AlertDescription>
+                {tx(
+                  "Connect an OpenAI-compatible endpoint (a local Ollama works) in {integrations}, then try again. You can still build collections by hand or from a template.",
+                  {
+                    integrations: (
+                      <Link to="/services" className="font-medium underline" onClick={onClose}>
+                        {t("Integrations")}
+                      </Link>
+                    ),
+                  },
+                )}
+              </AlertDescription>
+            </Alert>
+          ) : (
+            <DescribeWall
+              spec={spec}
+              building={busy}
+              examples={EXAMPLES}
+              onExample={(text) => fillComposer(chat.current, text)}
+              onOpenTitle={setOpenTitle}
+              onShowMore={() => {
+                setBrowseParams(new URLSearchParams());
+                setBrowsing(true);
+              }}
+            />
+          )}
+        </>
+      }
+      error={error}
     >
-      <section
-        className="relative min-h-0 flex-1 basis-0 overflow-hidden border-b border-border"
-        aria-label={t("Live build")}
-      >
-        {enabled === false ? (
-          <Alert variant="info" className="m-4">
-            <AlertTitle>{t("Describe it needs a language model")}</AlertTitle>
-            <AlertDescription>
-              {tx(
-                "Connect an OpenAI-compatible endpoint (a local Ollama works) in {integrations}, then try again. You can still build collections by hand or from a template.",
-                {
-                  integrations: (
-                    <Link to="/services" className="font-medium underline" onClick={onClose}>
-                      {t("Integrations")}
-                    </Link>
-                  ),
-                },
-              )}
-            </AlertDescription>
-          </Alert>
-        ) : (
-          <DescribeWall
-            spec={spec}
-            building={busy}
-            examples={EXAMPLES}
-            onExample={(text) => fillComposer(chat.current, text)}
-            onOpenTitle={setOpenTitle}
-            onShowMore={() => {
-              setBrowseParams(new URLSearchParams());
-              setBrowsing(true);
-            }}
-          />
-        )}
-      </section>
-      {error ? (
-        <p role="alert" className="shrink-0 border-b border-border px-4 py-2 text-sm text-danger">
-          {error}
-        </p>
-      ) : null}
-      <div ref={chat} className="describe-chat flex min-h-0 flex-1 basis-0 flex-col">
+      <div ref={chat} className="contents">
         <AgentPanel
           enabled={enabled !== false}
           initialMessages={messages}
@@ -433,6 +425,7 @@ export function DescribeDialog({
         onClose={() => setBrowsing(false)}
         title={spec?.name || t("Untitled collection")}
         size="2xl"
+        bodyClassName="flex min-h-0 flex-col overflow-hidden"
       >
         {browsing && spec ? (
           <CatalogBrowser
@@ -446,19 +439,6 @@ export function DescribeDialog({
       {openTitle ? (
         <TitleInspector key={openTitle} titleKey={openTitle} onClose={() => setOpenTitle(null)} />
       ) : null}
-    </Drawer>
+    </DescribeSurface>
   );
-}
-
-/**
- * Puts an example into the agent panel's composer so the owner can send or
- * edit it. The composer keeps its own state, so this goes through the input
- * event React listens for.
- */
-function fillComposer(root: HTMLElement | null, text: string) {
-  const box = root?.querySelector("textarea");
-  if (!box) return;
-  Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set?.call(box, text);
-  box.dispatchEvent(new Event("input", { bubbles: true }));
-  box.focus();
 }

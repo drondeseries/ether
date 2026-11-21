@@ -3,14 +3,17 @@ package app
 import (
 	"bytes"
 	"context"
-	"fmt"
+	"github.com/braedonsaunders/ether/internal/admin"
 	"github.com/braedonsaunders/ether/internal/artwork"
+	"github.com/braedonsaunders/ether/internal/backup"
+	"github.com/braedonsaunders/ether/internal/cluster"
 	"github.com/braedonsaunders/ether/internal/config"
 	"github.com/braedonsaunders/ether/internal/core"
+	"github.com/braedonsaunders/ether/internal/extras"
 	"github.com/braedonsaunders/ether/internal/livetv"
 	"github.com/braedonsaunders/ether/internal/llm"
 	"github.com/braedonsaunders/ether/internal/onair"
-	"github.com/braedonsaunders/ether/internal/plexmeta"
+	plexmeta "github.com/braedonsaunders/ether/internal/plexmeta"
 	"github.com/braedonsaunders/ether/internal/transcode"
 	"image"
 	"net/url"
@@ -21,11 +24,15 @@ import (
 )
 
 func (a *App) buildOnAir() error {
-	o := onair.Options{Changed: func(ctx context.Context) error {
+	o := onair.Options{Enabled: func() bool { return a.livetv != nil && a.livetv.Enabled() }, Showcase: parityShowcase(), Changed: func(ctx context.Context) error {
 		if a.livetv != nil {
 			return a.livetv.RefreshGuide(ctx)
 		}
 		return nil
+	}, ReelsChanged: func(ctx context.Context) {
+		if a.livetv != nil {
+			a.livetv.RefreshGraphics(ctx)
+		}
 	}, DB: a.db, Dir: filepath.Join(a.opts.DataDir, "cache", "onair"), Logger: a.log.With("component", "onair"), Bindings: a.onairBindings}
 	o.StyleChannels = func(ctx context.Context) (map[string][]string, error) {
 		if a.livetv == nil {
@@ -47,8 +54,9 @@ func (a *App) buildOnAir() error {
 	o.StaticRequests = func(ctx context.Context, id string) []core.ClipRequest { return a.livetv.GraphicsRequests(ctx, id) }
 	o.Upcoming = func(ctx context.Context) []core.ClipRequest { return a.livetv.GraphicsRequests(ctx, "") }
 	if a.images != nil {
+		o.ArtworkBytes = a.onairArtworkBytes
 		o.Artwork = func(ctx context.Context, ref string) (image.Image, error) {
-			b, e := a.onairArtwork(ctx, ref)
+			b, _, e := a.onairArtworkBytes(ctx, ref)
 			if e != nil {
 				return nil, e
 			}
@@ -58,20 +66,24 @@ func (a *App) buildOnAir() error {
 	}
 	if a.transcoder != nil {
 		o.Acquire = func(ctx context.Context) (context.Context, func(), error) {
-			priority := transcode.SlotBackground
-			if deadline, imminent := onair.BoundaryDeadline(ctx); imminent && deadline.After(time.Now()) {
-				priority = transcode.SlotLivePrep
-			}
-			return a.transcoder.AcquireTranscodeSlot(ctx, priority)
+			return a.transcoder.AcquireTranscodeSlot(ctx, transcode.SlotBackground)
 		}
 		o.FFmpeg = a.transcoder.FFmpegPath
 		o.Probe = a.transcoder.Probe
-		o.WorkingSize = func() (int, int) {
-			hw := a.transcoder.HWAccel()
-			if hw.Name == "" || hw.Name == "none" {
-				return 1280, 720
-			}
-			return 1920, 1080
+		o.EncoderOptions = a.transcoder.OnAirEncoderOptions
+		o.WorkingSize = func() (int, int) { return 1280, 720 }
+	}
+	o.Downloader = extras.NewDownloader(extras.DownloaderOptions{
+		ToolsDir: filepath.Join(a.opts.DataDir, "tools"),
+		Config:   func() config.Extras { return a.cfg.Read().Extras },
+		FFmpeg:   o.FFmpeg,
+	})
+	o.AssetDir = filepath.Join(a.opts.DataDir, backup.OnAirAssetDir)
+	if a.cluster != nil {
+		o.NodeID = a.cluster.Self().ID
+		if a.cluster.Mode() != cluster.ModeSolo {
+			o.Members = a.onairMembers
+			o.AssetsChanged = func(ctx context.Context) { _ = a.cluster.Publish(ctx, onairAssetsTopic, nil) }
 		}
 	}
 	svc, e := onair.New(o)
@@ -80,11 +92,55 @@ func (a *App) buildOnAir() error {
 	}
 	a.onair = svc
 	a.closers = append(a.closers, svc.Close)
+	if o.Members != nil {
+		// Another node asked for bytes, or membership changed: run a pass.
+		a.closers = append(a.closers, a.cluster.Subscribe(onairAssetsTopic, func([]byte) { svc.PokeAssets() }), a.cluster.Subscribe(cluster.TopicMembers, func([]byte) { svc.PokeAssets() }))
+	}
 	return nil
 }
+
+// onairAssetsTopic asks every node to run an On Air asset pass.
+const onairAssetsTopic = "onair:assets"
+
+// onairMembers are the nodes that keep On Air assets: every recorded member
+// (dead ones stay recorded for a day) that runs On Air or may be an older
+// full server reading asset bytes from the database.
+func (a *App) onairMembers(ctx context.Context) ([]onair.Member, error) {
+	nodes, err := a.cluster.AllNodes(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]onair.Member, 0, len(nodes))
+	for _, n := range nodes {
+		if n.Caps.OnAirAssets > 0 || n.Caps.Roles.FullServer() {
+			out = append(out, onair.Member{ID: n.ID, Files: n.Caps.OnAirAssets >= onair.AssetFilesVersion})
+		}
+	}
+	return out, nil
+}
+
+// onairPreviewImageURL converts an On Air artwork reference (TMDB path or
+// title:<key>/<poster|art>) into a browser-loadable URL served by Ether's
+// image proxies instead of a bare root path that 401s against Plex routes.
+func onairPreviewImageURL(ref string, width int) string {
+	if ref == "" {
+		return ""
+	}
+	if artwork.ValidPath(ref) {
+		return admin.ImageURL(ref, width)
+	}
+	if _, _, ok := livetv.ParseArtworkRef(ref); ok {
+		return "/ether/api/onair/artwork?ref=" + url.QueryEscape(ref)
+	}
+	if strings.HasPrefix(ref, "http://") || strings.HasPrefix(ref, "https://") {
+		return ref
+	}
+	return ""
+}
+
 func (a *App) onairBindings(ctx context.Context, channel, viewer string, at time.Time) (any, error) {
 	empty := func() map[string]string {
-		return map[string]string{"title": "", "time": "", "reason": "", "meta": "", "logline": "", "backdrop": ""}
+		return map[string]string{"title": "", "time": "", "reason": "", "meta": "", "logline": "", "poster": "", "backdrop": ""}
 	}
 	out := map[string]any{"channel": map[string]string{"name": ""}, "viewer": map[string]string{"name": "", "greeting": ""}, "now": empty(), "next": empty(), "list": []map[string]string{empty(), empty(), empty(), empty()}, "offair": map[string]string{"message": "Off air"}}
 	if a.livetv == nil {
@@ -142,44 +198,66 @@ func (a *App) onairBindings(ctx context.Context, channel, viewer string, at time
 		v := empty()
 		v["title"] = p.Item.Title
 		v["time"] = p.Start.Format("15:04")
-		v["meta"] = fmt.Sprintf("%d min", p.Item.DurationMS/60000)
-		v["logline"] = strings.SplitN(p.Item.Summary, ". ", 2)[0]
-		v["backdrop"] = livetv.ArtworkRef(p.Item.Key, p.Item.Art, "art")
+		v["reason"] = p.Reason
+		v["meta"] = livetv.ProgrammeMeta(p.Item)
+		v["logline"] = livetv.Logline(p.Item.Summary)
+		v["poster"] = onairPreviewImageURL(livetv.ArtworkRef(p.Item.Key, p.Item.Thumb, "poster"), 780)
+		v["backdrop"] = onairPreviewImageURL(livetv.ArtworkRef(p.Item.Key, p.Item.Art, "art"), 1280)
 		list = append(list, v)
 		if len(list) == 4 {
 			break
+		}
+	}
+	if len(list) > 0 {
+		out["now"] = list[0]
+		if len(list) > 1 {
+			out["next"] = list[1]
+		} else {
+			out["next"] = list[0]
 		}
 	}
 	for len(list) < 4 {
 		list = append(list, empty())
 	}
 	out["list"] = list
-	if len(list) > 0 {
-		out["now"] = list[0]
-	}
-	if len(list) > 1 {
-		out["next"] = list[1]
-	}
 	return out, nil
 }
 
 var _ core.ChannelGraphics = (*onair.Service)(nil)
 
-// onairArtwork loads an On Air artwork reference: a TMDB image path, or a
-// title's poster/backdrop by key, which resolves Plex-sourced art through the
-// verified Plex metadata cache the Plex apps use for the same title.
 func (a *App) onairArtwork(ctx context.Context, ref string) ([]byte, error) {
+	b, _, err := a.onairArtworkBytes(ctx, ref)
+	return b, err
+}
+
+// onairArtworkBytes loads an On Air artwork reference: a TMDB image path, a
+// console proxy URL wrapping one, or a title's poster/backdrop by key, which
+// resolves Plex-sourced art through the verified Plex metadata cache the Plex
+// apps use for the same title.
+func (a *App) onairArtworkBytes(ctx context.Context, ref string) ([]byte, string, error) {
+	if strings.HasPrefix(ref, "/ether/api/image?") {
+		if u, err := url.Parse(ref); err == nil {
+			if p := u.Query().Get("path"); p != "" {
+				ref = p
+			}
+		}
+	} else if strings.HasPrefix(ref, "/ether/api/onair/artwork?") {
+		if u, err := url.Parse(ref); err == nil {
+			if inner := u.Query().Get("ref"); inner != "" {
+				ref = inner
+			}
+		}
+	}
 	key, element, ok := livetv.ParseArtworkRef(ref)
 	if !ok {
-		b, _, e := a.images.Get(ctx, ref, 1920)
-		return b, e
+		return a.images.Get(ctx, ref, 1920)
 	}
 	if a.catalog == nil {
-		return nil, artwork.ErrNotFound
+		return nil, "", artwork.ErrNotFound
 	}
 	t, e := a.catalog.Get(ctx, key)
 	if e != nil {
-		return nil, e
+		return nil, "", e
 	}
 	path := t.PosterPath
 	if element == "art" {
@@ -188,15 +266,14 @@ func (a *App) onairArtwork(ctx context.Context, ref string) ([]byte, error) {
 		path = t.StillPath
 	}
 	if artwork.ValidPath(path) {
-		b, _, e := a.images.Get(ctx, path, 1920)
-		return b, e
+		return a.images.Get(ctx, path, 1920)
 	}
 	if path != plexmeta.RemoteArt || a.plexMeta == nil || a.plexGUID == nil {
-		return nil, artwork.ErrNotFound
+		return nil, "", artwork.ErrNotFound
 	}
 	row, ok := a.plexMeta.Cached(ctx, key)
 	if !ok || row.Empty() || row.GUID == "" || row.GUID != a.plexGUID.Cached(ctx, key) {
-		return nil, artwork.ErrNotFound
+		return nil, "", artwork.ErrNotFound
 	}
 	remote := row.ThumbURL
 	if element == "art" {
@@ -204,8 +281,7 @@ func (a *App) onairArtwork(ctx context.Context, ref string) ([]byte, error) {
 	}
 	u, e := url.Parse(remote)
 	if e != nil || !u.IsAbs() || !plexmeta.ImageHost(u.Host) {
-		return nil, artwork.ErrNotFound
+		return nil, "", artwork.ErrNotFound
 	}
-	b, _, e := a.images.GetUntrustedURL(ctx, remote)
-	return b, e
+	return a.images.GetUntrustedURL(ctx, remote)
 }

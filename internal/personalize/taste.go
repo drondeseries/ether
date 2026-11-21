@@ -671,18 +671,20 @@ func (ts *Taste) Fit(t *core.Title) (float64, string) {
 		for _, d := range t.Directors {
 			add(d, 1, "Directed by")
 		}
+		// A ranking window (core.WithRankingCandidates) reads these
+		// credits and no others.
 		for i, wr := range t.Writers {
-			if i < 3 {
+			if i < core.RankWriters {
 				add(wr, 0.7, "Written by")
 			}
 		}
 		for i, c := range t.Cast {
-			if i < 5 {
+			if i < core.RankCast {
 				add(c, 0.9-0.1*float64(i), "With")
 			}
 		}
 		for i, cr := range t.Crew {
-			if i >= 6 {
+			if i >= core.RankCrew {
 				break
 			}
 			switch strings.ToLower(cr.Role) {
@@ -798,7 +800,13 @@ func (ts *Taste) Profile(imageURL func(path string, width int) string) *core.Tas
 	for _, kv := range sortedByWeight(ts.Genre, 25) {
 		p.Genres = append(p.Genres, core.TasteWeight{Name: kv.k, Weight: round3(kv.w)})
 	}
-	for _, kv := range sortedByWeight(ts.Keyword, 30) {
+	filteredKeywords := make(map[string]float64, len(ts.Keyword))
+	for k, w := range ts.Keyword {
+		if isDisplayThemeKeyword(k) {
+			filteredKeywords[k] = w
+		}
+	}
+	for _, kv := range sortedByWeight(filteredKeywords, 30) {
 		p.Keywords = append(p.Keywords, core.TasteWeight{Name: kv.k, Weight: round3(kv.w)})
 	}
 	for _, kv := range sortedByWeight(ts.Person, 30) {

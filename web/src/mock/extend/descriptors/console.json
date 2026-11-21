@@ -97,6 +97,22 @@
   },
   {
     "kind": "command",
+    "id": "new-flow",
+    "owner": "builtin",
+    "label": {
+      "source": "New flow"
+    },
+    "hint": {},
+    "order": 65,
+    "meta": {
+      "route": "/flows/new",
+      "keywords": {
+        "source": "automation workflow create"
+      }
+    }
+  },
+  {
+    "kind": "command",
     "id": "back-up-now",
     "owner": "builtin",
     "label": {
@@ -234,6 +250,35 @@
       "configKey": "openSubtitles",
       "endpoint": "opensubtitles",
       "test": "opensubtitles",
+      "flag": "enabled",
+      "readyField": "apiKey"
+    }
+  },
+  {
+    "kind": "integration",
+    "id": "subdl",
+    "owner": "builtin",
+    "label": {
+      "source": "SubDL"
+    },
+    "hint": {
+      "source": "Fetch subtitles from SubDL when a release doesn't include them."
+    },
+    "group": "playback-extras",
+    "order": 11,
+    "meta": {
+      "category": "playback-extras",
+      "logo": "subdl",
+      "adds": [
+        {
+          "source": "Subtitles"
+        }
+      ],
+      "connect": "fields",
+      "tab": "subdl",
+      "configKey": "subdl",
+      "endpoint": "subdl",
+      "test": "subdl",
       "flag": "enabled",
       "readyField": "apiKey"
     }
@@ -397,6 +442,34 @@
     }
   },
   {
+    "kind": "integration",
+    "id": "mdblist",
+    "owner": "builtin",
+    "label": {
+      "source": "MDBList"
+    },
+    "hint": {
+      "source": "Sync watch history with MDBList. Each viewer pastes their own API key."
+    },
+    "group": "watch-tracking",
+    "order": 21,
+    "meta": {
+      "category": "watch-tracking",
+      "logo": "mdblist",
+      "adds": [
+        {
+          "source": "Watch history"
+        }
+      ],
+      "connect": "custom",
+      "tab": "mdblist",
+      "configKey": "mdblist",
+      "endpoint": "mdblist",
+      "flag": "enabled",
+      "form": "mdblist"
+    }
+  },
+  {
     "kind": "navItem",
     "id": "overview",
     "owner": "builtin",
@@ -447,18 +520,18 @@
   },
   {
     "kind": "navItem",
-    "id": "catalog",
+    "id": "libraries",
     "owner": "builtin",
     "label": {
-      "source": "Catalog"
+      "source": "Libraries"
     },
     "hint": {},
     "icon": "Library",
     "group": "library",
     "order": 10,
     "meta": {
-      "route": "/catalog",
-      "page": "catalog"
+      "route": "/libraries",
+      "page": "libraries"
     }
   },
   {
@@ -620,6 +693,22 @@
     "meta": {
       "route": "/notifications",
       "page": "notifications"
+    }
+  },
+  {
+    "kind": "navItem",
+    "id": "flows",
+    "owner": "builtin",
+    "label": {
+      "source": "Flows"
+    },
+    "hint": {},
+    "icon": "Workflow",
+    "group": "server",
+    "order": 55,
+    "meta": {
+      "route": "/flows",
+      "page": "flows"
     }
   },
   {
@@ -799,7 +888,7 @@
       "inNav": true,
       "mobile": true,
       "keywords": {
-        "source": "users friends accounts people"
+        "source": "users friends accounts people watchlist monitoring"
       }
     }
   },
@@ -887,30 +976,57 @@
   },
   {
     "kind": "page",
-    "id": "catalog",
+    "id": "libraries",
     "owner": "builtin",
     "label": {
-      "source": "Catalog"
+      "source": "Libraries"
     },
     "hint": {},
     "icon": "Library",
     "group": "library",
     "order": 10,
     "meta": {
-      "route": "/catalog",
+      "route": "/libraries",
       "navGroup": "library",
       "inNav": true,
       "keywords": {
-        "source": "catalogue movies shows browse search library"
+        "source": "catalogue catalog movies shows browse search library libraries"
       },
       "sections": [
         {
-          "key": "settings",
+          "key": "1/rules",
           "label": {
-            "source": "Catalog settings"
+            "source": "Movies · Rules"
+          },
+          "keywords": {
+            "source": "hide show rules movie exclusions visibility"
+          }
+        },
+        {
+          "key": "1/settings",
+          "label": {
+            "source": "Movies · Settings"
           },
           "keywords": {
             "source": "tmdb language region popularity new releases playable digital"
+          }
+        },
+        {
+          "key": "2/rules",
+          "label": {
+            "source": "TV Shows · Rules"
+          },
+          "keywords": {
+            "source": "hide show rules tv exclusions visibility"
+          }
+        },
+        {
+          "key": "2/settings",
+          "label": {
+            "source": "TV Shows · Settings"
+          },
+          "keywords": {
+            "source": "tmdb language region popularity new releases episodes"
           }
         }
       ]
@@ -981,15 +1097,6 @@
           },
           "keywords": {
             "source": "virtual channel"
-          }
-        },
-        {
-          "key": "sources",
-          "label": {
-            "source": "IPTV sources"
-          },
-          "keywords": {
-            "source": "m3u xmltv playlist"
           }
         },
         {
@@ -1252,6 +1359,15 @@
           }
         },
         {
+          "key": "mdblist",
+          "label": {
+            "source": "MDBList"
+          },
+          "keywords": {
+            "source": "mdblist sync history"
+          }
+        },
+        {
           "key": "llm",
           "label": {
             "source": "Language model"
@@ -1264,6 +1380,15 @@
           "key": "opensubtitles",
           "label": {
             "source": "OpenSubtitles"
+          },
+          "keywords": {
+            "source": "subtitles"
+          }
+        },
+        {
+          "key": "subdl",
+          "label": {
+            "source": "SubDL"
           },
           "keywords": {
             "source": "subtitles"
@@ -1333,6 +1458,46 @@
             "source": "Delivery history"
           },
           "keywords": {}
+        }
+      ]
+    }
+  },
+  {
+    "kind": "page",
+    "id": "flows",
+    "owner": "builtin",
+    "label": {
+      "source": "Flows"
+    },
+    "hint": {},
+    "icon": "Workflow",
+    "group": "server",
+    "order": 55,
+    "meta": {
+      "route": "/flows",
+      "navGroup": "server",
+      "inNav": true,
+      "keywords": {
+        "source": "automations automation workflows triggers actions events rules alerts"
+      },
+      "sections": [
+        {
+          "key": "templates",
+          "label": {
+            "source": "Templates"
+          },
+          "keywords": {
+            "source": "recipes starter tautulli kill stream newsletter"
+          }
+        },
+        {
+          "key": "runs",
+          "label": {
+            "source": "Runs"
+          },
+          "keywords": {
+            "source": "history trace test dry run"
+          }
         }
       ]
     }
@@ -1410,6 +1575,15 @@
           },
           "keywords": {
             "source": "nntp backfill connections"
+          }
+        },
+        {
+          "key": "iptv",
+          "label": {
+            "source": "IPTV"
+          },
+          "keywords": {
+            "source": "m3u xmltv playlist"
           }
         },
         {

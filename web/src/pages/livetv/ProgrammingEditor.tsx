@@ -21,6 +21,7 @@ import { ClockRows } from "./onair/ClockRows";
 import { BreakPatternEditor, breakPatternPreset } from "./onair/BreakPatternEditor";
 import { personalRecipe } from "./onair/defaults";
 import { ChannelLook, OnAirAsset, Reel, onair } from "./onair/model";
+import { RundownOrderEditor } from "./onair/RundownOrderEditor";
 
 function detectedBreaks(channel: Channel): number {
   const counts = new Map<number, number>();
@@ -145,14 +146,15 @@ export function ProgrammingEditor({
           start,
           end: Math.min(1440, start + 30),
           days: weekdays,
-          sources: [{ ...newSource(), kind: "show", strip: true }],
+          sources: [{ ...newSource(), kind: "show", strip: true, startSeason: 1, startEpisode: 1 }],
           items: [],
         },
       });
     } else {
       const pin = pins.findIndex((p) => p.id === editRequest.pinId);
       const block = blocks.findIndex((b) => b.id === editRequest.blockId);
-      if (pin >= 0) setEditing({ kind: "pin", index: pin, value: structuredClone(pins[pin]!) });
+      if (pin >= 0)
+        setEditing({ kind: "pin", index: iPin(pin), value: structuredClone(pins[pin]!) });
       else if (block >= 0)
         setEditing({ kind: "block", index: block, value: structuredClone(blocks[block]!) });
     }
@@ -192,7 +194,16 @@ export function ProgrammingEditor({
           end: 1230,
           days: weekdays,
           date: kind === "special" ? new Date().toISOString().slice(0, 10) : undefined,
-          sources: [{ ...newSource(), kind: "show", strip: true, order: "order" }],
+          sources: [
+            {
+              ...newSource(),
+              kind: "show",
+              strip: true,
+              order: "order",
+              startSeason: 1,
+              startEpisode: 1,
+            },
+          ],
           items: [],
         },
       });
@@ -542,8 +553,16 @@ export function ProgrammingEditor({
                 type="number"
                 min={0}
                 max={30}
-                value={v.repeatDays || 0}
-                onChange={(e) => update({ repeatDays: Number(e.currentTarget.value) })}
+                placeholder="0"
+                value={v.repeatDays ?? ""}
+                onChange={(e) =>
+                  update({
+                    repeatDays: e.currentTarget.value ? Number(e.currentTarget.value) : undefined,
+                  })
+                }
+                onBlur={(e) => {
+                  if (!e.currentTarget.value) update({ repeatDays: 0 });
+                }}
               />
             </Field>
             {editing.kind === "block" && !(v.sources?.length === 1 && v.sources[0]?.strip) && (
@@ -606,6 +625,9 @@ export function ProgrammingEditor({
     </div>
   );
 }
+function iPin(pin: number): number {
+  return pin;
+}
 function Sources({
   sources,
   onChange,
@@ -648,6 +670,14 @@ function Sources({
                           kind,
                           items: [],
                           personal: kind === "personal" ? personalRecipe() : undefined,
+                          filter: kind === "lineup" ? { type: "show" } : undefined,
+                          // The season/episode fields below display "1" as a
+                          // placeholder when unset; without writing it here,
+                          // that placeholder never becomes real data unless
+                          // the field is explicitly retyped, silently
+                          // defaulting to season 0 (specials/extras) instead.
+                          startSeason: kind === "show" ? 1 : undefined,
+                          startEpisode: kind === "show" ? 1 : undefined,
                         }
                       : source,
                   ),
@@ -661,6 +691,7 @@ function Sources({
               <option value="filter">{t("Smart filter")}</option>
               <option value="personal">{t("Personal picks")}</option>
               <option value="plugin">{t("Plugin segment")}</option>
+              <option value="lineup">{t("Series lineup")}</option>
               {depth < 2 && <option value="mix">{t("Weighted mix")}</option>}
             </Select>
             <Button
@@ -677,8 +708,16 @@ function Sources({
                 aria-label={t("Weight")}
                 type="number"
                 min={1}
-                value={s.weight || 1}
-                onChange={(e) => set(i, { weight: Number(e.currentTarget.value) })}
+                placeholder="1"
+                value={s.weight || ""}
+                onChange={(e) =>
+                  set(i, {
+                    weight: e.currentTarget.value ? Number(e.currentTarget.value) : undefined,
+                  })
+                }
+                onBlur={(e) => {
+                  if (!e.currentTarget.value) set(i, { weight: 1 });
+                }}
               />
             </Field>
           )}
@@ -694,7 +733,44 @@ function Sources({
               </Select>
             </Field>
           )}
-          {(s.kind === "items" || s.kind === "movies" || !s.kind) && (
+          {s.kind === "movies" && s.filter && (
+            <>
+              <GenreChips
+                filter={s.filter}
+                lockType="movie"
+                onChange={(filter) => set(i, { filter })}
+              />
+              <ExcludeGenres
+                type="movie"
+                value={s.excludeGenres}
+                onChange={(excludeGenres) => set(i, { excludeGenres })}
+              />
+              <SmartFilter
+                filter={s.filter}
+                onChange={(filter) => set(i, { filter: { ...s.filter, ...filter } })}
+              />
+              <Field label={t("Movies in the pool")} hint={t("The most popular matches.")}>
+                <Input
+                  aria-label={t("Movies in the pool")}
+                  type="number"
+                  min={1}
+                  max={200}
+                  placeholder="40"
+                  value={s.pool || ""}
+                  onChange={(e) =>
+                    set(i, {
+                      pool: e.currentTarget.value ? Number(e.currentTarget.value) : undefined,
+                    })
+                  }
+                  onBlur={(e) => {
+                    if (!e.currentTarget.value) set(i, { pool: 40 });
+                  }}
+                />
+              </Field>
+            </>
+          )}
+          {s.kind === "lineup" && <LineupFields source={s} onChange={(p) => set(i, p)} />}
+          {(s.kind === "items" || (s.kind === "movies" && !s.filter) || !s.kind) && (
             <ProgrammePicker
               label={t("Selected titles")}
               items={s.items || []}
@@ -717,10 +793,18 @@ function Sources({
                     type="number"
                     min={1}
                     aria-label={t("Start season")}
-                    value={s.startSeason || 1}
+                    placeholder="1"
+                    value={s.startSeason || ""}
                     onChange={(e) =>
-                      set(i, { startDate: undefined, startSeason: Number(e.currentTarget.value) })
+                      set(i, {
+                        startSeason: e.currentTarget.value
+                          ? Number(e.currentTarget.value)
+                          : undefined,
+                      })
                     }
+                    onBlur={(e) => {
+                      if (!e.currentTarget.value) set(i, { startSeason: 1 });
+                    }}
                   />
                 </Field>
                 <Field label={t("Start episode")}>
@@ -728,10 +812,18 @@ function Sources({
                     type="number"
                     min={1}
                     aria-label={t("Start episode")}
-                    value={s.startEpisode || 1}
+                    placeholder="1"
+                    value={s.startEpisode || ""}
                     onChange={(e) =>
-                      set(i, { startDate: undefined, startEpisode: Number(e.currentTarget.value) })
+                      set(i, {
+                        startEpisode: e.currentTarget.value
+                          ? Number(e.currentTarget.value)
+                          : undefined,
+                      })
                     }
+                    onBlur={(e) => {
+                      if (!e.currentTarget.value) set(i, { startEpisode: 1 });
+                    }}
                   />
                 </Field>
               </div>
@@ -945,11 +1037,20 @@ function Breaks({
                 max={600}
                 step={4}
                 aria-label={t("Pod length (seconds)")}
-                value={value.breakSeconds || 120}
-                onChange={(e) => set({ breakSeconds: Number(e.currentTarget.value) })}
+                placeholder="120"
+                value={value.breakSeconds || ""}
+                onChange={(e) =>
+                  set({
+                    breakSeconds: e.currentTarget.value ? Number(e.currentTarget.value) : undefined,
+                  })
+                }
+                onBlur={(e) => {
+                  if (!e.currentTarget.value) set({ breakSeconds: 120 });
+                }}
               />
             </Field>
           )}
+          <RundownOrderEditor value={value} onChange={set} includeBetween={false} />
         </>
       )}
     </div>
@@ -984,7 +1085,7 @@ function Creative({
           [
             { key: "ident", label: t("Ident") },
             { key: "upnext", label: t("Up next") },
-            { key: "tonight", label: t("Tonight") },
+            { key: "tonight", label: t("Upcoming shows") },
             { key: "break", label: t("Break") },
             { key: "back", label: t("Back") },
           ] as const
@@ -1011,7 +1112,7 @@ function Creative({
         [
           { key: "ident", label: t("Ident when tuning in") },
           { key: "upNext", label: t("Up next") },
-          { key: "tonight", label: t("Coming up tonight") },
+          { key: "tonight", label: t("Upcoming shows") },
         ] as const
       ).map((x) => (
         <SettingsRow
@@ -1084,6 +1185,9 @@ function Creative({
           />
         }
       />
+      <div className="border-t border-border pt-3">
+        <RundownOrderEditor value={value} onChange={set} />
+      </div>
     </div>
   );
 }
@@ -1152,6 +1256,11 @@ function SmartFilter({
           }}
         >
           <option value="">{t("Any decade")}</option>
+          {decade && Number(decade) % 10 !== 0 && (
+            <option value={decade}>
+              {t("{from}–{to}", { from: decade, to: String(filter?.yearTo ?? "") })}
+            </option>
+          )}
           {[2020, 2010, 2000, 1990, 1980, 1970, 1960].map((year) => (
             <option key={year} value={year}>
               {t("{year}s", { year })}
@@ -1233,15 +1342,8 @@ function SmartFilter({
   );
 }
 
-function GenreChips({
-  filter,
-  onChange,
-}: {
-  filter?: Record<string, unknown>;
-  onChange: (v: Record<string, unknown>) => void;
-}) {
+function useGenres(type: "movie" | "show") {
   const [genres, setGenres] = useState<{ key: string; title: string }[]>([]);
-  const type = filter?.type === "show" ? "show" : "movie";
   useEffect(() => {
     let live = true;
     api
@@ -1254,25 +1356,164 @@ function GenreChips({
       live = false;
     };
   }, [type]);
-  const selected = Array.isArray(filter?.genres) ? filter.genres.map(String) : [];
-  const options = [
+  return genres;
+}
+
+function genreOptions(genres: { key: string; title: string }[], selected: string[]) {
+  return [
     ...genres.map((g) => ({ value: g.key, label: g.title })),
     ...selected
       .filter((v) => !genres.some((g) => g.key === v))
       .map((v) => ({ value: v, label: v })),
   ];
+}
+
+function ExcludeGenres({
+  type,
+  value,
+  onChange,
+}: {
+  type: "movie" | "show";
+  value?: string[];
+  onChange: (v: string[]) => void;
+}) {
+  const genres = useGenres(type);
+  const selected = value ?? [];
+  return (
+    <Field label={t("Leave out genres")}>
+      <ChipGroup
+        ariaLabel={t("Leave out genres")}
+        value={selected}
+        options={genreOptions(genres, selected)}
+        onChange={onChange}
+      />
+    </Field>
+  );
+}
+
+function LineupFields({
+  source,
+  onChange,
+}: {
+  source: ProgramSource;
+  onChange: (p: Partial<ProgramSource>) => void;
+}) {
+  const shows = source.shows || 4;
+  const series = (source.sources ?? []).map((s) => s.name).filter(Boolean);
   return (
     <>
-      <Field label={t("Catalogue")}>
-        <Select
-          aria-label={t("Catalogue")}
-          value={type}
-          onChange={(e) => onChange({ ...filter, type: e.currentTarget.value })}
-        >
-          <option value="movie">{t("Movies")}</option>
-          <option value="show">{t("TV shows")}</option>
-        </Select>
-      </Field>
+      <p className="text-xs text-fg-muted">
+        {t(
+          "The most popular series matching these rules take turns in this slot. Each series continues from the episode it reached last time.",
+        )}
+      </p>
+      <GenreChips
+        filter={source.filter}
+        lockType="show"
+        onChange={(filter) => onChange({ filter })}
+      />
+      <ExcludeGenres
+        type="show"
+        value={source.excludeGenres}
+        onChange={(excludeGenres) => onChange({ excludeGenres })}
+      />
+      <FilterCount filter={{ ...source.filter, type: "show" }} />
+      <SmartFilter
+        filter={source.filter}
+        onChange={(filter) => onChange({ filter: { ...source.filter, ...filter, type: "show" } })}
+      />
+      <div className="grid gap-4 sm:grid-cols-3">
+        <Field label={t("Series on air")}>
+          <Input
+            aria-label={t("Series on air")}
+            type="number"
+            min={1}
+            max={48}
+            placeholder="4"
+            value={source.shows || ""}
+            onChange={(e) =>
+              onChange({ shows: e.currentTarget.value ? Number(e.currentTarget.value) : undefined })
+            }
+            onBlur={(e) => {
+              if (!e.currentTarget.value) onChange({ shows: 4 });
+            }}
+          />
+        </Field>
+        <Field label={t("Series in the pool")}>
+          <Input
+            aria-label={t("Series in the pool")}
+            type="number"
+            min={1}
+            max={48}
+            placeholder={String(source.rotateDays ? shows * 3 : shows)}
+            value={source.pool || ""}
+            onChange={(e) =>
+              onChange({ pool: e.currentTarget.value ? Number(e.currentTarget.value) : undefined })
+            }
+            onBlur={(e) => {
+              if (!e.currentTarget.value) onChange({ pool: source.rotateDays ? shows * 3 : shows });
+            }}
+          />
+        </Field>
+        <Field label={t("New series every")} hint={t("Days on air. 0 keeps the same series.")}>
+          <Input
+            aria-label={t("New series every")}
+            type="number"
+            min={0}
+            max={365}
+            placeholder="0"
+            value={source.rotateDays ?? ""}
+            onChange={(e) =>
+              onChange({
+                rotateDays: e.currentTarget.value ? Number(e.currentTarget.value) : undefined,
+              })
+            }
+            onBlur={(e) => {
+              if (!e.currentTarget.value) onChange({ rotateDays: 0 });
+            }}
+          />
+        </Field>
+      </div>
+      {series.length > 0 && (
+        <Field label={t("In the pool now")}>
+          <div className="flex flex-wrap gap-1.5">
+            {series.map((name) => (
+              <Badge key={name}>{name}</Badge>
+            ))}
+          </div>
+        </Field>
+      )}
+    </>
+  );
+}
+
+function GenreChips({
+  filter,
+  onChange,
+  lockType,
+}: {
+  filter?: Record<string, unknown>;
+  onChange: (v: Record<string, unknown>) => void;
+  lockType?: "movie" | "show";
+}) {
+  const type = lockType ?? (filter?.type === "show" ? "show" : "movie");
+  const genres = useGenres(type);
+  const selected = Array.isArray(filter?.genres) ? filter.genres.map(String) : [];
+  const options = genreOptions(genres, selected);
+  return (
+    <>
+      {!lockType && (
+        <Field label={t("Catalogue")}>
+          <Select
+            aria-label={t("Catalogue")}
+            value={type}
+            onChange={(e) => onChange({ ...filter, type: e.currentTarget.value })}
+          >
+            <option value="movie">{t("Movies")}</option>
+            <option value="show">{t("TV shows")}</option>
+          </Select>
+        </Field>
+      )}
       <Field label={t("Genres")}>
         <ChipGroup
           ariaLabel={t("Genres")}

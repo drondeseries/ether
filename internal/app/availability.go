@@ -8,26 +8,45 @@ import (
 )
 
 func (a *App) buildAvailability() error {
-	s, err := availability.New(availability.Deps{DB: a.db, Config: a.cfg.Read, ConfigGeneration: a.cfg.Generation, Feeds: a.indexers, Catalog: a.catalog, Validator: a.resolver,
-		CacheCheck: a.debrid.CheckCached, Search: func(ctx context.Context, req core.SearchRequest) ([]core.Release, error) {
+	s, err := availability.New(availability.Deps{Clustered: a.clustered(), DB: a.db, Config: a.cfg.Read, ConfigGeneration: a.cfg.Generation, Feeds: a.indexers, Catalog: a.catalog, Validator: a.resolver,
+		CacheCheck: a.debrid.CheckCached, PackFiles: a.debrid.CachedPackMatcher, Search: func(ctx context.Context, req core.SearchRequest) ([]core.Release, error) {
 			if a.indexers == nil {
 				return nil, nil
 			}
 			return a.indexers.Search(ctx, req)
 		}, Watchlist: func(ctx context.Context) (map[core.RatingKey]bool, error) {
-			rows, err := a.db.QueryContext(ctx, `SELECT DISTINCT item_key FROM watchlist_items`)
-			if err != nil {
-				return nil, nil
-			}
-			defer rows.Close()
 			out := map[core.RatingKey]bool{}
-			for rows.Next() {
-				var key int64
-				if rows.Scan(&key) == nil {
-					out[core.RatingKey(key)] = true
+			follow := func(k core.RatingKey) {
+				out[k] = true
+				if k.Kind() == core.KindEpisode || k.Kind() == core.KindSeason {
+					out[core.ShowKey(k.TMDB())] = true
 				}
 			}
-			return out, rows.Err()
+			rows, err := a.db.QueryContext(ctx, `SELECT DISTINCT item_key FROM watchlist_items`)
+			if err != nil {
+				return nil, err
+			}
+			defer rows.Close()
+			for rows.Next() {
+				var key int64
+				if err := rows.Scan(&key); err != nil {
+					return nil, err
+				}
+				follow(core.RatingKey(key))
+			}
+			if err := rows.Err(); err != nil {
+				return nil, err
+			}
+			if a.state != nil {
+				recent, err := a.state.RecentlyViewedKeys(ctx, time.Now().Add(-30*24*time.Hour), 200)
+				if err != nil {
+					return nil, err
+				}
+				for _, k := range recent {
+					follow(k)
+				}
+			}
+			return out, nil
 		}, Active: func() bool { return len(a.playback.Sessions()) > 0 },
 		Seal: func(raw string) (string, error) { return a.cfg.Seal("availability-release", []byte(raw)) },
 		Open: func(raw string) (string, error) {
@@ -68,5 +87,11 @@ func (a *App) invalidateRelease(ctx context.Context, id string) {
 func (a *App) observeSearch(ctx context.Context, t *core.Title, rs []core.Release) {
 	if a.availability != nil {
 		a.availability.RecordSearch(ctx, t, rs)
+	}
+}
+
+func (a *App) revealTitleSeason(key core.RatingKey) {
+	if a.availability != nil {
+		a.availability.RevealTitleSeason(key)
 	}
 }

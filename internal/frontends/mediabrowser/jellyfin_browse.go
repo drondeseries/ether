@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -37,7 +38,7 @@ func requestedSpecialItems(r *http.Request) specialItems {
 	for _, value := range values {
 		for _, typ := range strings.Split(value, ",") {
 			switch strings.ToLower(strings.TrimSpace(typ)) {
-			case "":
+			case "", "userview":
 			case "boxset":
 				box = true
 			case "playlist":
@@ -69,6 +70,19 @@ func splitCSV(value string) []string {
 		}
 	}
 	return out
+}
+
+// guidLike reports whether id parses as a UUID the way the Jellyfin
+// Kotlin SDK does: 32 hex digits, optionally dashed 8-4-4-4-12.
+func guidLike(id string) bool {
+	if len(id) == 36 && id[8] == '-' && id[13] == '-' && id[18] == '-' && id[23] == '-' {
+		id = id[:8] + id[9:13] + id[14:18] + id[19:23] + id[24:]
+	}
+	if len(id) != 32 {
+		return false
+	}
+	_, err := hex.DecodeString(id)
+	return err == nil
 }
 
 func dashedGUID(id string) string {
@@ -153,7 +167,10 @@ func withJellyfinListFiles(r *http.Request) *http.Request {
 	if r == nil || r.Context().Value(jellyfinListFileKey{}) != nil {
 		return r
 	}
-	return r.WithContext(context.WithValue(r.Context(), jellyfinListFileKey{}, true))
+	// Lists join stored artwork facts and let hashing finish behind the read.
+	// A 100ms hashing wait alone would consume the entire home-row budget.
+	ctx := frontend.WithoutSynchronousArtworkMetadata(r.Context())
+	return r.WithContext(context.WithValue(ctx, jellyfinListFileKey{}, true))
 }
 
 func jellyfinListFile(r *http.Request) bool {
@@ -171,7 +188,10 @@ func jellyfinListFile(r *http.Request) bool {
 // WebDAV uses. Probed streams stay; a row with none still names a video and
 // an audio track so the source is a file rather than an empty remote.
 func (i *instance) presentJellyfinFile(item, source map[string]any, title frontend.Title) {
-	if i == nil || item == nil || source == nil || (title.Type != "movie" && title.Type != "episode") {
+	// A declared audio/book/photo item keeps its own probed streams: this
+	// helper would otherwise stamp it as a video file and invent a video
+	// stream for a source that has none yet.
+	if i == nil || item == nil || source == nil || mbDeclaredNonVideo(title) || (title.Type != "movie" && title.Type != "episode") {
 		return
 	}
 	container, _ := source["Container"].(string)
@@ -241,7 +261,18 @@ func jellyfinMediaSourceShape(source map[string]any, name string) {
 	if name != "" {
 		setMissing(source, "Name", name)
 	}
-	setMissing(source, "VideoType", "VideoFile")
+	// A source whose probed streams hold no video (a music track, an
+	// audiobook) is not a video file; an unprobed source keeps the stamp.
+	if streams, ok := source["MediaStreams"].([]any); !ok || len(streams) == 0 {
+		setMissing(source, "VideoType", "VideoFile")
+	} else {
+		for _, stream := range streams {
+			if dto, ok := stream.(map[string]any); ok && dto["Type"] == "Video" {
+				setMissing(source, "VideoType", "VideoFile")
+				break
+			}
+		}
+	}
 	setMissing(source, "UseMostCompatibleTranscodingProfile", false)
 	if id, _ := source["Id"].(string); id != "" {
 		setMissing(source, "ETag", itemEtag(id))
@@ -259,14 +290,23 @@ func (i *instance) shapeJellyfinItem(r *http.Request, viewer *frontend.Viewer, i
 	setMissing(item, "BackdropImageTags", []string{})
 	setMissing(item, "ImageTags", map[string]string{})
 	setMissing(item, "ImageBlurHashes", map[string]any{})
+	// The type switches below describe the video hierarchy; a declared
+	// music/book/photo item keeps only the generic shell around them.
+	nonVideo := mbDeclaredNonVideo(title)
 	switch title.Type {
 	case "movie", "episode":
+		if nonVideo {
+			break
+		}
 		setMissing(item, "VideoType", "VideoFile")
 		setMissing(item, "Container", "")
 		if title.Type == "movie" {
 			i.attachLibraryParent(r, viewer, item, "movie")
 		}
 	case "show":
+		if nonVideo {
+			break
+		}
 		setMissing(item, "AirDays", []string{})
 		setMissing(item, "MediaType", "Unknown")
 		i.attachLibraryParent(r, viewer, item, "show")
@@ -278,9 +318,12 @@ func (i *instance) shapeJellyfinItem(r *http.Request, viewer *frontend.Viewer, i
 			setMissing(item, "DateLastMediaAdded", wireTime(title.LastAirDate))
 		}
 	case "season":
+		if nonVideo {
+			break
+		}
 		setMissing(item, "MediaType", "Unknown")
 	}
-	if title.Type == "episode" || title.Type == "season" {
+	if !nonVideo && (title.Type == "episode" || title.Type == "season") {
 		setMissing(item, "ParentBackdropImageTags", []string{})
 		for _, key := range []string{"ParentBackdropItemId", "ParentLogoImageTag", "ParentLogoItemId", "ParentPrimaryImageItemId", "ParentPrimaryImageTag", "SeriesPrimaryImageTag"} {
 			setMissing(item, key, nil)
@@ -303,7 +346,7 @@ func (i *instance) shapeJellyfinItem(r *http.Request, viewer *frontend.Viewer, i
 	if fields["overview"] {
 		setMissing(item, "Overview", title.Summary)
 	}
-	if fields["genres"] {
+	if fields["genres"] || !jellyfinListFile(r) {
 		if len(title.Genres) > 0 {
 			setMissing(item, "Genres", title.Genres)
 		} else {
@@ -360,7 +403,10 @@ func (i *instance) attachUnplayedCount(r *http.Request, viewer *frontend.Viewer,
 		return
 	}
 	if counts, ok := unplayedCountsFrom(r); ok {
-		if n, found := counts[title.Key]; found {
+		if counts.absent[title.Key] {
+			return
+		}
+		if n, found := counts.n[title.Key]; found {
 			data, ok := item["UserData"].(map[string]any)
 			if !ok {
 				return
@@ -523,7 +569,11 @@ func (i *instance) writeBoxSets(w http.ResponseWriter, r *http.Request, viewer *
 		http.Error(w, "Unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	page, err := i.host.Experience.Collections(r.Context(), viewer, device(r), frontend.CollectionQuery{Offset: q.Offset, Limit: q.Limit})
+	if slices.Contains(q.ExcludedTypes, frontend.MediaType("boxset")) {
+		jsonReply(w, i.queryResult([]any{}, 0, q.Offset))
+		return
+	}
+	page, err := i.host.Experience.Collections(r.Context(), viewer, device(r), frontend.CollectionQuery{Query: q.Filter.Query, Offset: q.Offset, Limit: q.Limit})
 	if errors.Is(err, frontend.ErrNotAvailable) {
 		jsonReply(w, i.queryResult([]any{}, 0, q.Offset))
 		return
@@ -706,6 +756,25 @@ func (i *instance) nameChildSeries(r *http.Request, viewer *frontend.Viewer, par
 // empty. A show key plus a season number encodes the season when the item
 // key does not.
 func attachParentIdentity(m map[string]any, t frontend.Title) {
+	if mbDeclaredNonVideo(t) {
+		// A declared music/book/photo item names its immediate parent in
+		// the kind's hierarchy (track -> album -> artist), never a series
+		// or season. Jellyfin reads a track's album from Album/AlbumId.
+		if t.ParentKey != 0 {
+			parentID := ids.RatingKeyGUID(t.ParentKey)
+			m["ParentId"] = parentID
+			if t.MBItemType == "Audio" {
+				m["AlbumId"] = parentID
+				if t.ParentTitle != "" {
+					m["Album"] = t.ParentTitle
+				}
+			}
+		}
+		if t.ItemIndex > 0 {
+			m["IndexNumber"] = t.ItemIndex
+		}
+		return
+	}
 	show := t.ShowKey
 	if show == 0 && (t.Key.Kind() == frontend.KindEpisode || t.Key.Kind() == frontend.KindSeason) {
 		show = frontend.ShowKey(t.Key.TMDB())
@@ -998,17 +1067,10 @@ func (i *instance) jellyfinDetailShell(item map[string]any) {
 // jellyfinStudioFacts records studio names the title already has. Named-facet
 // ids replace this list when the experience issued them.
 func jellyfinStudioFacts(item map[string]any, title frontend.Title) {
-	if _, ok := item["Studios"]; !ok && len(title.Studios) > 0 {
-		pairs := make([]any, 0, len(title.Studios))
-		for _, name := range title.Studios {
-			if name != "" {
-				pairs = append(pairs, map[string]any{"Name": name})
-			}
-		}
-		if len(pairs) > 0 {
-			item["Studios"] = pairs
-		}
-	}
+	// NameGuidPair.Id is a required UUID in the Jellyfin SDK, so a
+	// name-only Studios entry fails decoding of the whole item (#614).
+	// Studios only ever carries the authorized facet pairs addNamedFacets
+	// issued; the plain names stay available as SeriesStudio below.
 	if title.Type == "show" || title.Type == "episode" || title.Type == "season" {
 		for _, name := range title.Studios {
 			if name != "" {
@@ -1043,7 +1105,11 @@ func (i *instance) jellyfinKnownVersionFacts(dto map[string]any, versions []fron
 	if len(version.Media.Chapters) > 0 {
 		chapters := make([]any, 0, len(version.Media.Chapters))
 		for _, chapter := range version.Media.Chapters {
-			entry := map[string]any{"StartPositionTicks": chapter.Start.Nanoseconds() / 100}
+			// ChapterInfo.ImageDateModified is non-null in the Jellyfin
+			// SDK; without it the whole item fails to decode (#614).
+			// Ether has no chapter-image date, so it carries the zero
+			// date Jellyfin itself sends for chapters without images.
+			entry := map[string]any{"StartPositionTicks": chapter.Start.Nanoseconds() / 100, "ImageDateModified": wireTime(time.Time{})}
 			if chapter.Title != "" {
 				entry["Name"] = chapter.Title
 			}
@@ -1185,13 +1251,8 @@ func (i *instance) virtualFolders(w http.ResponseWriter, r *http.Request) {
 		if i.protocol == "jellyfin" && view.Virtual {
 			entry["Locations"] = []string{}
 		}
-		switch view.Type {
-		case "movie", "movies":
-			entry["CollectionType"] = "movies"
-		case "show", "tvshows":
-			entry["CollectionType"] = "tvshows"
-		case "music", "musicvideos", "homevideos", "boxsets", "books", "mixed":
-			entry["CollectionType"] = view.Type
+		if ct := mediaBrowserCollectionType(view); ct != "" {
+			entry["CollectionType"] = ct
 		}
 		result = append(result, entry)
 	}
@@ -1226,11 +1287,12 @@ func mediaHasSubtitles(media frontend.MediaInfo) bool {
 
 type editionPageKey struct{}
 
-// pageEditions loads probed files only when the Jellyfin response will keep
-// MediaSources. Emby lists never embed them, and a Jellyfin list without
-// that field deletes the objects after they are built.
+// pageEditions loads probed files when the response will keep MediaSources.
+// Both Jellyfin and Emby list rows carry probed MediaSources when the request
+// names the field; a list without it deletes the objects after they are built,
+// so the probe is skipped then.
 func (i *instance) pageEditions(r *http.Request, viewer *frontend.Viewer, keys []frontend.RatingKey) *http.Request {
-	if i == nil || i.protocol != "jellyfin" {
+	if i == nil {
 		return r
 	}
 	return i.withPageEditions(r, viewer, keys)
@@ -1239,6 +1301,11 @@ func (i *instance) pageEditions(r *http.Request, viewer *frontend.Viewer, keys [
 func (i *instance) withPageEditions(r *http.Request, viewer *frontend.Viewer, keys []frontend.RatingKey) *http.Request {
 	batch, ok := i.host.Editions.(frontend.EditionBatch)
 	if !ok || viewer == nil || r == nil || len(keys) == 0 {
+		return r
+	}
+	// Editions only ever feed MediaSources, so skip the batch when the
+	// response will not keep it.
+	if !fieldSet(r)["mediasources"] {
 		return r
 	}
 	versions, err := batch.EditionsMany(r.Context(), viewer, device(r), keys)
@@ -1255,10 +1322,11 @@ type jellyfinEdition struct {
 }
 
 // jellyfinEditions returns one probed local copy per file. A single copy keeps
-// the title id. Several copies become separate Jellyfin items, matching a
-// library that stores each file as its own item.
+// the title id. Several copies become separate items, matching a library that
+// stores each file as its own item. Emby and Jellyfin both embed these on a
+// list row when the request asks for MediaSources.
 func (i *instance) jellyfinEditions(r *http.Request, viewer *frontend.Viewer, title frontend.Title) []jellyfinEdition {
-	if i == nil || i.protocol != "jellyfin" || i.host.Editions == nil || viewer == nil || r == nil {
+	if i == nil || i.host.Editions == nil || viewer == nil || r == nil {
 		return nil
 	}
 	if !fieldSet(r)["mediasources"] {
@@ -1301,6 +1369,14 @@ func (i *instance) jellyfinEditions(r *http.Request, viewer *frontend.Viewer, ti
 			id = handle
 		}
 		source := i.detailMediaSourceDTO(id, version.Media)
+		if i.protocol == "emby" {
+			i.versionSourceFacts(source, version)
+			i.embyMediaSourceDTO(source, ids.RatingKeyGUID(title.Key), version.Media)
+			// Emby list rows omit chapter arrays too. Detail keeps them.
+			delete(source, "Chapters")
+			out = append(out, jellyfinEdition{handle: id, source: source, media: version.Media})
+			continue
+		}
 		jellyfinMediaSourceShape(source, title.Title)
 		i.jellyfinMediaSourceDTO(source, version.Media, false)
 		// Jellyfin list rows omit chapter arrays. Detail keeps them.
@@ -1419,10 +1495,7 @@ func (i *instance) attachParentArtwork(r *http.Request, viewer *frontend.Viewer,
 	if i == nil || r == nil || item == nil {
 		return
 	}
-	show := title.ShowKey
-	if show == 0 && (title.Key.Kind() == frontend.KindEpisode || title.Key.Kind() == frontend.KindSeason) {
-		show = frontend.ShowKey(title.Key.TMDB())
-	}
+	show := parentShowKey(title)
 	if show == 0 {
 		return
 	}
@@ -1442,6 +1515,51 @@ func (i *instance) attachParentArtwork(r *http.Request, viewer *frontend.Viewer,
 	if backs, _ := images["BackdropImageTags"].([]string); len(backs) > 0 {
 		item["ParentBackdropImageTags"] = backs
 		item["ParentBackdropItemId"] = seriesID
+	}
+}
+
+// parentShowKey is the series of an episode or season: its ShowKey, or the
+// show its key encodes.
+func parentShowKey(title frontend.Title) frontend.RatingKey {
+	show := title.ShowKey
+	if show == 0 && (title.Key.Kind() == frontend.KindEpisode || title.Key.Kind() == frontend.KindSeason) {
+		show = frontend.ShowKey(title.Key.TMDB())
+	}
+	return show
+}
+
+// prefetchParentArtwork signs the series artwork of every episode and
+// season in titles in one page signing, so attachParentArtwork reads it
+// from the request's cache. Signing each series alone ran the artwork,
+// overlay and grant reads once per series on the page.
+func (i *instance) prefetchParentArtwork(r *http.Request, titles []frontend.Title) {
+	if i == nil || i.protocol != "jellyfin" || r == nil {
+		return
+	}
+	cache, _ := r.Context().Value(showArtworkCacheKey{}).(map[frontend.RatingKey]map[string]any)
+	if cache == nil {
+		return
+	}
+	var shows []frontend.Title
+	seen := map[frontend.RatingKey]bool{}
+	for _, title := range titles {
+		if title.Type != "episode" && title.Type != "season" {
+			continue
+		}
+		show := parentShowKey(title)
+		if _, cached := cache[show]; show == 0 || cached || seen[show] {
+			continue
+		}
+		seen[show] = true
+		shows = append(shows, frontend.Title{Key: show})
+	}
+	if len(shows) == 0 {
+		return
+	}
+	// A series the batch did not sign is left to cachedShowArtwork, which
+	// signs it alone as before.
+	for key, art := range i.gridImagesFor(r, shows) {
+		cache[key] = art
 	}
 }
 

@@ -8,7 +8,7 @@ import (
 	"strings"
 
 	protocol "github.com/braedonsaunders/ether/internal/conform/plex"
-	server "github.com/braedonsaunders/ether/internal/plex"
+	server "github.com/braedonsaunders/ether/internal/frontends/plex"
 	"github.com/go-chi/chi/v5"
 )
 
@@ -65,6 +65,24 @@ func missingRoutes() []string {
 // unprobedRoutes are GET routes the offline parity world cannot compare
 // byte for byte, each with the reason. They are not counted as covered.
 var unprobedRoutes = map[string]string{
+	// v0.3.12 TV discovery depends on the owner's imported guides and the
+	// current programme window. The offline parity corpus has no matching
+	// PMS guide; livetv_discovery_test.go exercises bounded projections.
+	"/tv.plex.providers.epg.xmltv:1/hubs/discover":                 "owner guide discovery has no recorded PMS baseline",
+	"/tv.plex.providers.epg.xmltv:1/hubs/promoted":                 "owner guide discovery has no recorded PMS baseline",
+	"/tv.plex.providers.epg.xmltv:1/hubs/sections/home":            "owner guide discovery has no recorded PMS baseline",
+	"/tv.plex.providers.epg.xmltv:1/lineups/dvr/channels/featured": "owner guide featured channels have no recorded PMS baseline",
+	"/tv.plex.providers.epg.xmltv:1/sections":                      "owner guide sections have no recorded PMS baseline",
+	"/tv.plex.providers.epg.xmltv:1/watchnow/tonight":              "current programme window has no recorded PMS baseline",
+	"/library/metadata/{key}/theme/{version}":                      "theme audio requires an owner-enabled cache and version digest absent from the offline world",
+	// Owner-defined guides and genre-filtered channel menus have no recorded
+	// PMS baseline. Populated membership and visibility are exercised by
+	// internal/frontends/plex/livetv_guides_test.go.
+	"/tv.plex.providers.epg.xmltv:1/categories/{category}/channels":        "owner guide category channels have no recorded PMS baseline",
+	"/tv.plex.providers.epg.xmltv:1/guides/{guide}/channels":               "owner-defined guides have no recorded PMS baseline",
+	"/tv.plex.providers.epg.xmltv:1/watchnow/categories/{category}":        "owner guide category listings have no recorded PMS baseline",
+	"/service/ultrablur/colors":                                            "colours come from the artwork palette cache, which the offline world does not warm",
+	"/services/ultrablur/colors":                                           "colours come from the artwork palette cache, which the offline world does not warm",
 	"/library/parts/{part}/{changestamp}/":                                 "PM4K bare changestamp route has no offline parity request",
 	"/statistics/resources":                                                "live host CPU and memory samples differ between any two processes",
 	"/{ttype:video|music|audio|subtitles}/:/transcode/universal/start":     "Plex for Mac's protocol=http conversion streams from a live FFmpeg the offline world does not run",
@@ -76,6 +94,13 @@ var unprobedRoutes = map[string]string{
 	"/devices/{id}":         "new route in v0.3; pre-32e51bfaf baselines answer 404",
 	"/statistics/bandwidth": "new route in v0.3; pre-32e51bfaf baselines answer 404",
 	"/statistics/media":     "new route in v0.3; pre-32e51bfaf baselines answer 404",
+	// New in v0.3.6; v0.2.58 and main answer 404. Unit tests in internal/plex
+	// guard them (metadata_guid_list_test.go, livetv_logo_compat_test.go).
+	"/library/metadata/plex:/*":           "new route in v0.3.6 (Infuse Watchlist plex:// identity paths); baselines answer 404",
+	"/livetv/logos/{channel}/{signature}": "new route in v0.3.6 (Apple TV guide logos); baselines answer 404 and the signature is an HMAC under a per-node key",
+	// New in v0.3.8; v0.2.58 and main answer 404. Unit tests in
+	// internal/frontends/plex guard it.
+	"/library/metadata/{key}/subscription/modes": "new route in v0.3.8 (Plex for Mac download subscription modes, #365); baselines answer 404",
 }
 
 func inventorySummary() string { m := missingRoutes(); return strings.Join(m, ", ") }
